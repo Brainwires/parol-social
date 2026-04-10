@@ -21,5 +21,8 @@ subtle.workspace = true
 serde.workspace = true
 thiserror.workspace = true
 
+curve25519-dalek.workspace = true
+
 [dev-dependencies]
 proptest.workspace = true
+hex.workspace = true

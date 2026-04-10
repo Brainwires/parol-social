@@ -4,28 +4,66 @@
 //! and AES-256-GCM (secondary, for transport-layer TLS disguise).
 
 use crate::{Aead, CryptoError};
+use zeroize::{Zeroize, ZeroizeOnDrop};
 
 /// ChaCha20-Poly1305 AEAD cipher.
 ///
 /// Primary cipher for all internal encryption. Constant-time on all
 /// platforms including mobile ARM without AES-NI hardware support.
+#[derive(Zeroize, ZeroizeOnDrop)]
 pub struct ChaCha20Poly1305Cipher {
-    // TODO: key material
+    key: [u8; 32],
 }
 
 impl ChaCha20Poly1305Cipher {
-    pub fn new(_key: &[u8]) -> Result<Self, CryptoError> {
-        todo!("ChaCha20-Poly1305 initialization")
+    pub fn new(key: &[u8]) -> Result<Self, CryptoError> {
+        if key.len() != 32 {
+            return Err(CryptoError::InvalidKeyLength {
+                expected: 32,
+                got: key.len(),
+            });
+        }
+        let mut k = [0u8; 32];
+        k.copy_from_slice(key);
+        Ok(Self { key: k })
     }
 }
 
 impl Aead for ChaCha20Poly1305Cipher {
-    fn encrypt(&self, _nonce: &[u8], _plaintext: &[u8], _aad: &[u8]) -> Result<Vec<u8>, CryptoError> {
-        todo!("ChaCha20-Poly1305 encrypt")
+    fn encrypt(&self, nonce: &[u8], plaintext: &[u8], aad: &[u8]) -> Result<Vec<u8>, CryptoError> {
+        use chacha20poly1305::aead::{Aead as AeadTrait, KeyInit, Payload};
+        use chacha20poly1305::ChaCha20Poly1305;
+
+        if nonce.len() != 12 {
+            return Err(CryptoError::InvalidNonceLength {
+                expected: 12,
+                got: nonce.len(),
+            });
+        }
+
+        let cipher = ChaCha20Poly1305::new((&self.key).into());
+        let nonce = chacha20poly1305::Nonce::from_slice(nonce);
+        cipher
+            .encrypt(nonce, Payload { msg: plaintext, aad })
+            .map_err(|_| CryptoError::EncryptionFailed)
     }
 
-    fn decrypt(&self, _nonce: &[u8], _ciphertext: &[u8], _aad: &[u8]) -> Result<Vec<u8>, CryptoError> {
-        todo!("ChaCha20-Poly1305 decrypt")
+    fn decrypt(&self, nonce: &[u8], ciphertext: &[u8], aad: &[u8]) -> Result<Vec<u8>, CryptoError> {
+        use chacha20poly1305::aead::{Aead as AeadTrait, KeyInit, Payload};
+        use chacha20poly1305::ChaCha20Poly1305;
+
+        if nonce.len() != 12 {
+            return Err(CryptoError::InvalidNonceLength {
+                expected: 12,
+                got: nonce.len(),
+            });
+        }
+
+        let cipher = ChaCha20Poly1305::new((&self.key).into());
+        let nonce = chacha20poly1305::Nonce::from_slice(nonce);
+        cipher
+            .decrypt(nonce, Payload { msg: ciphertext, aad })
+            .map_err(|_| CryptoError::DecryptionFailed)
     }
 
     fn key_len(&self) -> usize { 32 }
@@ -36,23 +74,60 @@ impl Aead for ChaCha20Poly1305Cipher {
 ///
 /// Secondary cipher used at the transport layer to match TLS cipher suites.
 /// Provides hardware acceleration on platforms with AES-NI.
+#[derive(Zeroize, ZeroizeOnDrop)]
 pub struct Aes256GcmCipher {
-    // TODO: key material
+    key: [u8; 32],
 }
 
 impl Aes256GcmCipher {
-    pub fn new(_key: &[u8]) -> Result<Self, CryptoError> {
-        todo!("AES-256-GCM initialization")
+    pub fn new(key: &[u8]) -> Result<Self, CryptoError> {
+        if key.len() != 32 {
+            return Err(CryptoError::InvalidKeyLength {
+                expected: 32,
+                got: key.len(),
+            });
+        }
+        let mut k = [0u8; 32];
+        k.copy_from_slice(key);
+        Ok(Self { key: k })
     }
 }
 
 impl Aead for Aes256GcmCipher {
-    fn encrypt(&self, _nonce: &[u8], _plaintext: &[u8], _aad: &[u8]) -> Result<Vec<u8>, CryptoError> {
-        todo!("AES-256-GCM encrypt")
+    fn encrypt(&self, nonce: &[u8], plaintext: &[u8], aad: &[u8]) -> Result<Vec<u8>, CryptoError> {
+        use aes_gcm::aead::{Aead as AeadTrait, KeyInit, Payload};
+        use aes_gcm::Aes256Gcm;
+
+        if nonce.len() != 12 {
+            return Err(CryptoError::InvalidNonceLength {
+                expected: 12,
+                got: nonce.len(),
+            });
+        }
+
+        let cipher = Aes256Gcm::new((&self.key).into());
+        let nonce = aes_gcm::Nonce::from_slice(nonce);
+        cipher
+            .encrypt(nonce, Payload { msg: plaintext, aad })
+            .map_err(|_| CryptoError::EncryptionFailed)
     }
 
-    fn decrypt(&self, _nonce: &[u8], _ciphertext: &[u8], _aad: &[u8]) -> Result<Vec<u8>, CryptoError> {
-        todo!("AES-256-GCM decrypt")
+    fn decrypt(&self, nonce: &[u8], ciphertext: &[u8], aad: &[u8]) -> Result<Vec<u8>, CryptoError> {
+        use aes_gcm::aead::{Aead as AeadTrait, KeyInit, Payload};
+        use aes_gcm::Aes256Gcm;
+
+        if nonce.len() != 12 {
+            return Err(CryptoError::InvalidNonceLength {
+                expected: 12,
+                got: nonce.len(),
+            });
+        }
+
+        let cipher = Aes256Gcm::new((&self.key).into());
+        let nonce = aes_gcm::Nonce::from_slice(nonce);
+        cipher
+            .decrypt(nonce, Payload { msg: ciphertext, aad })
+            .map_err(|_| CryptoError::DecryptionFailed)
     }
 
     fn key_len(&self) -> usize { 32 }
