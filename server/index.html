@@ -1,0 +1,357 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Calculator - Simple calculator for everyday use</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
+      background: #f5f5f7;
+      color: #1d1d1f;
+      line-height: 1.5;
+      -webkit-font-smoothing: antialiased;
+    }
+
+    .container {
+      max-width: 480px;
+      margin: 0 auto;
+      padding: 24px 20px 40px;
+    }
+
+    /* Header */
+    .header {
+      text-align: center;
+      padding: 32px 0 8px;
+    }
+    .header h1 {
+      font-size: 22px;
+      font-weight: 600;
+      color: #1d1d1f;
+    }
+    .header p {
+      font-size: 14px;
+      color: #86868b;
+      margin-top: 4px;
+    }
+
+    /* App Card */
+    .app-card {
+      background: #fff;
+      border-radius: 16px;
+      padding: 24px;
+      margin-top: 24px;
+      box-shadow: 0 1px 3px rgba(0,0,0,0.06), 0 1px 2px rgba(0,0,0,0.04);
+    }
+    .app-info {
+      display: flex;
+      align-items: center;
+      gap: 16px;
+    }
+    .app-icon {
+      width: 80px;
+      height: 80px;
+      border-radius: 18px;
+      flex-shrink: 0;
+      overflow: hidden;
+    }
+    .app-icon svg {
+      width: 100%;
+      height: 100%;
+      display: block;
+    }
+    .app-details h2 {
+      font-size: 20px;
+      font-weight: 600;
+    }
+    .app-meta {
+      font-size: 13px;
+      color: #86868b;
+      margin-top: 4px;
+    }
+    .app-meta span {
+      display: inline-block;
+    }
+    .app-meta span + span::before {
+      content: "\00b7";
+      margin: 0 6px;
+    }
+    .app-stars {
+      color: #ff9500;
+      font-size: 14px;
+      margin-top: 4px;
+      letter-spacing: 1px;
+    }
+
+    .app-stats {
+      display: flex;
+      justify-content: space-around;
+      margin-top: 20px;
+      padding-top: 16px;
+      border-top: 1px solid #f0f0f0;
+      text-align: center;
+    }
+    .stat-label {
+      font-size: 11px;
+      color: #86868b;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+    }
+    .stat-value {
+      font-size: 15px;
+      font-weight: 600;
+      margin-top: 2px;
+    }
+
+    /* Install Button */
+    .install-section {
+      text-align: center;
+      margin-top: 28px;
+    }
+    .install-btn {
+      display: inline-block;
+      background: #007aff;
+      color: #fff;
+      font-size: 17px;
+      font-weight: 600;
+      padding: 14px 48px;
+      border-radius: 12px;
+      text-decoration: none;
+      border: none;
+      cursor: pointer;
+      transition: background 0.15s;
+      width: 100%;
+      max-width: 320px;
+    }
+    .install-btn:hover {
+      background: #0066d6;
+    }
+    .install-btn:active {
+      background: #0055b3;
+    }
+    .install-note {
+      font-size: 13px;
+      color: #86868b;
+      margin-top: 12px;
+    }
+    .install-note-small {
+      font-size: 12px;
+      color: #aeaeb2;
+      margin-top: 4px;
+    }
+
+    /* How to Install */
+    .how-to {
+      background: #fff;
+      border-radius: 16px;
+      padding: 24px;
+      margin-top: 24px;
+      box-shadow: 0 1px 3px rgba(0,0,0,0.06), 0 1px 2px rgba(0,0,0,0.04);
+    }
+    .how-to summary {
+      font-size: 16px;
+      font-weight: 600;
+      cursor: pointer;
+      list-style: none;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+    .how-to summary::-webkit-details-marker { display: none; }
+    .how-to summary::after {
+      content: "\25B8";
+      font-size: 14px;
+      color: #86868b;
+      transition: transform 0.2s;
+    }
+    .how-to[open] summary::after {
+      transform: rotate(90deg);
+    }
+    .how-to ol {
+      margin-top: 16px;
+      padding-left: 20px;
+    }
+    .how-to li {
+      font-size: 14px;
+      color: #3a3a3c;
+      margin-bottom: 10px;
+      line-height: 1.6;
+    }
+    .how-to li:last-child { margin-bottom: 0; }
+
+    /* Footer */
+    .footer {
+      text-align: center;
+      margin-top: 40px;
+      padding-top: 20px;
+      border-top: 1px solid #e5e5ea;
+    }
+    .footer p {
+      font-size: 12px;
+      color: #aeaeb2;
+    }
+    .footer a {
+      color: #86868b;
+      text-decoration: none;
+    }
+    .footer a:hover {
+      text-decoration: underline;
+    }
+
+    /* Privacy overlay */
+    .privacy-overlay {
+      display: none;
+      position: fixed;
+      inset: 0;
+      background: rgba(0,0,0,0.4);
+      z-index: 100;
+      justify-content: center;
+      align-items: center;
+    }
+    .privacy-overlay.visible {
+      display: flex;
+    }
+    .privacy-box {
+      background: #fff;
+      border-radius: 16px;
+      padding: 24px;
+      max-width: 340px;
+      margin: 20px;
+      text-align: center;
+    }
+    .privacy-box h3 {
+      font-size: 17px;
+      font-weight: 600;
+      margin-bottom: 8px;
+    }
+    .privacy-box p {
+      font-size: 14px;
+      color: #3a3a3c;
+      line-height: 1.6;
+    }
+    .privacy-close {
+      display: inline-block;
+      margin-top: 16px;
+      background: #007aff;
+      color: #fff;
+      border: none;
+      padding: 8px 24px;
+      border-radius: 8px;
+      font-size: 14px;
+      font-weight: 600;
+      cursor: pointer;
+    }
+  </style>
+</head>
+<body>
+
+  <div class="container">
+
+    <!-- Header -->
+    <div class="header">
+      <h1>Calculator</h1>
+      <p>Simple calculator for everyday use</p>
+    </div>
+
+    <!-- App Card -->
+    <div class="app-card">
+      <div class="app-info">
+        <div class="app-icon">
+          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 120 120" width="120" height="120">
+            <rect width="120" height="120" rx="26" fill="#1c1b1f"/>
+            <rect x="10" y="10" width="100" height="30" rx="8" fill="#2d2c31"/>
+            <text x="102" y="32" font-family="system-ui, sans-serif" font-size="18" fill="#e6e0e9" text-anchor="end">0</text>
+            <rect x="10" y="46" width="22" height="14" rx="7" fill="#332d41"/>
+            <rect x="35" y="46" width="22" height="14" rx="7" fill="#332d41"/>
+            <rect x="60" y="46" width="22" height="14" rx="7" fill="#332d41"/>
+            <rect x="85" y="46" width="25" height="14" rx="7" fill="#332d41"/>
+            <rect x="10" y="64" width="22" height="14" rx="7" fill="#2d2c31"/>
+            <rect x="35" y="64" width="22" height="14" rx="7" fill="#2d2c31"/>
+            <rect x="60" y="64" width="22" height="14" rx="7" fill="#2d2c31"/>
+            <rect x="85" y="64" width="25" height="14" rx="7" fill="#332d41"/>
+            <rect x="10" y="82" width="22" height="14" rx="7" fill="#2d2c31"/>
+            <rect x="35" y="82" width="22" height="14" rx="7" fill="#2d2c31"/>
+            <rect x="60" y="82" width="22" height="14" rx="7" fill="#2d2c31"/>
+            <rect x="85" y="82" width="25" height="14" rx="7" fill="#332d41"/>
+            <rect x="10" y="100" width="47" height="14" rx="7" fill="#2d2c31"/>
+            <rect x="60" y="100" width="22" height="14" rx="7" fill="#2d2c31"/>
+            <rect x="85" y="100" width="25" height="14" rx="7" fill="#d0bcff"/>
+          </svg>
+        </div>
+        <div class="app-details">
+          <h2>Calculator</h2>
+          <div class="app-meta">
+            <span>Version 1.0.0</span>
+            <span>Utilities</span>
+          </div>
+          <div class="app-stars" aria-label="5 out of 5 stars">&#9733;&#9733;&#9733;&#9733;&#9733;</div>
+        </div>
+      </div>
+
+      <div class="app-stats">
+        <div>
+          <div class="stat-label">Released</div>
+          <div class="stat-value">Apr 2026</div>
+        </div>
+        <div>
+          <div class="stat-label">Size</div>
+          <div class="stat-value">~2 MB</div>
+        </div>
+        <div>
+          <div class="stat-label">Category</div>
+          <div class="stat-value">Utilities</div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Install -->
+    <div class="install-section">
+      <a href="../pwa/index.html?mode=calc" class="install-btn">Install App</a>
+      <p class="install-note">Works on Android, iPhone, Windows, Mac, Linux</p>
+      <p class="install-note-small">No app store required. Opens in your browser.</p>
+    </div>
+
+    <!-- How to Install -->
+    <details class="how-to">
+      <summary>How to install</summary>
+      <ol>
+        <li>Tap <strong>Install App</strong> above.</li>
+        <li>Your browser will ask to <strong>Add to Home Screen</strong> &mdash; tap Yes.</li>
+        <li>The app appears on your home screen like any other app.</li>
+        <li>Open it and start using!</li>
+      </ol>
+    </details>
+
+    <!-- Footer -->
+    <div class="footer">
+      <p>Free &amp; open source &nbsp;&middot;&nbsp; <a href="#" id="privacy-link">Privacy</a></p>
+    </div>
+
+  </div>
+
+  <!-- Privacy Overlay -->
+  <div class="privacy-overlay" id="privacy-overlay">
+    <div class="privacy-box">
+      <h3>Privacy</h3>
+      <p>This app does not collect any data. Everything stays on your device.</p>
+      <button class="privacy-close" id="privacy-close">OK</button>
+    </div>
+  </div>
+
+  <script>
+    document.getElementById('privacy-link').addEventListener('click', function(e) {
+      e.preventDefault();
+      document.getElementById('privacy-overlay').classList.add('visible');
+    });
+    document.getElementById('privacy-close').addEventListener('click', function() {
+      document.getElementById('privacy-overlay').classList.remove('visible');
+    });
+    document.getElementById('privacy-overlay').addEventListener('click', function(e) {
+      if (e.target === this) this.classList.remove('visible');
+    });
+  </script>
+
+</body>
+</html>
