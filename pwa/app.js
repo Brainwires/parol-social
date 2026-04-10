@@ -609,11 +609,8 @@ function stopQRScanner() {
 function renderBootstrapQR() {
     const canvas = document.getElementById('qr-canvas');
     if (!canvas) return;
-    const ctx = canvas.getContext('2d');
-    ctx.fillStyle = '#fff';
-    ctx.fillRect(0, 0, canvas.width, canvas.height);
 
-    let data = 'ParolNet:' + (window._peerId || 'not-initialized');
+    let data = 'parolnet:' + (window._peerId || 'no-identity');
 
     if (wasm && wasm.generate_qr_payload && wasm.get_public_key) {
         try {
@@ -623,62 +620,31 @@ function renderBootstrapQR() {
         }
     }
 
-    // Draw a visual data matrix from the hex string
-    drawDataMatrix(ctx, data, canvas.width, canvas.height);
+    // Use the real QR code library (qrcode.js loaded as global)
+    if (typeof makeQR === 'function' && typeof renderQRToCanvas === 'function') {
+        try {
+            const qr = makeQR(data);
+            renderQRToCanvas(qr, canvas, 2);
+        } catch(e) {
+            console.error('QR render failed:', e);
+            // Fallback: show text
+            const ctx = canvas.getContext('2d');
+            ctx.fillStyle = '#fff';
+            ctx.fillRect(0, 0, canvas.width, canvas.height);
+            ctx.fillStyle = '#333';
+            ctx.font = '12px monospace';
+            ctx.textAlign = 'center';
+            ctx.fillText('QR generation failed', canvas.width/2, canvas.height/2);
+        }
+    } else {
+        console.warn('QR library not loaded');
+    }
 
     // Show shareable text code
     const codeEl = document.getElementById('qr-share-code');
     if (codeEl) {
         codeEl.textContent = data;
     }
-}
-
-function drawDataMatrix(ctx, data, w, h) {
-    // Convert data to binary and draw as a grid of modules
-    const bytes = [];
-    for (let i = 0; i < data.length; i++) {
-        bytes.push(data.charCodeAt(i));
-    }
-
-    const gridSize = Math.ceil(Math.sqrt(bytes.length * 8));
-    const moduleSize = Math.floor(Math.min(w, h) / (gridSize + 4)); // padding
-    const offsetX = Math.floor((w - gridSize * moduleSize) / 2);
-    const offsetY = Math.floor((h - gridSize * moduleSize) / 2);
-
-    ctx.fillStyle = '#000';
-    let bitIndex = 0;
-    for (let row = 0; row < gridSize; row++) {
-        for (let col = 0; col < gridSize; col++) {
-            const byteIdx = Math.floor(bitIndex / 8);
-            const bitPos = 7 - (bitIndex % 8);
-            if (byteIdx < bytes.length && (bytes[byteIdx] >> bitPos) & 1) {
-                ctx.fillRect(
-                    offsetX + col * moduleSize,
-                    offsetY + row * moduleSize,
-                    moduleSize - 1,
-                    moduleSize - 1
-                );
-            }
-            bitIndex++;
-        }
-    }
-
-    // Draw finder patterns (top-left, top-right, bottom-left corners)
-    drawFinderPattern(ctx, offsetX, offsetY, moduleSize);
-    if (gridSize >= 7) {
-        drawFinderPattern(ctx, offsetX + (gridSize - 7) * moduleSize, offsetY, moduleSize);
-        drawFinderPattern(ctx, offsetX, offsetY + (gridSize - 7) * moduleSize, moduleSize);
-    }
-}
-
-function drawFinderPattern(ctx, x, y, moduleSize) {
-    const s = moduleSize;
-    ctx.fillStyle = '#000';
-    ctx.fillRect(x, y, 7 * s, 7 * s);
-    ctx.fillStyle = '#fff';
-    ctx.fillRect(x + s, y + s, 5 * s, 5 * s);
-    ctx.fillStyle = '#000';
-    ctx.fillRect(x + 2 * s, y + 2 * s, 3 * s, 3 * s);
 }
 
 function copyBootstrapCode() {

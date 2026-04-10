@@ -87,6 +87,16 @@ export function get_file_offer(file_id_hex: string): any;
 export function get_next_chunk(file_id_hex: string): any;
 
 /**
+ * Get the current peer ID (hex). Returns empty string if not initialized.
+ */
+export function get_peer_id(): string;
+
+/**
+ * Get the current public key (hex). Returns empty string if not initialized.
+ */
+export function get_public_key(): string;
+
+/**
  * Hang up an active call.
  */
 export function hangup_call(call_id_hex: string): void;
@@ -186,6 +196,8 @@ export interface InitOutput {
     readonly get_call_state: (a: number, b: number, c: number) => void;
     readonly get_file_offer: (a: number, b: number, c: number) => void;
     readonly get_next_chunk: (a: number, b: number, c: number) => void;
+    readonly get_peer_id: (a: number) => void;
+    readonly get_public_key: (a: number) => void;
     readonly hangup_call: (a: number, b: number, c: number) => void;
     readonly has_session: (a: number, b: number) => number;
     readonly init: () => void;

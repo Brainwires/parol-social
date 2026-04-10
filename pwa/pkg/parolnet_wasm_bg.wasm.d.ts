@@ -14,6 +14,8 @@ export const generate_qr_payload: (a: number, b: number, c: number, d: number, e
 export const get_call_state: (a: number, b: number, c: number) => void;
 export const get_file_offer: (a: number, b: number, c: number) => void;
 export const get_next_chunk: (a: number, b: number, c: number) => void;
+export const get_peer_id: (a: number) => void;
+export const get_public_key: (a: number) => void;
 export const hangup_call: (a: number, b: number, c: number) => void;
 export const has_session: (a: number, b: number) => number;
 export const init: () => void;
