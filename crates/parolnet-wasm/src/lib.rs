@@ -104,6 +104,28 @@ pub fn initialize() -> String {
     peer_id
 }
 
+/// Get the current peer ID (hex). Returns empty string if not initialized.
+#[wasm_bindgen]
+pub fn get_peer_id() -> String {
+    let state = STATE.lock().unwrap();
+    state
+        .client
+        .as_ref()
+        .map(|c| hex::encode(c.peer_id().0))
+        .unwrap_or_default()
+}
+
+/// Get the current public key (hex). Returns empty string if not initialized.
+#[wasm_bindgen]
+pub fn get_public_key() -> String {
+    let state = STATE.lock().unwrap();
+    state
+        .client
+        .as_ref()
+        .map(|c| hex::encode(c.public_key()))
+        .unwrap_or_default()
+}
+
 // ── Session Management ──────────────────────────────────────
 
 /// Establish a Double Ratchet session with a peer.

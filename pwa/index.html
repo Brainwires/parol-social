@@ -80,16 +80,20 @@
         </div>
         <div id="add-tab-qr-show" class="add-tab-content">
             <p>Share your QR code with someone nearby to exchange keys securely.</p>
-            <div id="qr-display" style="width:200px;height:200px;background:var(--bg3);border-radius:12px;display:flex;align-items:center;justify-content:center;color:var(--text3);">QR Code</div>
+            <canvas id="qr-canvas" width="200" height="200" style="border-radius:12px;background:#fff;"></canvas>
+            <div id="qr-share-code" class="mono" style="margin-top:12px;padding:12px;background:var(--bg3);border-radius:8px;font-size:11px;word-break:break-all;max-width:300px;user-select:text;-webkit-user-select:text;"></div>
+            <button onclick="copyBootstrapCode()" style="max-width:300px;">Copy Code</button>
+            <p style="font-size:12px;color:var(--text3);">Share this code with your contact</p>
         </div>
         <div id="add-tab-qr-scan" class="add-tab-content hidden">
             <p>Point your camera at a contact's QR code.</p>
-            <div style="width:250px;height:250px;background:var(--bg3);border-radius:12px;display:flex;align-items:center;justify-content:center;color:var(--text3);">Camera</div>
+            <video id="qr-scanner-video" autoplay playsinline style="width:250px;height:250px;border-radius:12px;object-fit:cover;background:#000;"></video>
+            <p id="qr-scanner-status" style="margin-top:8px;font-size:13px;color:var(--text3);">Tap to start camera</p>
         </div>
         <div id="add-tab-passphrase" class="add-tab-content hidden">
             <p>Enter a shared passphrase to find each other on the network.</p>
             <input type="text" placeholder="Enter shared passphrase..." dir="auto">
-            <button onclick="alert('Searching...')">Connect</button>
+            <button onclick="connectViaPassphrase()">Connect</button>
         </div>
     </div>
 

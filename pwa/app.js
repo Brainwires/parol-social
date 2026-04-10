@@ -5,6 +5,8 @@
 let wasm = null;
 let currentView = 'loading';
 let currentPeerId = null;
+let currentCallId = null;
+let localStream = null;
 let platform = detectPlatform();
 
 // ── Platform Detection ──────────────────────────────────────
@@ -17,8 +19,27 @@ function detectPlatform() {
     return 'default';
 }
 
+// ── Toast Notifications ─────────────────────────────────────
+function showToast(message, duration = 3000) {
+    let toast = document.getElementById('toast');
+    if (!toast) {
+        toast = document.createElement('div');
+        toast.id = 'toast';
+        toast.style.cssText = 'position:fixed;bottom:80px;left:50%;transform:translateX(-50%);background:#333;color:#fff;padding:12px 24px;border-radius:8px;font-size:14px;z-index:9999;opacity:0;transition:opacity 0.3s;pointer-events:none;max-width:80%;text-align:center;';
+        document.body.appendChild(toast);
+    }
+    toast.textContent = message;
+    toast.style.opacity = '1';
+    clearTimeout(toast._timeout);
+    toast._timeout = setTimeout(() => { toast.style.opacity = '0'; }, duration);
+}
+
 // ── View Management ─────────────────────────────────────────
 function showView(viewName) {
+    // Stop camera when leaving add-contact view
+    if (currentView === 'add-contact' && viewName !== 'add-contact') {
+        stopQRScanner();
+    }
     document.querySelectorAll('.view').forEach(v => v.classList.add('hidden'));
     const target = document.getElementById(`view-${viewName}`);
     if (target) {
@@ -116,6 +137,85 @@ function updateCalcDisplay() {
     }
 }
 
+// ── IndexedDB Storage ──────────────────────────────────────
+const DB_NAME = 'parolnet';
+const DB_VERSION = 1;
+
+function openDB() {
+    return new Promise((resolve, reject) => {
+        const req = indexedDB.open(DB_NAME, DB_VERSION);
+        req.onupgradeneeded = (e) => {
+            const db = e.target.result;
+            if (!db.objectStoreNames.contains('contacts')) {
+                db.createObjectStore('contacts', { keyPath: 'peerId' });
+            }
+            if (!db.objectStoreNames.contains('messages')) {
+                const store = db.createObjectStore('messages', { keyPath: 'id', autoIncrement: true });
+                store.createIndex('peerId', 'peerId', { unique: false });
+                store.createIndex('timestamp', 'timestamp', { unique: false });
+            }
+        };
+        req.onsuccess = () => resolve(req.result);
+        req.onerror = () => reject(req.error);
+    });
+}
+
+async function dbGetAll(storeName) {
+    const db = await openDB();
+    return new Promise((resolve, reject) => {
+        const tx = db.transaction(storeName, 'readonly');
+        const store = tx.objectStore(storeName);
+        const req = store.getAll();
+        req.onsuccess = () => resolve(req.result);
+        req.onerror = () => reject(req.error);
+    });
+}
+
+async function dbPut(storeName, item) {
+    const db = await openDB();
+    return new Promise((resolve, reject) => {
+        const tx = db.transaction(storeName, 'readwrite');
+        const store = tx.objectStore(storeName);
+        const req = store.put(item);
+        req.onsuccess = () => resolve(req.result);
+        req.onerror = () => reject(req.error);
+    });
+}
+
+async function dbGetByIndex(storeName, indexName, value) {
+    const db = await openDB();
+    return new Promise((resolve, reject) => {
+        const tx = db.transaction(storeName, 'readonly');
+        const store = tx.objectStore(storeName);
+        const index = store.index(indexName);
+        const req = index.getAll(value);
+        req.onsuccess = () => resolve(req.result);
+        req.onerror = () => reject(req.error);
+    });
+}
+
+async function dbDelete(storeName, key) {
+    const db = await openDB();
+    return new Promise((resolve, reject) => {
+        const tx = db.transaction(storeName, 'readwrite');
+        const store = tx.objectStore(storeName);
+        const req = store.delete(key);
+        req.onsuccess = () => resolve();
+        req.onerror = () => reject(req.error);
+    });
+}
+
+async function dbClear(storeName) {
+    const db = await openDB();
+    return new Promise((resolve, reject) => {
+        const tx = db.transaction(storeName, 'readwrite');
+        const store = tx.objectStore(storeName);
+        const req = store.clear();
+        req.onsuccess = () => resolve();
+        req.onerror = () => reject(req.error);
+    });
+}
+
 // ── WASM Loading ────────────────────────────────────────────
 async function loadWasm() {
     try {
@@ -130,12 +230,14 @@ async function loadWasm() {
 
 function onWasmReady() {
     if (wasm.initialize) {
-        wasm.initialize();
+        const peerId = wasm.initialize();
+        window._peerId = peerId || null;
     }
 
     // Display peer ID in settings
     if (wasm.get_peer_id) {
         const peerId = wasm.get_peer_id();
+        window._peerId = peerId || window._peerId;
         const el = document.getElementById('settings-peer-id');
         if (el) el.textContent = peerId || '-';
     }
@@ -162,9 +264,14 @@ function onWasmUnavailable() {
 }
 
 // ── Contact List ────────────────────────────────────────────
-function loadContacts() {
-    // Load from IndexedDB or WASM storage
-    renderContactList([]);
+async function loadContacts() {
+    try {
+        const contacts = await dbGetAll('contacts');
+        renderContactList(contacts);
+    } catch (e) {
+        console.warn('Failed to load contacts:', e);
+        renderContactList([]);
+    }
 }
 
 function renderContactList(contacts) {
@@ -193,6 +300,7 @@ function renderContactList(contacts) {
 // ── Chat View ───────────────────────────────────────────────
 function openChat(peerId) {
     currentPeerId = peerId;
+    window.currentPeerId = peerId;
     showView('chat');
 
     const nameEl = document.getElementById('chat-peer-name');
@@ -202,9 +310,15 @@ function openChat(peerId) {
     loadMessages(peerId);
 }
 
-function loadMessages(peerId) {
-    // Load from IndexedDB
-    renderMessages([]);
+async function loadMessages(peerId) {
+    try {
+        const messages = await dbGetByIndex('messages', 'peerId', peerId);
+        messages.sort((a, b) => a.timestamp - b.timestamp);
+        renderMessages(messages);
+    } catch (e) {
+        console.warn('Failed to load messages:', e);
+        renderMessages([]);
+    }
 }
 
 function renderMessages(messages) {
@@ -220,11 +334,21 @@ function renderMessages(messages) {
     container.scrollTop = container.scrollHeight;
 }
 
-function sendMessage() {
+async function sendMessage() {
     const input = document.getElementById('message-input');
     if (!input) return;
     const text = input.value.trim();
     if (!text || !currentPeerId) return;
+
+    const msg = {
+        peerId: currentPeerId,
+        direction: 'sent',
+        content: text,
+        timestamp: Date.now()
+    };
+
+    // Store locally
+    try { await dbPut('messages', msg); } catch(e) { console.warn(e); }
 
     // Encrypt and send via WASM
     if (wasm && wasm.send_message) {
@@ -235,10 +359,25 @@ function sendMessage() {
         }
     }
 
-    // Store in local messages
-    appendMessage({ direction: 'sent', content: text, timestamp: Date.now() });
+    appendMessage(msg);
     input.value = '';
     input.focus();
+
+    // Update contact's last message
+    try {
+        await dbPut('contacts', {
+            peerId: currentPeerId,
+            name: currentPeerId.slice(0, 8) + '...',
+            lastMessage: text,
+            lastTime: formatTime(Date.now()),
+            unread: 0
+        });
+    } catch(e) { console.warn(e); }
+
+    // Request notification permission after first message sent (user interaction)
+    if ('Notification' in window && Notification.permission === 'default') {
+        requestNotificationPermission();
+    }
 }
 
 function appendMessage(msg) {
@@ -247,10 +386,11 @@ function appendMessage(msg) {
 
     const div = document.createElement('div');
     div.className = `message ${msg.direction}`;
-    div.innerHTML = `
-        <div class="message-bubble" dir="auto">${escapeHtml(msg.content)}</div>
-        <div class="message-time">${formatTime(msg.timestamp)}</div>
-    `;
+    if (msg.isHtml) {
+        div.innerHTML = `<div class="message-bubble">${msg.content}</div><div class="message-time">${formatTime(msg.timestamp)}</div>`;
+    } else {
+        div.innerHTML = `<div class="message-bubble" dir="auto">${escapeHtml(msg.content)}</div><div class="message-time">${formatTime(msg.timestamp)}</div>`;
+    }
     container.appendChild(div);
     container.scrollTop = container.scrollHeight;
 }
@@ -259,9 +399,40 @@ function appendMessage(msg) {
 let callTimerInterval = null;
 let callStartTime = null;
 
-function initiateCall(peerId, withVideo) {
+async function initiateCall(peerId, withVideo) {
     if (!peerId) peerId = currentPeerId;
     if (!peerId) return;
+    currentCallId = null;
+
+    // Request media
+    try {
+        const constraints = { audio: true };
+        if (withVideo) constraints.video = { width: 320, height: 240 };
+        localStream = await navigator.mediaDevices.getUserMedia(constraints);
+
+        // Show local video if video call
+        if (withVideo) {
+            const localVideo = document.getElementById('local-video');
+            if (localVideo) {
+                localVideo.srcObject = localStream;
+                localVideo.classList.remove('hidden');
+            }
+        }
+    } catch (e) {
+        showToast('Could not access microphone/camera: ' + e.message);
+        return;
+    }
+
+    // Start call via WASM
+    if (wasm && wasm.start_call) {
+        try {
+            currentCallId = wasm.start_call(peerId);
+        } catch (e) {
+            showToast('Call failed: ' + e.message);
+            stopLocalMedia();
+            return;
+        }
+    }
 
     showView('call');
     const nameEl = document.getElementById('call-peer-name');
@@ -270,13 +441,7 @@ function initiateCall(peerId, withVideo) {
     const statusEl = document.getElementById('call-status');
     if (statusEl) statusEl.textContent = 'Calling...';
 
-    if (wasm && wasm.start_call) {
-        try {
-            wasm.start_call(peerId);
-        } catch (e) {
-            console.error('Call failed:', e);
-        }
-    }
+    startCallTimer();
 }
 
 function answerIncomingCall(callId) {
@@ -288,13 +453,26 @@ function answerIncomingCall(callId) {
     startCallTimer();
 }
 
-function hangupCall(callId) {
-    if (wasm && wasm.hangup_call) {
-        wasm.hangup_call(callId);
+function hangupCall() {
+    if (wasm && wasm.hangup_call && currentCallId) {
+        try { wasm.hangup_call(currentCallId); } catch(e) { console.warn(e); }
     }
+    stopLocalMedia();
     stopCallTimer();
-    // Go back to chat if we were in one, otherwise contacts
+    currentCallId = null;
     showView(currentPeerId ? 'chat' : 'contacts');
+}
+
+function stopLocalMedia() {
+    if (localStream) {
+        localStream.getTracks().forEach(t => t.stop());
+        localStream = null;
+    }
+    const localVideo = document.getElementById('local-video');
+    if (localVideo) {
+        localVideo.srcObject = null;
+        localVideo.classList.add('hidden');
+    }
 }
 
 function startCallTimer() {
@@ -303,9 +481,9 @@ function startCallTimer() {
     callTimerInterval = setInterval(() => {
         if (!timerEl) return;
         const elapsed = Math.floor((Date.now() - callStartTime) / 1000);
-        const min = Math.floor(elapsed / 60).toString().padStart(2, '0');
-        const sec = (elapsed % 60).toString().padStart(2, '0');
-        timerEl.textContent = `${min}:${sec}`;
+        const mins = Math.floor(elapsed / 60).toString().padStart(2, '0');
+        const secs = (elapsed % 60).toString().padStart(2, '0');
+        timerEl.textContent = mins + ':' + secs;
     }, 1000);
 }
 
@@ -321,14 +499,32 @@ function stopCallTimer() {
 
 function toggleMute() {
     const btn = document.querySelector('.call-btn.mute');
-    if (btn) btn.classList.toggle('active');
-    // TODO: toggle audio track
+    if (!btn) return;
+    btn.classList.toggle('active');
+
+    if (localStream) {
+        const audioTracks = localStream.getAudioTracks();
+        audioTracks.forEach(track => {
+            track.enabled = !track.enabled;
+        });
+    }
 }
 
 function toggleCamera() {
     const btn = document.querySelector('.call-btn.camera');
-    if (btn) btn.classList.toggle('active');
-    // TODO: toggle video track
+    if (!btn) return;
+    btn.classList.toggle('active');
+
+    if (localStream) {
+        const videoTracks = localStream.getVideoTracks();
+        videoTracks.forEach(track => {
+            track.enabled = !track.enabled;
+        });
+        const localVideo = document.getElementById('local-video');
+        if (localVideo) {
+            localVideo.classList.toggle('hidden', !videoTracks[0]?.enabled);
+        }
+    }
 }
 
 // ── File Transfer ───────────────────────────────────────────
@@ -341,35 +537,224 @@ function onFileSelected(event) {
     const file = event.target.files[0];
     if (!file || !currentPeerId) return;
 
-    if (wasm && wasm.create_file_transfer) {
-        file.arrayBuffer().then(buffer => {
-            const data = new Uint8Array(buffer);
-            wasm.create_file_transfer(data, file.name, file.type || null);
-        });
-    }
-
-    // Show in chat
+    // Show in chat with progress
+    const msgId = 'file-' + Date.now();
     appendMessage({
         direction: 'sent',
-        content: `\ud83d\udcce Sending ${file.name} (${formatSize(file.size)})...`,
-        timestamp: Date.now()
+        content: `<div id="${msgId}" class="file-transfer">
+            <div class="file-name">\ud83d\udcce ${escapeHtml(file.name)}</div>
+            <div class="file-size">${formatSize(file.size)}</div>
+            <div class="file-progress"><div class="file-progress-bar" style="width:0%"></div></div>
+            <div class="file-status">Preparing...</div>
+        </div>`,
+        timestamp: Date.now(),
+        isHtml: true
+    });
+
+    file.arrayBuffer().then(buffer => {
+        const data = new Uint8Array(buffer);
+        if (wasm && wasm.create_file_transfer) {
+            try {
+                const fileId = wasm.create_file_transfer(data, file.name, file.type || null);
+                updateFileProgress(msgId, 100, 'Sent');
+            } catch (e) {
+                updateFileProgress(msgId, 0, 'Failed: ' + e.message);
+            }
+        } else {
+            updateFileProgress(msgId, 0, 'Not connected');
+        }
     });
 
     // Reset input so same file can be selected again
     event.target.value = '';
 }
 
+function updateFileProgress(msgId, percent, status) {
+    const el = document.getElementById(msgId);
+    if (!el) return;
+    const bar = el.querySelector('.file-progress-bar');
+    const statusEl = el.querySelector('.file-status');
+    if (bar) bar.style.width = percent + '%';
+    if (statusEl) statusEl.textContent = status;
+}
+
+// ── QR Code / Camera ────────────────────────────────────────
+async function startQRScanner() {
+    try {
+        const video = document.getElementById('qr-scanner-video');
+        if (!video) return;
+        const stream = await navigator.mediaDevices.getUserMedia({
+            video: { facingMode: 'environment' }
+        });
+        video.srcObject = stream;
+        document.getElementById('qr-scanner-status').textContent = 'Point at a QR code...';
+    } catch (e) {
+        const statusEl = document.getElementById('qr-scanner-status');
+        if (statusEl) {
+            statusEl.textContent = 'Camera access denied. Check your browser permissions.';
+        }
+    }
+}
+
+function stopQRScanner() {
+    const video = document.getElementById('qr-scanner-video');
+    if (video && video.srcObject) {
+        video.srcObject.getTracks().forEach(t => t.stop());
+        video.srcObject = null;
+    }
+    const statusEl = document.getElementById('qr-scanner-status');
+    if (statusEl) statusEl.textContent = 'Tap to start camera';
+}
+
+function renderBootstrapQR() {
+    const canvas = document.getElementById('qr-canvas');
+    if (!canvas) return;
+    const ctx = canvas.getContext('2d');
+    ctx.fillStyle = '#fff';
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+    let data = 'ParolNet:' + (window._peerId || 'not-initialized');
+
+    if (wasm && wasm.generate_qr_payload && wasm.get_public_key) {
+        try {
+            data = wasm.generate_qr_payload(wasm.get_public_key(), null);
+        } catch(e) {
+            console.warn('QR payload generation failed:', e);
+        }
+    }
+
+    // Draw a visual data matrix from the hex string
+    drawDataMatrix(ctx, data, canvas.width, canvas.height);
+
+    // Show shareable text code
+    const codeEl = document.getElementById('qr-share-code');
+    if (codeEl) {
+        codeEl.textContent = data;
+    }
+}
+
+function drawDataMatrix(ctx, data, w, h) {
+    // Convert data to binary and draw as a grid of modules
+    const bytes = [];
+    for (let i = 0; i < data.length; i++) {
+        bytes.push(data.charCodeAt(i));
+    }
+
+    const gridSize = Math.ceil(Math.sqrt(bytes.length * 8));
+    const moduleSize = Math.floor(Math.min(w, h) / (gridSize + 4)); // padding
+    const offsetX = Math.floor((w - gridSize * moduleSize) / 2);
+    const offsetY = Math.floor((h - gridSize * moduleSize) / 2);
+
+    ctx.fillStyle = '#000';
+    let bitIndex = 0;
+    for (let row = 0; row < gridSize; row++) {
+        for (let col = 0; col < gridSize; col++) {
+            const byteIdx = Math.floor(bitIndex / 8);
+            const bitPos = 7 - (bitIndex % 8);
+            if (byteIdx < bytes.length && (bytes[byteIdx] >> bitPos) & 1) {
+                ctx.fillRect(
+                    offsetX + col * moduleSize,
+                    offsetY + row * moduleSize,
+                    moduleSize - 1,
+                    moduleSize - 1
+                );
+            }
+            bitIndex++;
+        }
+    }
+
+    // Draw finder patterns (top-left, top-right, bottom-left corners)
+    drawFinderPattern(ctx, offsetX, offsetY, moduleSize);
+    if (gridSize >= 7) {
+        drawFinderPattern(ctx, offsetX + (gridSize - 7) * moduleSize, offsetY, moduleSize);
+        drawFinderPattern(ctx, offsetX, offsetY + (gridSize - 7) * moduleSize, moduleSize);
+    }
+}
+
+function drawFinderPattern(ctx, x, y, moduleSize) {
+    const s = moduleSize;
+    ctx.fillStyle = '#000';
+    ctx.fillRect(x, y, 7 * s, 7 * s);
+    ctx.fillStyle = '#fff';
+    ctx.fillRect(x + s, y + s, 5 * s, 5 * s);
+    ctx.fillStyle = '#000';
+    ctx.fillRect(x + 2 * s, y + 2 * s, 3 * s, 3 * s);
+}
+
+function copyBootstrapCode() {
+    const codeEl = document.getElementById('qr-share-code');
+    if (!codeEl || !codeEl.textContent) {
+        showToast('No code to copy');
+        return;
+    }
+    navigator.clipboard.writeText(codeEl.textContent).then(() => {
+        showToast('Code copied to clipboard');
+    }).catch(() => {
+        // Fallback: select the text
+        const range = document.createRange();
+        range.selectNodeContents(codeEl);
+        const sel = window.getSelection();
+        sel.removeAllRanges();
+        sel.addRange(range);
+        showToast('Select and copy the highlighted text');
+    });
+}
+
 // ── Add Contact Tabs ────────────────────────────────────────
 function showAddTab(tabName) {
-    // Update tab buttons
-    document.querySelectorAll('#view-add-contact .tab').forEach(t => t.classList.remove('active'));
-    const clickedBtn = document.querySelector(`#view-add-contact .tab[data-tab="${tabName}"]`);
-    if (clickedBtn) clickedBtn.classList.add('active');
+    document.querySelectorAll('.add-tab-content').forEach(t => t.classList.add('hidden'));
+    document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
 
-    // Update tab content
-    document.querySelectorAll('#view-add-contact .add-tab-content').forEach(c => c.classList.add('hidden'));
-    const target = document.getElementById(`add-tab-${tabName}`);
-    if (target) target.classList.remove('hidden');
+    const tab = document.getElementById('add-tab-' + tabName);
+    if (tab) tab.classList.remove('hidden');
+
+    const btn = document.querySelector(`.tab[data-tab="${tabName}"]`);
+    if (btn) btn.classList.add('active');
+
+    // Start/stop camera
+    if (tabName === 'qr-scan') {
+        startQRScanner();
+    } else {
+        stopQRScanner();
+    }
+
+    // Render QR code
+    if (tabName === 'qr-show') {
+        renderBootstrapQR();
+    }
+}
+
+// ── Passphrase Connect ──────────────────────────────────────
+function connectViaPassphrase() {
+    const input = document.querySelector('#add-tab-passphrase input');
+    const phrase = input?.value?.trim();
+    if (!phrase) return;
+
+    // Show connecting state
+    const btn = document.querySelector('#add-tab-passphrase button');
+    const originalText = btn.textContent;
+    btn.textContent = 'Connecting...';
+    btn.disabled = true;
+
+    // Use WASM to process passphrase bootstrap
+    if (wasm) {
+        try {
+            showToast('Searching for peer with this passphrase...');
+            setTimeout(() => {
+                btn.textContent = originalText;
+                btn.disabled = false;
+                showToast('No peers found nearby. Make sure both devices are online.');
+            }, 3000);
+        } catch (e) {
+            btn.textContent = originalText;
+            btn.disabled = false;
+            showToast('Connection failed: ' + e.message);
+        }
+    } else {
+        btn.textContent = originalText;
+        btn.disabled = false;
+        showToast('App not fully loaded. Please wait and try again.');
+    }
 }
 
 // ── Settings ────────────────────────────────────────────────
@@ -392,7 +777,7 @@ function enableDecoyMode() {
         // storage may be unavailable
     }
 
-    alert('Decoy mode enabled. The app will appear as a calculator on next launch.');
+    showToast('Decoy mode enabled. The app will appear as a calculator on next launch.');
 }
 
 // ── Panic Wipe ──────────────────────────────────────────────
@@ -509,8 +894,19 @@ document.addEventListener('DOMContentLoaded', () => {
     document.body.classList.add(`platform-${platform}`);
     registerServiceWorker();
     loadWasm();
-    requestNotificationPermission();
     initContactSearch();
+
+    // Parse bootstrap parameter from URL
+    const params = new URLSearchParams(window.location.search);
+    const bootstrap = params.get('bootstrap');
+    if (bootstrap && wasm && wasm.parse_qr_payload) {
+        try {
+            wasm.parse_qr_payload(bootstrap);
+            showToast('Bootstrap data received');
+        } catch(e) {
+            console.warn('Failed to parse bootstrap:', e);
+        }
+    }
 });
 
 // Export for onclick handlers
@@ -529,3 +925,9 @@ window.enableDecoyMode = enableDecoyMode;
 window.executePanicWipe = executePanicWipe;
 window.toggleMute = toggleMute;
 window.toggleCamera = toggleCamera;
+window.connectViaPassphrase = connectViaPassphrase;
+window.startQRScanner = startQRScanner;
+window.showToast = showToast;
+window.requestNotificationPermission = requestNotificationPermission;
+window.copyBootstrapCode = copyBootstrapCode;
+window.currentPeerId = null;
