@@ -46,6 +46,11 @@ function showView(viewName) {
         target.classList.remove('hidden');
     }
     currentView = viewName;
+
+    // Render QR when entering add-contact view
+    if (viewName === 'add-contact') {
+        renderBootstrapQR();
+    }
 }
 
 // ── Calculator ──────────────────────────────────────────────
@@ -254,6 +259,8 @@ function onWasmReady() {
         showView('contacts');
     }
     loadContacts();
+    // Pre-render QR code so it's ready when user opens Add Contact
+    renderBootstrapQR();
 }
 
 function onWasmUnavailable() {
