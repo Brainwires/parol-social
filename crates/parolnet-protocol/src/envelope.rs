@@ -68,9 +68,12 @@ impl Envelope {
     }
 
     /// Compute the total wire size of this envelope.
+    ///
+    /// This is the size as encoded by `CborCodec`: 4-byte header length prefix +
+    /// CBOR header + encrypted payload + 16-byte MAC.
     pub fn total_size(&self) -> usize {
-        // header serialized size + encrypted payload + 16 byte MAC
-        // Actual size depends on CBOR encoding of header
-        todo!("Envelope total size calculation")
+        use crate::codec::encode_header;
+        let header_len = encode_header(&self.header).map(|h| h.len()).unwrap_or(0);
+        4 + header_len + self.encrypted_payload.len() + 16
     }
 }

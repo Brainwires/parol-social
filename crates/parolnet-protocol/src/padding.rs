@@ -2,8 +2,12 @@
 //!
 //! All messages are padded to one of: 256, 1024, 4096, or 16384 bytes.
 //! This prevents an observer from distinguishing message types by length.
+//!
+//! Padding format: the plaintext is prefixed with a 4-byte big-endian length,
+//! followed by the original data, then random padding bytes to fill the bucket.
 
 use crate::{PaddingStrategy, ProtocolError, BUCKET_SIZES};
+use rand::RngCore;
 
 /// Standard bucket-based padding strategy.
 ///
@@ -11,13 +15,53 @@ use crate::{PaddingStrategy, ProtocolError, BUCKET_SIZES};
 /// cryptographically random padding bytes.
 pub struct BucketPadding;
 
+/// Overhead: 4 bytes for the length prefix.
+const LENGTH_PREFIX_SIZE: usize = 4;
+
 impl PaddingStrategy for BucketPadding {
-    fn pad(&self, _plaintext: &[u8]) -> Vec<u8> {
-        todo!("Bucket padding implementation")
+    fn pad(&self, plaintext: &[u8]) -> Vec<u8> {
+        let needed = plaintext.len() + LENGTH_PREFIX_SIZE;
+        let bucket = select_bucket(needed).unwrap_or(*BUCKET_SIZES.last().unwrap());
+
+        let mut output = Vec::with_capacity(bucket);
+
+        // 4-byte big-endian length prefix
+        let len = plaintext.len() as u32;
+        output.extend_from_slice(&len.to_be_bytes());
+
+        // Original plaintext
+        output.extend_from_slice(plaintext);
+
+        // Random padding to fill the bucket
+        let pad_len = bucket - output.len();
+        if pad_len > 0 {
+            let mut pad = vec![0u8; pad_len];
+            rand::thread_rng().fill_bytes(&mut pad);
+            output.extend_from_slice(&pad);
+        }
+
+        debug_assert_eq!(output.len(), bucket);
+        output
     }
 
-    fn unpad(&self, _padded: &[u8]) -> Result<Vec<u8>, ProtocolError> {
-        todo!("Bucket unpadding implementation")
+    fn unpad(&self, padded: &[u8]) -> Result<Vec<u8>, ProtocolError> {
+        if padded.len() < LENGTH_PREFIX_SIZE {
+            return Err(ProtocolError::PaddingError("data too short for length prefix".into()));
+        }
+
+        if !BUCKET_SIZES.contains(&padded.len()) {
+            return Err(ProtocolError::InvalidEnvelopeLength(padded.len()));
+        }
+
+        let len = u32::from_be_bytes([padded[0], padded[1], padded[2], padded[3]]) as usize;
+
+        if LENGTH_PREFIX_SIZE + len > padded.len() {
+            return Err(ProtocolError::PaddingError(
+                format!("length prefix {} exceeds padded data size {}", len, padded.len()),
+            ));
+        }
+
+        Ok(padded[LENGTH_PREFIX_SIZE..LENGTH_PREFIX_SIZE + len].to_vec())
     }
 }
 
