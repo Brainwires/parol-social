@@ -12,17 +12,15 @@ crate-type = ["cdylib", "rlib"]
 [dependencies]
 parolnet-crypto.workspace = true
 parolnet-protocol.workspace = true
+parolnet-core.workspace = true
 wasm-bindgen.workspace = true
 web-sys = { workspace = true, features = [
     "WebSocket",
     "MessageEvent",
     "BinaryType",
-    "IdbFactory",
-    "IdbDatabase",
-    "IdbTransaction",
-    "IdbObjectStore",
     "Window",
 ] }
 js-sys.workspace = true
 serde-wasm-bindgen.workspace = true
 serde.workspace = true
+hex.workspace = true

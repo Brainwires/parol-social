@@ -1,0 +1,367 @@
+<!DOCTYPE html>
+<html lang="en" dir="ltr">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <meta name="theme-color" content="#1a1a2e">
+    <meta name="description" content="Secure, private communication">
+    <meta name="apple-mobile-web-app-capable" content="yes">
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+    <link rel="manifest" href="manifest.json">
+    <link rel="icon" type="image/svg+xml" href="icons/icon.svg">
+    <link rel="apple-touch-icon" href="icons/icon-192.png">
+    <title>ParolNet</title>
+    <style>
+        :root {
+            --bg: #1a1a2e;
+            --bg2: #16213e;
+            --accent: #0f3460;
+            --text: #e0e0e0;
+            --text2: #a0a0a0;
+            --green: #4ecca3;
+            --red: #e74c3c;
+            --radius: 12px;
+        }
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
+            background: var(--bg);
+            color: var(--text);
+            min-height: 100vh;
+            display: flex;
+            flex-direction: column;
+        }
+        header {
+            background: var(--bg2);
+            padding: 16px 20px;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            border-bottom: 1px solid var(--accent);
+        }
+        header h1 { font-size: 20px; font-weight: 600; }
+        .status {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            font-size: 12px;
+            color: var(--text2);
+        }
+        .status-dot {
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            background: var(--green);
+        }
+        .status-dot.offline { background: var(--red); }
+        main {
+            flex: 1;
+            padding: 20px;
+            max-width: 600px;
+            margin: 0 auto;
+            width: 100%;
+        }
+        .card {
+            background: var(--bg2);
+            border-radius: var(--radius);
+            padding: 20px;
+            margin-bottom: 16px;
+        }
+        .card h2 {
+            font-size: 16px;
+            margin-bottom: 12px;
+            color: var(--green);
+        }
+        .card p {
+            font-size: 14px;
+            line-height: 1.5;
+            color: var(--text2);
+            margin-bottom: 12px;
+        }
+        .info-row {
+            display: flex;
+            justify-content: space-between;
+            padding: 8px 0;
+            border-bottom: 1px solid rgba(255,255,255,0.05);
+            font-size: 13px;
+        }
+        .info-row .label { color: var(--text2); }
+        .info-row .value {
+            color: var(--text);
+            font-family: monospace;
+            font-size: 12px;
+            word-break: break-all;
+            max-width: 60%;
+            text-align: right;
+        }
+        button {
+            background: var(--accent);
+            color: var(--text);
+            border: none;
+            padding: 12px 24px;
+            border-radius: 8px;
+            font-size: 14px;
+            cursor: pointer;
+            width: 100%;
+            margin-top: 8px;
+            transition: opacity 0.2s;
+        }
+        button:hover { opacity: 0.85; }
+        button:active { opacity: 0.7; }
+        button.danger {
+            background: var(--red);
+        }
+        button.success {
+            background: var(--green);
+            color: var(--bg);
+        }
+        #loading {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            min-height: 60vh;
+            gap: 16px;
+        }
+        #loading .spinner {
+            width: 40px;
+            height: 40px;
+            border: 3px solid var(--accent);
+            border-top-color: var(--green);
+            border-radius: 50%;
+            animation: spin 0.8s linear infinite;
+        }
+        @keyframes spin { to { transform: rotate(360deg); } }
+        .hidden { display: none !important; }
+        footer {
+            text-align: center;
+            padding: 16px;
+            font-size: 11px;
+            color: var(--text2);
+        }
+        footer a { color: var(--green); text-decoration: none; }
+        @media (prefers-color-scheme: light) {
+            :root {
+                --bg: #f5f5f5;
+                --bg2: #ffffff;
+                --accent: #3498db;
+                --text: #1a1a2e;
+                --text2: #666;
+            }
+        }
+    </style>
+</head>
+<body>
+    <header>
+        <h1>ParolNet</h1>
+        <div class="status">
+            <div class="status-dot" id="statusDot"></div>
+            <span id="statusText">Initializing...</span>
+        </div>
+    </header>
+
+    <main>
+        <!-- Loading state -->
+        <div id="loading">
+            <div class="spinner"></div>
+            <p>Loading secure module...</p>
+        </div>
+
+        <!-- Main app (shown after WASM loads) -->
+        <div id="app" class="hidden">
+            <!-- Identity card -->
+            <div class="card">
+                <h2>Your Identity</h2>
+                <p>Your identity is a cryptographic key. No phone number, no email, no registration.</p>
+                <div class="info-row">
+                    <span class="label">Peer ID</span>
+                    <span class="value" id="peerId">-</span>
+                </div>
+                <div class="info-row">
+                    <span class="label">Public Key</span>
+                    <span class="value" id="publicKey">-</span>
+                </div>
+                <div class="info-row">
+                    <span class="label">Version</span>
+                    <span class="value" id="version">-</span>
+                </div>
+            </div>
+
+            <!-- Bootstrap card -->
+            <div class="card">
+                <h2>Connect with Someone</h2>
+                <p>Share this QR code in person or exchange a passphrase over a trusted channel. No server involved.</p>
+                <button class="success" onclick="generateQR()">Generate Bootstrap QR</button>
+                <div id="qrResult" class="hidden" style="margin-top: 12px;">
+                    <div class="info-row">
+                        <span class="label">QR Payload</span>
+                        <span class="value" id="qrPayload" style="font-size: 10px;">-</span>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Status card -->
+            <div class="card">
+                <h2>Network Status</h2>
+                <div class="info-row">
+                    <span class="label">Mode</span>
+                    <span class="value" id="networkMode">Offline (PWA)</span>
+                </div>
+                <div class="info-row">
+                    <span class="label">Cached</span>
+                    <span class="value" id="cacheStatus">Checking...</span>
+                </div>
+                <div class="info-row">
+                    <span class="label">Service Worker</span>
+                    <span class="value" id="swStatus">Checking...</span>
+                </div>
+            </div>
+
+            <!-- Emergency card -->
+            <div class="card">
+                <h2>Emergency</h2>
+                <p>Instantly destroy all keys, messages, and session data. This cannot be undone.</p>
+                <button class="danger" onclick="panicWipe()">Panic Wipe</button>
+            </div>
+        </div>
+    </main>
+
+    <footer>
+        ParolNet &mdash; Free speech protected by strong security
+        <br>
+        <a href="https://github.com/parolnet/parolnet" target="_blank" rel="noopener">Source Code</a>
+    </footer>
+
+    <script type="module">
+        // ── Service Worker Registration ─────────────────────────
+        if ('serviceWorker' in navigator) {
+            navigator.serviceWorker.register('sw.js')
+                .then(reg => {
+                    document.getElementById('swStatus').textContent = 'Active';
+                    console.log('SW registered:', reg.scope);
+                })
+                .catch(err => {
+                    document.getElementById('swStatus').textContent = 'Failed';
+                    console.error('SW registration failed:', err);
+                });
+        } else {
+            document.getElementById('swStatus').textContent = 'Not supported';
+        }
+
+        // ── WASM Module Loading ─────────────────────────────────
+        let wasm = null;
+
+        async function loadWasm() {
+            try {
+                // Try loading the WASM module
+                // In production: import from the bundled pkg/
+                // For development: use a dynamic import
+                wasm = await import('./pkg/parolnet_wasm.js');
+                await wasm.default(); // Initialize
+
+                onWasmLoaded();
+            } catch (e) {
+                console.warn('WASM not available (expected during development):', e.message);
+                onWasmUnavailable();
+            }
+        }
+
+        function onWasmLoaded() {
+            document.getElementById('loading').classList.add('hidden');
+            document.getElementById('app').classList.remove('hidden');
+            document.getElementById('statusDot').classList.remove('offline');
+            document.getElementById('statusText').textContent = 'Secure';
+
+            // Display identity info
+            const keypair = wasm.generate_keypair();
+            document.getElementById('peerId').textContent = keypair.peer_id;
+            document.getElementById('publicKey').textContent = keypair.public_key;
+            document.getElementById('version').textContent = wasm.version();
+
+            // Store keypair for later use
+            window._keypair = keypair;
+        }
+
+        function onWasmUnavailable() {
+            // Show app anyway with placeholder data (development mode)
+            document.getElementById('loading').classList.add('hidden');
+            document.getElementById('app').classList.remove('hidden');
+            document.getElementById('statusDot').classList.add('offline');
+            document.getElementById('statusText').textContent = 'Dev Mode (no WASM)';
+            document.getElementById('peerId').textContent = 'WASM not loaded';
+            document.getElementById('publicKey').textContent = 'Build with wasm-pack first';
+            document.getElementById('version').textContent = 'dev';
+        }
+
+        // ── App Functions ───────────────────────────────────────
+        window.generateQR = function() {
+            if (!wasm || !window._keypair) {
+                alert('WASM module not loaded');
+                return;
+            }
+            try {
+                const payload = wasm.generate_qr_payload(window._keypair.public_key, null);
+                document.getElementById('qrPayload').textContent = payload;
+                document.getElementById('qrResult').classList.remove('hidden');
+            } catch (e) {
+                alert('Error generating QR: ' + e.message);
+            }
+        };
+
+        window.panicWipe = function() {
+            if (confirm('EMERGENCY WIPE\n\nThis will permanently destroy all keys, messages, and session data.\n\nThis cannot be undone. Continue?')) {
+                // Clear all storage
+                localStorage.clear();
+                sessionStorage.clear();
+
+                // Clear IndexedDB
+                if (window.indexedDB) {
+                    indexedDB.databases().then(dbs => {
+                        dbs.forEach(db => indexedDB.deleteDatabase(db.name));
+                    }).catch(() => {});
+                }
+
+                // Clear WASM state
+                if (wasm) {
+                    try { wasm.panic_wipe(); } catch(e) {}
+                }
+
+                // Clear caches
+                if ('caches' in window) {
+                    caches.keys().then(names => {
+                        names.forEach(name => caches.delete(name));
+                    });
+                }
+
+                // Unregister service worker
+                if ('serviceWorker' in navigator) {
+                    navigator.serviceWorker.getRegistrations().then(regs => {
+                        regs.forEach(reg => reg.unregister());
+                    });
+                }
+
+                // Reset UI
+                document.getElementById('peerId').textContent = 'WIPED';
+                document.getElementById('publicKey').textContent = 'WIPED';
+                document.getElementById('statusDot').classList.add('offline');
+                document.getElementById('statusText').textContent = 'Wiped';
+
+                alert('All data destroyed.');
+            }
+        };
+
+        // ── Cache Status ────────────────────────────────────────
+        if ('caches' in window) {
+            caches.has('parolnet-v1').then(exists => {
+                document.getElementById('cacheStatus').textContent =
+                    exists ? 'All assets cached (works offline)' : 'Not yet cached';
+            });
+        } else {
+            document.getElementById('cacheStatus').textContent = 'Not supported';
+        }
+
+        // ── Boot ────────────────────────────────────────────────
+        loadWasm();
+    </script>
+</body>
+</html>
