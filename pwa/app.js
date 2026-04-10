@@ -586,17 +586,48 @@ function updateFileProgress(msgId, percent, status) {
 }
 
 // ── QR Code / Camera ────────────────────────────────────────
+let scannerInterval = null;
+
 async function startQRScanner() {
+    const video = document.getElementById('qr-scanner-video');
+    const statusEl = document.getElementById('qr-scanner-status');
+    if (!video) return;
+
+    // Check for BarcodeDetector (Chrome 83+, Safari 16.4+, Android)
+    const hasBarcodeAPI = 'BarcodeDetector' in window;
+
     try {
-        const video = document.getElementById('qr-scanner-video');
-        if (!video) return;
         const stream = await navigator.mediaDevices.getUserMedia({
-            video: { facingMode: 'environment' }
+            video: { facingMode: 'environment', width: { ideal: 640 }, height: { ideal: 480 } }
         });
         video.srcObject = stream;
-        document.getElementById('qr-scanner-status').textContent = 'Point at a QR code...';
+        await video.play();
+
+        if (hasBarcodeAPI) {
+            // Native QR detection — zero library code needed
+            const detector = new BarcodeDetector({ formats: ['qr_code'] });
+            if (statusEl) statusEl.textContent = 'Scanning for QR code...';
+
+            scannerInterval = setInterval(async () => {
+                if (!video.srcObject) return;
+                try {
+                    const barcodes = await detector.detect(video);
+                    if (barcodes.length > 0) {
+                        const data = barcodes[0].rawValue;
+                        stopQRScanner();
+                        handleScannedQR(data);
+                    }
+                } catch (e) {
+                    // Frame not ready yet, ignore
+                }
+            }, 250); // Scan 4 times per second
+        } else {
+            // No BarcodeDetector — fall back to manual entry
+            if (statusEl) {
+                statusEl.innerHTML = 'Your browser doesn\'t support QR scanning.<br>Ask your contact to share their code, then paste it in the <strong>Passphrase</strong> tab.';
+            }
+        }
     } catch (e) {
-        const statusEl = document.getElementById('qr-scanner-status');
         if (statusEl) {
             statusEl.textContent = 'Camera access denied. Check your browser permissions.';
         }
@@ -604,13 +635,56 @@ async function startQRScanner() {
 }
 
 function stopQRScanner() {
+    if (scannerInterval) {
+        clearInterval(scannerInterval);
+        scannerInterval = null;
+    }
     const video = document.getElementById('qr-scanner-video');
     if (video && video.srcObject) {
         video.srcObject.getTracks().forEach(t => t.stop());
         video.srcObject = null;
     }
     const statusEl = document.getElementById('qr-scanner-status');
-    if (statusEl) statusEl.textContent = 'Tap to start camera';
+    if (statusEl) statusEl.textContent = 'Scanner stopped';
+}
+
+function handleScannedQR(data) {
+    showToast('QR code detected!');
+
+    // Try to parse as ParolNet bootstrap payload
+    if (wasm && wasm.parse_qr_payload) {
+        try {
+            // If it's hex-encoded CBOR from our QR generator
+            const result = wasm.parse_qr_payload(data);
+            showToast('Contact found! Establishing secure connection...');
+            // Switch to contacts view
+            setTimeout(() => showView('contacts'), 1500);
+            return;
+        } catch (e) {
+            // Not a valid ParolNet payload — try parsing as parolnet: URI
+        }
+    }
+
+    // Handle parolnet: URI format
+    if (data.startsWith('parolnet:')) {
+        const peerId = data.slice('parolnet:'.length);
+        showToast('Peer found: ' + peerId.slice(0, 16) + '...');
+        // Store as contact
+        dbPut('contacts', {
+            peerId: peerId,
+            name: peerId.slice(0, 8) + '...',
+            lastMessage: 'Connected via QR',
+            lastTime: formatTime(Date.now()),
+            unread: 0
+        }).then(() => {
+            loadContacts();
+            showView('contacts');
+        }).catch(e => console.warn('Failed to save contact:', e));
+        return;
+    }
+
+    // Unknown QR format
+    showToast('Scanned: ' + data.slice(0, 50) + (data.length > 50 ? '...' : ''));
 }
 
 function renderBootstrapQR() {
