@@ -18,6 +18,14 @@ thiserror.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 async-trait.workspace = true
+ciborium.workspace = true
+hmac.workspace = true
+sha2.workspace = true
+subtle.workspace = true
+rand.workspace = true
+zeroize.workspace = true
+serde_bytes.workspace = true
 
 [dev-dependencies]
 tokio-test.workspace = true
+x25519-dalek.workspace = true
