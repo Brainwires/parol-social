@@ -1,0 +1,8 @@
+[build]
+rustflags = ["-C", "overflow-checks=yes"]
+
+[profile.release]
+strip = true
+lto = true
+codegen-units = 1
+panic = "abort"

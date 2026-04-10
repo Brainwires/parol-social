@@ -1,0 +1,22 @@
+[package]
+name = "parolnet-mesh"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Mesh networking for ParolNet: peer discovery, gossip protocol, store-and-forward"
+
+[dependencies]
+parolnet-crypto.workspace = true
+parolnet-protocol.workspace = true
+parolnet-transport.workspace = true
+tokio.workspace = true
+rand.workspace = true
+serde.workspace = true
+ciborium.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+async-trait.workspace = true
+
+[dev-dependencies]
+tokio-test.workspace = true

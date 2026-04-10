@@ -1,0 +1,28 @@
+[package]
+name = "parolnet-wasm"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "WASM bindings for ParolNet — exposes crypto + protocol to JS/TS PWA shell"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+parolnet-crypto.workspace = true
+parolnet-protocol.workspace = true
+wasm-bindgen.workspace = true
+web-sys = { workspace = true, features = [
+    "WebSocket",
+    "MessageEvent",
+    "BinaryType",
+    "IdbFactory",
+    "IdbDatabase",
+    "IdbTransaction",
+    "IdbObjectStore",
+    "Window",
+] }
+js-sys.workspace = true
+serde-wasm-bindgen.workspace = true
+serde.workspace = true
