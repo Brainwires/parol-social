@@ -24,3 +24,5 @@ js-sys.workspace = true
 serde-wasm-bindgen.workspace = true
 serde.workspace = true
 hex.workspace = true
+sha2.workspace = true
+subtle.workspace = true

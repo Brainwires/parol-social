@@ -1,0 +1,26 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 120 120" width="120" height="120">
+  <rect width="120" height="120" rx="26" fill="#1c1c1e"/>
+  <!-- Display -->
+  <rect x="12" y="12" width="96" height="28" rx="6" fill="#2c2c2e"/>
+  <text x="100" y="33" font-family="system-ui, sans-serif" font-size="18" fill="#fff" text-anchor="end">0</text>
+  <!-- Row 1: AC, +/-, %, / -->
+  <circle cx="24" cy="54" r="10" fill="#a5a5a5"/>
+  <circle cx="48" cy="54" r="10" fill="#a5a5a5"/>
+  <circle cx="72" cy="54" r="10" fill="#a5a5a5"/>
+  <circle cx="96" cy="54" r="10" fill="#ff9f0a"/>
+  <!-- Row 2: 7, 8, 9, x -->
+  <circle cx="24" cy="74" r="10" fill="#333"/>
+  <circle cx="48" cy="74" r="10" fill="#333"/>
+  <circle cx="72" cy="74" r="10" fill="#333"/>
+  <circle cx="96" cy="74" r="10" fill="#ff9f0a"/>
+  <!-- Row 3: 4, 5, 6, - -->
+  <circle cx="24" cy="94" r="10" fill="#333"/>
+  <circle cx="48" cy="94" r="10" fill="#333"/>
+  <circle cx="72" cy="94" r="10" fill="#333"/>
+  <circle cx="96" cy="94" r="10" fill="#ff9f0a"/>
+  <!-- Row 4 hint: 1, 2, 3, + (partially visible) -->
+  <circle cx="24" cy="114" r="10" fill="#333"/>
+  <circle cx="48" cy="114" r="10" fill="#333"/>
+  <circle cx="72" cy="114" r="10" fill="#333"/>
+  <circle cx="96" cy="114" r="10" fill="#ff9f0a"/>
+</svg>

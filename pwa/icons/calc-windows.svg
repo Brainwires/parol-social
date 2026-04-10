@@ -1,0 +1,25 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 120 120" width="120" height="120">
+  <rect width="120" height="120" rx="8" fill="#202020"/>
+  <!-- Display -->
+  <rect x="8" y="8" width="104" height="30" rx="4" fill="#2a2a2a"/>
+  <text x="104" y="30" font-family="Segoe UI, system-ui, sans-serif" font-size="18" fill="#fff" text-anchor="end">0</text>
+  <!-- Row 1 -->
+  <rect x="8" y="44" width="23" height="16" rx="3" fill="#323232"/>
+  <rect x="33" y="44" width="23" height="16" rx="3" fill="#323232"/>
+  <rect x="58" y="44" width="23" height="16" rx="3" fill="#323232"/>
+  <rect x="83" y="44" width="29" height="16" rx="3" fill="#323232"/>
+  <!-- Row 2 -->
+  <rect x="8" y="63" width="23" height="16" rx="3" fill="#3b3b3b"/>
+  <rect x="33" y="63" width="23" height="16" rx="3" fill="#3b3b3b"/>
+  <rect x="58" y="63" width="23" height="16" rx="3" fill="#3b3b3b"/>
+  <rect x="83" y="63" width="29" height="16" rx="3" fill="#323232"/>
+  <!-- Row 3 -->
+  <rect x="8" y="82" width="23" height="16" rx="3" fill="#3b3b3b"/>
+  <rect x="33" y="82" width="23" height="16" rx="3" fill="#3b3b3b"/>
+  <rect x="58" y="82" width="23" height="16" rx="3" fill="#3b3b3b"/>
+  <rect x="83" y="82" width="29" height="16" rx="3" fill="#323232"/>
+  <!-- Row 4 -->
+  <rect x="8" y="101" width="48" height="16" rx="3" fill="#3b3b3b"/>
+  <rect x="58" y="101" width="23" height="16" rx="3" fill="#3b3b3b"/>
+  <rect x="83" y="101" width="29" height="16" rx="3" fill="#4cc2ff"/>
+</svg>

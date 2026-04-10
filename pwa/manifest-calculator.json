@@ -1,0 +1,18 @@
+{
+    "name": "Calculator",
+    "short_name": "Calc",
+    "description": "Simple calculator",
+    "start_url": "./index.html?mode=calc",
+    "display": "standalone",
+    "orientation": "portrait",
+    "background_color": "#000000",
+    "theme_color": "#000000",
+    "scope": "./",
+    "icons": [
+        {
+            "src": "icons/calc-ios.svg",
+            "sizes": "any",
+            "type": "image/svg+xml"
+        }
+    ]
+}

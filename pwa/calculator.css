@@ -1,0 +1,284 @@
+/* ── Calculator Decoy Mode ────────────────────────────────────
+   Platform-specific calculator styles that mimic native apps.
+   ──────────────────────────────────────────────────────────── */
+
+/* ── Base Calculator ─────────────────────────────────────────── */
+.calculator {
+    display: flex;
+    flex-direction: column;
+    height: 100%;
+    background: #000;
+}
+
+.calc-display {
+    flex: 1;
+    display: flex;
+    align-items: flex-end;
+    justify-content: flex-end;
+    font-size: 48px;
+    font-weight: 300;
+    padding: 20px 24px;
+    color: #fff;
+    overflow: hidden;
+    word-break: break-all;
+    min-height: 120px;
+    line-height: 1.1;
+}
+
+.calc-grid {
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    gap: 1px;
+    padding: 0;
+    flex-shrink: 0;
+}
+
+.calc-btn {
+    font-size: 24px;
+    padding: 20px;
+    border: none;
+    cursor: pointer;
+    min-height: 64px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    transition: opacity 0.1s ease;
+    -webkit-tap-highlight-color: transparent;
+    user-select: none;
+    -webkit-user-select: none;
+    width: auto;
+    margin: 0;
+    border-radius: 0;
+    font-weight: 400;
+    background: #333;
+    color: #fff;
+}
+
+.calc-btn:active {
+    opacity: 0.7;
+}
+
+.calc-btn.function {
+    background: #a5a5a5;
+    color: #000;
+}
+
+.calc-btn.operator {
+    background: #ff9f0a;
+    color: #fff;
+}
+
+.calc-btn.equals {
+    background: #ff9f0a;
+    color: #fff;
+}
+
+.calc-btn.zero {
+    grid-column: span 2;
+}
+
+/* ── iOS Style ───────────────────────────────────────────────── */
+.platform-ios .calculator {
+    background: #000;
+}
+
+.platform-ios .calc-display {
+    font-size: 64px;
+    font-weight: 200;
+    padding: 20px 28px;
+}
+
+.platform-ios .calc-grid {
+    gap: 12px;
+    padding: 0 12px 12px;
+}
+
+.platform-ios .calc-btn {
+    border-radius: 50%;
+    aspect-ratio: 1;
+    margin: 0;
+    background: #333;
+    color: #fff;
+    font-size: 26px;
+    padding: 0;
+    min-height: 0;
+}
+
+.platform-ios .calc-btn.function {
+    background: #a5a5a5;
+    color: #000;
+}
+
+.platform-ios .calc-btn.operator {
+    background: #ff9f0a;
+    color: #fff;
+}
+
+.platform-ios .calc-btn.equals {
+    background: #ff9f0a;
+    color: #fff;
+}
+
+.platform-ios .calc-btn.zero {
+    border-radius: 34px;
+    aspect-ratio: auto;
+    justify-content: flex-start;
+    padding-left: 28px;
+}
+
+/* ── Android / Material Style ────────────────────────────────── */
+.platform-android .calculator {
+    background: #1c1b1f;
+}
+
+.platform-android .calc-display {
+    font-size: 56px;
+    font-weight: 300;
+    color: #e6e0e9;
+    padding: 24px;
+}
+
+.platform-android .calc-grid {
+    gap: 8px;
+    padding: 8px 12px 16px;
+}
+
+.platform-android .calc-btn {
+    border-radius: 24px;
+    margin: 0;
+    background: #2d2c31;
+    color: #e6e0e9;
+    font-size: 22px;
+    padding: 16px;
+    min-height: 56px;
+}
+
+.platform-android .calc-btn.function {
+    background: #332d41;
+    color: #d0bcff;
+}
+
+.platform-android .calc-btn.operator {
+    background: #332d41;
+    color: #d0bcff;
+}
+
+.platform-android .calc-btn.equals {
+    background: #d0bcff;
+    color: #381e72;
+}
+
+.platform-android .calc-btn.zero {
+    border-radius: 24px;
+}
+
+/* ── Windows Style ───────────────────────────────────────────── */
+.platform-windows .calculator {
+    background: #202020;
+}
+
+.platform-windows .calc-display {
+    font-size: 48px;
+    font-weight: 200;
+    color: #fff;
+    padding: 16px 20px;
+    font-family: 'Segoe UI', system-ui, sans-serif;
+}
+
+.platform-windows .calc-grid {
+    gap: 2px;
+    padding: 2px;
+}
+
+.platform-windows .calc-btn {
+    border-radius: 4px;
+    margin: 0;
+    background: #3b3b3b;
+    color: #fff;
+    font-size: 20px;
+    padding: 18px;
+    min-height: 56px;
+    font-family: 'Segoe UI', system-ui, sans-serif;
+}
+
+.platform-windows .calc-btn.function {
+    background: #323232;
+    color: #fff;
+}
+
+.platform-windows .calc-btn.operator {
+    background: #323232;
+    color: #fff;
+}
+
+.platform-windows .calc-btn.equals {
+    background: #4cc2ff;
+    color: #000;
+}
+
+.platform-windows .calc-btn.zero {
+    border-radius: 4px;
+}
+
+/* ── macOS Style ─────────────────────────────────────────────── */
+.platform-macos .calculator {
+    background: #1e1e1e;
+}
+
+.platform-macos .calc-display {
+    font-size: 52px;
+    font-weight: 200;
+    color: #fff;
+    padding: 20px 24px;
+}
+
+.platform-macos .calc-grid {
+    gap: 1px;
+    padding: 0;
+}
+
+.platform-macos .calc-btn {
+    border-radius: 0;
+    background: #505050;
+    color: #fff;
+    font-size: 22px;
+    padding: 18px;
+    min-height: 52px;
+}
+
+.platform-macos .calc-btn.function {
+    background: #6e6e6e;
+    color: #fff;
+}
+
+.platform-macos .calc-btn.operator {
+    background: #ff9f0a;
+    color: #fff;
+}
+
+.platform-macos .calc-btn.equals {
+    background: #ff9f0a;
+    color: #fff;
+}
+
+/* ── Responsive adjustments ──────────────────────────────────── */
+@media (max-height: 600px) {
+    .calc-display {
+        font-size: 36px;
+        min-height: 80px;
+        padding: 12px 16px;
+    }
+
+    .calc-btn {
+        padding: 12px;
+        font-size: 20px;
+        min-height: 48px;
+    }
+}
+
+@media (min-width: 500px) {
+    .calculator {
+        max-width: 400px;
+        margin: 0 auto;
+    }
+}
