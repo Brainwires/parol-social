@@ -25,13 +25,13 @@ function showToast(message, duration = 3000) {
     if (!toast) {
         toast = document.createElement('div');
         toast.id = 'toast';
-        toast.style.cssText = 'position:fixed;bottom:80px;left:50%;transform:translateX(-50%);background:#333;color:#fff;padding:12px 24px;border-radius:8px;font-size:14px;z-index:9999;opacity:0;transition:opacity 0.3s;pointer-events:none;max-width:80%;text-align:center;';
+        toast.style.cssText = 'position:fixed;bottom:80px;left:50%;transform:translateX(-50%);background:#333;color:#fff;padding:12px 24px;border-radius:8px;font-size:14px;z-index:9999;pointer-events:none;max-width:80%;text-align:center;display:none;';
         document.body.appendChild(toast);
     }
     toast.textContent = message;
-    toast.style.opacity = '1';
+    toast.style.display = 'block';
     clearTimeout(toast._timeout);
-    toast._timeout = setTimeout(() => { toast.style.opacity = '0'; }, duration);
+    toast._timeout = setTimeout(() => { toast.style.display = 'none'; }, duration);
 }
 
 // ── View Management ─────────────────────────────────────────
@@ -1262,6 +1262,7 @@ function formatSize(bytes) {
 document.addEventListener('DOMContentLoaded', () => {
     document.body.classList.add(`platform-${platform}`);
     registerServiceWorker();
+    showToast('Starting ParolNet...', 2000);
     loadWasm();
 
     // If stuck on loading for 15 seconds, show recovery buttons
