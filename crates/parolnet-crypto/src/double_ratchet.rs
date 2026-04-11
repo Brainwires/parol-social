@@ -7,7 +7,7 @@
 
 use crate::aead::ChaCha20Poly1305Cipher;
 use crate::kdf::hkdf_sha256;
-use crate::{Aead, ChainKey, CryptoError, MessageKey, RatchetHeader, RatchetSession};
+use crate::{Aead, CryptoError, RatchetHeader, RatchetSession};
 use rand::rngs::OsRng;
 use std::collections::HashMap;
 use x25519_dalek::{PublicKey, StaticSecret};
