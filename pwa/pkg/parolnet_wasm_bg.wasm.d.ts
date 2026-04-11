@@ -8,6 +8,7 @@ export const create_file_transfer: (a: number, b: number, c: number, d: number, 
 export const create_session: (a: number, b: number, c: number, d: number, e: number, f: number, g: number) => void;
 export const decrypt_message: (a: number, b: number, c: number, d: number, e: number) => void;
 export const encrypt_message: (a: number, b: number, c: number, d: number, e: number) => void;
+export const export_secret_key: (a: number) => void;
 export const generate_identity: (a: number) => void;
 export const generate_keypair: () => number;
 export const generate_qr_payload: (a: number, b: number, c: number, d: number, e: number) => void;
@@ -20,6 +21,7 @@ export const hangup_call: (a: number, b: number, c: number) => void;
 export const has_session: (a: number, b: number) => number;
 export const init: () => void;
 export const initialize: (a: number) => void;
+export const initialize_from_key: (a: number, b: number, c: number) => void;
 export const is_decoy_enabled: () => number;
 export const panic_wipe: () => void;
 export const parse_qr_payload: (a: number, b: number, c: number) => void;

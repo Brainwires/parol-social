@@ -989,37 +989,65 @@ function showAddTab(tabName) {
     }
 }
 
-// ── Passphrase Connect ──────────────────────────────────────
+// ── Add Contact by Code ────────────────────────────────────
 function connectViaPassphrase() {
     const input = document.querySelector('#add-tab-passphrase input');
-    const phrase = input?.value?.trim();
-    if (!phrase) return;
-
-    // Show connecting state
-    const btn = document.querySelector('#add-tab-passphrase button');
-    const originalText = btn.textContent;
-    btn.textContent = 'Connecting...';
-    btn.disabled = true;
-
-    // Use WASM to process passphrase bootstrap
-    if (wasm) {
-        try {
-            showToast('Searching for peer with this passphrase...');
-            setTimeout(() => {
-                btn.textContent = originalText;
-                btn.disabled = false;
-                showToast('No peers found nearby. Make sure both devices are online.');
-            }, 3000);
-        } catch (e) {
-            btn.textContent = originalText;
-            btn.disabled = false;
-            showToast('Connection failed: ' + e.message);
-        }
-    } else {
-        btn.textContent = originalText;
-        btn.disabled = false;
-        showToast('App not fully loaded. Please wait and try again.');
+    const raw = input?.value?.trim();
+    if (!raw) {
+        showToast('Paste the code from your contact');
+        return;
     }
+
+    // Extract PeerId from whatever format they pasted
+    let peerId = null;
+
+    if (raw.startsWith('parolnet:')) {
+        // Format: parolnet:<64-char-hex>
+        peerId = raw.slice(9).trim();
+    } else if (/^[0-9a-fA-F]{64}$/.test(raw)) {
+        // Raw 64-char hex PeerId
+        peerId = raw.toLowerCase();
+    } else if (/^[0-9a-fA-F]+$/.test(raw) && raw.length > 64) {
+        // Full QR payload hex — try WASM parse
+        if (wasm && wasm.parse_qr_payload) {
+            try {
+                wasm.parse_qr_payload(raw);
+                // If parse succeeds, the payload contains an identity key
+                // Use the raw hex as an identifier for now
+                peerId = raw.slice(0, 64).toLowerCase();
+            } catch(e) { /* not a valid payload */ }
+        }
+        if (!peerId) {
+            // Take first 64 hex chars as PeerId
+            peerId = raw.slice(0, 64).toLowerCase();
+        }
+    }
+
+    if (!peerId || peerId.length !== 64) {
+        showToast('Invalid code. Copy the full code from your contact.');
+        return;
+    }
+
+    if (peerId === window._peerId) {
+        showToast("That's your own code!");
+        return;
+    }
+
+    // Add as contact, open chat
+    dbPut('contacts', {
+        peerId: peerId,
+        name: peerId.slice(0, 8) + '...',
+        lastMessage: '',
+        lastTime: formatTime(Date.now()),
+        unread: 0
+    }).then(() => {
+        input.value = '';
+        showToast('Contact added!');
+        loadContacts();
+        openChat(peerId);
+    }).catch(e => {
+        showToast('Failed: ' + e.message);
+    });
 }
 
 // ── Settings ────────────────────────────────────────────────

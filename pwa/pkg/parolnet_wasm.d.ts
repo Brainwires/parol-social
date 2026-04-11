@@ -54,6 +54,12 @@ export function encrypt_message(peer_id_hex: string, plaintext: Uint8Array): Uin
 export function enter_decoy_mode(): void;
 
 /**
+ * Export the current identity's secret key as hex.
+ * Used to save the identity to persistent storage.
+ */
+export function export_secret_key(): string;
+
+/**
  * Generate a new identity keypair and return the PeerId (32 bytes, hex-encoded).
  */
 export function generate_identity(): string;
@@ -116,6 +122,12 @@ export function init(): void;
  * Returns the peer_id as hex.
  */
 export function initialize(): string;
+
+/**
+ * Initialize from a saved secret key (hex-encoded 32 bytes).
+ * Returns the peer_id as hex.
+ */
+export function initialize_from_key(secret_key_hex: string): string;
 
 /**
  * Check if an unlock code has been set (decoy mode is enabled).
@@ -190,6 +202,7 @@ export interface InitOutput {
     readonly create_session: (a: number, b: number, c: number, d: number, e: number, f: number, g: number) => void;
     readonly decrypt_message: (a: number, b: number, c: number, d: number, e: number) => void;
     readonly encrypt_message: (a: number, b: number, c: number, d: number, e: number) => void;
+    readonly export_secret_key: (a: number) => void;
     readonly generate_identity: (a: number) => void;
     readonly generate_keypair: () => number;
     readonly generate_qr_payload: (a: number, b: number, c: number, d: number, e: number) => void;
@@ -202,6 +215,7 @@ export interface InitOutput {
     readonly has_session: (a: number, b: number) => number;
     readonly init: () => void;
     readonly initialize: (a: number) => void;
+    readonly initialize_from_key: (a: number, b: number, c: number) => void;
     readonly is_decoy_enabled: () => number;
     readonly panic_wipe: () => void;
     readonly parse_qr_payload: (a: number, b: number, c: number) => void;

@@ -76,7 +76,7 @@
         <div class="tabs">
             <button class="tab active" data-tab="qr-show" onclick="showAddTab('qr-show')">Show QR</button>
             <button class="tab" data-tab="qr-scan" onclick="showAddTab('qr-scan')">Scan QR</button>
-            <button class="tab" data-tab="passphrase" onclick="showAddTab('passphrase')">Passphrase</button>
+            <button class="tab" data-tab="passphrase" onclick="showAddTab('passphrase')">Paste Code</button>
         </div>
         <div id="add-tab-qr-show" class="add-tab-content">
             <p>Share your QR code with someone nearby to exchange keys securely.</p>
@@ -91,9 +91,9 @@
             <p id="qr-scanner-status" style="margin-top:8px;font-size:13px;color:var(--text3);">Tap to start camera</p>
         </div>
         <div id="add-tab-passphrase" class="add-tab-content hidden">
-            <p>Enter a shared passphrase to find each other on the network.</p>
-            <input type="text" placeholder="Enter shared passphrase..." dir="auto">
-            <button onclick="connectViaPassphrase()">Connect</button>
+            <p>Paste your contact's code here. They can copy it from their "Show QR" screen.</p>
+            <input type="text" placeholder="Paste code here..." dir="auto">
+            <button onclick="connectViaPassphrase()">Add Contact</button>
         </div>
     </div>
 
