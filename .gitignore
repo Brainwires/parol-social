@@ -8,3 +8,6 @@ Cargo.lock
 *.pem
 *.key
 coverage/
+node_modules/
+package.json
+package-lock.json
