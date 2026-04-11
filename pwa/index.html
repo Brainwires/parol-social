@@ -58,7 +58,7 @@
             <h1>Messages</h1>
             <div class="header-actions">
                 <button onclick="showView('add-contact')" title="Add contact">+</button>
-                <button onclick="openSettings()" title="Settings">\u2699</button>
+                <button onclick="openSettings()" title="Settings">⚙</button>
             </div>
         </header>
         <div class="search-bar">
@@ -70,7 +70,7 @@
     <!-- Add Contact -->
     <div id="view-add-contact" class="view hidden">
         <header>
-            <button onclick="showView('contacts')">\u2190</button>
+            <button onclick="showView('contacts')">←</button>
             <h1>Add Contact</h1>
         </header>
         <div class="tabs">
@@ -100,16 +100,16 @@
     <!-- Chat View -->
     <div id="view-chat" class="view hidden">
         <header>
-            <button onclick="showView('contacts')">\u2190</button>
+            <button onclick="showView('contacts')">←</button>
             <h1 id="chat-peer-name">Contact</h1>
             <div class="header-actions">
-                <button onclick="initiateCall(currentPeerId, false)" title="Voice call">\ud83d\udcde</button>
-                <button onclick="initiateCall(currentPeerId, true)" title="Video call">\ud83d\udcf9</button>
+                <button onclick="initiateCall(currentPeerId, false)" title="Voice call">📞</button>
+                <button onclick="initiateCall(currentPeerId, true)" title="Video call">📹</button>
             </div>
         </header>
         <div id="message-list" class="message-list"></div>
         <div class="chat-input">
-            <button class="attach-btn" onclick="attachFile()" title="Attach file">\ud83d\udcce</button>
+            <button class="attach-btn" onclick="attachFile()" title="Attach file">📎</button>
             <input type="text" id="message-input" placeholder="Type a message..." dir="auto"
                    onkeydown="if(event.key==='Enter')sendMessage()">
             <button class="send-btn" onclick="sendMessage()">Send</button>
@@ -126,9 +126,9 @@
             <video id="remote-video" class="remote-video hidden" autoplay playsinline></video>
             <video id="local-video" class="local-video hidden" autoplay playsinline muted></video>
             <div class="call-controls">
-                <button class="call-btn mute" onclick="toggleMute()">\ud83d\udd07</button>
+                <button class="call-btn mute" onclick="toggleMute()">🔇</button>
                 <button class="call-btn hangup" onclick="hangupCall()">End</button>
-                <button class="call-btn camera" onclick="toggleCamera()">\ud83d\udcf7</button>
+                <button class="call-btn camera" onclick="toggleCamera()">📷</button>
             </div>
         </div>
     </div>
@@ -136,7 +136,7 @@
     <!-- Settings -->
     <div id="view-settings" class="view hidden">
         <header>
-            <button onclick="showView('contacts')">\u2190</button>
+            <button onclick="showView('contacts')">←</button>
             <h1>Settings</h1>
         </header>
         <div class="settings-content">
