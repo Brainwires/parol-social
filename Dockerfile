@@ -1,13 +1,28 @@
+# Stage 1: Build relay server binary
+FROM rust:1.92-alpine AS builder
+RUN apk add --no-cache musl-dev pkgconfig
+WORKDIR /build
+COPY . .
+RUN cargo build --release -p parolnet-relay-server
+
+# Stage 2: Runtime with nginx + relay
 FROM nginx:alpine
 
-# Copy nginx config
+# Nginx config
 COPY server/nginx.conf /etc/nginx/conf.d/default.conf
 
-# Copy distribution landing page
+# Static files
 COPY server/index.html /usr/share/nginx/html/index.html
 COPY server/install.html /usr/share/nginx/html/install.html
-
-# Copy PWA app files
 COPY pwa/ /usr/share/nginx/html/pwa/
 
-EXPOSE 80 443
+# Relay binary
+COPY --from=builder /build/target/release/parolnet-relay /usr/local/bin/parolnet-relay
+
+# Entrypoint script
+COPY server/entrypoint.sh /entrypoint.sh
+RUN chmod +x /entrypoint.sh
+
+EXPOSE 80
+
+CMD ["/entrypoint.sh"]

@@ -1,0 +1,21 @@
+[package]
+name = "parolnet-relay-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "WebSocket relay server for ParolNet — routes encrypted messages between peers"
+
+[[bin]]
+name = "parolnet-relay"
+path = "src/main.rs"
+
+[dependencies]
+axum = { workspace = true, features = ["ws"] }
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+tower-http.workspace = true
+futures-util.workspace = true

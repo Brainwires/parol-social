@@ -2,7 +2,7 @@
 // Cache-first strategy: the app works entirely offline after first load.
 // If the source site goes down, the app continues to function from cache.
 
-const CACHE_NAME = 'parolnet-v4';
+const CACHE_NAME = 'parolnet-v5';
 
 // All assets that must be cached for offline operation.
 // The app is fully self-contained — zero external dependencies.

@@ -261,6 +261,9 @@ function onWasmReady() {
     loadContacts();
     // Pre-render QR code so it's ready when user opens Add Contact
     renderBootstrapQR();
+
+    // Connect to relay server
+    connectRelay();
 }
 
 function onWasmUnavailable() {
@@ -268,6 +271,154 @@ function onWasmUnavailable() {
     showView('calculator');
     const el = document.getElementById('settings-version');
     if (el) el.textContent = 'dev (no WASM)';
+
+    // Connect to relay server even without WASM (plaintext testing)
+    connectRelay();
+}
+
+// ── WebSocket Relay Connection ─────────────────────────────
+let ws = null;
+let wsReconnectTimer = null;
+let wsReconnectDelay = 1000;
+
+function connectRelay() {
+    if (ws && ws.readyState === WebSocket.OPEN) return;
+
+    // Determine WebSocket URL from current page location
+    const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
+    const wsUrl = protocol + '//' + location.host + '/ws';
+
+    try {
+        ws = new WebSocket(wsUrl);
+    } catch(e) {
+        console.warn('WebSocket connect failed:', e);
+        scheduleReconnect();
+        return;
+    }
+
+    ws.onopen = () => {
+        console.log('Relay connected');
+        wsReconnectDelay = 1000; // reset backoff
+        updateConnectionStatus(true);
+
+        // Register with our PeerId
+        if (window._peerId) {
+            ws.send(JSON.stringify({
+                type: 'register',
+                peer_id: window._peerId
+            }));
+        }
+    };
+
+    ws.onmessage = (event) => {
+        try {
+            const msg = JSON.parse(event.data);
+            handleRelayMessage(msg);
+        } catch(e) {
+            console.warn('Invalid relay message:', e);
+        }
+    };
+
+    ws.onclose = () => {
+        console.log('Relay disconnected');
+        updateConnectionStatus(false);
+        scheduleReconnect();
+    };
+
+    ws.onerror = (e) => {
+        console.warn('Relay error');
+        updateConnectionStatus(false);
+    };
+}
+
+function scheduleReconnect() {
+    if (wsReconnectTimer) return;
+    wsReconnectTimer = setTimeout(() => {
+        wsReconnectTimer = null;
+        wsReconnectDelay = Math.min(wsReconnectDelay * 2, 30000); // exponential backoff, max 30s
+        connectRelay();
+    }, wsReconnectDelay);
+}
+
+function updateConnectionStatus(connected) {
+    const dot = document.getElementById('connection-dot');
+    if (dot) {
+        dot.className = 'connection-dot ' + (connected ? 'online' : 'offline');
+    }
+}
+
+function handleRelayMessage(msg) {
+    switch (msg.type) {
+        case 'registered':
+            console.log('Registered with relay. Online peers:', msg.online_peers);
+            break;
+
+        case 'message':
+            // Incoming message from another peer
+            onIncomingMessage(msg.from, msg.payload);
+            break;
+
+        case 'queued':
+            console.log('Message queued (peer offline)');
+            showToast('Peer offline — message will be delivered when they connect');
+            break;
+
+        case 'error':
+            console.warn('Relay error:', msg.message);
+            if (msg.message === 'peer not connected') {
+                showToast('Peer is not online');
+            }
+            break;
+    }
+}
+
+function onIncomingMessage(fromPeerId, payload) {
+    if (!fromPeerId || !payload) return;
+
+    // Store the message
+    const msg = {
+        peerId: fromPeerId,
+        direction: 'received',
+        content: payload,
+        timestamp: Date.now()
+    };
+
+    dbPut('messages', msg).catch(e => console.warn('Failed to store message:', e));
+
+    // Update or create contact
+    dbPut('contacts', {
+        peerId: fromPeerId,
+        name: fromPeerId.slice(0, 8) + '...',
+        lastMessage: payload.slice(0, 50),
+        lastTime: formatTime(Date.now()),
+        unread: 1
+    }).catch(() => {});
+
+    // If we're viewing this peer's chat, show the message immediately
+    if (currentView === 'chat' && currentPeerId === fromPeerId) {
+        appendMessage(msg);
+    } else {
+        // Show notification
+        showLocalNotification('New Message', payload.slice(0, 100), fromPeerId);
+        showToast('Message from ' + fromPeerId.slice(0, 8) + '...');
+        // Refresh contact list if visible
+        if (currentView === 'contacts') {
+            loadContacts();
+        }
+    }
+}
+
+function sendToRelay(toPeerId, payload) {
+    if (!ws || ws.readyState !== WebSocket.OPEN) {
+        showToast('Not connected to relay');
+        return false;
+    }
+    ws.send(JSON.stringify({
+        type: 'message',
+        to: toPeerId,
+        payload: payload
+    }));
+    return true;
 }
 
 // ── Contact List ────────────────────────────────────────────
@@ -367,6 +518,10 @@ async function sendMessage() {
     }
 
     appendMessage(msg);
+
+    // Send through relay
+    sendToRelay(currentPeerId, text);
+
     input.value = '';
     input.focus();
 

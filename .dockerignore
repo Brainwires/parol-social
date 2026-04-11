@@ -1,4 +1,4 @@
 target/
 .git/
 coverage/
-.cargo/
+node_modules/

@@ -10,7 +10,7 @@ echo "=== ParolNet Deploy ==="
 echo ""
 
 # Step 1: Build WASM
-echo "[1/3] Building WASM module..."
+echo "[1/2] Building WASM module..."
 if ! command -v wasm-pack &> /dev/null; then
     echo "ERROR: wasm-pack not found. Install: curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh"
     exit 1
@@ -27,12 +27,11 @@ rm -f pwa/pkg/.gitignore pwa/pkg/package.json pwa/pkg/README.md
 echo "WASM built: $(du -sh pwa/pkg/parolnet_wasm_bg.wasm | cut -f1)"
 echo ""
 
-# Step 2: Rebuild Docker image
-echo "[2/3] Rebuilding Docker image..."
+# Step 2: Rebuild Docker image (multi-stage: compiles relay server + bundles with nginx)
+echo "[2/2] Rebuilding Docker image and restarting..."
 docker compose build --no-cache
 
-# Step 3: Restart container
-echo "[3/3] Restarting container..."
+# Restart container
 docker compose down
 docker compose up -d
 
