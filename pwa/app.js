@@ -8,6 +8,7 @@ let currentPeerId = null;
 let currentCallId = null;
 let localStream = null;
 let platform = detectPlatform();
+window._knownPeers = [];
 
 // ── Platform Detection ──────────────────────────────────────
 function detectPlatform() {
@@ -253,6 +254,58 @@ async function dbClear(storeName) {
     });
 }
 
+// ── Telemetry ──────────────────────────────────────────────
+const telemetry = {
+    sid: Array.from(crypto.getRandomValues(new Uint8Array(8))).map(b => b.toString(16).padStart(2, '0')).join(''),
+    events: [],
+    MAX_EVENTS: 500,
+
+    track(type, meta) {
+        if (this.events.length >= this.MAX_EVENTS) this.events.shift();
+        this.events.push({ type, ts: Date.now(), meta: meta || null });
+    },
+
+    async flush() {
+        if (this.events.length === 0) return;
+        const batch = {
+            sid: this.sid,
+            ts: Date.now(),
+            events: this.events.splice(0, this.events.length)
+        };
+        try {
+            const resp = await fetch('/telemetry', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(batch)
+            });
+            if (!resp.ok) {
+                // Put events back
+                this.events.unshift(...batch.events);
+                if (this.events.length > this.MAX_EVENTS) {
+                    this.events.length = this.MAX_EVENTS;
+                }
+            }
+        } catch(e) {
+            // Network error — put events back
+            this.events.unshift(...batch.events);
+            if (this.events.length > this.MAX_EVENTS) {
+                this.events.length = this.MAX_EVENTS;
+            }
+        }
+    }
+};
+
+// Flush telemetry every 60 seconds
+setInterval(() => telemetry.flush(), 60000);
+
+// Flush on page hide (user navigating away)
+document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'hidden') {
+        telemetry.flush();
+    }
+    telemetry.track(document.visibilityState === 'visible' ? 'app_visible' : 'app_hidden');
+});
+
 // ── WASM Loading ────────────────────────────────────────────
 async function loadWasm() {
     const statusEl = document.getElementById('loading-status');
@@ -264,9 +317,11 @@ async function loadWasm() {
         const wasmUrl = './pkg/parolnet_wasm_bg.wasm?v=' + Date.now();
         await wasm.default(wasmUrl);
         if (statusEl) statusEl.textContent = 'Restoring identity...';
+        telemetry.track('wasm_load_success');
         await onWasmReady();
     } catch (e) {
         console.warn('WASM not available:', e.message);
+        telemetry.track('wasm_load_fail', { error: e.message });
         showToast('WASM load failed: ' + e.message);
         if (statusEl) statusEl.textContent = 'Running without crypto (' + e.message + ')';
         onWasmUnavailable();
@@ -371,6 +426,7 @@ function connectRelay() {
 
     ws.onopen = () => {
         console.log('Relay connected');
+        telemetry.track('relay_connect');
         wsReconnectDelay = 1000; // reset backoff
         updateConnectionStatus(true);
 
@@ -381,6 +437,7 @@ function connectRelay() {
                 peer_id: window._peerId
             }));
         }
+        flushMessageQueue();
     };
 
     ws.onmessage = (event) => {
@@ -394,8 +451,18 @@ function connectRelay() {
 
     ws.onclose = () => {
         console.log('Relay disconnected');
+        telemetry.track('relay_disconnect');
         updateConnectionStatus(false);
         scheduleReconnect();
+
+        // Try WebRTC to known peers when relay drops
+        if (window._knownPeers && typeof RTCPeerConnection !== 'undefined') {
+            for (const pid of window._knownPeers) {
+                if (!hasDirectConnection(pid)) {
+                    initWebRTC(pid, true).catch(() => {});
+                }
+            }
+        }
     };
 
     ws.onerror = (e) => {
@@ -413,10 +480,49 @@ function scheduleReconnect() {
     }, wsReconnectDelay);
 }
 
-function updateConnectionStatus(connected) {
+function updateConnectionStatus(relayConnected) {
     const dot = document.getElementById('connection-dot');
-    if (dot) {
-        dot.className = 'connection-dot ' + (connected ? 'online' : 'offline');
+    if (!dot) return;
+
+    const hasAnyWebRTC = Object.values(rtcConnections).some(c => c.dc && c.dc.readyState === 'open');
+
+    if (relayConnected && hasAnyWebRTC) {
+        dot.className = 'connection-dot online';
+        dot.title = 'Connected (relay + direct)';
+    } else if (relayConnected || hasAnyWebRTC) {
+        dot.className = 'connection-dot partial';
+        dot.title = relayConnected ? 'Relay only' : 'Direct only (relay offline)';
+    } else {
+        dot.className = 'connection-dot offline';
+        dot.title = 'Offline — messages will be queued';
+    }
+}
+
+// ── Peer Discovery ─────────────────────────────────────────
+let discoveryInterval = null;
+
+async function discoverPeers() {
+    try {
+        const exclude = window._peerId || '';
+        const resp = await fetch('/bootstrap?exclude=' + encodeURIComponent(exclude));
+        if (!resp.ok) return;
+        const peerIds = await resp.json();
+        console.log('[Discovery]', peerIds.length, 'peers online');
+        window._knownPeers = peerIds;
+
+        // Attempt WebRTC to contacts who are online
+        if (typeof RTCPeerConnection === 'undefined') return;
+        let contacts;
+        try { contacts = await dbGetAll('contacts'); } catch(e) { return; }
+        const contactIds = new Set(contacts.map(c => c.peerId));
+
+        for (const pid of peerIds) {
+            if (contactIds.has(pid) && !hasDirectConnection(pid)) {
+                initWebRTC(pid, true).catch(() => {});
+            }
+        }
+    } catch(e) {
+        console.warn('[Discovery] Failed:', e.message);
     }
 }
 
@@ -424,6 +530,8 @@ function handleRelayMessage(msg) {
     switch (msg.type) {
         case 'registered':
             console.log('Registered with relay. Online peers:', msg.online_peers);
+            discoverPeers();
+            if (!discoveryInterval) discoveryInterval = setInterval(discoverPeers, 300000);
             break;
 
         case 'message':
@@ -457,6 +565,11 @@ function handleRelayMessage(msg) {
 
 function onIncomingMessage(fromPeerId, payload) {
     if (!fromPeerId || !payload) return;
+
+    // Dedup: create a hash of the message to avoid duplicate display
+    const dedupKey = fromPeerId + ':' + (typeof payload === 'string' ? payload.slice(0, 64) : '');
+    if (seenGossipMessages.has(dedupKey)) return;
+    markGossipSeen(dedupKey);
 
     // Handle system events (not displayed as chat messages)
     if (typeof payload === 'string' && payload.startsWith('__system:')) {
@@ -498,6 +611,8 @@ function onIncomingMessage(fromPeerId, payload) {
         }
         return;
     }
+
+    telemetry.track('message_received');
 
     // Attempt decryption if payload is encrypted
     let messageText = payload;
@@ -595,6 +710,9 @@ async function initWebRTC(peerId, isInitiator) {
 
     pc.onconnectionstatechange = () => {
         console.log('[WebRTC]', peerId.slice(0,8), 'state:', pc.connectionState);
+        if (pc.connectionState === 'failed') {
+            telemetry.track('webrtc_connect_fail');
+        }
         if (pc.connectionState === 'failed' || pc.connectionState === 'closed') {
             cleanupRTC(peerId);
         }
@@ -628,8 +746,10 @@ function setupDataChannel(peerId, dc) {
 
     dc.onopen = () => {
         console.log('[WebRTC] Data channel open with', peerId.slice(0,8));
+        telemetry.track('webrtc_connect_success');
         rtcConnections[peerId].status = 'open';
         updatePeerConnectionUI(peerId, 'direct');
+        flushMessageQueue();
     };
 
     dc.onclose = () => {
@@ -644,6 +764,19 @@ function setupDataChannel(peerId, dc) {
             const msg = JSON.parse(event.data);
             if (msg.type === 'chat') {
                 onIncomingMessage(peerId, msg.payload);
+            } else if (msg.type === 'gossip') {
+                // Gossip message — check if for us, forward if not seen
+                if (!msg.msgId || !msg.payload || seenGossipMessages.has(msg.msgId)) return;
+
+                const isForUs = !msg.to || msg.to === window._peerId;
+                if (isForUs) {
+                    onIncomingMessage(msg.from || peerId, msg.payload);
+                }
+
+                // Forward if TTL allows
+                if (msg.ttl > 0) {
+                    gossipForward(peerId, msg.msgId, msg.to, msg.payload, msg.ttl - 1);
+                }
             }
         } catch(e) {
             // Raw string message
@@ -718,6 +851,94 @@ function updatePeerConnectionUI(peerId, type) {
 function hasDirectConnection(peerId) {
     const conn = rtcConnections[peerId];
     return conn && conn.dc && conn.dc.readyState === 'open';
+}
+
+// ── Message Queue (offline resilience) ─────────────────────
+const messageQueue = [];
+const MAX_QUEUE_SIZE = 200;
+const MAX_QUEUE_AGE_MS = 3600000; // 1 hour
+
+function queueMessage(toPeerId, payload) {
+    if (messageQueue.length >= MAX_QUEUE_SIZE) messageQueue.shift();
+    messageQueue.push({ toPeerId, payload, timestamp: Date.now() });
+    console.log('[Queue] Message queued for', toPeerId.slice(0, 8), '- queue size:', messageQueue.length);
+}
+
+function flushMessageQueue() {
+    if (messageQueue.length === 0) return;
+    console.log('[Queue] Flushing', messageQueue.length, 'queued messages');
+    const toFlush = messageQueue.splice(0, messageQueue.length);
+    for (const msg of toFlush) {
+        if (Date.now() - msg.timestamp > MAX_QUEUE_AGE_MS) continue; // expired
+        let sent = false;
+        if (hasDirectConnection(msg.toPeerId)) {
+            sent = sendViaWebRTC(msg.toPeerId, msg.payload);
+        }
+        if (!sent) {
+            sent = sendToRelay(msg.toPeerId, msg.payload);
+        }
+        if (!sent) {
+            messageQueue.push(msg); // re-queue
+        }
+    }
+    if (messageQueue.length > 0) {
+        console.log('[Queue]', messageQueue.length, 'messages still queued');
+    }
+}
+
+// ── WebRTC Gossip Mesh ─────────────────────────────────────
+const seenGossipMessages = new Set();
+const SEEN_GOSSIP_MAX = 1000;
+let gossipForwardCount = 0;
+let gossipForwardResetTime = Date.now();
+const GOSSIP_RATE_LIMIT = 10; // max forwards per second
+
+function generateMsgId() {
+    const arr = new Uint8Array(16);
+    crypto.getRandomValues(arr);
+    return Array.from(arr).map(b => b.toString(16).padStart(2, '0')).join('');
+}
+
+function markGossipSeen(msgId) {
+    seenGossipMessages.add(msgId);
+    if (seenGossipMessages.size > SEEN_GOSSIP_MAX) {
+        const first = seenGossipMessages.values().next().value;
+        seenGossipMessages.delete(first);
+    }
+}
+
+function gossipForward(originPeerId, msgId, to, payload, ttl) {
+    if (seenGossipMessages.has(msgId)) return;
+    markGossipSeen(msgId);
+
+    // Rate limiting
+    const now = Date.now();
+    if (now - gossipForwardResetTime > 1000) {
+        gossipForwardCount = 0;
+        gossipForwardResetTime = now;
+    }
+    if (gossipForwardCount >= GOSSIP_RATE_LIMIT) return;
+
+    const gossipMsg = JSON.stringify({
+        type: 'gossip',
+        msgId: msgId,
+        from: originPeerId,
+        to: to,
+        payload: payload,
+        ttl: ttl
+    });
+
+    for (const [peerId, conn] of Object.entries(rtcConnections)) {
+        if (peerId === originPeerId) continue; // don't send back to origin
+        if (conn.dc && conn.dc.readyState === 'open') {
+            try {
+                conn.dc.send(gossipMsg);
+                gossipForwardCount++;
+            } catch(e) {
+                console.warn('[Gossip] Forward to', peerId.slice(0,8), 'failed:', e.message);
+            }
+        }
+    }
 }
 
 // ── Contact List ────────────────────────────────────────────
@@ -816,6 +1037,7 @@ async function sendMessage() {
 
     // Encrypt and send — try WebRTC first, fall back to relay
     let sent = false;
+    let relayPayload = text; // track what would be sent, for queuing/gossip
     if (wasm && wasm.encrypt_message && wasm.has_session && wasm.has_session(currentPeerId)) {
         try {
             const encoder = new TextEncoder();
@@ -824,6 +1046,7 @@ async function sendMessage() {
             // Convert Uint8Array to hex for JSON transport
             const hexPayload = Array.from(encrypted).map(b => b.toString(16).padStart(2, '0')).join('');
             const encPayload = 'enc:' + hexPayload;
+            relayPayload = encPayload;
             // Try WebRTC first, fall back to relay
             if (hasDirectConnection(currentPeerId)) {
                 sent = sendViaWebRTC(currentPeerId, encPayload);
@@ -842,10 +1065,34 @@ async function sendMessage() {
             sent = sendViaWebRTC(currentPeerId, text);
         }
         if (!sent) {
-            sendToRelay(currentPeerId, text);
+            sent = sendToRelay(currentPeerId, text);
+        }
+    }
+    if (!sent) {
+        queueMessage(currentPeerId, relayPayload);
+        showToast('Message queued — will send when connected');
+    }
+
+    // Also broadcast via gossip mesh for redundancy
+    const msgId = generateMsgId();
+    markGossipSeen(msgId);
+    const gossipPayload = relayPayload;
+    for (const [pid, conn] of Object.entries(rtcConnections)) {
+        if (conn.dc && conn.dc.readyState === 'open') {
+            try {
+                conn.dc.send(JSON.stringify({
+                    type: 'gossip',
+                    msgId: msgId,
+                    from: window._peerId,
+                    to: currentPeerId,
+                    payload: gossipPayload,
+                    ttl: 3
+                }));
+            } catch(e) {}
         }
     }
 
+    telemetry.track('message_sent');
     input.value = '';
     input.focus();
 
@@ -1174,6 +1421,7 @@ function handleScannedQR(data) {
             const result = wasm.process_scanned_qr(data);
             peerId = result.peer_id;
             sessionEstablished = true;
+            telemetry.track('session_established');
             console.log('[QR] Session established with:', peerId.slice(0, 8));
         } catch(e) {
             console.warn('[QR] process_scanned_qr failed:', e);

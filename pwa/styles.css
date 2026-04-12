@@ -739,6 +739,7 @@ button.success {
     vertical-align: middle;
 }
 .connection-dot.online { background: var(--green, #4ecca3); }
+.connection-dot.partial { background: #f0a500; }
 .connection-dot.offline { background: var(--red, #e74c3c); }
 
 /* ── Desktop Layout ──────────────────────────────────────────── */

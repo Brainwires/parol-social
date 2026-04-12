@@ -1,16 +1,23 @@
+use async_trait::async_trait;
 use axum::{
     Json, Router,
     extract::{
         Query,
         ws::{Message, WebSocket, WebSocketUpgrade},
     },
-    routing::get,
+    http::StatusCode,
+    response::IntoResponse,
+    routing::{get, post},
 };
 use futures_util::{SinkExt, StreamExt};
+use parolnet_mesh::peer_manager::PeerManager;
+use parolnet_protocol::address::PeerId;
+use parolnet_transport::{Connection, TransportError};
 use rand::seq::SliceRandom;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::{Mutex, mpsc};
 use tracing::info;
 
@@ -20,6 +27,46 @@ type MessageStore = Arc<Mutex<HashMap<String, Vec<String>>>>;
 // the relay server's message handling is refactored to use protocol Envelope types
 // instead of raw JSON strings. The InMemoryStore operates on Envelope + PeerId,
 // which requires deeper integration than a drop-in replacement.
+
+/// Adapter bridging a WebSocket peer's mpsc sender to the `Connection` trait,
+/// so that the PeerManager/gossip protocol can push CBOR gossip messages out
+/// over the existing relay WebSocket channels.
+struct WsConnection {
+    tx: mpsc::UnboundedSender<String>,
+}
+
+#[async_trait]
+impl Connection for WsConnection {
+    async fn send(&self, data: &[u8]) -> Result<(), TransportError> {
+        // Encode raw bytes as a hex string wrapped in a gossip JSON message
+        let hex_data = hex::encode(data);
+        let msg = serde_json::json!({
+            "type": "gossip",
+            "payload": hex_data,
+            "from": ""
+        })
+        .to_string();
+        self.tx
+            .send(msg)
+            .map_err(|_| TransportError::ConnectionClosed)
+    }
+
+    async fn recv(&self) -> Result<Vec<u8>, TransportError> {
+        // The relay server is push-based, not pull-based.
+        // Gossip messages arrive via handle_socket, not via recv().
+        Err(TransportError::NotAvailable(
+            "relay uses push-based messaging".into(),
+        ))
+    }
+
+    async fn close(&self) -> Result<(), TransportError> {
+        Ok(())
+    }
+
+    fn peer_addr(&self) -> Option<std::net::SocketAddr> {
+        None
+    }
+}
 
 // --- Analytics module (real implementation when feature enabled) ---
 #[cfg(feature = "analytics")]
@@ -130,6 +177,134 @@ struct OutgoingMessage {
     online_peers: Option<usize>,
 }
 
+// --- Client telemetry ---
+
+#[derive(Deserialize)]
+struct TelemetryEvent {
+    #[serde(rename = "type")]
+    event_type: String,
+    #[allow(dead_code)]
+    ts: u64,
+    #[allow(dead_code)]
+    meta: Option<serde_json::Value>,
+}
+
+#[derive(Deserialize)]
+struct TelemetryBatch {
+    sid: String,
+    #[allow(dead_code)]
+    ts: u64,
+    events: Vec<TelemetryEvent>,
+}
+
+struct ClientStats {
+    wasm_load_success: AtomicU64,
+    wasm_load_fail: AtomicU64,
+    relay_connects: AtomicU64,
+    relay_disconnects: AtomicU64,
+    webrtc_success: AtomicU64,
+    webrtc_fail: AtomicU64,
+    messages_sent: AtomicU64,
+    messages_received: AtomicU64,
+    sessions_established: AtomicU64,
+    errors: AtomicU64,
+    total_batches: AtomicU64,
+}
+
+impl ClientStats {
+    fn new() -> Self {
+        Self {
+            wasm_load_success: AtomicU64::new(0),
+            wasm_load_fail: AtomicU64::new(0),
+            relay_connects: AtomicU64::new(0),
+            relay_disconnects: AtomicU64::new(0),
+            webrtc_success: AtomicU64::new(0),
+            webrtc_fail: AtomicU64::new(0),
+            messages_sent: AtomicU64::new(0),
+            messages_received: AtomicU64::new(0),
+            sessions_established: AtomicU64::new(0),
+            errors: AtomicU64::new(0),
+            total_batches: AtomicU64::new(0),
+        }
+    }
+
+    #[cfg(feature = "analytics")]
+    fn to_json(&self) -> String {
+        format!(
+            r#"{{"wasm_load_success":{},"wasm_load_fail":{},"relay_connects":{},"relay_disconnects":{},"webrtc_success":{},"webrtc_fail":{},"messages_sent":{},"messages_received":{},"sessions_established":{},"errors":{},"total_batches":{}}}"#,
+            self.wasm_load_success.load(Ordering::Relaxed),
+            self.wasm_load_fail.load(Ordering::Relaxed),
+            self.relay_connects.load(Ordering::Relaxed),
+            self.relay_disconnects.load(Ordering::Relaxed),
+            self.webrtc_success.load(Ordering::Relaxed),
+            self.webrtc_fail.load(Ordering::Relaxed),
+            self.messages_sent.load(Ordering::Relaxed),
+            self.messages_received.load(Ordering::Relaxed),
+            self.sessions_established.load(Ordering::Relaxed),
+            self.errors.load(Ordering::Relaxed),
+            self.total_batches.load(Ordering::Relaxed),
+        )
+    }
+}
+
+async fn handle_telemetry(
+    client_stats: Arc<ClientStats>,
+    Json(batch): Json<TelemetryBatch>,
+) -> impl IntoResponse {
+    // Validate
+    if batch.events.len() > 500 || batch.sid.is_empty() {
+        return StatusCode::BAD_REQUEST;
+    }
+
+    client_stats.total_batches.fetch_add(1, Ordering::Relaxed);
+
+    for event in &batch.events {
+        match event.event_type.as_str() {
+            "wasm_load_success" => {
+                client_stats
+                    .wasm_load_success
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            "wasm_load_fail" => {
+                client_stats.wasm_load_fail.fetch_add(1, Ordering::Relaxed);
+            }
+            "relay_connect" => {
+                client_stats.relay_connects.fetch_add(1, Ordering::Relaxed);
+            }
+            "relay_disconnect" => {
+                client_stats
+                    .relay_disconnects
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            "webrtc_connect_success" => {
+                client_stats.webrtc_success.fetch_add(1, Ordering::Relaxed);
+            }
+            "webrtc_connect_fail" => {
+                client_stats.webrtc_fail.fetch_add(1, Ordering::Relaxed);
+            }
+            "message_sent" => {
+                client_stats.messages_sent.fetch_add(1, Ordering::Relaxed);
+            }
+            "message_received" => {
+                client_stats
+                    .messages_received
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            "session_established" => {
+                client_stats
+                    .sessions_established
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            "error" => {
+                client_stats.errors.fetch_add(1, Ordering::Relaxed);
+            }
+            _ => {}
+        }
+    }
+
+    StatusCode::OK
+}
+
 /// GET /peers — returns JSON list of currently connected peer IDs.
 async fn handle_peers(peers: PeerMap) -> Json<Vec<String>> {
     let peer_list = peers.lock().await;
@@ -166,6 +341,27 @@ async fn main() {
     let peers: PeerMap = Arc::new(Mutex::new(HashMap::new()));
     let store: MessageStore = Arc::new(Mutex::new(HashMap::new()));
     let stats = Arc::new(analytics::Stats::new());
+    let client_stats = Arc::new(ClientStats::new());
+
+    // Initialize mesh PeerManager as a gossip supernode
+    let our_peer_id = PeerId([0u8; 32]); // Relay's own peer ID (could generate a real one)
+    let peer_manager = Arc::new(PeerManager::new(our_peer_id));
+
+    // Spawn periodic maintenance (dedup rotation, stored-message expiry)
+    {
+        let pm = peer_manager.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(43200)); // 12 hours
+            loop {
+                interval.tick().await;
+                if let Err(e) = pm.run_maintenance().await {
+                    tracing::warn!(error = %e, "PeerManager maintenance failed");
+                } else {
+                    tracing::info!("PeerManager maintenance completed");
+                }
+            }
+        });
+    }
 
     // Determine whether the /stats endpoint should be active
     #[cfg(feature = "analytics")]
@@ -186,8 +382,11 @@ async fn main() {
                 let peers = peers.clone();
                 let store = store.clone();
                 let stats = stats.clone();
+                let peer_manager = peer_manager.clone();
                 move |ws: WebSocketUpgrade| async move {
-                    ws.on_upgrade(move |socket| handle_socket(socket, peers, store, stats))
+                    ws.on_upgrade(move |socket| {
+                        handle_socket(socket, peers, store, stats, peer_manager)
+                    })
                 }
             }),
         )
@@ -212,6 +411,16 @@ async fn main() {
                 }
             }),
         )
+        .route(
+            "/telemetry",
+            post({
+                let client_stats = client_stats.clone();
+                move |body: Json<TelemetryBatch>| {
+                    let client_stats = client_stats.clone();
+                    async move { handle_telemetry(client_stats, body).await }
+                }
+            }),
+        )
         .layer(tower_http::cors::CorsLayer::permissive());
 
     // Add /stats endpoint only when feature is enabled AND env var is set
@@ -220,16 +429,27 @@ async fn main() {
         if analytics_enabled {
             let stats_clone = stats.clone();
             let peers_clone = peers.clone();
+            let client_stats_clone = client_stats.clone();
+            let pm_clone = peer_manager.clone();
             app = app.route(
                 "/stats",
                 get(move || {
                     let s = stats_clone.clone();
                     let p = peers_clone.clone();
+                    let cs = client_stats_clone.clone();
+                    let pm = pm_clone.clone();
                     async move {
                         let online = p.lock().await.len();
+                        let server_json = s.to_json(online);
+                        let client_json = cs.to_json();
+                        let mesh_peers = pm.peer_count().await;
+                        let combined = format!(
+                            r#"{{"server":{},"client":{},"mesh":{{"connected_peers":{}}}}}"#,
+                            server_json, client_json, mesh_peers
+                        );
                         (
                             [(axum::http::header::CONTENT_TYPE, "application/json")],
-                            s.to_json(online),
+                            combined,
                         )
                     }
                 }),
@@ -285,11 +505,25 @@ async fn forward_gossip(
     }
 }
 
+/// Try to parse a hex-encoded peer ID string into a `PeerId`.
+/// Returns `None` if the string is not valid 64-char hex (32 bytes).
+fn parse_peer_id(hex_str: &str) -> Option<PeerId> {
+    let bytes = hex::decode(hex_str).ok()?;
+    if bytes.len() == 32 {
+        let mut arr = [0u8; 32];
+        arr.copy_from_slice(&bytes);
+        Some(PeerId(arr))
+    } else {
+        None
+    }
+}
+
 async fn handle_socket(
     socket: WebSocket,
     peers: PeerMap,
     store: MessageStore,
     stats: Arc<analytics::Stats>,
+    peer_manager: Arc<PeerManager>,
 ) {
     let (mut sender, mut receiver) = socket.split();
     let (tx, mut rx) = mpsc::unbounded_channel::<String>();
@@ -328,11 +562,23 @@ async fn handle_socket(
         match incoming.msg_type.as_str() {
             "register" => {
                 if let Some(peer_id) = incoming.peer_id {
-                    // Register this peer
+                    // Register this peer in the relay's peer map
                     peers.lock().await.insert(peer_id.clone(), tx.clone());
                     my_peer_id = Some(peer_id.clone());
 
                     stats.record_connection();
+
+                    // Register with PeerManager for gossip protocol routing
+                    if let Some(mesh_pid) = parse_peer_id(&peer_id) {
+                        let ws_conn = Arc::new(WsConnection { tx: tx.clone() });
+                        if let Err(e) = peer_manager.add_peer(mesh_pid, ws_conn).await {
+                            tracing::warn!(
+                                peer = %peer_id,
+                                error = %e,
+                                "failed to add peer to mesh PeerManager"
+                            );
+                        }
+                    }
 
                     let online = peers.lock().await.len();
                     let _ = tx.send(
@@ -400,8 +646,29 @@ async fn handle_socket(
                 // Forward gossip payload to up to 3 random peers (excluding sender + exclude list)
                 let from = my_peer_id.clone().unwrap_or_default();
                 if let Some(payload) = incoming.payload {
+                    // Forward via existing relay mechanism (JSON, for browser clients)
                     forward_gossip(&peers, &from, &incoming.exclude, &payload, 3).await;
                     stats.record_message_routed();
+
+                    // Also feed into PeerManager for proper gossip protocol processing
+                    // (CBOR-based dedup, bloom filters, PoW validation, score tracking)
+                    if let Ok(bytes) = hex::decode(&payload) {
+                        let pm = peer_manager.clone();
+                        tokio::spawn(async move {
+                            match pm.handle_incoming(&bytes).await {
+                                Ok(Some(_delivered)) => {
+                                    tracing::debug!("Gossip message delivered to relay");
+                                }
+                                Ok(None) => {} // forwarded or dropped by gossip protocol
+                                Err(e) => {
+                                    tracing::debug!(
+                                        error = %e,
+                                        "PeerManager gossip processing error (expected for non-CBOR payloads)"
+                                    );
+                                }
+                            }
+                        });
+                    }
                 }
             }
 
@@ -441,6 +708,12 @@ async fn handle_socket(
     if let Some(peer_id) = &my_peer_id {
         peers.lock().await.remove(peer_id);
         stats.record_disconnection();
+
+        // Remove from mesh PeerManager
+        if let Some(mesh_pid) = parse_peer_id(peer_id) {
+            peer_manager.remove_peer(&mesh_pid).await;
+        }
+
         info!(
             "Peer disconnected: {}...",
             &peer_id[..16.min(peer_id.len())]
