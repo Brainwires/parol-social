@@ -137,13 +137,54 @@ impl KeyAgreement for X3dhKeyAgreement {
     /// Respond to an incoming X3DH handshake.
     ///
     /// Bob performs the symmetric DH computation using his private keys.
-    fn respond(&self, _header: &X3dhHeader) -> Result<SharedSecret, CryptoError> {
-        // This requires Bob's SPK private key and optionally OPK private key,
-        // which are stored in the identity/key management layer.
-        // The full implementation needs access to the key store.
-        Err(CryptoError::NotImplemented {
-            feature: "X3DH response (requires key store integration)".into(),
-        })
+    /// Computes per PNP-002 Section 5.1 (Bob's side):
+    /// - DH1 = X25519(SPK_b, IK_a_x25519)
+    /// - DH2 = X25519(IK_b_x25519, EK_a)
+    /// - DH3 = X25519(SPK_b, EK_a)
+    /// - DH4 = X25519(OPK_b, EK_a) — if OPK was used
+    fn respond(
+        &self,
+        header: &X3dhHeader,
+        spk_secret: &StaticSecret,
+        opk_secret: Option<&StaticSecret>,
+    ) -> Result<SharedSecret, CryptoError> {
+        // Convert Alice's identity key (Ed25519) to X25519 public
+        let alice_ik_ed =
+            ed25519_dalek::VerifyingKey::from_bytes(&header.identity_key).map_err(|_| {
+                CryptoError::InvalidPreKeyBundle {
+                    reason: "invalid identity key in X3DH header".into(),
+                }
+            })?;
+        let ik_a_x25519 = ed25519_verify_to_x25519(&alice_ik_ed)?;
+
+        // Alice's ephemeral key is already X25519
+        let ek_a = X25519Public::from(header.ephemeral_key);
+
+        // Convert Bob's own identity key to X25519 secret
+        let ik_b_x25519 = ed25519_signing_to_x25519(&self.identity.signing_key);
+
+        // Compute DH values (symmetric to Alice's computation)
+        let dh1 = spk_secret.diffie_hellman(&ik_a_x25519);
+        let dh2 = ik_b_x25519.diffie_hellman(&ek_a);
+        let dh3 = spk_secret.diffie_hellman(&ek_a);
+
+        // Build IKM: 0xFF * 32 || DH1 || DH2 || DH3 [|| DH4]
+        let mut ikm = Vec::with_capacity(32 + 32 * 4);
+        ikm.extend_from_slice(&[0xFF; 32]); // domain separator
+        ikm.extend_from_slice(dh1.as_bytes());
+        ikm.extend_from_slice(dh2.as_bytes());
+        ikm.extend_from_slice(dh3.as_bytes());
+
+        if let Some(opk) = opk_secret {
+            let dh4 = opk.diffie_hellman(&ek_a);
+            ikm.extend_from_slice(dh4.as_bytes());
+        }
+
+        // Derive shared secret via HKDF
+        let sk = hkdf_sha256_fixed::<32>(&[0u8; 32], &ikm, b"ParolNet_X3DH_v1")?;
+        ikm.zeroize();
+
+        Ok(SharedSecret(sk))
     }
 }
 
@@ -211,6 +252,54 @@ mod tests {
 
         assert_eq!(secret.0.len(), 32);
         assert_eq!(header.one_time_prekey_id, None);
+    }
+
+    #[test]
+    fn test_x3dh_initiate_respond_shared_secret_match() {
+        let alice = IdentityKeyPair::generate();
+        let bob = IdentityKeyPair::generate();
+        let (bundle, spk, opk) = make_bob_bundle(&bob);
+
+        let alice_agreement = X3dhKeyAgreement { identity: alice };
+        let (alice_secret, header) = alice_agreement.initiate(&bundle).unwrap();
+
+        let bob_agreement = X3dhKeyAgreement { identity: bob };
+        let bob_secret = bob_agreement
+            .respond(&header, &spk.private_key, Some(&opk.private_key))
+            .unwrap();
+
+        assert_eq!(
+            alice_secret.0, bob_secret.0,
+            "Alice and Bob must derive identical shared secret"
+        );
+    }
+
+    #[test]
+    fn test_x3dh_initiate_respond_no_opk() {
+        let alice = IdentityKeyPair::generate();
+        let bob = IdentityKeyPair::generate();
+        let spk = SignedPreKey::generate(1, &bob).unwrap();
+
+        let bundle = PreKeyBundle {
+            identity_key: bob.public_key_bytes(),
+            signed_prekey: *spk.public_key.as_bytes(),
+            signed_prekey_id: spk.id,
+            signed_prekey_sig: spk.signature.to_vec(),
+            one_time_prekeys: vec![],
+        };
+
+        let alice_agreement = X3dhKeyAgreement { identity: alice };
+        let (alice_secret, header) = alice_agreement.initiate(&bundle).unwrap();
+
+        let bob_agreement = X3dhKeyAgreement { identity: bob };
+        let bob_secret = bob_agreement
+            .respond(&header, &spk.private_key, None)
+            .unwrap();
+
+        assert_eq!(
+            alice_secret.0, bob_secret.0,
+            "Alice and Bob must derive identical shared secret without OPK"
+        );
     }
 
     #[test]

@@ -81,7 +81,12 @@ pub trait KeyAgreement {
         recipient_bundle: &PreKeyBundle,
     ) -> Result<(SharedSecret, X3dhHeader), CryptoError>;
 
-    fn respond(&self, header: &X3dhHeader) -> Result<SharedSecret, CryptoError>;
+    fn respond(
+        &self,
+        header: &X3dhHeader,
+        spk_secret: &x25519_dalek::StaticSecret,
+        opk_secret: Option<&x25519_dalek::StaticSecret>,
+    ) -> Result<SharedSecret, CryptoError>;
 }
 
 // ── Key material types ─────────────────────────────────────────────
