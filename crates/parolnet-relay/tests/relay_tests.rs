@@ -554,3 +554,105 @@ fn test_gossip_accepts_valid_signed_descriptor() {
     let accepted = dir.handle_gossip_descriptor(desc, 1700000000 + 60);
     assert!(accepted, "valid signed descriptor should be accepted");
 }
+
+// ── DESTROY Forwarding Chain Tests ────────────────────────────
+
+#[tokio::test]
+async fn test_destroy_with_next_hop_forwards() {
+    let node = StandardRelayNode::new();
+    let keys = HopKeys::from_shared_secret(&[1u8; 32]).unwrap();
+    let next_addr: SocketAddr = "10.0.0.5:443".parse().unwrap();
+    let next_cid = 500;
+
+    node.register_circuit(42, keys, Some((next_addr, next_cid)))
+        .unwrap();
+
+    let cell = RelayCell::destroy(42, 0x01);
+    let action = node.handle_cell(cell).await.unwrap();
+
+    match action {
+        RelayAction::Forward {
+            next_hop,
+            cell: forwarded,
+        } => {
+            assert_eq!(next_hop, next_addr);
+            assert_eq!(forwarded.circuit_id, next_cid);
+            assert_eq!(forwarded.cell_type, CellType::Destroy);
+        }
+        other => panic!(
+            "expected Forward, got: {:?}",
+            std::mem::discriminant(&other)
+        ),
+    }
+
+    assert_eq!(node.circuit_count(), 0);
+}
+
+#[tokio::test]
+async fn test_destroy_without_next_hop_discards() {
+    let node = StandardRelayNode::new();
+    let keys = HopKeys::from_shared_secret(&[2u8; 32]).unwrap();
+
+    // Exit relay — no next_hop
+    node.register_circuit(77, keys, None).unwrap();
+
+    let cell = RelayCell::destroy(77, 0x02);
+    let action = node.handle_cell(cell).await.unwrap();
+
+    assert!(
+        matches!(action, RelayAction::Discard),
+        "exit relay should discard DESTROY"
+    );
+    assert_eq!(node.circuit_count(), 0);
+}
+
+#[tokio::test]
+async fn test_destroy_reason_codes_preserved() {
+    let node = StandardRelayNode::new();
+    let next_addr: SocketAddr = "10.0.0.9:443".parse().unwrap();
+
+    // Test reason code 0x03
+    let keys = HopKeys::from_shared_secret(&[3u8; 32]).unwrap();
+    node.register_circuit(100, keys, Some((next_addr, 200)))
+        .unwrap();
+
+    let cell = RelayCell::destroy(100, 0x03);
+    let action = node.handle_cell(cell).await.unwrap();
+
+    match &action {
+        RelayAction::Forward { cell: fwd, .. } => {
+            assert_eq!(fwd.payload[0], 0x03, "reason code 0x03 must be preserved");
+        }
+        other => panic!("expected Forward, got: {:?}", std::mem::discriminant(other)),
+    }
+
+    // Test reason code 0x00 (normal teardown)
+    let keys2 = HopKeys::from_shared_secret(&[4u8; 32]).unwrap();
+    node.register_circuit(101, keys2, Some((next_addr, 201)))
+        .unwrap();
+
+    let cell2 = RelayCell::destroy(101, 0x00);
+    let action2 = node.handle_cell(cell2).await.unwrap();
+
+    match &action2 {
+        RelayAction::Forward { cell: fwd, .. } => {
+            assert_eq!(fwd.payload[0], 0x00, "reason code 0x00 must be preserved");
+        }
+        other => panic!("expected Forward, got: {:?}", std::mem::discriminant(other)),
+    }
+}
+
+#[tokio::test]
+async fn test_destroy_unknown_circuit_discards() {
+    let node = StandardRelayNode::new();
+
+    // No circuits registered — send DESTROY for non-existent circuit
+    let cell = RelayCell::destroy(999, 0x01);
+    let action = node.handle_cell(cell).await.unwrap();
+
+    assert!(
+        matches!(action, RelayAction::Discard),
+        "DESTROY for unknown circuit should discard"
+    );
+    assert_eq!(node.circuit_count(), 0);
+}
