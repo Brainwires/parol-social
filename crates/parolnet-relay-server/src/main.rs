@@ -23,11 +23,88 @@ use tokio::sync::{Mutex, mpsc};
 use tracing::info;
 
 type PeerMap = Arc<Mutex<HashMap<String, mpsc::UnboundedSender<String>>>>;
-type MessageStore = Arc<Mutex<HashMap<String, Vec<String>>>>;
-// TODO: Replace MessageStore with parolnet_mesh::store_forward::InMemoryStore once
-// the relay server's message handling is refactored to use protocol Envelope types
-// instead of raw JSON strings. The InMemoryStore operates on Envelope + PeerId,
-// which requires deeper integration than a drop-in replacement.
+
+/// Maximum number of buffered messages per offline peer.
+const MAX_STORED_MESSAGES_PER_PEER: usize = 256;
+/// Maximum total size of buffered messages per peer (4 MB).
+const MAX_STORED_BUFFER_SIZE: usize = 4 * 1024 * 1024;
+/// Time-to-live for buffered messages (24 hours).
+const MESSAGE_TTL: Duration = Duration::from_secs(86400);
+
+/// A JSON message buffered for an offline peer, with metadata for TTL / eviction.
+struct BufferedRelayMessage {
+    json: String,
+    stored_at: std::time::Instant,
+    size: usize,
+}
+
+/// Store-and-forward buffer for relay messages destined to offline peers.
+///
+/// Keys are typed `PeerId` values; stored payloads remain JSON strings
+/// because they are forwarded verbatim to browser WebSocket clients.
+struct RelayMessageStore {
+    buffers: HashMap<PeerId, Vec<BufferedRelayMessage>>,
+}
+
+impl RelayMessageStore {
+    fn new() -> Self {
+        Self {
+            buffers: HashMap::new(),
+        }
+    }
+
+    /// Buffer a JSON message for `peer`. Evicts oldest messages when the
+    /// per-peer count or size limit is exceeded.
+    fn store(&mut self, peer: PeerId, msg: String) {
+        let size = msg.len();
+        let buffer = self.buffers.entry(peer).or_default();
+
+        // Evict oldest messages until under count limit
+        while buffer.len() >= MAX_STORED_MESSAGES_PER_PEER {
+            buffer.remove(0);
+        }
+
+        // Evict oldest messages until under size limit
+        let mut total_size: usize = buffer.iter().map(|m| m.size).sum();
+        while total_size + size > MAX_STORED_BUFFER_SIZE && !buffer.is_empty() {
+            total_size -= buffer.remove(0).size;
+        }
+
+        buffer.push(BufferedRelayMessage {
+            json: msg,
+            stored_at: std::time::Instant::now(),
+            size,
+        });
+    }
+
+    /// Retrieve and drain all buffered messages for `peer`.
+    fn retrieve(&mut self, peer: &PeerId) -> Vec<String> {
+        self.buffers
+            .remove(peer)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|m| m.json)
+            .collect()
+    }
+
+    /// Remove messages older than [`MESSAGE_TTL`]. Returns the number of
+    /// expired messages removed.
+    fn expire(&mut self) -> usize {
+        let now = std::time::Instant::now();
+        let mut expired = 0;
+
+        for buffer in self.buffers.values_mut() {
+            let before = buffer.len();
+            buffer.retain(|m| now.duration_since(m.stored_at) < MESSAGE_TTL);
+            expired += before - buffer.len();
+        }
+
+        // Remove empty peer entries
+        self.buffers.retain(|_, v| !v.is_empty());
+
+        expired
+    }
+}
 
 /// Adapter bridging a WebSocket peer's mpsc sender to the `Connection` trait,
 /// so that the PeerManager/gossip protocol can push CBOR gossip messages out
@@ -340,7 +417,7 @@ async fn main() {
         .unwrap_or(9000);
 
     let peers: PeerMap = Arc::new(Mutex::new(HashMap::new()));
-    let store: MessageStore = Arc::new(Mutex::new(HashMap::new()));
+    let store = Arc::new(Mutex::new(RelayMessageStore::new()));
     let stats = Arc::new(analytics::Stats::new());
     let client_stats = Arc::new(ClientStats::new());
 
@@ -360,6 +437,21 @@ async fn main() {
                     tracing::warn!(error = %e, "PeerManager maintenance failed");
                 } else {
                     tracing::info!("PeerManager maintenance completed");
+                }
+            }
+        });
+    }
+
+    // Spawn periodic message store expiry (every hour)
+    {
+        let store = store.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(3600));
+            loop {
+                interval.tick().await;
+                let expired = store.lock().await.expire();
+                if expired > 0 {
+                    tracing::info!(expired, "Expired stale buffered relay messages");
                 }
             }
         });
@@ -523,7 +615,7 @@ fn parse_peer_id(hex_str: &str) -> Option<PeerId> {
 async fn handle_socket(
     socket: WebSocket,
     peers: PeerMap,
-    store: MessageStore,
+    store: Arc<Mutex<RelayMessageStore>>,
     stats: Arc<analytics::Stats>,
     peer_manager: Arc<PeerManager>,
 ) {
@@ -622,9 +714,11 @@ async fn handle_socket(
                     );
 
                     // Deliver any stored messages
-                    let pending = store.lock().await.remove(&peer_id).unwrap_or_default();
-                    for msg in pending {
-                        let _ = tx.send(msg);
+                    if let Some(mesh_pid) = parse_peer_id(&peer_id) {
+                        let pending = store.lock().await.retrieve(&mesh_pid);
+                        for msg in pending {
+                            let _ = tx.send(msg);
+                        }
                     }
                 }
             }
@@ -646,12 +740,10 @@ async fn handle_socket(
                         let _ = recipient_tx.send(outgoing);
                         stats.record_message_routed();
                     } else {
-                        // Recipient offline -- store for later (max 1000 per peer)
+                        // Recipient offline -- buffer for later delivery
                         drop(peers_lock);
-                        let mut store_lock = store.lock().await;
-                        let pending = store_lock.entry(to).or_default();
-                        if pending.len() < 1000 {
-                            pending.push(outgoing);
+                        if let Some(dest_pid) = parse_peer_id(&to) {
+                            store.lock().await.store(dest_pid, outgoing);
                             stats.record_message_queued();
                         }
                         let _ = tx.send(
