@@ -10,9 +10,10 @@ use crate::AEAD_TAG_SIZE;
 use crate::RelayError;
 use parolnet_crypto::Aead;
 use parolnet_crypto::aead::ChaCha20Poly1305Cipher;
+use zeroize::{Zeroize, ZeroizeOnDrop};
 
 /// A single hop's encryption keys and nonce state.
-#[derive(Clone)]
+#[derive(Clone, Zeroize, ZeroizeOnDrop)]
 pub struct HopKeys {
     /// Forward key (OP -> Exit direction).
     pub forward_key: [u8; 32],
