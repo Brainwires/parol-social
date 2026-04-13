@@ -805,9 +805,8 @@ function hasDirectConnection(peerId) {
 // ── Tracker Signaling (PNP-008) ──────────────────────────────
 
 const DEFAULT_TRACKERS = [
-    'wss://tracker.openwebtorrent.com',
-    'wss://tracker.webtorrent.dev',
-    'wss://tracker.btorrent.xyz'
+    `${location.protocol === 'https:' ? 'wss:' : 'ws:'}//${location.host}/tracker`,
+    'wss://tracker.files.fm:7073/announce',
 ];
 
 async function sha1Hex(input) {
