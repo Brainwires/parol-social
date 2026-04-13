@@ -171,6 +171,8 @@ Six formal RFC-style protocol specifications define the system:
 - **Serialization**: CBOR (RFC 8949) via ciborium
 - **Async**: tokio
 - **WASM**: wasm-bindgen for browser PWA delivery
+- **Relay**: Built-in WebTorrent tracker for WebRTC peer discovery
+- **Storage**: AES-256-GCM encrypted IndexedDB with PBKDF2 key derivation
 - **License**: MIT OR Apache-2.0
 
 ## Building
@@ -203,12 +205,12 @@ To a passive network observer (ISP, national firewall), ParolNet traffic appears
 ### Threat model
 - Assumes network is fully compromised (DPI, traffic analysis)
 - Assumes any individual relay may be compromised (zero-trust)
-- Protects against: censorship, surveillance, metadata collection, device seizure (panic wipe)
+- Protects against: censorship, surveillance, metadata collection, device seizure (panic wipe + encrypted storage)
 - Does NOT protect against: global passive adversary with simultaneous control of all relay hops
 
 ## Project Status
 
-**Phase**: Initial scaffolding complete. Protocol specifications written. Crate structure defined with trait interfaces and stub implementations. Implementation of crypto primitives, wire format, and transport layer in progress.
+**Phase**: Core implementation complete. Crypto primitives (X3DH, Double Ratchet, AEAD), wire format, transport layer, onion routing, gossip mesh, and relay server all implemented with 390+ tests passing. PWA with offline support, encrypted local storage, built-in WebRTC tracker, and decoy mode deployed.
 
 See [ROADMAP.md](ROADMAP.md) for the full development plan.
 See [STRATEGIES.md](STRATEGIES.md) for the adoption and distribution strategy.

@@ -8,6 +8,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- Self-hosted WebTorrent-compatible WebSocket tracker endpoint in relay server (`/tracker`)
+- Password-encrypted IndexedDB storage using AES-256-GCM with PBKDF2 key derivation (600k iterations)
+- Unlock screen for encrypted storage (passphrase or calculator keypad in decoy mode)
+- Auto-lock after 5 minutes in background, panic wipe clears in-memory keys
+- Settings UI to enable encryption with passphrase setup and automatic data migration
+- Configurable relay server URL in PWA settings
+- Platform-agnostic time functions for WASM compatibility (`time_compat.rs`)
+
+### Changed
+- PWA auto-connects to self-hosted tracker first, external trackers as fallback
+- Tracker reconnect capped at 5 attempts per URL with 30s max backoff
+- Connection dot shows green for relay connection (was orange)
+- Service worker properly skips POST requests in cache handler
+- WASM init uses non-deprecated `{ module_or_path }` form
+
+### Removed
+- Dead tracker URLs (fastcast.nz, most public WSS trackers)
+
+### Fixed
+- `SystemTime::now()` panic on wasm32 target (replaced with `js_sys::Date::now()`)
+- Service worker crash on POST request caching
+
+### Security
+- All local data (private keys, messages, contacts) can now be encrypted at rest
+- Decoy mode unlock code doubles as encryption passphrase — no separate prompt
 - Protocol specifications (PNP-001 through PNP-006) in `specs/`
 - Rust workspace with 7 crates: crypto, protocol, transport, mesh, relay, core, wasm
 - Trait definitions for all core interfaces (AEAD, Transport, Connection, etc.)
