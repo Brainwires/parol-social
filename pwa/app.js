@@ -807,8 +807,7 @@ function hasDirectConnection(peerId) {
 const DEFAULT_TRACKERS = [
     'wss://tracker.openwebtorrent.com',
     'wss://tracker.webtorrent.dev',
-    'wss://tracker.btorrent.xyz',
-    'wss://tracker.fastcast.nz'
+    'wss://tracker.btorrent.xyz'
 ];
 
 async function sha1Hex(input) {
@@ -878,7 +877,11 @@ class TrackerClient {
     _scheduleReconnect(url) {
         if (this.closed) return;
         const attempt = this.reconnectAttempts.get(url) || 0;
-        const delay = Math.min(1000 * Math.pow(2, attempt), 60000);
+        if (attempt >= 5) {
+            console.warn('[Tracker] Giving up on', url, 'after 5 attempts');
+            return;
+        }
+        const delay = Math.min(1000 * Math.pow(2, attempt), 30000);
         console.log('[Tracker] Reconnecting to', url, 'in', delay, 'ms (attempt', attempt + 1 + ')');
         const timer = setTimeout(() => {
             this.reconnectTimers.delete(url);
