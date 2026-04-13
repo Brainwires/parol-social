@@ -18,6 +18,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 use tokio::sync::{Mutex, mpsc};
 use tracing::info;
 
@@ -533,18 +534,40 @@ async fn handle_socket(
     // Spawn task to forward messages from channel to WebSocket
     let send_task = tokio::spawn(async move {
         while let Some(msg) = rx.recv().await {
-            if sender.send(Message::Text(msg.into())).await.is_err() {
+            // Sentinel value: send a WebSocket ping frame instead of text
+            if msg == "__ping__" {
+                if sender.send(Message::Ping(vec![].into())).await.is_err() {
+                    break;
+                }
+            } else if sender.send(Message::Text(msg.into())).await.is_err() {
                 break;
             }
         }
     });
 
-    // Read messages from WebSocket
-    while let Some(Ok(msg)) = receiver.next().await {
-        let text = match msg {
-            Message::Text(t) => t.to_string(),
-            Message::Close(_) => break,
-            _ => continue,
+    // Ping interval to keep the WebSocket connection alive
+    let mut ping_interval = tokio::time::interval(Duration::from_secs(30));
+    ping_interval.tick().await; // consume the immediate first tick
+
+    // Read messages from WebSocket, multiplexed with ping keepalive
+    loop {
+        let text = tokio::select! {
+            msg_opt = receiver.next() => {
+                match msg_opt {
+                    Some(Ok(Message::Text(t))) => t.to_string(),
+                    Some(Ok(Message::Pong(_))) => continue,
+                    Some(Ok(Message::Close(_))) | None => break,
+                    Some(Ok(_)) => continue,
+                    Some(Err(_)) => break,
+                }
+            }
+            _ = ping_interval.tick() => {
+                // Send a ping through the channel to the send task
+                if tx.send("__ping__".to_string()).is_err() {
+                    break; // send task died, connection is dead
+                }
+                continue;
+            }
         };
 
         let Ok(incoming) = serde_json::from_str::<IncomingMessage>(&text) else {
