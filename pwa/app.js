@@ -388,6 +388,9 @@ async function onWasmReady() {
     // Check if decoy mode is enabled
     if (wasm.is_decoy_enabled && wasm.is_decoy_enabled()) {
         showView('calculator');
+        // Swap manifest so home screen shows calculator
+        const manifestLink = document.getElementById('manifest-link');
+        if (manifestLink) manifestLink.href = 'manifest-calculator.json';
     } else {
         showView('contacts');
     }
@@ -642,8 +645,21 @@ async function initWebRTC(peerId, isInitiator) {
         if (pc.connectionState === 'failed') {
             telemetry.track('webrtc_connect_fail');
         }
-        if (pc.connectionState === 'failed' || pc.connectionState === 'closed') {
+        if (pc.connectionState === 'failed' || pc.connectionState === 'disconnected') {
             cleanupRTC(peerId);
+            // Auto-reconnect after backoff (only if we were the initiator)
+            if (isInitiator) {
+                const delay = 2000 + Math.random() * 3000; // 2-5s jitter
+                setTimeout(() => {
+                    console.log('[WebRTC] Auto-reconnecting to', peerId.slice(0,8));
+                    initWebRTC(peerId, true).catch(e =>
+                        console.warn('[WebRTC] Reconnect failed:', e)
+                    );
+                }, delay);
+            }
+        } else if (pc.connectionState === 'closed') {
+            cleanupRTC(peerId);
+            // no reconnect — intentional close
         }
     };
 
@@ -1154,8 +1170,11 @@ const connMgr = {
             };
 
             pc.onconnectionstatechange = () => {
-                if (pc.connectionState === 'failed' || pc.connectionState === 'closed') {
+                if (pc.connectionState === 'failed' || pc.connectionState === 'disconnected') {
                     cleanupRTC(fromPeerId);
+                } else if (pc.connectionState === 'closed') {
+                    cleanupRTC(fromPeerId);
+                    // no reconnect — intentional close
                 }
             };
 
@@ -2183,6 +2202,12 @@ function enableDecoyMode() {
         // storage may be unavailable
     }
 
+    // Swap manifest to calculator
+    const manifestLink = document.getElementById('manifest-link');
+    if (manifestLink) {
+        manifestLink.href = 'manifest-calculator.json';
+    }
+
     showToast('Decoy mode enabled. The app will appear as a calculator on next launch.');
 }
 
@@ -2240,28 +2265,15 @@ function showLocalNotification(title, body, peerId) {
 // ── Service Worker Registration ─────────────────────────────
 function registerServiceWorker() {
     if ('serviceWorker' in navigator) {
-        // First: unregister any old service workers that might be serving stale content
-        navigator.serviceWorker.getRegistrations().then(regs => {
-            regs.forEach(reg => {
-                reg.unregister();
-                console.log('Unregistered old SW:', reg.scope);
-            });
+        // Register service worker for offline support
+        navigator.serviceWorker.register('sw.js').then(reg => {
+            console.log('SW registered:', reg.scope);
+
+            // Check for updates periodically
+            setInterval(() => reg.update(), 3600000); // every hour
+        }).catch(err => {
+            console.warn('SW registration failed:', err);
         });
-        // Clear all caches left by old SWs
-        if ('caches' in window) {
-            caches.keys().then(names => {
-                names.forEach(name => {
-                    caches.delete(name);
-                    console.log('Cleared cache:', name);
-                });
-            });
-        }
-        // NOTE: Service Worker registration disabled during development.
-        // The SW was caching aggressively and causing stale content on iOS.
-        // Re-enable for production by uncommenting:
-        // navigator.serviceWorker.register('sw.js').then(reg => {
-        //     console.log('SW registered:', reg.scope);
-        // });
     }
 }
 
