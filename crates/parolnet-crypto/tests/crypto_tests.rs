@@ -341,6 +341,122 @@ fn test_ratchet_max_skip_overflow() {
     );
 }
 
+// ── Double Ratchet Out-of-Order Tests ──────────────────────────
+
+#[test]
+fn test_ratchet_larger_gap_reorder() {
+    use parolnet_crypto::RatchetSession;
+
+    let (mut alice, mut bob) = setup_session_pair();
+
+    // Alice encrypts messages 0-5
+    let mut ciphertexts = Vec::new();
+    for i in 0u32..6 {
+        let msg = format!("msg-{}", i);
+        let (header, ct) = alice.encrypt(msg.as_bytes()).unwrap();
+        ciphertexts.push((header, ct, msg));
+    }
+
+    // Bob decrypts in order: 0, 5, 1, 2, 3, 4
+    let order = [0, 5, 1, 2, 3, 4];
+    for &idx in &order {
+        let (ref header, ref ct, ref expected) = ciphertexts[idx];
+        let pt = bob.decrypt(header, ct).unwrap();
+        assert_eq!(pt, expected.as_bytes(), "message {} failed to decrypt", idx);
+    }
+}
+
+#[test]
+fn test_ratchet_reverse_order() {
+    use parolnet_crypto::RatchetSession;
+
+    let (mut alice, mut bob) = setup_session_pair();
+
+    // Alice encrypts messages 0-9
+    let mut ciphertexts = Vec::new();
+    for i in 0u32..10 {
+        let msg = format!("reverse-{}", i);
+        let (header, ct) = alice.encrypt(msg.as_bytes()).unwrap();
+        ciphertexts.push((header, ct, msg));
+    }
+
+    // Bob decrypts in reverse order: 9, 8, 7, ..., 0
+    for idx in (0..10).rev() {
+        let (ref header, ref ct, ref expected) = ciphertexts[idx];
+        let pt = bob.decrypt(header, ct).unwrap();
+        assert_eq!(
+            pt,
+            expected.as_bytes(),
+            "message {} failed to decrypt in reverse order",
+            idx
+        );
+    }
+}
+
+#[test]
+fn test_ratchet_exact_max_skip_succeeds() {
+    use parolnet_crypto::RatchetSession;
+
+    let (mut alice, mut bob) = setup_session_pair();
+
+    // Alice encrypts 1001 messages (indices 0..1001)
+    let mut ciphertexts = Vec::new();
+    for i in 0u32..1001 {
+        let msg = format!("skip-{}", i);
+        let (header, ct) = alice.encrypt(msg.as_bytes()).unwrap();
+        ciphertexts.push((header, ct, msg));
+    }
+
+    // Bob decrypts ONLY message #1000 (skipping exactly 1000 keys = MAX_SKIP)
+    // This should succeed (the existing test shows #1001 fails)
+    let (ref header, ref ct, ref expected) = ciphertexts[1000];
+    let pt = bob
+        .decrypt(header, ct)
+        .expect("decrypting message #1000 (exactly MAX_SKIP) should succeed");
+    assert_eq!(pt, expected.as_bytes());
+
+    // Now Bob should be able to decrypt message #0 from the skipped keys
+    let (ref header0, ref ct0, ref expected0) = ciphertexts[0];
+    let pt0 = bob
+        .decrypt(header0, ct0)
+        .expect("decrypting message #0 from skipped keys should succeed");
+    assert_eq!(pt0, expected0.as_bytes());
+}
+
+#[test]
+fn test_ratchet_ooo_across_dh_ratchet() {
+    use parolnet_crypto::RatchetSession;
+
+    let (mut alice, mut bob) = setup_session_pair();
+
+    // Alice encrypts msg0
+    let (h0, ct0) = alice.encrypt(b"msg0").unwrap();
+    // Bob decrypts msg0 (establishes receiving chain)
+    let pt0 = bob.decrypt(&h0, &ct0).unwrap();
+    assert_eq!(pt0, b"msg0");
+
+    // Bob encrypts reply0 (triggers DH ratchet)
+    let (rh0, rct0) = bob.encrypt(b"reply0").unwrap();
+    // Alice decrypts reply0
+    let rpt0 = alice.decrypt(&rh0, &rct0).unwrap();
+    assert_eq!(rpt0, b"reply0");
+
+    // Alice encrypts msg1, msg2, msg3 (new DH ratchet)
+    let (h1, ct1) = alice.encrypt(b"msg1").unwrap();
+    let (h2, ct2) = alice.encrypt(b"msg2").unwrap();
+    let (h3, ct3) = alice.encrypt(b"msg3").unwrap();
+
+    // Bob decrypts msg3 first (skip 2), then msg1, then msg2
+    let pt3 = bob.decrypt(&h3, &ct3).unwrap();
+    assert_eq!(pt3, b"msg3");
+
+    let pt1 = bob.decrypt(&h1, &ct1).unwrap();
+    assert_eq!(pt1, b"msg1");
+
+    let pt2 = bob.decrypt(&h2, &ct2).unwrap();
+    assert_eq!(pt2, b"msg2");
+}
+
 // ── X3DH Edge Case Tests ───────────────────────────────────────
 
 /// Helper: build a Bob pre-key bundle for X3DH tests.
