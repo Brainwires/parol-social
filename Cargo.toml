@@ -104,4 +104,4 @@ hickory-resolver = { version = "0.24", default-features = false, features = ["to
 # Testing
 proptest = "1"
 tokio-test = "0.4"
-rcgen = "0.13"
+rcgen = "0.14"
