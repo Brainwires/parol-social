@@ -203,3 +203,146 @@ fn test_wasm_decode_32_invalid_length() {
     let result = parolnet_wasm::compute_sas(short, &valid, &valid, &valid, &valid);
     assert!(result.is_err(), "compute_sas should fail with short input");
 }
+
+// ── Sequential operation / mutex recovery regression tests ──
+
+/// Calling initialize() twice should produce distinct peer IDs and reset sessions.
+#[test]
+fn test_wasm_sequential_init_reinit() {
+    let peer_id_1 = parolnet_wasm::initialize();
+    let peer_id_2 = parolnet_wasm::initialize();
+
+    // Each initialize() generates a fresh identity, so peer IDs should differ.
+    assert_ne!(
+        peer_id_1, peer_id_2,
+        "sequential initialize() calls should produce different peer IDs"
+    );
+
+    // get_peer_id() must match the most recent init.
+    let current = parolnet_wasm::get_peer_id();
+    assert_eq!(
+        current, peer_id_2,
+        "get_peer_id() should return the second init's peer_id"
+    );
+
+    // No sessions should exist after a fresh init.
+    assert_eq!(
+        parolnet_wasm::session_count(),
+        0,
+        "session_count should be 0 after reinit"
+    );
+}
+
+/// Wipe + reinit must produce a clean slate.
+#[test]
+fn test_wasm_sequential_operations_after_wipe() {
+    let peer_id_1 = parolnet_wasm::initialize();
+    parolnet_wasm::set_unlock_code("wipe_test_code").expect("set_unlock_code should succeed");
+    assert!(
+        parolnet_wasm::verify_unlock_code("wipe_test_code"),
+        "verify should succeed before wipe"
+    );
+
+    parolnet_wasm::panic_wipe();
+    let peer_id_2 = parolnet_wasm::initialize();
+
+    assert_ne!(
+        peer_id_1, peer_id_2,
+        "peer_id after wipe+reinit should differ from original"
+    );
+    assert!(
+        !parolnet_wasm::is_decoy_enabled(),
+        "decoy should be disabled after wipe+reinit"
+    );
+    assert_eq!(
+        parolnet_wasm::session_count(),
+        0,
+        "session_count should be 0 after wipe+reinit"
+    );
+    assert_eq!(
+        parolnet_wasm::get_peer_id(),
+        peer_id_2,
+        "get_peer_id should return new peer_id after wipe+reinit"
+    );
+}
+
+/// Creating multiple file transfers sequentially should yield unique IDs.
+#[test]
+fn test_wasm_file_transfer_sequential() {
+    let file_id_1 = parolnet_wasm::create_file_transfer(b"file1", "a.txt", None)
+        .expect("first create_file_transfer should succeed");
+    let file_id_2 = parolnet_wasm::create_file_transfer(b"file2", "b.txt", None)
+        .expect("second create_file_transfer should succeed");
+
+    assert_ne!(
+        file_id_1, file_id_2,
+        "sequential file transfers must have unique IDs"
+    );
+
+    // Both should be valid 32-char hex (16-byte file ID).
+    for (label, fid) in [("file_id_1", &file_id_1), ("file_id_2", &file_id_2)] {
+        assert_eq!(
+            fid.len(),
+            32,
+            "{label} should be 32 hex chars, got {}",
+            fid.len()
+        );
+        assert!(
+            fid.chars().all(|c| c.is_ascii_hexdigit()),
+            "{label} should be hex, got: {fid}"
+        );
+    }
+}
+
+/// Export a secret key, wipe, re-import — the identity should round-trip.
+#[test]
+fn test_wasm_init_export_reimport() {
+    let peer_id_1 = parolnet_wasm::initialize();
+    let secret_hex = parolnet_wasm::export_secret_key().expect("export_secret_key should succeed");
+
+    parolnet_wasm::panic_wipe();
+
+    let peer_id_2 = parolnet_wasm::initialize_from_key(&secret_hex)
+        .expect("initialize_from_key should succeed");
+
+    assert_eq!(
+        peer_id_1, peer_id_2,
+        "re-importing the same secret key should restore the original peer_id"
+    );
+}
+
+/// Full decoy-mode lifecycle: set code, verify, enter decoy, wipe.
+#[test]
+fn test_wasm_decoy_mode_lifecycle() {
+    parolnet_wasm::panic_wipe();
+
+    assert!(
+        !parolnet_wasm::is_decoy_enabled(),
+        "decoy should be disabled after wipe"
+    );
+
+    parolnet_wasm::set_unlock_code("secret123").expect("set_unlock_code should succeed");
+
+    assert!(
+        parolnet_wasm::is_decoy_enabled(),
+        "decoy should be enabled after setting unlock code"
+    );
+    assert!(
+        parolnet_wasm::verify_unlock_code("secret123"),
+        "correct code should verify"
+    );
+    assert!(
+        !parolnet_wasm::verify_unlock_code("wrong"),
+        "wrong code should not verify"
+    );
+
+    // enter_decoy_mode should not panic.
+    parolnet_wasm::enter_decoy_mode();
+
+    parolnet_wasm::panic_wipe();
+
+    assert!(
+        !parolnet_wasm::is_decoy_enabled(),
+        "decoy should be disabled after final wipe"
+    );
+}
