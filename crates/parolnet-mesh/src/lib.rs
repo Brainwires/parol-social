@@ -55,6 +55,7 @@ pub trait GossipProtocol: Send + Sync {
 }
 
 /// Action to take after receiving a gossip message.
+#[derive(Debug)]
 pub enum GossipAction {
     /// Relay to these specific peers.
     Forward(Vec<PeerId>),

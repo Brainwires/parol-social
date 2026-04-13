@@ -1,10 +1,16 @@
 use parolnet_mesh::MessageStore;
-use parolnet_mesh::gossip::{DedupFilter, ProofOfWork, SeenBloomFilter};
+use parolnet_mesh::connection_pool::ConnectionPool;
+use parolnet_mesh::gossip::{DedupFilter, ProofOfWork, SeenBloomFilter, StandardGossip};
 use parolnet_mesh::peer_table::PeerScore;
 use parolnet_mesh::store_forward::InMemoryStore;
 use parolnet_protocol::address::PeerId;
 use parolnet_protocol::envelope::{CleartextHeader, Envelope};
-use std::time::Duration;
+use parolnet_protocol::gossip::GossipEnvelope;
+
+use ed25519_dalek::{Signer, SigningKey};
+use sha2::{Digest, Sha256};
+use std::sync::Arc;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 // ── Peer Score Tests ────────────────────────────────────────────
 
@@ -392,4 +398,270 @@ fn test_pow_different_inputs_different_nonces() {
 
     // Nonces should differ for different inputs
     assert_ne!(nonce_1, nonce_2);
+}
+
+// ── Gossip Signature Verification Integration Tests ─────────
+
+/// Build a valid CBOR-encoded GossipEnvelope that passes all checks
+/// (structure, expiry, dedup, PoW, signature).
+fn make_valid_gossip_cbor() -> (Vec<u8>, SigningKey, PeerId) {
+    let signing_key = SigningKey::from_bytes(&[42u8; 32]);
+    let verifying_key = signing_key.verifying_key();
+    let pubkey_bytes = verifying_key.to_bytes();
+    let peer_id = PeerId(Sha256::digest(pubkey_bytes).into());
+
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+
+    let msg_id = [0xAA; 32];
+
+    // Compute PoW with difficulty 8 for fast tests
+    let pow_nonce = ProofOfWork::compute(&msg_id, &peer_id, now, 8);
+
+    let mut env = GossipEnvelope {
+        v: 1,
+        id: msg_id.to_vec(),
+        src: peer_id,
+        src_pubkey: pubkey_bytes.to_vec(),
+        ts: now,
+        exp: now + 86400,
+        ttl: 7,
+        hops: 0,
+        seen: vec![0; 128],
+        pow: pow_nonce.to_vec(),
+        sig: vec![0u8; 64],
+        payload_type: 0xFF, // Unrecognized type so process_gossip uses default_difficulty (8)
+        payload: b"test payload".to_vec(),
+    };
+
+    // Sign the envelope
+    let signable = env.signable_bytes();
+    let signature = signing_key.sign(&signable);
+    env.sig = signature.to_bytes().to_vec();
+
+    let cbor = env.to_cbor().unwrap();
+    (cbor, signing_key, peer_id)
+}
+
+/// Create a StandardGossip instance with difficulty 8 for testing.
+fn make_test_gossip() -> StandardGossip {
+    let signing_key = SigningKey::from_bytes(&[0xFFu8; 32]);
+    let verifying_key = signing_key.verifying_key();
+    let peer_id = PeerId(Sha256::digest(verifying_key.to_bytes()).into());
+    let pool = Arc::new(ConnectionPool::new());
+    let mut gossip = StandardGossip::new(peer_id, signing_key, pool);
+    gossip.default_difficulty = 8;
+    gossip
+}
+
+#[tokio::test]
+async fn test_process_gossip_valid_signature() {
+    let gossip = make_test_gossip();
+    let (cbor, _, _) = make_valid_gossip_cbor();
+
+    let result = gossip.process_gossip(&cbor).await;
+    // Should succeed — returns Deliver (ttl=7 but no connected peers to forward)
+    // or Drop if no peers to forward to. Either way, no error.
+    assert!(result.is_ok(), "expected Ok, got: {:?}", result.err());
+}
+
+#[tokio::test]
+async fn test_process_gossip_tampered_payload_rejected() {
+    let gossip = make_test_gossip();
+    let (cbor, _, _) = make_valid_gossip_cbor();
+
+    // Deserialize, tamper with payload, re-serialize
+    let mut env = GossipEnvelope::from_cbor(&cbor).unwrap();
+    env.payload = b"tampered payload data".to_vec();
+    let tampered_cbor = env.to_cbor().unwrap();
+
+    let result = gossip.process_gossip(&tampered_cbor).await;
+    assert!(result.is_err());
+    let err = result.unwrap_err().to_string();
+    assert!(
+        err.contains("invalid Ed25519 signature"),
+        "expected signature error, got: {err}"
+    );
+}
+
+#[tokio::test]
+async fn test_process_gossip_wrong_signing_key_rejected() {
+    // Build an envelope signed with a different key than the one in src_pubkey
+    let legit_key = SigningKey::from_bytes(&[42u8; 32]);
+    let wrong_key = SigningKey::from_bytes(&[99u8; 32]);
+    let legit_verifying = legit_key.verifying_key();
+    let pubkey_bytes = legit_verifying.to_bytes();
+    let peer_id = PeerId(Sha256::digest(pubkey_bytes).into());
+
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+
+    let msg_id = [0xBB; 32];
+    let pow_nonce = ProofOfWork::compute(&msg_id, &peer_id, now, 8);
+
+    let mut env = GossipEnvelope {
+        v: 1,
+        id: msg_id.to_vec(),
+        src: peer_id,
+        src_pubkey: pubkey_bytes.to_vec(), // legit key's pubkey
+        ts: now,
+        exp: now + 86400,
+        ttl: 7,
+        hops: 0,
+        seen: vec![0; 128],
+        pow: pow_nonce.to_vec(),
+        sig: vec![0u8; 64],
+        payload_type: 0xFF,
+        payload: b"wrong key test".to_vec(),
+    };
+
+    // Sign with the WRONG key
+    let signable = env.signable_bytes();
+    let signature = wrong_key.sign(&signable);
+    env.sig = signature.to_bytes().to_vec();
+
+    let cbor = env.to_cbor().unwrap();
+
+    let gossip = make_test_gossip();
+    let result = gossip.process_gossip(&cbor).await;
+    assert!(result.is_err());
+    let err = result.unwrap_err().to_string();
+    assert!(
+        err.contains("invalid Ed25519 signature"),
+        "expected signature error, got: {err}"
+    );
+}
+
+#[tokio::test]
+async fn test_process_gossip_peerid_pubkey_mismatch_rejected() {
+    let signing_key = SigningKey::from_bytes(&[42u8; 32]);
+    let verifying_key = signing_key.verifying_key();
+    let pubkey_bytes = verifying_key.to_bytes();
+    // Use a WRONG PeerId (not derived from pubkey)
+    let wrong_peer_id = PeerId([0xDD; 32]);
+
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+
+    let msg_id = [0xCC; 32];
+    let pow_nonce = ProofOfWork::compute(&msg_id, &wrong_peer_id, now, 8);
+
+    let mut env = GossipEnvelope {
+        v: 1,
+        id: msg_id.to_vec(),
+        src: wrong_peer_id, // mismatched PeerId
+        src_pubkey: pubkey_bytes.to_vec(),
+        ts: now,
+        exp: now + 86400,
+        ttl: 7,
+        hops: 0,
+        seen: vec![0; 128],
+        pow: pow_nonce.to_vec(),
+        sig: vec![0u8; 64],
+        payload_type: 0xFF,
+        payload: b"mismatch test".to_vec(),
+    };
+
+    let signable = env.signable_bytes();
+    let signature = signing_key.sign(&signable);
+    env.sig = signature.to_bytes().to_vec();
+
+    let cbor = env.to_cbor().unwrap();
+
+    let gossip = make_test_gossip();
+    let result = gossip.process_gossip(&cbor).await;
+    assert!(result.is_err());
+    let err = result.unwrap_err().to_string();
+    assert!(
+        err.contains("src_pubkey does not match src PeerId"),
+        "expected PeerId mismatch error, got: {err}"
+    );
+}
+
+#[tokio::test]
+async fn test_process_gossip_invalid_signature_length_rejected() {
+    let signing_key = SigningKey::from_bytes(&[42u8; 32]);
+    let verifying_key = signing_key.verifying_key();
+    let pubkey_bytes = verifying_key.to_bytes();
+    let peer_id = PeerId(Sha256::digest(pubkey_bytes).into());
+
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+
+    let msg_id = [0xDD; 32];
+    let pow_nonce = ProofOfWork::compute(&msg_id, &peer_id, now, 8);
+
+    let env = GossipEnvelope {
+        v: 1,
+        id: msg_id.to_vec(),
+        src: peer_id,
+        src_pubkey: pubkey_bytes.to_vec(),
+        ts: now,
+        exp: now + 86400,
+        ttl: 7,
+        hops: 0,
+        seen: vec![0; 128],
+        pow: pow_nonce.to_vec(),
+        sig: vec![0u8; 32], // Wrong length: 32 instead of 64
+        payload_type: 0xFF,
+        payload: b"bad sig len".to_vec(),
+    };
+
+    let cbor = env.to_cbor().unwrap();
+
+    let gossip = make_test_gossip();
+    let result = gossip.process_gossip(&cbor).await;
+    assert!(result.is_err());
+    let err = result.unwrap_err().to_string();
+    assert!(
+        err.contains("invalid gossip envelope structure"),
+        "expected structure validation error, got: {err}"
+    );
+}
+
+#[tokio::test]
+async fn test_process_gossip_empty_pubkey_rejected() {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+
+    let peer_id = PeerId([0xEE; 32]);
+    let msg_id = [0xEE; 32];
+    let pow_nonce = ProofOfWork::compute(&msg_id, &peer_id, now, 8);
+
+    let env = GossipEnvelope {
+        v: 1,
+        id: msg_id.to_vec(),
+        src: peer_id,
+        src_pubkey: vec![], // Empty pubkey
+        ts: now,
+        exp: now + 86400,
+        ttl: 7,
+        hops: 0,
+        seen: vec![0; 128],
+        pow: pow_nonce.to_vec(),
+        sig: vec![0u8; 64],
+        payload_type: 0xFF,
+        payload: b"empty pubkey".to_vec(),
+    };
+
+    let cbor = env.to_cbor().unwrap();
+
+    let gossip = make_test_gossip();
+    let result = gossip.process_gossip(&cbor).await;
+    assert!(result.is_err());
+    let err = result.unwrap_err().to_string();
+    assert!(
+        err.contains("invalid gossip envelope structure"),
+        "expected structure validation error, got: {err}"
+    );
 }
