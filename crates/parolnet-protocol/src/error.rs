@@ -32,6 +32,9 @@ pub enum ProtocolError {
     #[error("timestamp out of range")]
     TimestampOutOfRange,
 
+    #[error("invalid state transition: {0}")]
+    InvalidTransition(String),
+
     #[error("crypto error: {0}")]
     Crypto(#[from] parolnet_crypto::CryptoError),
 }
