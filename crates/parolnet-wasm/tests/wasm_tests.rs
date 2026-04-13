@@ -6,11 +6,17 @@
 //! Functions returning `JsValue` or constructing `JsError` on the error path
 //! are gated with `#[cfg(target_arch = "wasm32")]` since those types panic
 //! on non-wasm targets.
+//!
+//! All tests share a global `STATE` mutex, so they must run serially
+//! to avoid cross-test interference.
+
+use serial_test::serial;
 
 // ── Identity tests ──────────────────────────────────────────
 
 /// generate_identity() should return a 64-character hex string (32 bytes).
 #[test]
+#[serial]
 fn test_wasm_generate_identity_returns_hex() {
     let id = parolnet_wasm::generate_identity();
     assert_eq!(
@@ -28,6 +34,7 @@ fn test_wasm_generate_identity_returns_hex() {
 
 /// version() should return a non-empty string.
 #[test]
+#[serial]
 fn test_wasm_version_not_empty() {
     let v = parolnet_wasm::version();
     assert!(!v.is_empty(), "version() must not be empty");
@@ -35,6 +42,7 @@ fn test_wasm_version_not_empty() {
 
 /// panic_wipe() should not panic.
 #[test]
+#[serial]
 fn test_wasm_panic_wipe_does_not_panic() {
     parolnet_wasm::panic_wipe();
 }
@@ -43,6 +51,7 @@ fn test_wasm_panic_wipe_does_not_panic() {
 
 /// initialize() should return a 64-char hex peer_id.
 #[test]
+#[serial]
 fn test_wasm_initialize_returns_peer_id() {
     let peer_id = parolnet_wasm::initialize();
     assert_eq!(
@@ -62,6 +71,7 @@ fn test_wasm_initialize_returns_peer_id() {
 
 /// After initialization, session_count() should be 0.
 #[test]
+#[serial]
 fn test_wasm_session_count_starts_zero() {
     parolnet_wasm::initialize();
     let count = parolnet_wasm::session_count();
@@ -70,6 +80,7 @@ fn test_wasm_session_count_starts_zero() {
 
 /// has_session for a random peer_id should return false before any session is created.
 #[test]
+#[serial]
 fn test_wasm_has_session_false_before_create() {
     parolnet_wasm::initialize();
     let random_peer = "aa".repeat(32);
@@ -89,6 +100,7 @@ fn test_wasm_has_session_false_before_create() {
 /// natively by accepting that JsError::new would panic only if we hit the error
 /// path.
 #[test]
+#[serial]
 fn test_wasm_file_transfer_create() {
     let data = b"hello parolnet file transfer";
     let result = parolnet_wasm::create_file_transfer(data, "test.txt", None);
@@ -112,6 +124,7 @@ fn test_wasm_file_transfer_create() {
 
 /// Setting and verifying an unlock code with the correct code should return true.
 #[test]
+#[serial]
 fn test_wasm_unlock_code_default() {
     // Reset state first
     parolnet_wasm::panic_wipe();
@@ -125,6 +138,7 @@ fn test_wasm_unlock_code_default() {
 
 /// Verifying with the wrong code should return false.
 #[test]
+#[serial]
 fn test_wasm_unlock_code_wrong() {
     // Reset state first
     parolnet_wasm::panic_wipe();
@@ -138,6 +152,7 @@ fn test_wasm_unlock_code_wrong() {
 
 /// is_decoy_enabled() should return false when no unlock code has been set.
 #[test]
+#[serial]
 fn test_wasm_decoy_not_enabled_by_default() {
     // Reset state to ensure no unlock code is set
     parolnet_wasm::panic_wipe();
@@ -153,6 +168,7 @@ fn test_wasm_decoy_not_enabled_by_default() {
 ///
 /// Gated to wasm32 only because `parse_qr_payload` returns `JsValue`.
 #[test]
+#[serial]
 #[cfg(target_arch = "wasm32")]
 fn test_wasm_qr_payload_roundtrip() {
     let key_hex = "aa".repeat(32);
@@ -169,6 +185,7 @@ fn test_wasm_qr_payload_roundtrip() {
 
 /// compute_sas with valid 64-char hex strings should return Ok with a 6-char string.
 #[test]
+#[serial]
 fn test_wasm_decode_32_valid() {
     let hex_a = "aa".repeat(32);
     let hex_b = "bb".repeat(32);
@@ -195,6 +212,7 @@ fn test_wasm_decode_32_valid() {
 ///
 /// Gated to wasm32 because the error path constructs JsError.
 #[test]
+#[serial]
 #[cfg(target_arch = "wasm32")]
 fn test_wasm_decode_32_invalid_length() {
     let valid = "aa".repeat(32);
@@ -208,6 +226,7 @@ fn test_wasm_decode_32_invalid_length() {
 
 /// Calling initialize() twice should produce distinct peer IDs and reset sessions.
 #[test]
+#[serial]
 fn test_wasm_sequential_init_reinit() {
     let peer_id_1 = parolnet_wasm::initialize();
     let peer_id_2 = parolnet_wasm::initialize();
@@ -235,6 +254,7 @@ fn test_wasm_sequential_init_reinit() {
 
 /// Wipe + reinit must produce a clean slate.
 #[test]
+#[serial]
 fn test_wasm_sequential_operations_after_wipe() {
     let peer_id_1 = parolnet_wasm::initialize();
     parolnet_wasm::set_unlock_code("wipe_test_code").expect("set_unlock_code should succeed");
@@ -268,6 +288,7 @@ fn test_wasm_sequential_operations_after_wipe() {
 
 /// Creating multiple file transfers sequentially should yield unique IDs.
 #[test]
+#[serial]
 fn test_wasm_file_transfer_sequential() {
     let file_id_1 = parolnet_wasm::create_file_transfer(b"file1", "a.txt", None)
         .expect("first create_file_transfer should succeed");
@@ -296,6 +317,7 @@ fn test_wasm_file_transfer_sequential() {
 
 /// Export a secret key, wipe, re-import — the identity should round-trip.
 #[test]
+#[serial]
 fn test_wasm_init_export_reimport() {
     let peer_id_1 = parolnet_wasm::initialize();
     let secret_hex = parolnet_wasm::export_secret_key().expect("export_secret_key should succeed");
@@ -313,6 +335,7 @@ fn test_wasm_init_export_reimport() {
 
 /// Full decoy-mode lifecycle: set code, verify, enter decoy, wipe.
 #[test]
+#[serial]
 fn test_wasm_decoy_mode_lifecycle() {
     parolnet_wasm::panic_wipe();
 
