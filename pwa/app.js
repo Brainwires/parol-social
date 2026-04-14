@@ -901,7 +901,6 @@ function hasDirectConnection(peerId) {
 
 const DEFAULT_TRACKERS = [
     `${location.protocol === 'https:' ? 'wss:' : 'ws:'}//${location.host}/tracker`,
-    'wss://tracker.files.fm:7073/announce',
 ];
 
 async function sha1Hex(input) {
