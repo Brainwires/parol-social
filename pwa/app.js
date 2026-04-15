@@ -13,6 +13,63 @@ let localStream = null;
 let platform = detectPlatform();
 window._knownPeers = [];
 
+// ── Safe Math Parser (replaces eval/new Function) ──────────
+function safeEval(expr) {
+    // Remove anything that's not a number, operator, parenthesis, or decimal point
+    const sanitized = expr.replace(/[^0-9+\-*/().]/g, '');
+    if (!sanitized) return NaN;
+
+    let pos = 0;
+
+    function parseExpression() {
+        let result = parseTerm();
+        while (pos < sanitized.length && (sanitized[pos] === '+' || sanitized[pos] === '-')) {
+            const op = sanitized[pos++];
+            const term = parseTerm();
+            result = op === '+' ? result + term : result - term;
+        }
+        return result;
+    }
+
+    function parseTerm() {
+        let result = parseFactor();
+        while (pos < sanitized.length && (sanitized[pos] === '*' || sanitized[pos] === '/')) {
+            const op = sanitized[pos++];
+            const factor = parseFactor();
+            result = op === '*' ? result * factor : result / factor;
+        }
+        return result;
+    }
+
+    function parseFactor() {
+        if (sanitized[pos] === '(') {
+            pos++; // skip '('
+            const result = parseExpression();
+            pos++; // skip ')'
+            return result;
+        }
+        // Handle negative numbers
+        let negative = false;
+        if (sanitized[pos] === '-') {
+            negative = true;
+            pos++;
+        }
+        let numStr = '';
+        while (pos < sanitized.length && (sanitized[pos] >= '0' && sanitized[pos] <= '9' || sanitized[pos] === '.')) {
+            numStr += sanitized[pos++];
+        }
+        const num = parseFloat(numStr);
+        return negative ? -num : num;
+    }
+
+    try {
+        const result = parseExpression();
+        return isFinite(result) ? result : NaN;
+    } catch {
+        return NaN;
+    }
+}
+
 // ── Platform Detection ──────────────────────────────────────
 function detectPlatform() {
     const ua = navigator.userAgent;
@@ -101,10 +158,8 @@ async function calcPress(key) {
         }
         // Normal calculation
         try {
-            // Safe evaluation via Function constructor
-            const expr = calcExpression.replace(/[^0-9+\-*/().]/g, '');
-            const result = new Function('return ' + expr)();
-            calcDisplay = String(result !== undefined && result !== null ? result : 0);
+            const result = safeEval(calcExpression);
+            calcDisplay = String(!isNaN(result) ? result : 'Error');
         } catch {
             calcDisplay = 'Error';
         }
@@ -135,8 +190,8 @@ async function calcPress(key) {
     } else if (key === '%') {
         calcExpression += '/100';
         try {
-            const expr = calcExpression.replace(/[^0-9+\-*/().]/g, '');
-            calcDisplay = String(new Function('return ' + expr)());
+            const result = safeEval(calcExpression);
+            if (!isNaN(result)) calcDisplay = String(result);
         } catch {
             // keep display as-is
         }
@@ -1170,38 +1225,32 @@ async function sendMessage() {
 
     appendMessage(msg);
 
-    // Encrypt and send — try WebRTC first, fall back to relay
+    // Encrypt and send — require encryption, never send plaintext
     let sent = false;
-    let relayPayload = text; // track what would be sent, for queuing/gossip
-    if (wasm && wasm.encrypt_message && wasm.has_session && wasm.has_session(currentPeerId)) {
-        try {
-            const encoder = new TextEncoder();
-            const plainBytes = encoder.encode(text);
-            const encrypted = wasm.encrypt_message(currentPeerId, plainBytes);
-            // Convert Uint8Array to hex for JSON transport
-            const hexPayload = Array.from(encrypted).map(b => b.toString(16).padStart(2, '0')).join('');
-            const encPayload = 'enc:' + hexPayload;
-            relayPayload = encPayload;
-            // Try WebRTC first, fall back to relay
-            if (hasDirectConnection(currentPeerId)) {
-                sent = sendViaWebRTC(currentPeerId, encPayload);
-            }
-            if (!sent) {
-                sent = sendToRelay(currentPeerId, encPayload);
-            }
-        } catch (e) {
-            console.error('Encryption failed, sending plaintext:', e);
-        }
+    let relayPayload = null;
+    if (!wasm || !wasm.encrypt_message || !wasm.has_session || !wasm.has_session(currentPeerId)) {
+        showToast('Cannot send: secure session not established with this contact');
+        return;
     }
-    if (!sent) {
-        // No session or encryption failed — send plaintext (legacy/fallback)
+    try {
+        const encoder = new TextEncoder();
+        const plainBytes = encoder.encode(text);
+        const encrypted = wasm.encrypt_message(currentPeerId, plainBytes);
+        // Convert Uint8Array to hex for JSON transport
+        const hexPayload = Array.from(encrypted).map(b => b.toString(16).padStart(2, '0')).join('');
+        const encPayload = 'enc:' + hexPayload;
+        relayPayload = encPayload;
         // Try WebRTC first, fall back to relay
         if (hasDirectConnection(currentPeerId)) {
-            sent = sendViaWebRTC(currentPeerId, text);
+            sent = sendViaWebRTC(currentPeerId, encPayload);
         }
         if (!sent) {
-            sent = sendToRelay(currentPeerId, text);
+            sent = sendToRelay(currentPeerId, encPayload);
         }
+    } catch (e) {
+        console.error('Encryption failed:', e);
+        showToast('Encryption failed — message not sent');
+        return;
     }
     if (!sent) {
         queueMessage(currentPeerId, relayPayload);
