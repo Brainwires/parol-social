@@ -35,6 +35,11 @@ docker compose build --no-cache
 docker compose down
 docker compose up -d
 
+# Cleanup dangling images and build cache
+echo "Cleaning up old Docker artifacts..."
+docker image prune -f
+docker builder prune -f
+
 echo ""
 echo "=== Deploy complete ==="
 echo "Site: http://localhost:1411"

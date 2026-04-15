@@ -744,9 +744,11 @@ button.success {
 
 /* ── Desktop Layout ──────────────────────────────────────────── */
 @media (min-width: 768px) {
-    #view-contacts {
-        max-width: var(--sidebar-width);
-        border-right: 1px solid var(--border);
+    .view {
+        max-width: 600px;
+        margin: 0 auto;
+        left: 0;
+        right: 0;
     }
 
     .message {
