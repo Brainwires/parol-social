@@ -252,7 +252,7 @@ fn setup_session_pair() -> (
     use x25519_dalek::{PublicKey, StaticSecret};
 
     let shared_secret = [0x42u8; 32];
-    let bob_ratchet = StaticSecret::random_from_rng(&mut OsRng);
+    let bob_ratchet = StaticSecret::random_from_rng(OsRng);
     let bob_ratchet_pub = *PublicKey::from(&bob_ratchet).as_bytes();
 
     let alice = parolnet_crypto::double_ratchet::DoubleRatchetSession::initialize_initiator(

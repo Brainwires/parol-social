@@ -38,7 +38,7 @@ impl PeerManager {
         peer_id: PeerId,
         conn: Arc<dyn Connection>,
     ) -> Result<(), MeshError> {
-        self.pool.add_peer(peer_id, conn.clone()).await;
+        self.pool.add_peer(peer_id, conn.clone()).await?;
         info!(peer = %peer_id, "peer connected");
 
         // Deliver any stored messages for this peer

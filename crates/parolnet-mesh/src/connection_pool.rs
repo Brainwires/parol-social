@@ -1,5 +1,6 @@
 //! Connection pool for managing active peer connections and scores.
 
+use crate::MeshError;
 use crate::peer_table::PeerScore;
 use parolnet_protocol::address::PeerId;
 use parolnet_transport::Connection;
@@ -7,6 +8,9 @@ use rand::seq::SliceRandom;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
+
+/// Maximum number of simultaneous peer connections.
+pub const MAX_PEERS: usize = 256;
 
 /// Manages active peer connections and their reputation scores.
 pub struct ConnectionPool {
@@ -29,13 +33,25 @@ impl ConnectionPool {
     }
 
     /// Add a peer connection and initialize its score.
-    pub async fn add_peer(&self, peer_id: PeerId, conn: Arc<dyn Connection>) {
-        self.connections.write().await.insert(peer_id, conn);
+    ///
+    /// Returns `MeshError::PeerLimitReached` if MAX_PEERS is exceeded.
+    pub async fn add_peer(
+        &self,
+        peer_id: PeerId,
+        conn: Arc<dyn Connection>,
+    ) -> Result<(), MeshError> {
+        let mut connections = self.connections.write().await;
+        if connections.len() >= MAX_PEERS && !connections.contains_key(&peer_id) {
+            return Err(MeshError::PeerLimitReached);
+        }
+        connections.insert(peer_id, conn);
+        drop(connections);
         self.scores
             .write()
             .await
             .entry(peer_id)
             .or_insert_with(|| PeerScore::new(peer_id));
+        Ok(())
     }
 
     /// Remove a peer's connection and score.
@@ -142,7 +158,7 @@ mod tests {
         let peer_id = PeerId([1u8; 32]);
         let (conn, _sent) = MockConnection::new();
 
-        pool.add_peer(peer_id, Arc::new(conn)).await;
+        pool.add_peer(peer_id, Arc::new(conn)).await.unwrap();
         assert_eq!(pool.peer_count().await, 1);
         assert!(pool.get_connection(&peer_id).await.is_some());
         assert!(pool.get_score(&peer_id).await.is_some());
@@ -164,9 +180,9 @@ mod tests {
         let (conn2, _) = MockConnection::new();
         let (conn3, _) = MockConnection::new();
 
-        pool.add_peer(good_peer, Arc::new(conn1)).await;
-        pool.add_peer(banned_peer, Arc::new(conn2)).await;
-        pool.add_peer(excluded_peer, Arc::new(conn3)).await;
+        pool.add_peer(good_peer, Arc::new(conn1)).await.unwrap();
+        pool.add_peer(banned_peer, Arc::new(conn2)).await.unwrap();
+        pool.add_peer(excluded_peer, Arc::new(conn3)).await.unwrap();
 
         // Ban the second peer by reducing score below 0
         pool.update_score(&banned_peer, |s| {
@@ -193,8 +209,8 @@ mod tests {
         let (c1, _) = MockConnection::new();
         let (c2, _) = MockConnection::new();
 
-        pool.add_peer(p1, Arc::new(c1)).await;
-        pool.add_peer(p2, Arc::new(c2)).await;
+        pool.add_peer(p1, Arc::new(c1)).await.unwrap();
+        pool.add_peer(p2, Arc::new(c2)).await.unwrap();
 
         let peers = pool.connected_peers().await;
         assert_eq!(peers.len(), 2);
@@ -208,7 +224,7 @@ mod tests {
         let peer_id = PeerId([1u8; 32]);
         let (conn, _) = MockConnection::new();
 
-        pool.add_peer(peer_id, Arc::new(conn)).await;
+        pool.add_peer(peer_id, Arc::new(conn)).await.unwrap();
 
         pool.update_score(&peer_id, |s| s.reward()).await;
         let score = pool.get_score(&peer_id).await.unwrap();

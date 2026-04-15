@@ -227,7 +227,7 @@ mod tests {
     /// Helper: create a deterministic test key from a byte value.
     fn test_key(n: u8) -> [u8; 32] {
         let mut hasher = Sha256::new();
-        hasher.update(&[n]);
+        hasher.update([n]);
         hasher.finalize().into()
     }
 

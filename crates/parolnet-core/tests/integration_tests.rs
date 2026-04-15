@@ -6,7 +6,7 @@ use parolnet_core::bootstrap;
 use parolnet_core::{ParolNet, ParolNetConfig};
 use parolnet_crypto::aead::ChaCha20Poly1305Cipher;
 use parolnet_crypto::double_ratchet::DoubleRatchetSession;
-use parolnet_crypto::{Aead, IdentityKeyPair, RatchetSession};
+use parolnet_crypto::{Aead, RatchetSession};
 use parolnet_protocol::padding::BucketPadding;
 use parolnet_protocol::{BUCKET_SIZES, PaddingStrategy};
 use parolnet_relay::circuit::EstablishedCircuit;
@@ -22,7 +22,7 @@ fn test_end_to_end_message_exchange() {
     let shared_secret = [0x42u8; 32];
 
     // Bob generates his ratchet keypair
-    let bob_ratchet_secret = StaticSecret::random_from_rng(&mut rand::rngs::OsRng);
+    let bob_ratchet_secret = StaticSecret::random_from_rng(rand::rngs::OsRng);
     let bob_ratchet_pub = *PublicKey::from(&bob_ratchet_secret).as_bytes();
 
     let mut alice = DoubleRatchetSession::initialize_initiator(shared_secret, &bob_ratchet_pub)

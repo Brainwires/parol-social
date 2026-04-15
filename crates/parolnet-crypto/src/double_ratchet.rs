@@ -166,6 +166,18 @@ impl DoubleRatchetSession {
         Ok(message_key)
     }
 
+    /// Construct a 12-byte nonce from the ratchet public key and message_number.
+    ///
+    /// Uses 8 bytes from the ratchet key (unique per chain) plus the message
+    /// number to guarantee nonce uniqueness: different chains have different
+    /// ratchet keys, and within a chain the message number is monotonic.
+    fn build_nonce(ratchet_key: &[u8; 32], message_number: u32) -> [u8; 12] {
+        let mut nonce = [0u8; 12];
+        nonce[0..8].copy_from_slice(&ratchet_key[..8]);
+        nonce[8..12].copy_from_slice(&message_number.to_be_bytes());
+        nonce
+    }
+
     /// Skip message keys for out-of-order delivery.
     fn skip_message_keys(&mut self, remote_key: &[u8; 32], until: u32) -> Result<(), CryptoError> {
         if let Some(ref mut ck) = self.recv_chain_key {
@@ -209,9 +221,7 @@ impl RatchetSession for DoubleRatchetSession {
 
         // Encrypt with ChaCha20-Poly1305
         let cipher = ChaCha20Poly1305Cipher::new(&message_key)?;
-        // Nonce from message number (per PNP-001: chain_index || seq_number)
-        let mut nonce = [0u8; 12];
-        nonce[8..12].copy_from_slice(&self.send_n.to_be_bytes());
+        let nonce = Self::build_nonce(&ratchet_pub, self.send_n);
         let ciphertext = cipher.encrypt(&nonce, plaintext, &header.ratchet_key)?;
 
         self.send_n += 1;
@@ -230,8 +240,7 @@ impl RatchetSession for DoubleRatchetSession {
             .remove(&(header.ratchet_key, header.message_number))
         {
             let cipher = ChaCha20Poly1305Cipher::new(&mk)?;
-            let mut nonce = [0u8; 12];
-            nonce[8..12].copy_from_slice(&header.message_number.to_be_bytes());
+            let nonce = Self::build_nonce(&header.ratchet_key, header.message_number);
             return cipher.decrypt(&nonce, ciphertext, &header.ratchet_key);
         }
 
@@ -266,8 +275,7 @@ impl RatchetSession for DoubleRatchetSession {
 
         // Decrypt
         let cipher = ChaCha20Poly1305Cipher::new(&message_key)?;
-        let mut nonce = [0u8; 12];
-        nonce[8..12].copy_from_slice(&header.message_number.to_be_bytes());
+        let nonce = Self::build_nonce(&header.ratchet_key, header.message_number);
         cipher.decrypt(&nonce, ciphertext, &header.ratchet_key)
     }
 }
@@ -280,7 +288,7 @@ mod tests {
         let shared_secret = [0x42u8; 32];
 
         // Bob generates his initial ratchet keypair
-        let bob_ratchet = StaticSecret::random_from_rng(&mut OsRng);
+        let bob_ratchet = StaticSecret::random_from_rng(OsRng);
         let bob_ratchet_pub = *PublicKey::from(&bob_ratchet).as_bytes();
 
         let alice =

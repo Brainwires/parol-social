@@ -170,19 +170,25 @@ impl CallManager {
 
         let call = Call::new_outgoing(call_id, peer_id);
 
-        self.calls.lock().unwrap().insert(call_id, call);
+        self.calls
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(call_id, call);
         Ok(call_id)
     }
 
     /// Register an incoming call.
     pub fn incoming_call(&self, call_id: [u8; 16], peer_id: PeerId) {
         let call = Call::new_incoming(call_id, peer_id);
-        self.calls.lock().unwrap().insert(call_id, call);
+        self.calls
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(call_id, call);
     }
 
     /// Answer an incoming call (transition Ringing -> Active).
     pub fn answer(&self, call_id: &[u8; 16]) -> Result<(), crate::CoreError> {
-        let mut calls = self.calls.lock().unwrap();
+        let mut calls = self.calls.lock().unwrap_or_else(|e| e.into_inner());
         let call = calls
             .get_mut(call_id)
             .ok_or(crate::CoreError::SessionError("call not found".into()))?;
@@ -202,7 +208,7 @@ impl CallManager {
 
     /// Reject an incoming call.
     pub fn reject(&self, call_id: &[u8; 16]) -> Result<(), crate::CoreError> {
-        let mut calls = self.calls.lock().unwrap();
+        let mut calls = self.calls.lock().unwrap_or_else(|e| e.into_inner());
         let call = calls
             .get_mut(call_id)
             .ok_or(crate::CoreError::SessionError("call not found".into()))?;
@@ -221,7 +227,7 @@ impl CallManager {
 
     /// Hang up an active call.
     pub fn hangup(&self, call_id: &[u8; 16]) -> Result<(), crate::CoreError> {
-        let mut calls = self.calls.lock().unwrap();
+        let mut calls = self.calls.lock().unwrap_or_else(|e| e.into_inner());
         let call = calls
             .get_mut(call_id)
             .ok_or(crate::CoreError::SessionError("call not found".into()))?;
@@ -231,7 +237,7 @@ impl CallManager {
 
     /// Toggle mute on an active call.
     pub fn toggle_mute(&self, call_id: &[u8; 16], muted: bool) -> Result<(), crate::CoreError> {
-        let mut calls = self.calls.lock().unwrap();
+        let mut calls = self.calls.lock().unwrap_or_else(|e| e.into_inner());
         let call = calls
             .get_mut(call_id)
             .ok_or(crate::CoreError::SessionError("call not found".into()))?;
@@ -246,12 +252,16 @@ impl CallManager {
 
     /// Get a call's state.
     pub fn get_state(&self, call_id: &[u8; 16]) -> Option<CallState> {
-        self.calls.lock().unwrap().get(call_id).map(|c| c.state)
+        self.calls
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(call_id)
+            .map(|c| c.state)
     }
 
     /// Remove timed-out calls.
     pub fn cleanup_timed_out(&self) -> Vec<[u8; 16]> {
-        let mut calls = self.calls.lock().unwrap();
+        let mut calls = self.calls.lock().unwrap_or_else(|e| e.into_inner());
         let timed_out: Vec<[u8; 16]> = calls
             .iter()
             .filter(|(_, c)| c.is_timed_out())
@@ -279,12 +289,12 @@ impl CallManager {
 
     /// Get total call count (all states).
     pub fn total_call_count(&self) -> usize {
-        self.calls.lock().unwrap().len()
+        self.calls.lock().unwrap_or_else(|e| e.into_inner()).len()
     }
 
     /// Remove ended/rejected calls from the map.
     pub fn prune_finished(&self) -> usize {
-        let mut calls = self.calls.lock().unwrap();
+        let mut calls = self.calls.lock().unwrap_or_else(|e| e.into_inner());
         let before = calls.len();
         calls.retain(|_, c| !matches!(c.state, CallState::Ended | CallState::Rejected));
         before - calls.len()

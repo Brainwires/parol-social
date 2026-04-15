@@ -184,7 +184,7 @@ mod tests {
         assert_eq!(create_cell.circuit_id, circuit_id);
 
         // Relay handles CREATE, produces CREATED + keys
-        let relay_secret = StaticSecret::random_from_rng(&mut rand::thread_rng());
+        let relay_secret = StaticSecret::random_from_rng(rand::thread_rng());
         let (created_cell, relay_keys) =
             CircuitHandshake::handle_create(&create_cell, &relay_secret).unwrap();
         assert_eq!(created_cell.cell_type, CellType::Created);
@@ -240,7 +240,7 @@ mod tests {
         let (_extend_cell, client_secret) = CircuitHandshake::extend_cell(circuit_id, target);
 
         // Next-hop relay does CREATE/CREATED internally, gives us its public key
-        let relay_secret = StaticSecret::random_from_rng(&mut rand::thread_rng());
+        let relay_secret = StaticSecret::random_from_rng(rand::thread_rng());
         let relay_public = PublicKey::from(&relay_secret);
 
         // Middle relay wraps it as EXTENDED

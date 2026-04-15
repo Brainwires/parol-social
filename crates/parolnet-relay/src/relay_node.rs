@@ -13,6 +13,8 @@ use x25519_dalek::StaticSecret;
 pub const MAX_CIRCUITS: usize = 8192;
 /// Maximum buffered cells per circuit.
 pub const MAX_CELLS_PER_CIRCUIT: usize = 64;
+/// Maximum RELAY_EARLY cells (circuit extensions) per circuit.
+pub const MAX_RELAY_EARLY: u8 = 8;
 
 /// State for one side of a circuit at a relay.
 struct CircuitEntry {
@@ -20,9 +22,11 @@ struct CircuitEntry {
     keys: HopKeys,
     /// Forward direction counter.
     forward_counter: u32,
-    /// Backward direction counter.
+    /// Backward direction counter (used when relaying responses back).
     #[allow(dead_code)]
     backward_counter: u32,
+    /// Count of RELAY_EARLY cells seen on this circuit.
+    relay_early_count: u8,
     /// Next hop: (address, circuit_id) or None if this is the exit.
     next_hop: Option<(SocketAddr, u32)>,
 }
@@ -53,7 +57,7 @@ impl StandardRelayNode {
         keys: HopKeys,
         next_hop: Option<(SocketAddr, u32)>,
     ) -> Result<(), RelayError> {
-        let mut circuits = self.circuits.lock().unwrap();
+        let mut circuits = self.circuits.lock().unwrap_or_else(|e| e.into_inner());
         if circuits.len() >= MAX_CIRCUITS {
             return Err(RelayError::CircuitLimitExceeded);
         }
@@ -63,6 +67,7 @@ impl StandardRelayNode {
                 keys,
                 forward_counter: 0,
                 backward_counter: 0,
+                relay_early_count: 0,
                 next_hop,
             },
         );
@@ -71,12 +76,18 @@ impl StandardRelayNode {
 
     /// Remove a circuit.
     pub fn remove_circuit(&self, circuit_id: u32) {
-        self.circuits.lock().unwrap().remove(&circuit_id);
+        self.circuits
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&circuit_id);
     }
 
     /// Get the current number of active circuits.
     pub fn circuit_count(&self) -> usize {
-        self.circuits.lock().unwrap().len()
+        self.circuits
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .len()
     }
 }
 
@@ -92,7 +103,7 @@ impl RelayNode for StandardRelayNode {
             CellType::Destroy => {
                 // Look up next hop BEFORE removing
                 let next = {
-                    let circuits = self.circuits.lock().unwrap();
+                    let circuits = self.circuits.lock().unwrap_or_else(|e| e.into_inner());
                     circuits.get(&cell.circuit_id).and_then(|e| e.next_hop)
                 };
                 // Remove our circuit state
@@ -111,7 +122,7 @@ impl RelayNode for StandardRelayNode {
             }
 
             CellType::Data => {
-                let mut circuits = self.circuits.lock().unwrap();
+                let mut circuits = self.circuits.lock().unwrap_or_else(|e| e.into_inner());
                 let entry = circuits
                     .get_mut(&cell.circuit_id)
                     .ok_or(RelayError::CircuitNotFound(cell.circuit_id))?;
@@ -165,7 +176,17 @@ impl RelayNode for StandardRelayNode {
                 Ok(RelayAction::Respond(created))
             }
 
-            CellType::Extend => {
+            CellType::RelayEarly | CellType::Extend => {
+                // Enforce RELAY_EARLY hop counter to prevent circuit extension abuse
+                {
+                    let mut circuits = self.circuits.lock().unwrap_or_else(|e| e.into_inner());
+                    if let Some(entry) = circuits.get_mut(&cell.circuit_id) {
+                        entry.relay_early_count += 1;
+                        if entry.relay_early_count > MAX_RELAY_EARLY {
+                            return Err(RelayError::RelayEarlyLimitExceeded);
+                        }
+                    }
+                }
                 // Parse EXTEND to get target address and client's ephemeral key.
                 // The current relay must connect to target_addr, send a CREATE
                 // on behalf of the client, and relay the CREATED back as EXTENDED.

@@ -7,6 +7,29 @@ use parolnet_protocol::file::{DEFAULT_CHUNK_SIZE, FileChunkHeader, FileOffer};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 
+/// Sanitize a file name to prevent path traversal and other attacks.
+///
+/// - Strips directory components (path separators)
+/// - Removes leading dots (hidden files / `.` / `..`)
+/// - Replaces NUL bytes
+/// - Falls back to "unnamed" if the result is empty
+pub fn sanitize_filename(name: &str) -> String {
+    // Take only the final path component
+    let base = name.rsplit(['/', '\\']).next().unwrap_or(name);
+
+    // Strip leading dots to prevent hidden files and .. traversal
+    let trimmed = base.trim_start_matches('.');
+
+    // Remove NUL bytes and control characters
+    let cleaned: String = trimmed.chars().filter(|c| !c.is_control()).collect();
+
+    if cleaned.is_empty() {
+        "unnamed".to_string()
+    } else {
+        cleaned
+    }
+}
+
 /// Tracks an outgoing file transfer.
 pub struct FileTransferSender {
     pub offer: FileOffer,
@@ -27,7 +50,7 @@ impl FileTransferSender {
 
         let offer = FileOffer {
             file_id,
-            file_name,
+            file_name: sanitize_filename(&file_name),
             file_size: data.len() as u64,
             chunk_size: DEFAULT_CHUNK_SIZE,
             sha256,

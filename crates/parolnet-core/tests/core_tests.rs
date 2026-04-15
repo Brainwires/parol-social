@@ -150,23 +150,26 @@ fn test_client_session_lifecycle() {
     let alice = ParolNet::new(ParolNetConfig::default());
     let bob = ParolNet::new(ParolNetConfig::default());
 
-    let shared_secret = SharedSecret([0x42; 32]);
-
     // Generate a ratchet key for Bob
     use rand::rngs::OsRng;
-    let bob_ratchet = x25519_dalek::StaticSecret::random_from_rng(&mut OsRng);
+    let bob_ratchet = x25519_dalek::StaticSecret::random_from_rng(OsRng);
     let bob_ratchet_pub = *x25519_dalek::PublicKey::from(&bob_ratchet).as_bytes();
 
     // Alice establishes session with Bob
     alice
-        .establish_session(bob.peer_id(), shared_secret.clone(), &bob_ratchet_pub, true)
+        .establish_session(
+            bob.peer_id(),
+            SharedSecret([0x42; 32]),
+            &bob_ratchet_pub,
+            true,
+        )
         .unwrap();
 
     assert!(alice.has_session(&bob.peer_id()));
     assert_eq!(alice.session_count(), 1);
 
     // Alice encrypts a message
-    let (header, ciphertext) = alice.send(&bob.peer_id(), b"hello bob").unwrap();
+    let (_header, ciphertext) = alice.send(&bob.peer_id(), b"hello bob").unwrap();
     assert!(!ciphertext.is_empty());
 }
 
@@ -177,7 +180,7 @@ fn test_panic_wipe_clears_sessions() {
     let mut client = ParolNet::new(ParolNetConfig::default());
 
     use rand::rngs::OsRng;
-    let ratchet = x25519_dalek::StaticSecret::random_from_rng(&mut OsRng);
+    let ratchet = x25519_dalek::StaticSecret::random_from_rng(OsRng);
     let ratchet_pub = *x25519_dalek::PublicKey::from(&ratchet).as_bytes();
 
     client
@@ -251,7 +254,7 @@ fn test_multiple_sessions() {
     for i in 0..3u8 {
         let peer_id = PeerId([i + 10; 32]);
         let shared_secret = SharedSecret([i + 1; 32]);
-        let ratchet_secret = x25519_dalek::StaticSecret::random_from_rng(&mut OsRng);
+        let ratchet_secret = x25519_dalek::StaticSecret::random_from_rng(OsRng);
         let ratchet_pub = *x25519_dalek::PublicKey::from(&ratchet_secret).as_bytes();
 
         client
@@ -451,7 +454,7 @@ fn test_file_transfer_integrity_failure() {
 
 #[test]
 fn test_file_transfer_progress() {
-    use parolnet_core::file_transfer::{FileTransferReceiver, FileTransferSender};
+    use parolnet_core::file_transfer::FileTransferSender;
 
     let data = vec![0u8; 8192]; // exactly 2 chunks
     let mut sender = FileTransferSender::new(data, "progress.bin".into(), None);
@@ -469,7 +472,6 @@ fn test_file_transfer_progress() {
 #[test]
 fn test_opus_encode_decode_roundtrip() {
     use parolnet_core::audio::{AudioConfig, AudioDecoder, AudioEncoder};
-    use parolnet_protocol::media::AudioCodec;
 
     let config = AudioConfig::default(); // Opus, 16kHz, mono
     let mut encoder = AudioEncoder::new(&config).unwrap();
@@ -574,7 +576,7 @@ fn test_video_fragment_large_frame() {
     };
 
     let fragments = fragment_video_frame(&frame, 42);
-    let expected_count = (10_000 + MAX_FRAGMENT_SIZE - 1) / MAX_FRAGMENT_SIZE;
+    let expected_count = 10_000_usize.div_ceil(MAX_FRAGMENT_SIZE);
     assert_eq!(fragments.len(), expected_count);
 
     // Verify sequential fragment indices
@@ -743,7 +745,7 @@ fn test_call_manager_prune() {
     let manager = CallManager::new();
 
     // Start 1 call, register 2 incoming, reject 2, keep 1 active
-    let id1 = manager.start_call(PeerId([1; 32])).unwrap();
+    let _id1 = manager.start_call(PeerId([1; 32])).unwrap();
     let id2 = [0xAA; 16];
     let id3 = [0xBB; 16];
     manager.incoming_call(id2, PeerId([2; 32]));
@@ -1187,9 +1189,7 @@ fn test_audio_frame_struct() {
 
 #[test]
 fn test_video_fragment_exact_boundary() {
-    use parolnet_core::video::{
-        MAX_FRAGMENT_SIZE, VideoFrame, fragment_video_frame, reassemble_video_frame,
-    };
+    use parolnet_core::video::{MAX_FRAGMENT_SIZE, VideoFrame, fragment_video_frame};
     use parolnet_protocol::media::VideoCodec;
 
     // Data exactly MAX_FRAGMENT_SIZE -- should be 1 fragment
@@ -1269,9 +1269,7 @@ fn test_video_reassemble_wrong_frame_id() {
 
 #[test]
 fn test_video_reassemble_out_of_order() {
-    use parolnet_core::video::{
-        VideoFragment, VideoFrame, fragment_video_frame, reassemble_video_frame,
-    };
+    use parolnet_core::video::{VideoFrame, fragment_video_frame, reassemble_video_frame};
     use parolnet_protocol::media::VideoCodec;
 
     let frame = VideoFrame {
@@ -1399,7 +1397,7 @@ fn test_call_hangup_from_active() {
 #[test]
 fn test_call_duration_tracking() {
     use parolnet_core::call::Call;
-    use parolnet_protocol::media::{CallSignalMessage, CallState};
+    use parolnet_protocol::media::CallSignalMessage;
 
     let call_id = [1; 16];
     let mut call = Call::new_outgoing(call_id, PeerId([1; 32]));
@@ -1478,7 +1476,7 @@ fn test_call_answer_wrong_state_fails() {
 #[test]
 fn test_call_reject_from_wrong_state_fails() {
     use parolnet_core::call::Call;
-    use parolnet_protocol::media::{CallSignalMessage, CallState};
+    use parolnet_protocol::media::CallSignalMessage;
 
     let call_id = [1; 16];
     let mut call = Call::new_outgoing(call_id, PeerId([1; 32]));
@@ -1554,7 +1552,6 @@ fn test_call_manager_answer_nonexistent_fails() {
 #[test]
 fn test_call_manager_multiple_active_calls() {
     use parolnet_core::call::CallManager;
-    use parolnet_protocol::media::CallState;
 
     let manager = CallManager::new();
     let id1 = [1; 16];
@@ -1751,7 +1748,7 @@ fn test_relay_padding_cell() {
 
 #[test]
 fn test_relay_destroy_cell() {
-    use parolnet_relay::{CELL_SIZE, CellType, RelayCell};
+    use parolnet_relay::{CellType, RelayCell};
 
     let cell = RelayCell::destroy(456, 0x01);
     assert_eq!(cell.cell_type, CellType::Destroy);
@@ -1990,19 +1987,22 @@ fn test_send_recv_padding_roundtrip() {
     let alice = ParolNet::new(ParolNetConfig::default());
     let bob = ParolNet::new(ParolNetConfig::default());
 
-    let shared_secret = SharedSecret([0x42; 32]);
-
     // Bob generates a ratchet keypair
-    let bob_ratchet_secret = x25519_dalek::StaticSecret::random_from_rng(&mut OsRng);
+    let bob_ratchet_secret = x25519_dalek::StaticSecret::random_from_rng(OsRng);
     let bob_ratchet_pub = *x25519_dalek::PublicKey::from(&bob_ratchet_secret).as_bytes();
 
     // Alice establishes as initiator, Bob as responder
     alice
-        .establish_session(bob.peer_id(), shared_secret.clone(), &bob_ratchet_pub, true)
+        .establish_session(
+            bob.peer_id(),
+            SharedSecret([0x42; 32]),
+            &bob_ratchet_pub,
+            true,
+        )
         .unwrap();
     bob.establish_responder_session(
         alice.peer_id(),
-        shared_secret,
+        SharedSecret([0x42; 32]),
         bob_ratchet_secret.to_bytes(),
     )
     .unwrap();

@@ -131,11 +131,7 @@ fn test_pow_wrong_nonce_fails() {
     let sender = PeerId([0xCD; 32]);
     let timestamp = 1700000000u64;
 
-    let nonce = ProofOfWork::compute(&msg_id, &sender, timestamp, 8);
-    // Tamper with nonce
-    let mut bad_nonce = nonce;
-    bad_nonce[0] ^= 0xFF;
-    // Bad nonce very likely fails (could theoretically still pass, but probability is ~2^-8)
+    let _nonce = ProofOfWork::compute(&msg_id, &sender, timestamp, 8);
     // Use higher difficulty to make collision essentially impossible
     let nonce16 = ProofOfWork::compute(&msg_id, &sender, timestamp, 16);
     let mut bad16 = nonce16;
@@ -167,7 +163,7 @@ fn make_test_envelope(dest: PeerId) -> Envelope {
             dest_peer_id: dest,
             message_id: [0; 16],
             timestamp: 1700000000,
-            ttl_and_hops: (7 << 8) | 0,
+            ttl_and_hops: 7 << 8,
             source_hint: None,
         },
         encrypted_payload: vec![0xEE; 64],
@@ -185,11 +181,11 @@ async fn test_store_and_retrieve() {
         .store(&envelope, Duration::from_secs(3600))
         .await
         .unwrap();
-    assert_eq!(store.count_for_peer(&peer), 1);
+    assert_eq!(store.count_for_peer(&peer).await, 1);
 
     let messages = store.retrieve(&peer).await.unwrap();
     assert_eq!(messages.len(), 1);
-    assert_eq!(store.count_for_peer(&peer), 0); // cleared after retrieve
+    assert_eq!(store.count_for_peer(&peer).await, 0); // cleared after retrieve
 }
 
 #[tokio::test]
@@ -206,7 +202,7 @@ async fn test_store_limit_eviction() {
     }
 
     // Should be capped at MAX_MESSAGES_PER_PEER
-    assert!(store.count_for_peer(&peer) <= 256);
+    assert!(store.count_for_peer(&peer).await <= 256);
 }
 
 #[tokio::test]
@@ -226,7 +222,7 @@ async fn test_store_expire() {
 
     let expired = store.expire().await.unwrap();
     assert_eq!(expired, 1);
-    assert_eq!(store.count_for_peer(&peer), 0);
+    assert_eq!(store.count_for_peer(&peer).await, 0);
 }
 
 // ── Additional Bloom Filter Tests ───────────────────────────────
@@ -324,14 +320,14 @@ async fn test_store_multiple_peers() {
         store.store(&env, Duration::from_secs(3600)).await.unwrap();
     }
 
-    assert_eq!(store.count_for_peer(&peer_a), 2);
-    assert_eq!(store.count_for_peer(&peer_b), 3);
-    assert_eq!(store.count_for_peer(&peer_c), 1);
+    assert_eq!(store.count_for_peer(&peer_a).await, 2);
+    assert_eq!(store.count_for_peer(&peer_b).await, 3);
+    assert_eq!(store.count_for_peer(&peer_c).await, 1);
 
     // Retrieve each independently and verify counts
     let msgs_a = store.retrieve(&peer_a).await.unwrap();
     assert_eq!(msgs_a.len(), 2);
-    assert_eq!(store.count_for_peer(&peer_a), 0); // cleared after retrieve
+    assert_eq!(store.count_for_peer(&peer_a).await, 0); // cleared after retrieve
 
     let msgs_b = store.retrieve(&peer_b).await.unwrap();
     assert_eq!(msgs_b.len(), 3);
@@ -352,14 +348,14 @@ async fn test_store_eviction_order() {
         env.header.message_id[1] = (i >> 8) as u8;
         store.store(&env, Duration::from_secs(3600)).await.unwrap();
     }
-    assert_eq!(store.count_for_peer(&peer), 256);
+    assert_eq!(store.count_for_peer(&peer).await, 256);
 
     // Store one more — should trigger eviction, count stays at 256
     let mut env = make_test_envelope(peer);
     env.header.message_id[0] = 0xFF;
     env.header.message_id[1] = 0xFF;
     store.store(&env, Duration::from_secs(3600)).await.unwrap();
-    assert_eq!(store.count_for_peer(&peer), 256);
+    assert_eq!(store.count_for_peer(&peer).await, 256);
 }
 
 // ── Additional Proof-of-Work Tests ──────────────────────────────
@@ -622,8 +618,8 @@ async fn test_process_gossip_invalid_signature_length_rejected() {
     assert!(result.is_err());
     let err = result.unwrap_err().to_string();
     assert!(
-        err.contains("invalid gossip envelope structure"),
-        "expected structure validation error, got: {err}"
+        err.contains("sig must be 64 bytes") || err.contains("invalid gossip envelope structure"),
+        "expected validation error for bad sig length, got: {err}"
     );
 }
 
@@ -661,7 +657,8 @@ async fn test_process_gossip_empty_pubkey_rejected() {
     assert!(result.is_err());
     let err = result.unwrap_err().to_string();
     assert!(
-        err.contains("invalid gossip envelope structure"),
-        "expected structure validation error, got: {err}"
+        err.contains("src_pubkey must be 32 bytes")
+            || err.contains("invalid gossip envelope structure"),
+        "expected validation error for empty pubkey, got: {err}"
     );
 }

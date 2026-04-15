@@ -25,4 +25,7 @@ pub enum MeshError {
 
     #[error("TTL exhausted")]
     TtlExhausted,
+
+    #[error("peer connection limit reached")]
+    PeerLimitReached,
 }

@@ -93,15 +93,15 @@ pub trait KeyAgreement {
 // All types holding secret material derive Zeroize and ZeroizeOnDrop.
 
 /// A 32-byte chain key used in the Double Ratchet KDF chain.
-#[derive(Clone, Zeroize, ZeroizeOnDrop)]
+#[derive(Zeroize, ZeroizeOnDrop)]
 pub struct ChainKey(pub [u8; 32]);
 
 /// A 32-byte message key derived from a chain key, used for one message.
-#[derive(Clone, Zeroize, ZeroizeOnDrop)]
+#[derive(Zeroize, ZeroizeOnDrop)]
 pub struct MessageKey(pub [u8; 32]);
 
 /// A 32-byte shared secret produced by X3DH key agreement.
-#[derive(Clone, Zeroize, ZeroizeOnDrop)]
+#[derive(Zeroize, ZeroizeOnDrop)]
 pub struct SharedSecret(pub [u8; 32]);
 
 /// Header sent with each Double Ratchet message.
