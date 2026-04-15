@@ -124,7 +124,7 @@ header {
     display: flex;
     align-items: center;
     gap: 12px;
-    height: var(--header-height);
+    min-height: var(--header-height);
     padding: 0 16px;
     background: var(--bg2);
     border-bottom: 1px solid var(--border);
@@ -775,17 +775,23 @@ button.success {
     }
 }
 
-/* ── Safe Area (notch devices) ───────────────────────────────── */
+/* ── Safe Area (notch / gesture-bar devices) ─────────────────── */
 @supports (padding: env(safe-area-inset-top)) {
     header {
         padding-top: env(safe-area-inset-top);
     }
 
     .chat-input {
-        padding-bottom: env(safe-area-inset-bottom);
+        margin-bottom: env(safe-area-inset-bottom);
     }
 
     .call-controls {
         bottom: calc(40px + env(safe-area-inset-bottom));
+    }
+
+    #view-loading,
+    .view {
+        padding-left: env(safe-area-inset-left);
+        padding-right: env(safe-area-inset-right);
     }
 }

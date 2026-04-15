@@ -2,7 +2,7 @@
 <html lang="en" dir="ltr">
 <head>
     <meta charset="utf-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
     <meta name="theme-color" content="#1a1a2e">
     <meta name="mobile-web-app-capable" content="yes">
     <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
@@ -253,7 +253,7 @@
         </div>
     </div>
 
-    <div id="build-stamp" style="position:fixed;bottom:4px;right:8px;font-size:10px;color:#888;z-index:9999;cursor:pointer;user-select:none;-webkit-user-select:none;padding:8px;"></div>
+    <div id="build-stamp" style="position:fixed;bottom:calc(16px + env(safe-area-inset-bottom, 0px));right:calc(8px + env(safe-area-inset-right, 0px));font-size:10px;color:#888;z-index:9999;cursor:pointer;user-select:none;-webkit-user-select:none;padding:8px;"></div>
     <script src="build-info.js" onerror=""></script>
     <script>document.getElementById('build-stamp').textContent=window.BUILD_INFO?BUILD_INFO.date:'no build info';</script>
     <script>
