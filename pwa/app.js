@@ -773,16 +773,22 @@ function switchListTab(tab) {
     if (btn) btn.classList.add('active');
     const contactList = document.getElementById('contact-list');
     const groupList = document.getElementById('group-list');
+    const addressBookList = document.getElementById('address-book-list');
     const createGroupBtn = document.getElementById('create-group-btn');
+    // Hide all lists
+    if (contactList) contactList.classList.add('hidden');
+    if (groupList) groupList.classList.add('hidden');
+    if (addressBookList) addressBookList.classList.add('hidden');
+    if (createGroupBtn) createGroupBtn.classList.add('hidden');
     if (tab === 'groups') {
-        if (contactList) contactList.classList.add('hidden');
         if (groupList) groupList.classList.remove('hidden');
         if (createGroupBtn) createGroupBtn.classList.remove('hidden');
         loadGroups();
+    } else if (tab === 'address-book') {
+        if (addressBookList) addressBookList.classList.remove('hidden');
+        loadAddressBook();
     } else {
         if (contactList) contactList.classList.remove('hidden');
-        if (groupList) groupList.classList.add('hidden');
-        if (createGroupBtn) createGroupBtn.classList.add('hidden');
         loadContacts();
     }
 }
@@ -2285,6 +2291,69 @@ function renderContactList(contacts) {
     `).join('');
 }
 
+// ── Address Book (Contacts Tab) ─────────────────────────────
+async function loadAddressBook() {
+    try {
+        const contacts = await dbGetAll('contacts');
+        contacts.sort((a, b) => (a.name || '').localeCompare(b.name || ''));
+        renderAddressBook(contacts);
+    } catch (e) {
+        console.warn('Failed to load address book:', e);
+        renderAddressBook([]);
+    }
+}
+
+function renderAddressBook(contacts) {
+    const list = document.getElementById('address-book-list');
+    if (!list) return;
+
+    if (!contacts || contacts.length === 0) {
+        list.innerHTML = '<div class="empty-state"><p>No contacts yet</p><p>Tap + to add someone</p></div>';
+        return;
+    }
+    list.innerHTML = contacts.map(c => `
+        <div class="contact-item address-book-item" data-peerid="${escapeAttr(c.peerId)}">
+            <div class="contact-avatar">${escapeHtml(c.name[0]?.toUpperCase() || '?')}</div>
+            <div class="contact-info" onclick="openChat('${escapeAttr(c.peerId)}')">
+                <div class="contact-name" dir="auto">${escapeHtml(c.name)}</div>
+                <div class="contact-peer-id">${escapeHtml(c.peerId.slice(0, 16) + '...')}</div>
+            </div>
+            <button class="contact-edit-btn" onclick="renameContact('${escapeAttr(c.peerId)}')" title="Rename contact">&#9998;</button>
+        </div>
+    `).join('');
+}
+
+async function renameContact(peerId) {
+    let contacts;
+    try {
+        contacts = await dbGetAll('contacts');
+    } catch (e) {
+        showToast('Failed to load contact');
+        return;
+    }
+    const contact = contacts.find(c => c.peerId === peerId);
+    if (!contact) { showToast('Contact not found'); return; }
+
+    const newName = prompt('Set name for this contact:', contact.name || '');
+    if (newName === null) return; // cancelled
+    const trimmed = newName.trim();
+    if (!trimmed) { showToast('Name cannot be empty'); return; }
+
+    contact.name = trimmed;
+    try {
+        await dbPut('contacts', contact);
+        showToast('Contact renamed');
+        loadAddressBook();
+        // Update chat header if this contact's chat is open
+        if (window.currentPeerId === peerId) {
+            const nameEl = document.getElementById('chat-peer-name');
+            if (nameEl) nameEl.textContent = trimmed;
+        }
+    } catch (e) {
+        showToast('Failed to rename: ' + e.message);
+    }
+}
+
 // ── Chat View ───────────────────────────────────────────────
 function openChat(peerId) {
     currentPeerId = peerId;
@@ -2293,7 +2362,12 @@ function openChat(peerId) {
 
     const nameEl = document.getElementById('chat-peer-name');
     if (nameEl) {
+        // Show truncated peerId immediately, then resolve contact name
         nameEl.textContent = peerId.length > 20 ? peerId.slice(0, 16) + '...' : peerId;
+        dbGetAll('contacts').then(contacts => {
+            const c = contacts.find(x => x.peerId === peerId);
+            if (c && c.name && nameEl) nameEl.textContent = c.name;
+        }).catch(() => {});
     }
     loadMessages(peerId);
 
@@ -3452,6 +3526,7 @@ document.addEventListener('visibilitychange', () => {
 window.calcPress = calcPress;
 window.sendMessage = sendMessage;
 window.openChat = openChat;
+window.renameContact = renameContact;
 window.attachFile = attachFile;
 window.onFileSelected = onFileSelected;
 window.openSettings = openSettings;

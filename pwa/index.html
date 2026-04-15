@@ -101,12 +101,14 @@
         <div class="list-tabs">
             <button class="list-tab active" data-list="contacts" onclick="switchListTab('contacts')">Chats</button>
             <button class="list-tab" data-list="groups" onclick="switchListTab('groups')">Groups</button>
+            <button class="list-tab" data-list="address-book" onclick="switchListTab('address-book')">Contacts</button>
         </div>
         <div class="search-bar">
             <input type="text" placeholder="Search..." id="contact-search">
         </div>
         <div id="contact-list" class="contact-list"></div>
         <div id="group-list" class="contact-list hidden"></div>
+        <div id="address-book-list" class="contact-list hidden"></div>
         <button id="create-group-btn" class="create-group-btn hidden" onclick="showCreateGroupDialog()">+ New Group</button>
         <div id="build-stamp" style="position:absolute;bottom:0;right:8px;font-size:10px;color:#888;z-index:9999;cursor:pointer;user-select:none;-webkit-user-select:none;padding:8px;"></div>
     </div>
