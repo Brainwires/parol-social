@@ -12,5 +12,6 @@ node_modules/
 package.json
 package-lock.json
 pwa/build-info.js
+pwa/pkg/
 docker-compose.override.yml
 .claude/worktrees/
