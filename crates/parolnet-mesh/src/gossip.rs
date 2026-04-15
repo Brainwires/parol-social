@@ -73,6 +73,9 @@ impl SeenBloomFilter {
     }
 }
 
+/// Maximum entries per dedup buffer to prevent memory exhaustion.
+const DEDUP_MAX_ENTRIES: usize = 100_000;
+
 /// Local deduplication filter for recently seen message IDs.
 ///
 /// Uses a double-buffer approach: current + previous, rotated every 12 hours.
@@ -97,24 +100,42 @@ impl DedupFilter {
 
     /// Check if a message ID has been seen recently.
     pub fn is_seen(&self, message_id: &[u8; 32]) -> bool {
-        self.current.lock().unwrap().contains(message_id)
-            || self.previous.lock().unwrap().contains(message_id)
+        self.current
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains(message_id)
+            || self
+                .previous
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .contains(message_id)
     }
 
     /// Mark a message ID as seen.
+    /// If the current buffer exceeds capacity, it is rotated first.
     pub fn mark_seen(&self, message_id: [u8; 32]) {
-        self.current.lock().unwrap().insert(message_id);
+        let mut current = self.current.lock().unwrap_or_else(|e| e.into_inner());
+        if current.len() >= DEDUP_MAX_ENTRIES {
+            let evicted = std::mem::take(&mut *current);
+            *self.previous.lock().unwrap_or_else(|e| e.into_inner()) = evicted;
+        }
+        current.insert(message_id);
     }
 
     /// Rotate the double buffer: discard previous, promote current.
     pub fn rotate(&self) {
-        let current = std::mem::take(&mut *self.current.lock().unwrap());
-        *self.previous.lock().unwrap() = current;
+        let current = std::mem::take(&mut *self.current.lock().unwrap_or_else(|e| e.into_inner()));
+        *self.previous.lock().unwrap_or_else(|e| e.into_inner()) = current;
     }
 
     /// Total number of entries across both buffers.
     pub fn len(&self) -> usize {
-        self.current.lock().unwrap().len() + self.previous.lock().unwrap().len()
+        self.current.lock().unwrap_or_else(|e| e.into_inner()).len()
+            + self
+                .previous
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .len()
     }
 
     /// Whether both buffers are empty.

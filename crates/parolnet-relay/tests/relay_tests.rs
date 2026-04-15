@@ -242,7 +242,7 @@ async fn test_circuit_build_wrong_hop_count() {
     // Build two RelayInfo structs (need 3)
     let hops: Vec<RelayInfo> = (1u8..=2)
         .map(|id| {
-            let secret = StaticSecret::random_from_rng(&mut OsRng);
+            let secret = StaticSecret::random_from_rng(OsRng);
             let public = PublicKey::from(&secret);
             RelayInfo {
                 peer_id: PeerId([id; 32]),
@@ -269,7 +269,7 @@ async fn test_circuit_build_with_3_relays() {
 
     let hops: Vec<RelayInfo> = (1u8..=3)
         .map(|id| {
-            let secret = StaticSecret::random_from_rng(&mut OsRng);
+            let secret = StaticSecret::random_from_rng(OsRng);
             let public = PublicKey::from(&secret);
             RelayInfo {
                 peer_id: PeerId([id; 32]),

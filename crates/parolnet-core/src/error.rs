@@ -32,3 +32,25 @@ pub enum CoreError {
     #[error("mesh error: {0}")]
     Mesh(#[from] parolnet_mesh::MeshError),
 }
+
+impl CoreError {
+    /// Return an opaque error message safe for external consumers.
+    ///
+    /// Internal details (paths, keys, peer IDs) are never leaked.
+    pub fn to_external(&self) -> &str {
+        match self {
+            CoreError::BootstrapFailed(_) => "bootstrap failed",
+            CoreError::SessionError(_) => "session error",
+            CoreError::NoSession => "no session",
+            CoreError::WipeFailed(_) => "wipe failed",
+            CoreError::Crypto(_) => "crypto error",
+            CoreError::Protocol(_) => "protocol error",
+            #[cfg(feature = "native")]
+            CoreError::Transport(_) => "transport error",
+            #[cfg(feature = "native")]
+            CoreError::Relay(_) => "relay error",
+            #[cfg(feature = "native")]
+            CoreError::Mesh(_) => "mesh error",
+        }
+    }
+}

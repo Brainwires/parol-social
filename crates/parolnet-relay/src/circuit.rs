@@ -53,8 +53,11 @@ impl EstablishedCircuit {
 
     /// Encrypt data with all onion layers for sending through the circuit.
     pub fn wrap_data(&self, data: &[u8]) -> Result<Vec<u8>, RelayError> {
-        let hop_keys = self.hop_keys.lock().unwrap();
-        let counters = self.forward_counters.lock().unwrap();
+        let hop_keys = self.hop_keys.lock().unwrap_or_else(|e| e.into_inner());
+        let counters = self
+            .forward_counters
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
 
         // Check for counter overflow before encrypting
         for c in counters.iter() {
@@ -68,7 +71,10 @@ impl EstablishedCircuit {
         drop(hop_keys);
 
         // Increment all forward counters
-        let mut counters = self.forward_counters.lock().unwrap();
+        let mut counters = self
+            .forward_counters
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         for c in counters.iter_mut() {
             *c += 1;
         }
@@ -78,8 +84,11 @@ impl EstablishedCircuit {
 
     /// Decrypt data received through the circuit (reverse direction).
     pub fn unwrap_data(&self, data: &[u8]) -> Result<Vec<u8>, RelayError> {
-        let hop_keys = self.hop_keys.lock().unwrap();
-        let counters = self.backward_counters.lock().unwrap();
+        let hop_keys = self.hop_keys.lock().unwrap_or_else(|e| e.into_inner());
+        let counters = self
+            .backward_counters
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
 
         // Check for counter overflow before decrypting
         for c in counters.iter() {
@@ -92,7 +101,10 @@ impl EstablishedCircuit {
         drop(counters);
         drop(hop_keys);
 
-        let mut counters = self.backward_counters.lock().unwrap();
+        let mut counters = self
+            .backward_counters
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         for c in counters.iter_mut() {
             *c += 1;
         }
@@ -107,7 +119,10 @@ impl EstablishedCircuit {
 
     /// Get the number of hops in this circuit.
     pub fn hop_count(&self) -> usize {
-        self.hop_keys.lock().unwrap().len()
+        self.hop_keys
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .len()
     }
 
     /// Check whether this circuit has a guard connection attached.
@@ -222,9 +237,18 @@ impl Circuit for EstablishedCircuit {
 
         // Derive keys for the new hop and add to circuit
         let new_keys = CircuitHandshake::process_extended(&response, &our_secret)?;
-        self.hop_keys.lock().unwrap().push(new_keys);
-        self.forward_counters.lock().unwrap().push(0);
-        self.backward_counters.lock().unwrap().push(0);
+        self.hop_keys
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(new_keys);
+        self.forward_counters
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(0);
+        self.backward_counters
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(0);
 
         Ok(())
     }

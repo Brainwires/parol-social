@@ -195,6 +195,40 @@ pub fn verify_bootstrap_proof(
     Ok(expected.ct_eq(proof).into())
 }
 
+/// Tracks seen bootstrap nonces to prevent replay attacks.
+///
+/// The verifier should maintain one of these and call `check_and_record`
+/// before accepting any bootstrap proof.
+pub struct NonceTracker {
+    seen: std::collections::HashSet<[u8; 16]>,
+    /// Maximum entries before oldest are discarded.
+    max_entries: usize,
+}
+
+impl NonceTracker {
+    /// Create a new tracker with a capacity limit.
+    pub fn new(max_entries: usize) -> Self {
+        Self {
+            seen: std::collections::HashSet::new(),
+            max_entries,
+        }
+    }
+
+    /// Check if a nonce has been seen before. If not, record it and return `true`.
+    /// Returns `false` (replay detected) if the nonce was already seen.
+    pub fn check_and_record(&mut self, nonce: &[u8; 16]) -> bool {
+        if self.seen.contains(nonce) {
+            return false;
+        }
+        // If at capacity, clear the oldest half (simple eviction).
+        if self.seen.len() >= self.max_entries {
+            self.seen.clear();
+        }
+        self.seen.insert(*nonce);
+        true
+    }
+}
+
 /// Compute a Short Authentication String (SAS) for voice verification.
 ///
 /// Returns a 6-digit decimal string.

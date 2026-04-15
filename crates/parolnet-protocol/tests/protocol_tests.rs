@@ -128,7 +128,7 @@ fn make_test_header() -> CleartextHeader {
         dest_peer_id: PeerId([0xAB; 32]),
         message_id: [0xCD; 16],
         timestamp: CleartextHeader::coarsen_timestamp(1700000000),
-        ttl_and_hops: (7 << 8) | 0,
+        ttl_and_hops: 7 << 8,
         source_hint: None,
     }
 }
@@ -341,7 +341,7 @@ fn test_envelope_is_valid_size_true() {
         dest_peer_id: PeerId([0xAB; 32]),
         message_id: [0xCD; 16],
         timestamp: CleartextHeader::coarsen_timestamp(1700000000),
-        ttl_and_hops: (7 << 8) | 0,
+        ttl_and_hops: 7 << 8,
         source_hint: None,
     };
 

@@ -328,7 +328,6 @@ struct TelemetryEvent {
 
 #[derive(Deserialize)]
 struct TelemetryBatch {
-    sid: String,
     #[allow(dead_code)]
     ts: u64,
     events: Vec<TelemetryEvent>,
@@ -389,7 +388,7 @@ async fn handle_telemetry(
     Json(batch): Json<TelemetryBatch>,
 ) -> impl IntoResponse {
     // Validate
-    if batch.events.len() > 500 || batch.sid.is_empty() {
+    if batch.events.len() > 500 {
         return StatusCode::BAD_REQUEST;
     }
 
@@ -669,7 +668,22 @@ async fn main() {
                 }
             }),
         )
-        .layer(tower_http::cors::CorsLayer::permissive());
+        .layer({
+            let cors_origins = std::env::var("CORS_ORIGINS").unwrap_or_default();
+            if cors_origins.is_empty() {
+                tower_http::cors::CorsLayer::permissive()
+            } else {
+                use tower_http::cors::{AllowOrigin, CorsLayer};
+                let origins: Vec<axum::http::HeaderValue> = cors_origins
+                    .split(',')
+                    .filter_map(|o| o.trim().parse().ok())
+                    .collect();
+                CorsLayer::new()
+                    .allow_origin(AllowOrigin::list(origins))
+                    .allow_methods(tower_http::cors::Any)
+                    .allow_headers(tower_http::cors::Any)
+            }
+        });
 
     // Add /stats endpoint only when feature is enabled AND env var is set
     #[cfg(feature = "analytics")]

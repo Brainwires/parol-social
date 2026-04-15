@@ -91,6 +91,15 @@ pub struct Envelope {
 }
 
 impl Envelope {
+    /// Verify the MAC in constant time using `subtle::ConstantTimeEq`.
+    ///
+    /// Returns `true` if `expected_mac` matches `self.mac` in constant time,
+    /// preventing timing side-channel attacks.
+    pub fn verify_mac(&self, expected_mac: &[u8; 16]) -> bool {
+        use subtle::ConstantTimeEq;
+        self.mac.ct_eq(expected_mac).into()
+    }
+
     /// Verify that the total envelope size matches a valid bucket size.
     pub fn is_valid_size(&self) -> bool {
         let total = self.total_size();

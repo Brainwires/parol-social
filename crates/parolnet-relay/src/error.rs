@@ -26,6 +26,9 @@ pub enum RelayError {
     #[error("AEAD verification failed")]
     AeadFailed,
 
+    #[error("RELAY_EARLY limit exceeded")]
+    RelayEarlyLimitExceeded,
+
     #[error("circuit timeout")]
     Timeout,
 

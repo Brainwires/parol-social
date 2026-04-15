@@ -32,7 +32,7 @@ impl SessionManager {
 
     /// Register a new session with a peer.
     pub fn add_session(&self, peer_id: PeerId, ratchet: DoubleRatchetSession) {
-        let mut sessions = self.sessions.lock().unwrap();
+        let mut sessions = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
         sessions.insert(peer_id, Session { peer_id, ratchet });
     }
 
@@ -42,7 +42,7 @@ impl SessionManager {
         peer_id: &PeerId,
         plaintext: &[u8],
     ) -> Result<(RatchetHeader, Vec<u8>), crate::CoreError> {
-        let mut sessions = self.sessions.lock().unwrap();
+        let mut sessions = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
         let session = sessions
             .get_mut(peer_id)
             .ok_or(crate::CoreError::NoSession)?;
@@ -59,7 +59,7 @@ impl SessionManager {
         header: &RatchetHeader,
         ciphertext: &[u8],
     ) -> Result<Vec<u8>, crate::CoreError> {
-        let mut sessions = self.sessions.lock().unwrap();
+        let mut sessions = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
         let session = sessions
             .get_mut(peer_id)
             .ok_or(crate::CoreError::NoSession)?;
@@ -71,12 +71,18 @@ impl SessionManager {
 
     /// Check if a session exists for a peer.
     pub fn has_session(&self, peer_id: &PeerId) -> bool {
-        self.sessions.lock().unwrap().contains_key(peer_id)
+        self.sessions
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains_key(peer_id)
     }
 
     /// Remove a session (for panic wipe or session close).
     pub fn remove_session(&self, peer_id: &PeerId) {
-        self.sessions.lock().unwrap().remove(peer_id);
+        self.sessions
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(peer_id);
     }
 
     /// Remove all sessions (panic wipe).
@@ -85,7 +91,7 @@ impl SessionManager {
     /// which zeroizes all secret key material (root keys, chain keys,
     /// skipped message keys, DH keys) before releasing memory.
     pub fn wipe_all(&self) {
-        let mut sessions = self.sessions.lock().unwrap();
+        let mut sessions = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
         for (_peer_id, session) in sessions.drain() {
             drop(session);
         }
@@ -93,6 +99,9 @@ impl SessionManager {
 
     /// Get the number of active sessions.
     pub fn session_count(&self) -> usize {
-        self.sessions.lock().unwrap().len()
+        self.sessions
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .len()
     }
 }

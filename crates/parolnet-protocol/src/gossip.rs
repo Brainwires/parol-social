@@ -105,10 +105,9 @@ impl GossipEnvelope {
     }
 
     /// Maximum serialized gossip envelope size (payload + overhead).
-    /// Prevents DoS via unbounded allocation during deserialization.
     const MAX_ENVELOPE_SIZE: usize = MAX_GOSSIP_PAYLOAD + 4096;
 
-    /// Decode a gossip envelope from CBOR bytes.
+    /// Decode a gossip envelope from CBOR bytes with structural validation.
     pub fn from_cbor(data: &[u8]) -> Result<Self, ProtocolError> {
         if data.len() > Self::MAX_ENVELOPE_SIZE {
             return Err(ProtocolError::CborDecode(format!(
@@ -118,16 +117,48 @@ impl GossipEnvelope {
             )));
         }
 
-        let envelope: Self = ciborium::from_reader(data)
+        let env: Self = ciborium::from_reader(data)
             .map_err(|e| ProtocolError::CborDecode(format!("CBOR decode: {e}")))?;
 
-        if !envelope.is_valid_structure() {
+        // Validate required field sizes
+        if env.id.len() != 32 {
+            return Err(ProtocolError::CborDecode("id must be 32 bytes".into()));
+        }
+        if !env.is_anonymous() && env.src_pubkey.len() != 32 {
+            return Err(ProtocolError::CborDecode(
+                "src_pubkey must be 32 bytes".into(),
+            ));
+        }
+        if env.pow.len() != 8 {
+            return Err(ProtocolError::CborDecode("pow must be 8 bytes".into()));
+        }
+        if env.sig.len() != 64 {
+            return Err(ProtocolError::CborDecode("sig must be 64 bytes".into()));
+        }
+        if env.seen.len() != 128 {
+            return Err(ProtocolError::CborDecode(
+                "seen bloom filter must be 128 bytes".into(),
+            ));
+        }
+        if env.payload.len() > MAX_GOSSIP_PAYLOAD {
+            return Err(ProtocolError::CborDecode("payload too large".into()));
+        }
+        if env.ttl > MAX_TTL {
+            return Err(ProtocolError::CborDecode("ttl exceeds maximum".into()));
+        }
+        if env.exp > env.ts + MAX_MESSAGE_AGE_SECS {
+            return Err(ProtocolError::CborDecode(
+                "expiry too far from timestamp".into(),
+            ));
+        }
+
+        if !env.is_valid_structure() {
             return Err(ProtocolError::CborDecode(
                 "invalid gossip envelope structure".into(),
             ));
         }
 
-        Ok(envelope)
+        Ok(env)
     }
 
     /// Get the message ID as a fixed-size array.

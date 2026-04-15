@@ -10,6 +10,62 @@ use crate::address::PeerId;
 use crate::envelope::{CleartextHeader, Envelope};
 use crate::{ProtocolCodec, ProtocolError};
 use serde::{Deserialize, Serialize};
+use std::collections::{HashSet, VecDeque};
+
+/// Replay cache to prevent nonce reuse / replay attacks.
+///
+/// Stores up to `capacity` nonces, evicting the oldest when full.
+pub struct ReplayCache {
+    seen: HashSet<[u8; 32]>,
+    order: VecDeque<[u8; 32]>,
+    capacity: usize,
+}
+
+impl ReplayCache {
+    /// Create a new replay cache with the given capacity.
+    pub fn new(capacity: usize) -> Self {
+        Self {
+            seen: HashSet::with_capacity(capacity),
+            order: VecDeque::with_capacity(capacity),
+            capacity,
+        }
+    }
+
+    /// Check if a nonce has been seen before. If not, insert it and return `true`.
+    /// Returns `false` if the nonce was already in the cache (replay detected).
+    pub fn check_and_insert(&mut self, nonce: &[u8; 32]) -> bool {
+        if self.seen.contains(nonce) {
+            return false;
+        }
+
+        // Evict oldest entries when at capacity
+        while self.seen.len() >= self.capacity {
+            if let Some(oldest) = self.order.pop_front() {
+                self.seen.remove(&oldest);
+            }
+        }
+
+        self.seen.insert(*nonce);
+        self.order.push_back(*nonce);
+        true
+    }
+
+    /// Number of entries currently in the cache.
+    pub fn len(&self) -> usize {
+        self.seen.len()
+    }
+
+    /// Whether the cache is empty.
+    pub fn is_empty(&self) -> bool {
+        self.seen.is_empty()
+    }
+}
+
+impl Default for ReplayCache {
+    fn default() -> Self {
+        Self::new(10_000)
+    }
+}
 
 /// Standard CBOR codec using ciborium.
 pub struct CborCodec;

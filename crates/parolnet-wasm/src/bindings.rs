@@ -18,7 +18,7 @@ pub fn encrypt_message(peer_id_hex: &str, plaintext: &[u8]) -> Result<Vec<u8>, J
     let peer_id_bytes = crate::decode_32(peer_id_hex)?;
     let peer_id = parolnet_protocol::address::PeerId(peer_id_bytes);
 
-    let state = STATE.lock().unwrap();
+    let state = STATE.lock().unwrap_or_else(|e| e.into_inner());
     let client = state
         .client
         .as_ref()
@@ -67,7 +67,7 @@ pub fn decrypt_message(peer_id_hex: &str, ciphertext: &[u8]) -> Result<Vec<u8>, 
         message_number,
     };
 
-    let state = STATE.lock().unwrap();
+    let state = STATE.lock().unwrap_or_else(|e| e.into_inner());
     let client = state
         .client
         .as_ref()

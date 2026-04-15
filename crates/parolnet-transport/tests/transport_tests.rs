@@ -447,10 +447,8 @@ async fn test_websocket_loopback_send_recv() {
     let server_handle = tokio::spawn(async move {
         let (stream, _) = tcp_listener.accept().await.unwrap();
         let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
-        if let Some(Ok(msg)) = ws.next().await {
-            if let Message::Binary(data) = msg {
-                ws.send(Message::Binary(data)).await.unwrap();
-            }
+        if let Some(Ok(Message::Binary(data))) = ws.next().await {
+            ws.send(Message::Binary(data)).await.unwrap();
         }
         ws.close(None).await.ok();
     });
