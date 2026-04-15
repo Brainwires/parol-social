@@ -24,6 +24,7 @@ pub mod ffi;
 pub mod file_transfer;
 pub mod group;
 pub mod group_call;
+pub mod group_file;
 pub mod panic;
 pub mod session;
 #[cfg(feature = "native")]
@@ -54,6 +55,8 @@ pub struct ParolNet {
     group_manager: Arc<group::GroupManager>,
     /// Group call manager.
     group_call_manager: Arc<group_call::GroupCallManager>,
+    /// Group file transfer manager.
+    group_file_manager: Arc<group_file::GroupFileManager>,
 }
 
 impl ParolNet {
@@ -74,6 +77,7 @@ impl ParolNet {
             config,
             group_manager: Arc::new(group::GroupManager::new()),
             group_call_manager: Arc::new(group_call::GroupCallManager::new()),
+            group_file_manager: Arc::new(group_file::GroupFileManager::new()),
         }
     }
 
@@ -93,6 +97,7 @@ impl ParolNet {
             config,
             group_manager: Arc::new(group::GroupManager::new()),
             group_call_manager: Arc::new(group_call::GroupCallManager::new()),
+            group_file_manager: Arc::new(group_file::GroupFileManager::new()),
         }
     }
 
@@ -229,6 +234,9 @@ impl ParolNet {
         // Wipe all group call state
         self.group_call_manager.wipe_all();
 
+        // Wipe all group file transfer state
+        self.group_file_manager.wipe_all();
+
         // Wipe storage
         panic::execute_panic_wipe(self.config.storage_path.as_deref())?;
 
@@ -258,6 +266,11 @@ impl ParolNet {
     /// Get a reference to the group call manager.
     pub fn group_call_manager(&self) -> &group_call::GroupCallManager {
         &self.group_call_manager
+    }
+
+    /// Get a reference to the group file transfer manager.
+    pub fn group_file_manager(&self) -> &group_file::GroupFileManager {
+        &self.group_file_manager
     }
 
     /// Get the number of active sessions.

@@ -474,6 +474,603 @@ pub fn assemble_file(file_id_hex: &str) -> Result<Vec<u8>, JsError> {
         .map_err(|e| JsError::new(&format!("{e}")))
 }
 
+// ── Group Management ───────────────────────────────────────
+
+/// Create a new group. Returns the group_id as hex.
+///
+/// The caller becomes the admin. `now_secs` is the current Unix timestamp.
+#[wasm_bindgen]
+pub fn create_group(name: &str, now_secs: u64) -> Result<String, JsError> {
+    let state = STATE.lock().unwrap_or_else(|e| e.into_inner());
+    let client = state
+        .client
+        .as_ref()
+        .ok_or_else(|| JsError::new("not initialized"))?;
+
+    let peer_id = client.peer_id();
+    let (group_id, _dist) = client
+        .group_manager()
+        .create_group(name.to_string(), peer_id, now_secs)
+        .map_err(|e| JsError::new(&format!("{e}")))?;
+
+    Ok(hex::encode(group_id.0))
+}
+
+/// Join an existing group.
+#[wasm_bindgen]
+pub fn join_group(
+    group_id_hex: &str,
+    name: &str,
+    creator_peer_id_hex: &str,
+    created_at: u64,
+) -> Result<(), JsError> {
+    let group_id_bytes = decode_32(group_id_hex)?;
+    let creator_bytes = decode_32(creator_peer_id_hex)?;
+
+    let group_id = parolnet_protocol::group::GroupId(group_id_bytes);
+    let creator_peer_id = parolnet_protocol::address::PeerId(creator_bytes);
+
+    let state = STATE.lock().unwrap_or_else(|e| e.into_inner());
+    let client = state
+        .client
+        .as_ref()
+        .ok_or_else(|| JsError::new("not initialized"))?;
+
+    let our_peer_id = client.peer_id();
+
+    // Build metadata with creator as admin and us as member
+    let metadata = parolnet_protocol::group::GroupMetadataPayload {
+        group_id,
+        version: 1,
+        name: name.to_string(),
+        members: vec![
+            parolnet_protocol::group::GroupMember {
+                peer_id: creator_peer_id,
+                role: parolnet_protocol::group::GroupRole::Admin,
+                joined_at: created_at,
+            },
+            parolnet_protocol::group::GroupMember {
+                peer_id: our_peer_id,
+                role: parolnet_protocol::group::GroupRole::Member,
+                joined_at: created_at,
+            },
+        ],
+        created_by: creator_peer_id,
+        created_at,
+        max_members: parolnet_protocol::group::MAX_GROUP_MEMBERS,
+    };
+
+    client
+        .group_manager()
+        .join_group(group_id, metadata, our_peer_id)
+        .map_err(|e| JsError::new(&format!("{e}")))?;
+
+    Ok(())
+}
+
+/// Leave a group.
+#[wasm_bindgen]
+pub fn leave_group(group_id_hex: &str) -> Result<(), JsError> {
+    let group_id_bytes = decode_32(group_id_hex)?;
+    let group_id = parolnet_protocol::group::GroupId(group_id_bytes);
+
+    let state = STATE.lock().unwrap_or_else(|e| e.into_inner());
+    let client = state
+        .client
+        .as_ref()
+        .ok_or_else(|| JsError::new("not initialized"))?;
+
+    client
+        .group_manager()
+        .leave_group(&group_id)
+        .map_err(|e| JsError::new(&format!("{e}")))?;
+
+    Ok(())
+}
+
+/// Get the members of a group. Returns a JSON array of `{peer_id, role, joined_at}`.
+#[wasm_bindgen]
+pub fn get_group_members(group_id_hex: &str) -> Result<JsValue, JsError> {
+    let group_id_bytes = decode_32(group_id_hex)?;
+    let group_id = parolnet_protocol::group::GroupId(group_id_bytes);
+
+    let state = STATE.lock().unwrap_or_else(|e| e.into_inner());
+    let client = state
+        .client
+        .as_ref()
+        .ok_or_else(|| JsError::new("not initialized"))?;
+
+    let members = client
+        .group_manager()
+        .get_members(&group_id)
+        .map_err(|e| JsError::new(&format!("{e}")))?;
+
+    #[derive(serde::Serialize)]
+    struct MemberJs {
+        peer_id: String,
+        role: String,
+        joined_at: u64,
+    }
+
+    let result: Vec<MemberJs> = members
+        .iter()
+        .map(|m| MemberJs {
+            peer_id: hex::encode(m.peer_id.0),
+            role: format!("{:?}", m.role).to_lowercase(),
+            joined_at: m.joined_at,
+        })
+        .collect();
+
+    serde_wasm_bindgen::to_value(&result).map_err(|e| JsError::new(&format!("serialize: {e}")))
+}
+
+/// Add a member to a group (admin only).
+#[wasm_bindgen]
+pub fn add_group_member(
+    group_id_hex: &str,
+    peer_id_hex: &str,
+    now_secs: u64,
+) -> Result<(), JsError> {
+    let group_id_bytes = decode_32(group_id_hex)?;
+    let peer_id_bytes = decode_32(peer_id_hex)?;
+
+    let group_id = parolnet_protocol::group::GroupId(group_id_bytes);
+    let new_member = parolnet_protocol::address::PeerId(peer_id_bytes);
+
+    let state = STATE.lock().unwrap_or_else(|e| e.into_inner());
+    let client = state
+        .client
+        .as_ref()
+        .ok_or_else(|| JsError::new("not initialized"))?;
+
+    let admin_peer_id = client.peer_id();
+
+    client
+        .group_manager()
+        .add_member(&group_id, &admin_peer_id, new_member, now_secs)
+        .map_err(|e| JsError::new(&format!("{e}")))?;
+
+    Ok(())
+}
+
+/// Remove a member from a group (admin only). Rotates sender key.
+#[wasm_bindgen]
+pub fn remove_group_member(
+    group_id_hex: &str,
+    peer_id_hex: &str,
+    now_secs: u64,
+) -> Result<(), JsError> {
+    let group_id_bytes = decode_32(group_id_hex)?;
+    let peer_id_bytes = decode_32(peer_id_hex)?;
+
+    let group_id = parolnet_protocol::group::GroupId(group_id_bytes);
+    let target = parolnet_protocol::address::PeerId(peer_id_bytes);
+
+    let state = STATE.lock().unwrap_or_else(|e| e.into_inner());
+    let client = state
+        .client
+        .as_ref()
+        .ok_or_else(|| JsError::new("not initialized"))?;
+
+    let admin_peer_id = client.peer_id();
+
+    client
+        .group_manager()
+        .remove_member(&group_id, &admin_peer_id, &target, now_secs)
+        .map_err(|e| JsError::new(&format!("{e}")))?;
+
+    Ok(())
+}
+
+// ── Group Text ─────────────────────────────────────────────
+
+/// Encrypt a text message for a group using sender keys.
+///
+/// Returns `{ chain_index, ciphertext_hex, signature_hex }`.
+#[wasm_bindgen]
+pub fn send_group_text(group_id_hex: &str, plaintext: &str) -> Result<JsValue, JsError> {
+    let group_id_bytes = decode_32(group_id_hex)?;
+    let group_id = parolnet_protocol::group::GroupId(group_id_bytes);
+
+    let state = STATE.lock().unwrap_or_else(|e| e.into_inner());
+    let client = state
+        .client
+        .as_ref()
+        .ok_or_else(|| JsError::new("not initialized"))?;
+
+    let (_peer_id, msg) = client
+        .group_manager()
+        .encrypt_group_text(&group_id, plaintext.as_bytes())
+        .map_err(|e| JsError::new(&format!("{e}")))?;
+
+    #[derive(serde::Serialize)]
+    struct GroupTextResult {
+        chain_index: u32,
+        ciphertext_hex: String,
+        signature_hex: String,
+    }
+
+    let result = GroupTextResult {
+        chain_index: msg.chain_index,
+        ciphertext_hex: hex::encode(&msg.ciphertext),
+        signature_hex: hex::encode(&msg.signature),
+    };
+
+    serde_wasm_bindgen::to_value(&result).map_err(|e| JsError::new(&format!("serialize: {e}")))
+}
+
+/// Decrypt a group text message from another member.
+///
+/// Returns the plaintext string.
+#[wasm_bindgen]
+pub fn recv_group_text(
+    group_id_hex: &str,
+    sender_peer_id_hex: &str,
+    chain_index: u32,
+    ciphertext_hex: &str,
+    signature_hex: &str,
+) -> Result<String, JsError> {
+    let group_id_bytes = decode_32(group_id_hex)?;
+    let sender_bytes = decode_32(sender_peer_id_hex)?;
+
+    let group_id = parolnet_protocol::group::GroupId(group_id_bytes);
+    let sender_peer_id = parolnet_protocol::address::PeerId(sender_bytes);
+
+    let ciphertext =
+        hex::decode(ciphertext_hex).map_err(|e| JsError::new(&format!("invalid hex: {e}")))?;
+    let signature =
+        hex::decode(signature_hex).map_err(|e| JsError::new(&format!("invalid hex: {e}")))?;
+
+    let msg = parolnet_crypto::sender_key::SenderKeyMessage {
+        chain_index,
+        ciphertext,
+        signature,
+    };
+
+    let state = STATE.lock().unwrap_or_else(|e| e.into_inner());
+    let client = state
+        .client
+        .as_ref()
+        .ok_or_else(|| JsError::new("not initialized"))?;
+
+    let plaintext = client
+        .group_manager()
+        .decrypt_group_text(&group_id, &sender_peer_id, &msg)
+        .map_err(|e| JsError::new(&format!("{e}")))?;
+
+    String::from_utf8(plaintext).map_err(|e| JsError::new(&format!("invalid UTF-8: {e}")))
+}
+
+/// Process a sender key distribution from another group member.
+///
+/// This must be called before decrypting messages from that member.
+#[wasm_bindgen]
+pub fn process_sender_key(
+    group_id_hex: &str,
+    sender_peer_id_hex: &str,
+    chain_key_hex: &str,
+    chain_index: u32,
+    signing_public_key_hex: &str,
+) -> Result<(), JsError> {
+    let group_id_bytes = decode_32(group_id_hex)?;
+    let sender_bytes = decode_32(sender_peer_id_hex)?;
+    let chain_key = decode_32(chain_key_hex)?;
+    let signing_public_key = decode_32(signing_public_key_hex)?;
+
+    let group_id = parolnet_protocol::group::GroupId(group_id_bytes);
+    let sender_peer_id = parolnet_protocol::address::PeerId(sender_bytes);
+
+    let dist = parolnet_crypto::sender_key::SenderKeyDistribution {
+        sender_peer_id: sender_bytes,
+        chain_key,
+        chain_index,
+        signing_public_key,
+    };
+
+    let state = STATE.lock().unwrap_or_else(|e| e.into_inner());
+    let client = state
+        .client
+        .as_ref()
+        .ok_or_else(|| JsError::new("not initialized"))?;
+
+    client
+        .group_manager()
+        .process_sender_key_distribution(&group_id, sender_peer_id, &dist)
+        .map_err(|e| JsError::new(&format!("{e}")))?;
+
+    Ok(())
+}
+
+/// Get our sender key distribution for a group.
+///
+/// Returns `{ chain_key_hex, chain_index, signing_public_key_hex }`.
+#[wasm_bindgen]
+pub fn get_sender_key_distribution(group_id_hex: &str) -> Result<JsValue, JsError> {
+    let group_id_bytes = decode_32(group_id_hex)?;
+    let group_id = parolnet_protocol::group::GroupId(group_id_bytes);
+
+    let state = STATE.lock().unwrap_or_else(|e| e.into_inner());
+    let client = state
+        .client
+        .as_ref()
+        .ok_or_else(|| JsError::new("not initialized"))?;
+
+    let dist = client
+        .group_manager()
+        .get_our_distribution(&group_id)
+        .map_err(|e| JsError::new(&format!("{e}")))?;
+
+    #[derive(serde::Serialize)]
+    struct DistJs {
+        chain_key_hex: String,
+        chain_index: u32,
+        signing_public_key_hex: String,
+    }
+
+    let result = DistJs {
+        chain_key_hex: hex::encode(dist.chain_key),
+        chain_index: dist.chain_index,
+        signing_public_key_hex: hex::encode(dist.signing_public_key),
+    };
+
+    serde_wasm_bindgen::to_value(&result).map_err(|e| JsError::new(&format!("serialize: {e}")))
+}
+
+// ── Group Calls ────────────────────────────────────────────
+
+/// Start a new group call. Returns the call_id as hex.
+#[wasm_bindgen]
+pub fn start_group_call(group_id_hex: &str) -> Result<String, JsError> {
+    let group_id_bytes = decode_32(group_id_hex)?;
+    let group_id = parolnet_protocol::group::GroupId(group_id_bytes);
+
+    let state = STATE.lock().unwrap_or_else(|e| e.into_inner());
+    let client = state
+        .client
+        .as_ref()
+        .ok_or_else(|| JsError::new("not initialized"))?;
+
+    let our_peer_id = client.peer_id();
+
+    let call_id = client
+        .group_call_manager()
+        .start_call(group_id, our_peer_id)
+        .map_err(|e| JsError::new(&format!("{e}")))?;
+
+    Ok(hex::encode(call_id))
+}
+
+/// Join an existing group call.
+#[wasm_bindgen]
+pub fn join_group_call(call_id_hex: &str, peer_id_hex: &str) -> Result<(), JsError> {
+    let call_id = decode_16(call_id_hex)?;
+    let peer_id_bytes = decode_32(peer_id_hex)?;
+    let peer_id = parolnet_protocol::address::PeerId(peer_id_bytes);
+
+    let state = STATE.lock().unwrap_or_else(|e| e.into_inner());
+    let client = state
+        .client
+        .as_ref()
+        .ok_or_else(|| JsError::new("not initialized"))?;
+
+    client
+        .group_call_manager()
+        .join_call(&call_id, peer_id)
+        .map_err(|e| JsError::new(&format!("{e}")))?;
+
+    Ok(())
+}
+
+/// Leave an existing group call.
+#[wasm_bindgen]
+pub fn leave_group_call(call_id_hex: &str, peer_id_hex: &str) -> Result<(), JsError> {
+    let call_id = decode_16(call_id_hex)?;
+    let peer_id_bytes = decode_32(peer_id_hex)?;
+    let peer_id = parolnet_protocol::address::PeerId(peer_id_bytes);
+
+    let state = STATE.lock().unwrap_or_else(|e| e.into_inner());
+    let client = state
+        .client
+        .as_ref()
+        .ok_or_else(|| JsError::new("not initialized"))?;
+
+    client
+        .group_call_manager()
+        .leave_call(&call_id, &peer_id)
+        .map_err(|e| JsError::new(&format!("{e}")))?;
+
+    Ok(())
+}
+
+/// Get participants in a group call. Returns a JSON array of peer_id hex strings.
+#[wasm_bindgen]
+pub fn get_group_call_participants(call_id_hex: &str) -> Result<JsValue, JsError> {
+    let call_id = decode_16(call_id_hex)?;
+
+    let state = STATE.lock().unwrap_or_else(|e| e.into_inner());
+    let client = state
+        .client
+        .as_ref()
+        .ok_or_else(|| JsError::new("not initialized"))?;
+
+    let participants = client
+        .group_call_manager()
+        .get_participants(&call_id)
+        .map_err(|e| JsError::new(&format!("{e}")))?;
+
+    let result: Vec<String> = participants.iter().map(|p| hex::encode(p.0)).collect();
+
+    serde_wasm_bindgen::to_value(&result).map_err(|e| JsError::new(&format!("serialize: {e}")))
+}
+
+/// Get the state of a group call. Returns "idle", "active", or "ended".
+#[wasm_bindgen]
+pub fn get_group_call_state(call_id_hex: &str) -> Result<String, JsError> {
+    let call_id = decode_16(call_id_hex)?;
+
+    let state = STATE.lock().unwrap_or_else(|e| e.into_inner());
+    let client = state
+        .client
+        .as_ref()
+        .ok_or_else(|| JsError::new("not initialized"))?;
+
+    let call_state = client.group_call_manager().get_state(&call_id);
+    let name = match call_state {
+        Some(s) => format!("{:?}", s).to_lowercase(),
+        None => "unknown".to_string(),
+    };
+    Ok(name)
+}
+
+// ── Group File Transfer ────────────────────────────────────
+
+/// Create a new group file transfer. Returns `{ file_id_hex, total_chunks, file_size }`.
+#[wasm_bindgen]
+pub fn create_group_file_transfer(
+    group_id_hex: &str,
+    data: &[u8],
+    filename: &str,
+) -> Result<JsValue, JsError> {
+    let group_id_bytes = decode_32(group_id_hex)?;
+    let group_id = parolnet_protocol::group::GroupId(group_id_bytes);
+
+    let state = STATE.lock().unwrap_or_else(|e| e.into_inner());
+    let client = state
+        .client
+        .as_ref()
+        .ok_or_else(|| JsError::new("not initialized"))?;
+
+    let (file_id, offer) = client.group_file_manager().create_send(
+        group_id,
+        filename.to_string(),
+        data.to_vec(),
+    );
+
+    #[derive(serde::Serialize)]
+    struct CreateResult {
+        file_id_hex: String,
+        total_chunks: u32,
+        file_size: u64,
+    }
+
+    let result = CreateResult {
+        file_id_hex: hex::encode(file_id),
+        total_chunks: offer.offer.total_chunks(),
+        file_size: offer.offer.file_size,
+    };
+
+    serde_wasm_bindgen::to_value(&result).map_err(|e| JsError::new(&format!("serialize: {e}")))
+}
+
+/// Get the next chunk from an outgoing group file transfer.
+///
+/// Returns `{ chunk_index, data_hex }` or null if all chunks are sent.
+#[wasm_bindgen]
+pub fn get_group_file_next_chunk(file_id_hex: &str) -> Result<JsValue, JsError> {
+    let file_id = decode_16(file_id_hex)?;
+
+    let state = STATE.lock().unwrap_or_else(|e| e.into_inner());
+    let client = state
+        .client
+        .as_ref()
+        .ok_or_else(|| JsError::new("not initialized"))?;
+
+    match client.group_file_manager().get_next_chunk(&file_id) {
+        Some(chunk) => {
+            #[derive(serde::Serialize)]
+            struct ChunkJs {
+                chunk_index: u32,
+                data_hex: String,
+            }
+            let result = ChunkJs {
+                chunk_index: chunk.chunk_index,
+                data_hex: hex::encode(&chunk.data),
+            };
+            serde_wasm_bindgen::to_value(&result)
+                .map_err(|e| JsError::new(&format!("serialize: {e}")))
+        }
+        None => Ok(JsValue::NULL),
+    }
+}
+
+/// Register an incoming group file transfer from a received offer.
+#[wasm_bindgen]
+pub fn receive_group_file_offer(
+    file_id_hex: &str,
+    group_id_hex: &str,
+    file_name: &str,
+    file_size: u64,
+    chunk_size: u32,
+    sha256_hex: &str,
+) -> Result<(), JsError> {
+    let file_id = decode_16(file_id_hex)?;
+    let group_id_bytes = decode_32(group_id_hex)?;
+    let sha256 = decode_32(sha256_hex)?;
+
+    let group_id = parolnet_protocol::group::GroupId(group_id_bytes);
+
+    let offer = parolnet_protocol::group::GroupFileOffer {
+        group_id,
+        offer: parolnet_protocol::file::FileOffer {
+            file_id,
+            file_name: file_name.to_string(),
+            file_size,
+            chunk_size,
+            sha256,
+            mime_type: None,
+        },
+    };
+
+    let state = STATE.lock().unwrap_or_else(|e| e.into_inner());
+    let client = state
+        .client
+        .as_ref()
+        .ok_or_else(|| JsError::new("not initialized"))?;
+
+    client.group_file_manager().receive_offer(&offer);
+    Ok(())
+}
+
+/// Receive a chunk for an incoming group file transfer. Returns true if complete.
+#[wasm_bindgen]
+pub fn receive_group_file_chunk(
+    file_id_hex: &str,
+    chunk_index: u32,
+    data: &[u8],
+) -> Result<bool, JsError> {
+    let file_id = decode_16(file_id_hex)?;
+
+    let state = STATE.lock().unwrap_or_else(|e| e.into_inner());
+    let client = state
+        .client
+        .as_ref()
+        .ok_or_else(|| JsError::new("not initialized"))?;
+
+    client
+        .group_file_manager()
+        .receive_chunk(&file_id, chunk_index, data.to_vec())
+        .map_err(|e| JsError::new(&format!("{e}")))?;
+
+    Ok(client.group_file_manager().is_recv_complete(&file_id))
+}
+
+/// Reassemble a completed group file transfer and return the raw bytes.
+#[wasm_bindgen]
+pub fn assemble_group_file(file_id_hex: &str) -> Result<Vec<u8>, JsError> {
+    let file_id = decode_16(file_id_hex)?;
+
+    let state = STATE.lock().unwrap_or_else(|e| e.into_inner());
+    let client = state
+        .client
+        .as_ref()
+        .ok_or_else(|| JsError::new("not initialized"))?;
+
+    client
+        .group_file_manager()
+        .assemble_file(&file_id)
+        .map_err(|e| JsError::new(&format!("{e}")))
+}
+
 // ── Decoy Mode / Unlock Code ────────────────────────────────
 
 /// Set an unlock code. The code is SHA-256 hashed before storage.
