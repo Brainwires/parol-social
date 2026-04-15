@@ -1,8 +1,8 @@
 # ParolNet Threat Model
 
 ### Document Status: DRAFT
-### Version: 0.1
-### Date: 2026-04-10
+### Version: 0.2
+### Date: 2026-04-15
 ### Framework: STRIDE (Microsoft)
 
 ---
@@ -56,6 +56,8 @@ The system is composed of seven Rust crates arranged in a layered dependency hie
 | Relay Circuits | PNP-004 | 3-hop onion routing, 512-byte fixed cells, per-hop X25519 key exchange |
 | Gossip/Mesh | PNP-005 | Epidemic propagation, bloom filter deduplication, PoW anti-spam, store-forward |
 | Traffic Shaping | PNP-006 | TLS fingerprint mimicry, constant-rate padding, DPI evasion |
+| Media Transfer | PNP-007 | Chunked encrypted file transfer |
+| Relay Federation | PNP-008 | Authority-endorsed relays, federated trust model, relay-to-relay directory sync |
 
 ### 1.3 Key Design Invariants
 
@@ -186,7 +188,7 @@ The system is composed of seven Rust crates arranged in a layered dependency hie
 | # | Threat | STRIDE Category | Mitigation | Residual Risk |
 |---|--------|----------------|------------|---------------|
 | R-1 | Single compromised relay deanonymizes circuit | Information Disclosure | 3-hop onion routing ensures no single relay knows both origin and destination (PNP-004 Section 7.1). Guard knows OP IP but not destination. Exit knows destination but not OP. | Compromising all 3 hops simultaneously breaks anonymity. Guard node reuse (PNP-004 Section 5.7) limits the probability of adversary selection as first hop but creates a long-term target. |
-| R-2 | Sybil attack on relay directory | Spoofing / Elevation of Privilege | Relay descriptors are Ed25519-signed (PNP-004 Section 5.6). PeerId verified as SHA-256(pubkey). No two hops may share same /16 IPv4 or /48 IPv6 prefix (PNP-004 Section 5.7). PoW difficulty 20 for RELAY_DESCRIPTOR messages (PNP-005 Section 5.6). | An adversary with many IP addresses across diverse subnets can still inject Sybil relays. There is no centralized directory authority to vet relays, unlike Tor. Gossip-based directory is more censorship-resistant but more vulnerable to Sybil injection. |
+| R-2 | Sybil attack on relay directory | Spoofing / Elevation of Privilege | Relay descriptors are Ed25519-signed (PNP-004 Section 5.6). PeerId verified as SHA-256(pubkey). No two hops may share same /16 IPv4 or /48 IPv6 prefix (PNP-004 Section 5.7). PoW difficulty 20 for RELAY_DESCRIPTOR messages (PNP-005 Section 5.6). **Federated trust model (PNP-008)**: relays must be endorsed by a threshold of authority key holders (e.g. 2-of-3) before clients accept them. Authority pubkeys are baked into the PWA at build time. | An adversary must compromise multiple authority key holders (threshold) to inject Sybil relays. Key holders should be in different jurisdictions. If all authority keys are compromised simultaneously, the network must be rebuilt with new keys (users export/reimport data). |
 | R-3 | Replay attack on circuit cells | Tampering | Monotonically increasing nonce counter per circuit direction (PNP-004 Section 5.1). AEAD tag validation rejects replayed cells. Circuit destroyed at counter 2^32 to prevent overflow (PNP-004 Section 5.1 step 5, Section 6.6). | None identified for cell replay. |
 | R-4 | Tagging attack (malicious relay modifies cell to trace it) | Tampering | AEAD authentication on every layer. Modified cells produce invalid tags at subsequent hops and are dropped. RELAY_EARLY hop counter prevents circuit extension attacks (PNP-004 Section 6.5). | A relay can drop cells selectively (rather than modify them) to perform a selective DoS, which may be detectable by the OP as circuit degradation. |
 | R-5 | Timing correlation across circuit hops | Information Disclosure | Constant-rate PADDING cells between all adjacent hop pairs at 1 cell/500ms when idle (PNP-004 Section 5.9). Jitter on all sends (PNP-006 Section 4.4). Fixed 512-byte cell size eliminates size correlation. | A global passive adversary observing all links simultaneously can still perform statistical traffic confirmation. This is an inherent limitation shared with all low-latency anonymity networks including Tor. |
@@ -406,9 +408,9 @@ The gossip layer necessarily exposes message metadata (source PeerId, TTL, times
 
 Local network discovery via mDNS uses the service type `_parolnet._tcp` (PNP-005 Section 5.9, PNP-003 Section 5.6), which unambiguously identifies a ParolNet user to any local network observer. In high-threat environments (e.g., monitored office networks, university campuses in authoritarian states), this is a significant risk. Users MUST be able to disable local discovery entirely.
 
-### 6.8 No Centralized Relay Vetting
+### 6.8 Federated Authority Trust Model
 
-Unlike Tor's directory authorities, ParolNet's relay directory is distributed via gossip. There is no authority to vet relay operators, flag malicious relays, or coordinate relay bans. PoW requirements (PNP-005 Section 5.6) raise the cost of Sybil attacks but do not prevent them from well-resourced adversaries. The gossip-based directory is more censorship-resistant but more vulnerable to Sybil injection than a centralized directory model.
+ParolNet uses a federated trust model (PNP-008) where authority Ed25519 public keys are baked into each PWA build. Relays must be endorsed by a threshold of authority key holders (e.g. 2-of-3) before clients accept them. This prevents Sybil attacks from state actors who cannot compromise multiple authority key holders simultaneously. However, this model has its own limitations: if all authority keys are compromised, the entire network must be rebuilt with new keys. Authority key holders are a high-value target. Key holders should be in separate jurisdictions and never store private keys on internet-connected machines. Relay-to-relay directory sync ensures no single relay is a point of failure — any single relay alive keeps the full directory available.
 
 ### 6.9 WASM Execution Environment
 
@@ -465,9 +467,11 @@ The system is designed to resist censorship through:
 - No single point of failure or control (decentralized)
 - Traffic indistinguishable from normal browsing (resists DPI-based blocking)
 - Relay probing returns plausible web content (resists active probing)
-- Gossip-based relay directory (no directory authority to censor)
+- Federated authority-endorsed relay directory with relay-to-relay sync (PNP-008) — any single relay alive keeps the full network reachable
+- Client fallback chain: cached directory → bundled bootstrap → relay discovery
 - Offline mesh capability via mDNS/BLE (survives internet shutdowns)
 - Domain fronting support where available (PNP-006 Section 5.2)
+- Encrypted data export/import — if app source is taken down, users export data, download from new source, reimport. Export file is opaque (indistinguishable from random bytes)
 
 ### 7.8 Panic Wipe / Data Destruction
 
@@ -511,3 +515,4 @@ Which adversary profiles pose which threats:
 | Version | Date | Author | Changes |
 |---------|------|--------|---------|
 | 0.1 | 2026-04-10 | ParolNet Team | Initial draft |
+| 0.2 | 2026-04-15 | ParolNet Team | Updated R-2 Sybil mitigations and Section 6.8 for federated authority trust model (PNP-008). Added relay resilience and encrypted data export to Section 7.7. |

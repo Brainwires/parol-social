@@ -240,7 +240,49 @@ Organizations that fund censorship circumvention and digital rights tools:
 
 ---
 
-## 9. Resilience Against Takedown
+## 9. Maintaining Network Integrity
+
+### 9.1 Federated Trust Model
+ParolNet uses a federated authority system to prevent network infiltration:
+- When a network is created, 2-3 trusted people each receive an **authority key** (Ed25519 keypair)
+- Only relays **endorsed by a threshold of authorities** (e.g. 2-of-3) are accepted by the app
+- Authority public keys are baked into the PWA at build time — users cannot be tricked into connecting to rogue relays
+- A state actor cannot spin up fake relays to harvest user IPs without compromising multiple authority key holders
+
+### 9.2 Sybil Attack Prevention
+- Without authority endorsement, a relay is invisible to the network
+- Endorsements expire — compromised or abandoned relays are automatically dropped
+- Each endorsement is cryptographically signed and verified by every client
+- The threshold requirement means a single compromised authority cannot inject malicious relays
+
+### 9.3 Relay Operator Vetting
+- Authority key holders are the gatekeepers — they must personally verify relay operators before endorsing
+- Endorsements should include expiry dates (e.g. 365 days) to force periodic re-vetting
+- If a relay operator is compromised, simply let their endorsement expire — no app update needed
+- Keep authority key holders in different jurisdictions when possible — harder to coerce all of them simultaneously
+
+### 9.4 Network Identity
+- Each network has a deterministic identity: `SHA-256(sorted authority pubkeys)`
+- Users can verify they're on the correct network by comparing network IDs
+- Different communities can run entirely separate ParolNet networks with their own authority keys
+- Networks are isolated by design — a compromised network cannot affect other networks
+
+### 9.5 Key Compromise Response
+- If one authority key is lost or compromised: the network still functions (2-of-3 threshold)
+- If two keys are compromised: rebuild the network with new keys, users export/reimport their data
+- Authority private keys must NEVER be on relay servers, in the PWA, or on internet-connected machines used for other purposes
+- See [STARTUP-GUIDE.md](STARTUP-GUIDE.md) for key management procedures
+
+### 9.6 Relay-to-Relay Resilience
+- Every relay syncs the full directory with every other relay
+- If all but one relay goes down, the surviving relay has the complete directory
+- Clients cache the relay directory locally — they can reconnect even after extended outages
+- Bootstrap relay addresses are bundled in the PWA for first-launch discovery
+- Any single relay alive = entire network reachable
+
+---
+
+## 10. Resilience Against Takedown
 
 ### 9.1 No Single Point of Failure
 - No central server to shut down
@@ -270,7 +312,7 @@ Organizations that fund censorship circumvention and digital rights tools:
 
 ---
 
-## 10. Metrics for Success
+## 11. Metrics for Success
 
 How do we know if ParolNet is working?
 
