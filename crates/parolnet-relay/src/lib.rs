@@ -104,6 +104,12 @@ impl RelayCell {
         let circuit_id = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]);
         let cell_type = CellType::from_u8(buf[4]).ok_or(RelayError::InvalidCellType(buf[4]))?;
         let payload_len = u16::from_be_bytes([buf[5], buf[6]]);
+        if payload_len as usize > CELL_PAYLOAD_SIZE {
+            return Err(RelayError::CellError(format!(
+                "payload_len {} exceeds cell payload size {}",
+                payload_len, CELL_PAYLOAD_SIZE
+            )));
+        }
         let mut payload = [0u8; CELL_PAYLOAD_SIZE];
         payload.copy_from_slice(&buf[7..]);
         Ok(Self {

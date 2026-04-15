@@ -80,8 +80,15 @@ impl SessionManager {
     }
 
     /// Remove all sessions (panic wipe).
+    ///
+    /// Explicitly drops each session to trigger `DoubleRatchetSession::Drop`,
+    /// which zeroizes all secret key material (root keys, chain keys,
+    /// skipped message keys, DH keys) before releasing memory.
     pub fn wipe_all(&self) {
-        self.sessions.lock().unwrap().clear();
+        let mut sessions = self.sessions.lock().unwrap();
+        for (_peer_id, session) in sessions.drain() {
+            drop(session);
+        }
     }
 
     /// Get the number of active sessions.

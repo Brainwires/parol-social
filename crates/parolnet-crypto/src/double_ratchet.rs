@@ -11,13 +11,13 @@ use crate::{Aead, CryptoError, RatchetHeader, RatchetSession};
 use rand::rngs::OsRng;
 use std::collections::HashMap;
 use x25519_dalek::{PublicKey, StaticSecret};
-use zeroize::{Zeroize, ZeroizeOnDrop};
+use zeroize::Zeroize;
 
 /// Maximum number of skipped message keys to store.
 const MAX_SKIP: u32 = 1000;
 
 /// State for an active Double Ratchet session.
-#[derive(Zeroize, ZeroizeOnDrop)]
+#[derive(Zeroize)]
 pub struct DoubleRatchetSession {
     /// Root key — ratcheted on each DH ratchet step.
     root_key: [u8; 32],
@@ -181,6 +181,30 @@ impl DoubleRatchetSession {
             }
         }
         Ok(())
+    }
+}
+
+/// Manual `Drop` to zeroize key material that `#[zeroize(skip)]` excludes:
+/// - `skipped_keys`: HashMap values contain message keys (secret material).
+/// - `dh_remote`: `PublicKey` does not implement `Zeroize`; we manually wipe its bytes.
+/// - `dh_self`: `StaticSecret` implements `ZeroizeOnDrop` natively, so the skip is safe.
+impl Drop for DoubleRatchetSession {
+    fn drop(&mut self) {
+        // Zeroize the derive-Zeroize fields (root_key, chain keys, etc.)
+        self.zeroize();
+
+        // Zeroize all skipped message keys (HashMap is #[zeroize(skip)])
+        for value in self.skipped_keys.values_mut() {
+            value.zeroize();
+        }
+        self.skipped_keys.clear();
+
+        // Zeroize the remote public key bytes via unsafe cast
+        // (PublicKey does not implement Zeroize)
+        if let Some(ref mut pk) = self.dh_remote {
+            let bytes: &mut [u8; 32] = unsafe { &mut *(pk as *mut PublicKey as *mut [u8; 32]) };
+            bytes.zeroize();
+        }
     }
 }
 

@@ -6,7 +6,14 @@
 use crate::error::RelayError;
 use crate::onion::HopKeys;
 use crate::{CELL_PAYLOAD_SIZE, CellType, RelayCell};
+use hmac::{Hmac, Mac};
+use sha2::Sha256;
 use x25519_dalek::{PublicKey, StaticSecret};
+
+type HmacSha256 = Hmac<Sha256>;
+
+/// HMAC key confirmation label for CREATED cells (PNP-004).
+const CREATED_HMAC_LABEL: &[u8] = b"prcp-created-v1";
 
 /// Circuit handshake utilities for CREATE/CREATED and EXTEND/EXTENDED cells.
 pub struct CircuitHandshake;
@@ -51,21 +58,31 @@ impl CircuitHandshake {
         let keys = HopKeys::from_shared_secret(shared.as_bytes())
             .map_err(|e| RelayError::KeyExchangeFailed(format!("{e}")))?;
 
-        // Our public key goes in the CREATED response
+        // Our public key goes in the CREATED response, followed by HMAC key confirmation
         let our_public = PublicKey::from(our_x25519_secret);
         let mut payload = [0u8; CELL_PAYLOAD_SIZE];
         payload[..32].copy_from_slice(our_public.as_bytes());
+
+        // HMAC-SHA256(shared_secret, "prcp-created-v1") for key confirmation
+        let mut mac = HmacSha256::new_from_slice(shared.as_bytes())
+            .map_err(|e| RelayError::KeyExchangeFailed(format!("HMAC init: {e}")))?;
+        mac.update(CREATED_HMAC_LABEL);
+        let hmac_result = mac.finalize().into_bytes();
+        payload[32..64].copy_from_slice(&hmac_result);
 
         let created = RelayCell {
             circuit_id: cell.circuit_id,
             cell_type: CellType::Created,
             payload,
-            payload_len: 32,
+            payload_len: 64,
         };
         Ok((created, keys))
     }
 
     /// Client side: process a CREATED cell using our secret to derive the same keys.
+    ///
+    /// Verifies the HMAC key confirmation to ensure both sides derived the same
+    /// shared secret before committing to the derived keys.
     pub fn process_created(
         cell: &RelayCell,
         our_secret: &StaticSecret,
@@ -79,6 +96,22 @@ impl CircuitHandshake {
         let relay_public = PublicKey::from(relay_pub);
 
         let shared = our_secret.diffie_hellman(&relay_public);
+
+        // Verify HMAC key confirmation
+        let mut mac = HmacSha256::new_from_slice(shared.as_bytes())
+            .map_err(|e| RelayError::KeyExchangeFailed(format!("HMAC init: {e}")))?;
+        mac.update(CREATED_HMAC_LABEL);
+        let expected_hmac = mac.finalize().into_bytes();
+
+        let received_hmac = &cell.payload[32..64];
+        let hmac_ok: bool =
+            subtle::ConstantTimeEq::ct_eq(received_hmac, expected_hmac.as_slice()).into();
+        if !hmac_ok {
+            return Err(RelayError::KeyExchangeFailed(
+                "CREATED HMAC key confirmation failed".into(),
+            ));
+        }
+
         HopKeys::from_shared_secret(shared.as_bytes())
             .map_err(|e| RelayError::KeyExchangeFailed(format!("{e}")))
     }

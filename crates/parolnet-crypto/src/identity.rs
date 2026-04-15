@@ -6,13 +6,13 @@
 use crate::CryptoError;
 use ed25519_dalek::Signer;
 use rand::rngs::OsRng;
-use zeroize::{Zeroize, ZeroizeOnDrop};
+use zeroize::Zeroize;
 
 /// A signed pre-key (medium-term X25519 keypair, signed by the identity key).
 ///
 /// Rotated every 7-30 days. The previous SPK should be retained for one
 /// additional rotation period to handle in-flight handshakes.
-#[derive(Zeroize, ZeroizeOnDrop)]
+#[derive(Zeroize)]
 pub struct SignedPreKey {
     pub id: u32,
     #[zeroize(skip)]
@@ -20,6 +20,20 @@ pub struct SignedPreKey {
     #[zeroize(skip)]
     pub public_key: x25519_dalek::PublicKey,
     pub signature: [u8; 64],
+}
+
+/// Manual `Drop` to zeroize the X25519 `PublicKey` bytes that `#[zeroize(skip)]` excludes.
+/// `StaticSecret` (private_key) implements `ZeroizeOnDrop` natively, so its skip is safe.
+impl Drop for SignedPreKey {
+    fn drop(&mut self) {
+        // Zeroize derive-Zeroize fields (id, signature)
+        self.zeroize();
+        // Zeroize the PublicKey bytes (not impl Zeroize, hence #[zeroize(skip)])
+        let bytes: &mut [u8; 32] = unsafe {
+            &mut *(&mut self.public_key as *mut x25519_dalek::PublicKey as *mut [u8; 32])
+        };
+        bytes.zeroize();
+    }
 }
 
 impl SignedPreKey {
@@ -60,13 +74,26 @@ impl SignedPreKey {
 /// A one-time pre-key (ephemeral X25519 keypair, used exactly once).
 ///
 /// Peers should maintain a pool of 20-100 OPKs and replenish proactively.
-#[derive(Zeroize, ZeroizeOnDrop)]
+#[derive(Zeroize)]
 pub struct OneTimePreKeyPair {
     pub id: u32,
     #[zeroize(skip)]
     pub private_key: x25519_dalek::StaticSecret,
     #[zeroize(skip)]
     pub public_key: x25519_dalek::PublicKey,
+}
+
+/// Manual `Drop` to zeroize the X25519 `PublicKey` bytes.
+impl Drop for OneTimePreKeyPair {
+    fn drop(&mut self) {
+        // Zeroize derive-Zeroize fields (id)
+        self.zeroize();
+        // Zeroize the PublicKey bytes (not impl Zeroize, hence #[zeroize(skip)])
+        let bytes: &mut [u8; 32] = unsafe {
+            &mut *(&mut self.public_key as *mut x25519_dalek::PublicKey as *mut [u8; 32])
+        };
+        bytes.zeroize();
+    }
 }
 
 impl OneTimePreKeyPair {

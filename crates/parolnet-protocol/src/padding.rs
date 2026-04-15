@@ -19,9 +19,18 @@ pub struct BucketPadding;
 const LENGTH_PREFIX_SIZE: usize = 4;
 
 impl PaddingStrategy for BucketPadding {
-    fn pad(&self, plaintext: &[u8]) -> Vec<u8> {
+    fn pad(&self, plaintext: &[u8]) -> Result<Vec<u8>, ProtocolError> {
         let needed = plaintext.len() + LENGTH_PREFIX_SIZE;
-        let bucket = select_bucket(needed).unwrap_or(*BUCKET_SIZES.last().unwrap());
+        let max_bucket = *BUCKET_SIZES.last().unwrap();
+        let bucket = match select_bucket(needed) {
+            Some(b) => b,
+            None => {
+                return Err(ProtocolError::MessageTooLarge {
+                    size: plaintext.len(),
+                    max: max_bucket - LENGTH_PREFIX_SIZE,
+                });
+            }
+        };
 
         let mut output = Vec::with_capacity(bucket);
 
@@ -41,7 +50,7 @@ impl PaddingStrategy for BucketPadding {
         }
 
         debug_assert_eq!(output.len(), bucket);
-        output
+        Ok(output)
     }
 
     fn unpad(&self, padded: &[u8]) -> Result<Vec<u8>, ProtocolError> {

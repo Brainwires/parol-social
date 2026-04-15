@@ -237,6 +237,12 @@ struct IncomingMessage {
     /// Peer IDs to exclude from gossip forwarding.
     #[serde(default)]
     exclude: Vec<String>,
+    /// Ed25519 public key (hex) for registration challenge-response.
+    pubkey: Option<String>,
+    /// Hex-encoded Ed25519 signature over the challenge nonce.
+    signature: Option<String>,
+    /// Hex-encoded challenge nonce being responded to.
+    nonce: Option<String>,
 }
 
 #[derive(Default, Serialize)]
@@ -422,8 +428,30 @@ async fn main() {
     let client_stats = Arc::new(ClientStats::new());
 
     // Initialize mesh PeerManager as a gossip supernode
-    let our_peer_id = PeerId([0u8; 32]); // Relay's own peer ID (could generate a real one)
-    let relay_signing_key = ed25519_dalek::SigningKey::from_bytes(&[0u8; 32]);
+    let relay_signing_key = match std::env::var("RELAY_SECRET_KEY") {
+        Ok(hex_key) => {
+            let key_bytes = hex::decode(&hex_key).expect("RELAY_SECRET_KEY must be valid hex");
+            assert_eq!(
+                key_bytes.len(),
+                32,
+                "RELAY_SECRET_KEY must be 32 bytes (64 hex chars)"
+            );
+            let mut arr = [0u8; 32];
+            arr.copy_from_slice(&key_bytes);
+            ed25519_dalek::SigningKey::from_bytes(&arr)
+        }
+        Err(_) => {
+            let key = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+            info!("Generated ephemeral relay signing key (set RELAY_SECRET_KEY for persistence)");
+            key
+        }
+    };
+    let pubkey_bytes = relay_signing_key.verifying_key().to_bytes();
+    let our_peer_id = {
+        use sha2::{Digest, Sha256};
+        PeerId(Sha256::digest(pubkey_bytes).into())
+    };
+    info!("Relay PeerId: {}", hex::encode(our_peer_id.0));
     let peer_manager = Arc::new(PeerManager::new(our_peer_id, relay_signing_key));
 
     // Spawn periodic maintenance (dedup rotation, stored-message expiry)
@@ -678,47 +706,116 @@ async fn handle_socket(
         match incoming.msg_type.as_str() {
             "register" => {
                 if let Some(peer_id) = incoming.peer_id {
-                    // Register this peer in the relay's peer map
-                    peers.lock().await.insert(peer_id.clone(), tx.clone());
-                    my_peer_id = Some(peer_id.clone());
+                    // Challenge-response: if peer provides pubkey + signature + nonce,
+                    // verify identity. Otherwise issue a challenge nonce.
+                    if let (Some(pubkey_hex), Some(sig_hex), Some(nonce_hex)) =
+                        (&incoming.pubkey, &incoming.signature, &incoming.nonce)
+                    {
+                        // Verify challenge-response
+                        let valid = (|| -> Result<bool, String> {
+                            let pubkey_bytes = hex::decode(pubkey_hex)
+                                .map_err(|e| format!("invalid pubkey hex: {e}"))?;
+                            let sig_bytes = hex::decode(sig_hex)
+                                .map_err(|e| format!("invalid signature hex: {e}"))?;
+                            let nonce_bytes = hex::decode(nonce_hex)
+                                .map_err(|e| format!("invalid nonce hex: {e}"))?;
 
-                    stats.record_connection();
+                            // Verify PeerId = SHA-256(pubkey)
+                            use sha2::{Digest, Sha256};
+                            let expected_pid = hex::encode(Sha256::digest(&pubkey_bytes));
+                            if expected_pid != peer_id {
+                                return Err("peer_id does not match pubkey".into());
+                            }
 
-                    // Register with PeerManager for gossip protocol routing
-                    if let Some(mesh_pid) = parse_peer_id(&peer_id) {
-                        let ws_conn = Arc::new(WsConnection { tx: tx.clone() });
-                        if let Err(e) = peer_manager.add_peer(mesh_pid, ws_conn).await {
-                            tracing::warn!(
-                                peer = %peer_id,
-                                error = %e,
-                                "failed to add peer to mesh PeerManager"
-                            );
+                            let vk_bytes: [u8; 32] = pubkey_bytes
+                                .try_into()
+                                .map_err(|_| "pubkey must be 32 bytes".to_string())?;
+                            let verifying_key = ed25519_dalek::VerifyingKey::from_bytes(&vk_bytes)
+                                .map_err(|e| format!("invalid Ed25519 key: {e}"))?;
+
+                            let sig_arr: [u8; 64] = sig_bytes
+                                .try_into()
+                                .map_err(|_| "signature must be 64 bytes".to_string())?;
+                            let signature = ed25519_dalek::Signature::from_bytes(&sig_arr);
+
+                            use ed25519_dalek::Verifier;
+                            verifying_key
+                                .verify(&nonce_bytes, &signature)
+                                .map_err(|_| "signature verification failed".to_string())?;
+
+                            Ok(true)
+                        })();
+
+                        match valid {
+                            Ok(true) => {
+                                // Authenticated — complete registration
+                                peers.lock().await.insert(peer_id.clone(), tx.clone());
+                                my_peer_id = Some(peer_id.clone());
+                                stats.record_connection();
+
+                                if let Some(mesh_pid) = parse_peer_id(&peer_id) {
+                                    let ws_conn = Arc::new(WsConnection { tx: tx.clone() });
+                                    if let Err(e) = peer_manager.add_peer(mesh_pid, ws_conn).await {
+                                        tracing::warn!(
+                                            peer = %peer_id, error = %e,
+                                            "failed to add peer to mesh PeerManager"
+                                        );
+                                    }
+                                }
+
+                                let online = peers.lock().await.len();
+                                let _ = tx.send(
+                                    serde_json::to_string(&OutgoingMessage {
+                                        msg_type: "registered".into(),
+                                        peer_id: Some(peer_id.clone()),
+                                        online_peers: Some(online),
+                                        ..Default::default()
+                                    })
+                                    .unwrap(),
+                                );
+
+                                info!(
+                                    "Peer registered (authenticated): {}...  ({} online)",
+                                    &peer_id[..16.min(peer_id.len())],
+                                    online
+                                );
+
+                                // Deliver stored messages
+                                if let Some(mesh_pid) = parse_peer_id(&peer_id) {
+                                    let pending = store.lock().await.retrieve(&mesh_pid);
+                                    for msg in pending {
+                                        let _ = tx.send(msg);
+                                    }
+                                }
+                            }
+                            Ok(false) | Err(_) => {
+                                let err_msg = match valid {
+                                    Err(e) => e,
+                                    _ => "authentication failed".into(),
+                                };
+                                let _ = tx.send(
+                                    serde_json::to_string(&OutgoingMessage {
+                                        msg_type: "error".into(),
+                                        message: Some(format!("register auth failed: {err_msg}")),
+                                        ..Default::default()
+                                    })
+                                    .unwrap(),
+                                );
+                            }
                         }
-                    }
-
-                    let online = peers.lock().await.len();
-                    let _ = tx.send(
-                        serde_json::to_string(&OutgoingMessage {
-                            msg_type: "registered".into(),
-                            peer_id: Some(peer_id.clone()),
-                            online_peers: Some(online),
-                            ..Default::default()
-                        })
-                        .unwrap(),
-                    );
-
-                    info!(
-                        "Peer registered: {}...  ({} online)",
-                        &peer_id[..16.min(peer_id.len())],
-                        online
-                    );
-
-                    // Deliver any stored messages
-                    if let Some(mesh_pid) = parse_peer_id(&peer_id) {
-                        let pending = store.lock().await.retrieve(&mesh_pid);
-                        for msg in pending {
-                            let _ = tx.send(msg);
-                        }
+                    } else {
+                        // No auth provided — issue a challenge nonce
+                        let mut nonce = [0u8; 32];
+                        rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut nonce);
+                        let nonce_hex = hex::encode(nonce);
+                        let _ = tx.send(
+                            serde_json::json!({
+                                "type": "challenge",
+                                "nonce": nonce_hex,
+                                "peer_id": peer_id
+                            })
+                            .to_string(),
+                        );
                     }
                 }
             }

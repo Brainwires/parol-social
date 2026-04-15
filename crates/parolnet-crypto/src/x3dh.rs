@@ -34,7 +34,9 @@ fn ed25519_signing_to_x25519(signing_key: &ed25519_dalek::SigningKey) -> StaticS
     let mut key_bytes = [0u8; 32];
     key_bytes.copy_from_slice(&h[..32]);
     h.zeroize();
-    StaticSecret::from(key_bytes)
+    let secret = StaticSecret::from(key_bytes);
+    key_bytes.zeroize();
+    secret
 }
 
 /// Convert an Ed25519 verifying key to an X25519 public key.

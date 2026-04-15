@@ -32,6 +32,7 @@ use parolnet_core::ParolNet;
 use parolnet_core::call::CallManager;
 use parolnet_core::file_transfer::{FileTransferReceiver, FileTransferSender};
 use parolnet_protocol::file::FileOffer;
+use zeroize::Zeroize;
 
 /// Pending bootstrap state from QR generation (presenter side).
 struct PendingBootstrap {
@@ -39,6 +40,13 @@ struct PendingBootstrap {
     seed: [u8; 32],
     /// Our X25519 ratchet secret key.
     ratchet_secret: [u8; 32],
+}
+
+impl Drop for PendingBootstrap {
+    fn drop(&mut self) {
+        self.seed.zeroize();
+        self.ratchet_secret.zeroize();
+    }
 }
 
 /// Global state accessible from stateless wasm-bindgen functions.
@@ -697,9 +705,12 @@ pub fn panic_wipe() {
     state.client = None;
     state.file_senders.clear();
     state.file_receivers.clear();
+    if let Some(ref mut hash) = state.unlock_code_hash {
+        hash.zeroize();
+    }
     state.unlock_code_hash = None;
     state.decoy_active = false;
-    state.pending_bootstrap = None;
+    state.pending_bootstrap = None; // Drop impl zeroizes seed + ratchet_secret
     // call_manager doesn't have a clear method, but dropping calls is fine
     // The CallManager is behind a Mutex internally; we replace it.
     // Note: we can't easily replace it due to LazyLock, so we prune finished calls.

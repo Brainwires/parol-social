@@ -210,6 +210,9 @@ pub struct StandardGossip {
     pub pool: Arc<ConnectionPool>,
 }
 
+// Note: `ed25519_dalek::SigningKey` implements `ZeroizeOnDrop`, so it
+// automatically zeroizes on drop. No manual Drop needed.
+
 impl StandardGossip {
     pub fn new(
         our_peer_id: PeerId,

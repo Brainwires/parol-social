@@ -94,6 +94,10 @@ impl Connection for TlsConnection {
     }
 
     async fn recv(&self) -> Result<Vec<u8>, TransportError> {
+        /// Maximum allowed frame size (64 KiB) to prevent remote DoS via
+        /// unbounded allocation from a malicious length prefix.
+        const MAX_FRAME_SIZE: u32 = 65536;
+
         let mut stream = self.stream.lock().await;
         let mut len_buf = [0u8; 4];
         match &mut *stream {
@@ -105,8 +109,13 @@ impl Connection for TlsConnection {
                         TransportError::from(e)
                     }
                 })?;
-                let len = u32::from_be_bytes(len_buf) as usize;
-                let mut buf = vec![0u8; len];
+                let len = u32::from_be_bytes(len_buf);
+                if len > MAX_FRAME_SIZE {
+                    return Err(TransportError::ReceiveFailed(
+                        "frame exceeds maximum size".into(),
+                    ));
+                }
+                let mut buf = vec![0u8; len as usize];
                 s.read_exact(&mut buf).await?;
                 Ok(buf)
             }
@@ -118,8 +127,13 @@ impl Connection for TlsConnection {
                         TransportError::from(e)
                     }
                 })?;
-                let len = u32::from_be_bytes(len_buf) as usize;
-                let mut buf = vec![0u8; len];
+                let len = u32::from_be_bytes(len_buf);
+                if len > MAX_FRAME_SIZE {
+                    return Err(TransportError::ReceiveFailed(
+                        "frame exceeds maximum size".into(),
+                    ));
+                }
+                let mut buf = vec![0u8; len as usize];
                 s.read_exact(&mut buf).await?;
                 Ok(buf)
             }

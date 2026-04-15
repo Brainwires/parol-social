@@ -18,7 +18,7 @@ fn test_hkdf_rfc5869_test_case_1() {
         "3cb25f25faacd57a90434f64d0362f2a2d2d0a90cf1a5a4c5db02d56ecc4c5bf34007208d5b887185865",
     )
     .unwrap();
-    assert_eq!(okm, expected);
+    assert_eq!(&*okm, &expected);
 }
 
 #[test]

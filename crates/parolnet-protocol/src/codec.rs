@@ -96,8 +96,19 @@ pub fn encode_header(header: &CleartextHeader) -> Result<Vec<u8>, ProtocolError>
     Ok(buf)
 }
 
+/// Maximum header size in bytes (prevents DoS via oversized CBOR headers).
+const MAX_HEADER_SIZE: usize = 512;
+
 /// Deserialize a cleartext header from CBOR bytes.
 pub fn decode_header(bytes: &[u8]) -> Result<CleartextHeader, ProtocolError> {
+    if bytes.len() > MAX_HEADER_SIZE {
+        return Err(ProtocolError::CborDecode(format!(
+            "header too large: {} bytes exceeds maximum {}",
+            bytes.len(),
+            MAX_HEADER_SIZE
+        )));
+    }
+
     let wire: WireHeader =
         ciborium::from_reader(bytes).map_err(|e| ProtocolError::CborDecode(e.to_string()))?;
 
@@ -136,6 +147,12 @@ impl ProtocolCodec for CborCodec {
         }
 
         let header_len = u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as usize;
+        if header_len > MAX_HEADER_SIZE {
+            return Err(ProtocolError::CborDecode(format!(
+                "header length {} exceeds maximum {}",
+                header_len, MAX_HEADER_SIZE
+            )));
+        }
         let header_end = 4 + header_len;
 
         if bytes.len() < header_end + 16 {

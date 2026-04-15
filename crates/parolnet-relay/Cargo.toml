@@ -19,6 +19,9 @@ async-trait.workspace = true
 ed25519-dalek.workspace = true
 x25519-dalek.workspace = true
 zeroize.workspace = true
+hmac.workspace = true
+sha2.workspace = true
+subtle.workspace = true
 
 [dev-dependencies]
 tokio-test.workspace = true

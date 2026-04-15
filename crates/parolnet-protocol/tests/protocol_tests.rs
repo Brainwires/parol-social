@@ -75,7 +75,7 @@ fn test_padding_roundtrip() {
     let padder = BucketPadding;
 
     for msg in [b"hello".as_slice(), b"", &[0xAB; 100], &[0xFF; 1000]] {
-        let padded = padder.pad(msg);
+        let padded = padder.pad(msg).unwrap();
         assert!(
             BUCKET_SIZES.contains(&padded.len()),
             "padded len {} not a bucket size",
@@ -92,13 +92,13 @@ fn test_padding_exact_bucket_boundaries() {
 
     // 252 bytes of data + 4 byte prefix = 256 exactly
     let data = vec![0xAB; 252];
-    let padded = padder.pad(&data);
+    let padded = padder.pad(&data).unwrap();
     assert_eq!(padded.len(), 256);
     assert_eq!(padder.unpad(&padded).unwrap(), data);
 
     // 253 bytes of data + 4 byte prefix = 257 → bucket 1024
     let data = vec![0xAB; 253];
-    let padded = padder.pad(&data);
+    let padded = padder.pad(&data).unwrap();
     assert_eq!(padded.len(), 1024);
     assert_eq!(padder.unpad(&padded).unwrap(), data);
 }
@@ -114,7 +114,7 @@ fn test_padding_invalid_bucket_size() {
 fn test_padding_large_message() {
     let padder = BucketPadding;
     let data = vec![0xCD; 10000];
-    let padded = padder.pad(&data);
+    let padded = padder.pad(&data).unwrap();
     assert_eq!(padded.len(), 16384);
     assert_eq!(padder.unpad(&padded).unwrap(), data);
 }

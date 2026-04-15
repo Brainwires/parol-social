@@ -104,10 +104,30 @@ impl GossipEnvelope {
         Ok(buf)
     }
 
+    /// Maximum serialized gossip envelope size (payload + overhead).
+    /// Prevents DoS via unbounded allocation during deserialization.
+    const MAX_ENVELOPE_SIZE: usize = MAX_GOSSIP_PAYLOAD + 4096;
+
     /// Decode a gossip envelope from CBOR bytes.
     pub fn from_cbor(data: &[u8]) -> Result<Self, ProtocolError> {
-        ciborium::from_reader(data)
-            .map_err(|e| ProtocolError::CborDecode(format!("CBOR decode: {e}")))
+        if data.len() > Self::MAX_ENVELOPE_SIZE {
+            return Err(ProtocolError::CborDecode(format!(
+                "gossip envelope too large: {} bytes exceeds maximum {}",
+                data.len(),
+                Self::MAX_ENVELOPE_SIZE
+            )));
+        }
+
+        let envelope: Self = ciborium::from_reader(data)
+            .map_err(|e| ProtocolError::CborDecode(format!("CBOR decode: {e}")))?;
+
+        if !envelope.is_valid_structure() {
+            return Err(ProtocolError::CborDecode(
+                "invalid gossip envelope structure".into(),
+            ));
+        }
+
+        Ok(envelope)
     }
 
     /// Get the message ID as a fixed-size array.

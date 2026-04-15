@@ -44,7 +44,8 @@ pub trait ProtocolCodec: Send + Sync {
 /// This prevents message length from leaking content type or size.
 pub trait PaddingStrategy: Send + Sync {
     /// Pad plaintext to the next bucket size.
-    fn pad(&self, plaintext: &[u8]) -> Vec<u8>;
+    /// Returns an error if the plaintext exceeds the maximum bucket size.
+    fn pad(&self, plaintext: &[u8]) -> Result<Vec<u8>, ProtocolError>;
     /// Remove padding, returning the original plaintext.
     fn unpad(&self, padded: &[u8]) -> Result<Vec<u8>, ProtocolError>;
 }

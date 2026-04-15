@@ -85,7 +85,7 @@ fn test_envelope_encrypt_pad_encode_decode_unpad() {
 
     // Pad the ciphertext with BucketPadding.
     let padder = BucketPadding;
-    let padded = padder.pad(&ciphertext);
+    let padded = padder.pad(&ciphertext).unwrap();
 
     // Verify padded size is one of the defined BUCKET_SIZES.
     assert!(

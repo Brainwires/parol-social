@@ -9,6 +9,7 @@
 use crate::CryptoError;
 use hkdf::Hkdf;
 use sha2::Sha256;
+use zeroize::Zeroizing;
 
 /// Derive key material using HKDF-SHA-256 (RFC 5869).
 ///
@@ -22,12 +23,12 @@ pub fn hkdf_sha256(
     ikm: &[u8],
     info: &[u8],
     len: usize,
-) -> Result<Vec<u8>, CryptoError> {
+) -> Result<Zeroizing<Vec<u8>>, CryptoError> {
     let hk = Hkdf::<Sha256>::new(Some(salt), ikm);
     let mut okm = vec![0u8; len];
     hk.expand(info, &mut okm)
         .map_err(|_| CryptoError::KdfFailed)?;
-    Ok(okm)
+    Ok(Zeroizing::new(okm))
 }
 
 /// Derive a fixed-size key using HKDF-SHA-256.

@@ -183,7 +183,7 @@ impl ParolNet {
         use parolnet_protocol::PaddingStrategy;
         use parolnet_protocol::padding::BucketPadding;
         let padder = BucketPadding;
-        let padded = padder.pad(message);
+        let padded = padder.pad(message)?;
         self.sessions.encrypt(peer_id, &padded)
     }
 
