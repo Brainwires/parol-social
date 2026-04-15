@@ -13,3 +13,4 @@ package.json
 package-lock.json
 pwa/build-info.js
 docker-compose.override.yml
+.claude/worktrees/
