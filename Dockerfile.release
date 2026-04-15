@@ -1,0 +1,56 @@
+# Reproducible build environment for ParolNet
+# Usage: docker build -f Dockerfile.release -t parolnet-build .
+#        docker run --rm -v $(pwd)/dist:/out parolnet-build
+
+FROM rust:1.92-bookworm AS builder
+
+# Pin wasm-pack version for deterministic WASM output
+ENV WASM_PACK_VERSION=0.13.1
+
+# Install build dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    binaryen \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install pinned wasm-pack
+RUN cargo install wasm-pack --version ${WASM_PACK_VERSION} --locked
+
+# Copy workspace
+WORKDIR /build
+COPY . .
+
+# Ensure lockfile is used (no network dependency resolution)
+# Build relay server
+RUN cargo build --release --locked --bin parolnet-relay-server
+
+# Build authority CLI
+RUN cargo build --release --locked --bin parolnet-authority-cli
+
+# Build WASM bindings
+RUN wasm-pack build crates/parolnet-wasm --target web --release
+
+# Optimize WASM with pinned wasm-opt (from binaryen package)
+RUN wasm-opt -O3 \
+    crates/parolnet-wasm/pkg/parolnet_wasm_bg.wasm \
+    -o crates/parolnet-wasm/pkg/parolnet_wasm_bg.wasm
+
+# Generate checksums
+RUN mkdir -p /artifacts && \
+    cp target/release/parolnet-relay-server /artifacts/ && \
+    cp target/release/parolnet-authority-cli /artifacts/ && \
+    cp -r crates/parolnet-wasm/pkg /artifacts/wasm-pkg && \
+    cp -r pwa /artifacts/pwa && \
+    cd /artifacts && \
+    sha256sum parolnet-relay-server > SHA256SUMS && \
+    sha256sum parolnet-authority-cli >> SHA256SUMS && \
+    find wasm-pkg -type f -name '*.wasm' -o -name '*.js' | sort | xargs sha256sum >> SHA256SUMS && \
+    find pwa -type f | sort | xargs sha256sum >> SHA256SUMS
+
+# Output stage - copy artifacts
+FROM scratch AS artifacts
+COPY --from=builder /artifacts /
+
+# Default: copy artifacts to /out volume
+FROM debian:bookworm-slim AS export
+COPY --from=builder /artifacts /artifacts
+CMD ["sh", "-c", "cp -r /artifacts/* /out/ && echo 'Artifacts copied to /out/' && cat /out/SHA256SUMS"]

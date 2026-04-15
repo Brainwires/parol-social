@@ -109,3 +109,21 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-cargo-msrv-
       - run: cargo check --workspace
+
+  reproducible:
+    name: Reproducible Build Check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build artifacts
+        run: |
+          mkdir -p dist
+          docker build -f Dockerfile.release -t parolnet-build --no-cache .
+          docker run --rm -v $(pwd)/dist:/out parolnet-build
+      - name: Display checksums
+        run: cat dist/SHA256SUMS
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-artifacts
+          path: dist/

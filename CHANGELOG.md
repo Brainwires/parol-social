@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added — Reproducible Builds
+- `Dockerfile.release`: deterministic build environment with pinned Rust 1.92, wasm-pack 0.13.1, and binaryen
+- `scripts/reproducible-build.sh`: build script with `--verify` mode that builds twice and compares SHA-256 checksums
+- CI job for reproducible build artifact generation with checksum output
+- Pinned exact Rust toolchain version (1.92.0) in `rust-toolchain.toml` for build determinism
+
 ### Added — PWA UI for Calls, Files & Groups
 - Group management UI: create groups, invite members, remove members, leave group
 - Group chat with per-group message history stored in IndexedDB (`groups` and `group_messages` stores)

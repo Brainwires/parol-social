@@ -66,6 +66,7 @@ This path provides end-to-end content encryption when a Double Ratchet session e
 - PWA group calls: participant grid (up to 8), mute toggle, group call invitations via structured messages.
 - PWA group file transfer: chunked send to all group members with progress tracking.
 - Sender key distribution for group encryption via structured `_pn_type: 'sender_key'` messages.
+- Reproducible builds: `Dockerfile.release` with pinned Rust 1.92.0, wasm-pack 0.13.1, and binaryen for deterministic WASM optimization. `scripts/reproducible-build.sh` builds artifacts and supports `--verify` mode (build twice, compare SHA-256 checksums). CI job generates and uploads release artifacts.
 
 ## Partial Or Prototype
 
@@ -86,7 +87,6 @@ This path provides end-to-end content encryption when a Double Ratchet session e
 - mDNS `_parolnet._tcp` discovery. Current code uses UDP broadcast with an HMAC-derived tag and masked PeerId.
 - Full domain fronting with HTTP/2 DATA frame wrapping (current bridge mode uses standard WebSocket over CDN proxy).
 - Certificate pinning.
-- Verified reproducible release process.
 
 ## Documentation Rule
 
