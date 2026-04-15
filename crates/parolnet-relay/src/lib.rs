@@ -9,6 +9,7 @@
 //! - Relay node behavior
 //! - Gossip-based relay directory
 
+pub mod authority;
 pub mod circuit;
 pub mod directory;
 pub mod error;
@@ -17,6 +18,7 @@ pub mod onion;
 pub mod padding;
 pub mod pool;
 pub mod relay_node;
+pub mod trust_roots;
 
 pub use error::RelayError;
 
