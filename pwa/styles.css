@@ -378,6 +378,8 @@ header button:hover {
     background: var(--bg2);
     border-top: 1px solid var(--border);
     flex-shrink: 0;
+    position: relative;
+    max-height: 60px;
 }
 
 .chat-input input[type="text"] {
@@ -776,13 +778,29 @@ button.success {
 
 /* ── Safe Area (notch / gesture-bar devices) ─────────────────── */
 @supports (padding: env(safe-area-inset-top)) {
+    body {
+        padding-left: env(safe-area-inset-left);
+        padding-right: env(safe-area-inset-right);
+        padding-bottom: env(safe-area-inset-bottom);
+        
+    }
     header {
         padding-top: env(safe-area-inset-top);
     }
 
-    .view {
-        padding-left: env(safe-area-inset-left);
-        padding-right: env(safe-area-inset-right);
+    .chat-input::after {
+        content: '';
+        position: absolute;
+        left: 0;
+        right: 0;
+        top: 100%;
+        /* height: env(safe-area-inset-bottom); */
+        background: var(--bg2);
+    }
+
+    .message-list,
+    .contact-list,
+    .settings-content {
         padding-bottom: env(safe-area-inset-bottom);
     }
 }
