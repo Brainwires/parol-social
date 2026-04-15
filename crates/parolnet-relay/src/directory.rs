@@ -1,9 +1,28 @@
 //! Relay directory — gossip-based discovery (PNP-004 Section 5.6).
 
 use crate::RelayInfo;
+use crate::authority::{EndorsedDescriptor, SignedDirectory};
+use crate::trust_roots;
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use parolnet_protocol::address::PeerId;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+
+/// Serde helper for `[u8; 64]` arrays (signatures).
+mod sig_bytes {
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    pub fn serialize<S: Serializer>(bytes: &[u8; 64], serializer: S) -> Result<S::Ok, S::Error> {
+        serde_bytes::Bytes::new(bytes.as_slice()).serialize(serializer)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<[u8; 64], D::Error> {
+        let v: Vec<u8> = serde_bytes::ByteBuf::deserialize(deserializer)?.into_vec();
+        v.try_into().map_err(|v: Vec<u8>| {
+            serde::de::Error::custom(format!("expected 64 bytes, got {}", v.len()))
+        })
+    }
+}
 
 /// Minimum relay descriptors to maintain locally.
 pub const MIN_DESCRIPTORS: usize = 100;
@@ -13,7 +32,7 @@ pub const MAX_DESCRIPTOR_AGE_SECS: u64 = 86400;
 pub const DESCRIPTOR_REFRESH_SECS: u64 = 21600;
 
 /// A signed relay descriptor (PNP-004 Section 5.6).
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RelayDescriptor {
     pub peer_id: PeerId,
     pub identity_key: [u8; 32],
@@ -22,9 +41,12 @@ pub struct RelayDescriptor {
     pub bandwidth_class: u8,
     pub uptime_secs: u64,
     pub timestamp: u64,
+    #[serde(with = "sig_bytes")]
     pub signature: [u8; 64],
     /// Estimated bandwidth in bytes/sec for weighted relay selection.
     pub bandwidth_estimate: u64,
+    /// Optional next public key for future key rotation.
+    pub next_pubkey: Option<[u8; 32]>,
 }
 
 /// Extract the /16 subnet prefix from a SocketAddr.
@@ -73,6 +95,12 @@ impl RelayDescriptor {
         buf.extend_from_slice(&self.uptime_secs.to_be_bytes());
         buf.extend_from_slice(&self.timestamp.to_be_bytes());
         buf.extend_from_slice(&self.bandwidth_estimate.to_be_bytes());
+        if let Some(ref next_key) = self.next_pubkey {
+            buf.push(1);
+            buf.extend_from_slice(next_key);
+        } else {
+            buf.push(0);
+        }
         buf
     }
 
@@ -264,6 +292,7 @@ impl RelayDirectory {
             timestamp: now,
             signature: [0u8; 64],
             bandwidth_estimate: 1000,
+            next_pubkey: None,
         };
         let sig = signing_key.sign(&desc.signable_bytes());
         desc.signature = sig.to_bytes();
@@ -303,6 +332,46 @@ impl RelayDirectory {
 
         self.insert(desc);
         true
+    }
+
+    /// Process an authority-endorsed descriptor.
+    ///
+    /// Verifies that the descriptor has sufficient authority endorsements
+    /// (meeting the configured threshold), then inserts it into the directory.
+    pub fn handle_endorsed_descriptor(
+        &mut self,
+        desc: EndorsedDescriptor,
+    ) -> Result<(), crate::RelayError> {
+        if !desc.verify_threshold(
+            trust_roots::AUTHORITY_PUBKEYS,
+            trust_roots::AUTHORITY_THRESHOLD,
+        )? {
+            return Err(crate::RelayError::CellError(
+                "endorsed descriptor did not meet authority threshold".into(),
+            ));
+        }
+        self.insert(desc.descriptor);
+        Ok(())
+    }
+
+    /// Process a signed directory snapshot from an authority.
+    ///
+    /// Verifies the directory signature, then replaces all known descriptors
+    /// with those from the signed directory.
+    pub fn handle_signed_directory(
+        &mut self,
+        dir: SignedDirectory,
+    ) -> Result<(), crate::RelayError> {
+        if !dir.verify(trust_roots::AUTHORITY_PUBKEYS)? {
+            return Err(crate::RelayError::CellError(
+                "signed directory verification failed".into(),
+            ));
+        }
+        self.descriptors.clear();
+        for endorsed in dir.descriptors {
+            self.insert(endorsed.descriptor);
+        }
+        Ok(())
     }
 
     /// Select a relay path: 1 guard + 2 random relays, with subnet diversity.
