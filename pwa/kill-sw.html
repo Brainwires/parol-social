@@ -8,6 +8,8 @@
 (async function() {
     const params = new URLSearchParams(location.search);
     const isPanic = params.has('panic');
+    let keepCompat = params.get('compat') === '1';
+    try { keepCompat = keepCompat || localStorage.getItem('parolnetCspCompat') === '1'; } catch(e) {}
     const heading = document.getElementById('heading');
     const s = document.getElementById('status');
 
@@ -34,6 +36,9 @@
         }
         // Clear storage
         try { localStorage.clear(); } catch(e) {}
+        if (!isPanic && keepCompat) {
+            try { localStorage.setItem('parolnetCspCompat', '1'); } catch(e) {}
+        }
         try { sessionStorage.clear(); } catch(e) {}
         // Clear IndexedDB
         if (window.indexedDB && indexedDB.databases) {
@@ -46,7 +51,11 @@
             // Stay on blank calculator screen — everything destroyed
         } else {
             s.textContent = 'Done! Redirecting...';
-            setTimeout(function() { window.location.href = './index.html?mode=calc&t=' + Date.now(); }, 1500);
+            setTimeout(function() {
+                var redirect = './index.html?mode=calc&t=' + Date.now();
+                if (keepCompat) redirect += '&compat=1';
+                window.location.href = redirect;
+            }, 1500);
         }
     } catch(e) {
         if (!isPanic) {

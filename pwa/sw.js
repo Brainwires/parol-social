@@ -2,7 +2,7 @@
 // Cache-first strategy: the app works entirely offline after first load.
 // If the source site goes down, the app continues to function from cache.
 
-const CACHE_NAME = 'parolnet-v6';
+const CACHE_NAME = 'parolnet-v7';
 
 // ── SRI hashes for critical resources ─────────────────────────
 // SHA-256 hashes of critical cached resources. On cache hit for these files,
@@ -10,11 +10,14 @@ const CACHE_NAME = 'parolnet-v6';
 // If the hash doesn't match, the resource is re-fetched from the network.
 // Regenerate these hashes whenever the corresponding files change.
 const RESOURCE_HASHES = {
-    'app.js':          '688c3749c593c760227864c8555bb37529abcea621f60262ba2a81887a711ba0',
-    'styles.css':      '59ff36998eaba6795e7c67861f2b2f5700c0028b03dc04538b2a0e8c5831ff65',
+    'app.js':          '3094113164859ac89de85d47861e9fecc4528a44d7ffd881e8907c544964c366',
+    'styles.css':      '3d3228629a323f70bf29d3f584476f09834abe7785068b12a14a625f8eb372bb',
     'crypto-store.js': '2aba63c04e985c4d9d3aeb969d3321eb9cb9c7e86e3d8519cdc7f4d722b0a45f',
-    'index.html':      '9b8b284fc8795c82858ef0506df433d7b203b835f502b7f49017114bf3441f8a',
+    'index.html':      'c0fc600a209f60cd9ed88e130c739a8d8f5aad10c75569350e9cfaa230b7a3fd',
 };
+
+const CSP_STRICT = "default-src 'self'; script-src 'self' 'unsafe-inline' 'wasm-unsafe-eval'; style-src 'self' 'unsafe-inline'; connect-src 'self' wss: ws:; img-src 'self' data: blob:; object-src 'none'; base-uri 'self'; form-action 'none'; frame-ancestors 'none'";
+const CSP_COMPAT = "default-src 'self'; script-src 'self' 'unsafe-inline' 'unsafe-eval' 'wasm-unsafe-eval'; style-src 'self' 'unsafe-inline'; connect-src 'self' wss: ws:; img-src 'self' data: blob:; object-src 'none'; base-uri 'self'; form-action 'none'; frame-ancestors 'none'";
 
 // Compute SHA-256 hex digest of an ArrayBuffer.
 async function sha256Hex(buffer) {
@@ -32,6 +35,22 @@ function getResourceName(url) {
     const path = new URL(url).pathname;
     const parts = path.split('/');
     return parts[parts.length - 1];
+}
+
+function isAppShellRequest(request) {
+    const url = new URL(request.url);
+    return url.pathname.endsWith('/pwa/') ||
+        url.pathname.endsWith('/pwa/index.html');
+}
+
+async function withAppShellCsp(response, compat) {
+    const headers = new Headers(response.headers);
+    headers.set('Content-Security-Policy', compat ? CSP_COMPAT : CSP_STRICT);
+    return new Response(await response.clone().arrayBuffer(), {
+        status: response.status,
+        statusText: response.statusText,
+        headers
+    });
 }
 
 // All assets that must be cached for offline operation.
@@ -115,6 +134,9 @@ self.addEventListener('fetch', event => {
         return;
     }
 
+    const appShellRequest = isAppShellRequest(event.request);
+    const compatShell = new URL(event.request.url).searchParams.get('compat') === '1';
+
     event.respondWith(
         caches.match(event.request)
             .then(async cachedResponse => {
@@ -165,7 +187,17 @@ self.addEventListener('fetch', event => {
                             // Network failed, but we have cache — that's fine
                         });
 
+                    if (appShellRequest) {
+                        return withAppShellCsp(cachedResponse, compatShell);
+                    }
                     return cachedResponse;
+                }
+
+                if (appShellRequest) {
+                    const cachedShell = await caches.match('./index.html');
+                    if (cachedShell) {
+                        return withAppShellCsp(cachedShell, compatShell);
+                    }
                 }
 
                 // Not in cache — try network
@@ -177,6 +209,9 @@ self.addEventListener('fetch', event => {
                             caches.open(CACHE_NAME).then(cache => {
                                 cache.put(event.request, clone);
                             });
+                        }
+                        if (appShellRequest) {
+                            return withAppShellCsp(networkResponse, compatShell);
                         }
                         return networkResponse;
                     })

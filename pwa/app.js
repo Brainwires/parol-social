@@ -484,6 +484,17 @@ document.addEventListener('visibilitychange', () => {
 });
 
 // ── WASM Loading ────────────────────────────────────────────
+function isCspWasmError(error) {
+    const message = String(error?.message || error || '');
+    return /webassembly|wasm|unsafe-eval|content security policy|script-src/i.test(message);
+}
+
+function showCspCompatOption(error) {
+    if (!isCspWasmError(error)) return;
+    const compatBtn = document.getElementById('loading-compat');
+    if (compatBtn) compatBtn.style.display = 'inline-block';
+}
+
 async function loadWasm() {
     const statusEl = document.getElementById('loading-status');
     try {
@@ -500,6 +511,7 @@ async function loadWasm() {
         console.warn('WASM not available:', e.message);
         telemetry.track('wasm_load_fail', { error: e.message });
         showToast('WASM load failed: ' + e.message);
+        showCspCompatOption(e);
         if (statusEl) statusEl.textContent = 'Running without crypto (' + e.message + ')';
         onWasmUnavailable();
     }
