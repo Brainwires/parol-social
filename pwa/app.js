@@ -3434,9 +3434,31 @@ function registerServiceWorker() {
         }
     });
 
+    // When a new SW takes control (after skipWaiting + activate), re-send relay config
+    navigator.serviceWorker.addEventListener('controllerchange', () => {
+        console.log('[SW] New controller active — re-sending relay config');
+        if (connMgr.relayUrl) {
+            connMgr._swPost({ type: 'relay_connect', url: connMgr.relayUrl, peerId: window._peerId || null });
+        }
+    });
+
     navigator.serviceWorker.register('sw.js').then(reg => {
         console.log('SW registered:', reg.scope);
         setInterval(() => reg.update(), 3600000);
+
+        // If a new SW is already waiting (e.g. v8→v9 upgrade), activate it
+        if (reg.waiting) reg.waiting.postMessage('skipWaiting');
+
+        // Watch for future SW updates — activate as soon as installed
+        reg.addEventListener('updatefound', () => {
+            const newSW = reg.installing;
+            if (!newSW) return;
+            newSW.addEventListener('statechange', () => {
+                if (newSW.state === 'installed' && reg.waiting) {
+                    reg.waiting.postMessage('skipWaiting');
+                }
+            });
+        });
 
         // Drain any messages that arrived while page was backgrounded
         drainSwInbox().catch(() => {});
