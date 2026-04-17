@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added — H12 Phase 3 prep: RelayReputation + directory integration (PNP-008 §7)
+- New `parolnet-relay::health` module: `RelayReputation` with EWMA-0.9 score (MUST-032), §7.1 event table (`ObservationEvent`), SUSPECT / BANNED state machine (MUST-034 / MUST-035), invalid-signature rolling window (>3 in 60 s triggers BAN), 24 h BAN cooldown, STABLE promotion after 7 d ACTIVE at score ≥ 0.8 (SHOULD-005), 10 min persist-due hinting (MUST-036). `RelayFlags` is a serde-transparent `u32` bitfield — no new crate deps.
+- `parolnet-relay::directory::RelayDirectory` now carries per-peer reputation: `record_reputation_event`, `reputation`, `reputation_mut`, `is_reputation_eligible`. The existing `weighted_select` path auto-filters SUSPECT and BANNED peers so all circuit-building callers pick up MUST-034 / MUST-035 without code changes. New `select_by_reputation()` complements `select_random()` with reputation-weighted selection for federation-peer choice.
+- Conformance upgrades: the MUST-032 EWMA test now exercises the real `RelayReputation`; new MUST-033 event-table test, integration test proving BANNED peers are excluded from `select_random`, and a stricter MUST-036 persist-cadence test. 16 new module tests + 5 new directory-integration tests.
+- Unblocks `FederationManager`: it can now drive per-peer observations into the directory's reputation map without owning persistence or selection logic itself.
+
 ### Added — H12 Phase 3 prep: tiered IBLT + federation payload registry + federation config (PNP-008 §4, §5, §6.2)
 - New `parolnet-protocol::federation` module: `FederationPayloadType` enum (0x06 `FederationSync`, 0x07 `FederationHeartbeat`, 0x08 `BridgeAnnouncement`) with `from_u8`/`is_federation_link_ok` helpers and spec-normative constants (heartbeat cadence, rate limits, replay window, clock-skew tolerance, bridge validity). Per `PNP-008-MUST-004` these codes live in a distinct registry from `GossipPayloadType` so they can never leak onto the public gossip mesh.
 - `parolnet-mesh::sync` gains tiered IBLT sizing per PNP-008 §6.2: `IbltTier::{S, M, L}` (80/3, 400/3, 2000/4), `Iblt::with_tier`, `Iblt::with_capacity(cells, hashes)`, `IbltTier::select_for_delta` (smallest tier satisfying MUST-024). `Iblt::subtract` now returns `Result` on dimension mismatch; `to_bytes`/`from_bytes` prepend a 3-byte header so receivers can decode any tier. `MAX_IBLT_CELLS = 2000` enforces `PNP-008-MUST-025` both at API level and on the wire.

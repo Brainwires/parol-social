@@ -2,6 +2,7 @@
 
 use crate::RelayInfo;
 use crate::authority::{EndorsedDescriptor, SignedDirectory};
+use crate::health::{ObservationEvent, RelayReputation};
 use crate::trust_roots;
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use parolnet_protocol::address::PeerId;
@@ -150,6 +151,9 @@ pub struct RelayDirectory {
     guards: Vec<PeerId>,
     /// Health metrics for known relays.
     health: HashMap<PeerId, RelayHealth>,
+    /// Federation-peer reputation (PNP-008 §7). Populated lazily on first
+    /// observation; absence means the peer is treated as reputation-neutral.
+    reputation: HashMap<PeerId, RelayReputation>,
 }
 
 impl Default for RelayDirectory {
@@ -167,7 +171,47 @@ impl RelayDirectory {
             descriptors: HashMap::new(),
             guards: Vec::new(),
             health: HashMap::new(),
+            reputation: HashMap::new(),
         }
+    }
+
+    /// Feed a PNP-008 §7 reputation event for `peer_id`. Lazily creates a
+    /// reputation record starting from `REPUTATION_INITIAL_SCORE`.
+    pub fn record_reputation_event(
+        &mut self,
+        peer_id: &PeerId,
+        event: ObservationEvent,
+        now: u64,
+    ) {
+        let rep = self
+            .reputation
+            .entry(*peer_id)
+            .or_insert_with(|| RelayReputation::new(now));
+        rep.record(event, now);
+    }
+
+    /// Look up a peer's reputation record, if tracked.
+    pub fn reputation(&self, peer_id: &PeerId) -> Option<&RelayReputation> {
+        self.reputation.get(peer_id)
+    }
+
+    /// Mutable access for reputation-aware subsystems that need to drive the
+    /// `mark_active_tick`/`evaluate_flags` state machine (federation manager).
+    pub fn reputation_mut(&mut self, peer_id: &PeerId) -> Option<&mut RelayReputation> {
+        self.reputation.get_mut(peer_id)
+    }
+
+    /// Whether `peer_id` is currently eligible for new circuit selection.
+    ///
+    /// Returns `true` when no reputation is tracked (reputation-neutral); the
+    /// PNP-008-MUST-034 / MUST-035 exclusions only fire once observations
+    /// have driven the flags. Unknown peers therefore keep Tor-style benefit
+    /// of the doubt — see also [`RelayDirectory::MIN_HEALTH_SCORE`].
+    pub fn is_reputation_eligible(&self, peer_id: &PeerId) -> bool {
+        self.reputation
+            .get(peer_id)
+            .map(|r| r.is_eligible_for_circuits())
+            .unwrap_or(true)
     }
 
     /// Record a successful interaction with a relay.
@@ -224,9 +268,11 @@ impl RelayDirectory {
         use rand::Rng;
         let mut rng = rand::thread_rng();
 
-        // Filter out relays below minimum health threshold
+        // PNP-008-MUST-034 / MUST-035: exclude SUSPECT and BANNED peers from
+        // new selection, then apply the health floor on top.
         let eligible: Vec<_> = candidates
             .iter()
+            .filter(|d| self.is_reputation_eligible(&d.peer_id))
             .filter(|d| self.health_score(&d.peer_id) >= Self::MIN_HEALTH_SCORE)
             .copied()
             .collect();
@@ -530,6 +576,55 @@ impl RelayDirectory {
         Ok(())
     }
 
+    /// Pick a random relay weighted by PNP-008 reputation score.
+    ///
+    /// Complements [`select_random`]: where `select_random` weights by
+    /// connection health (latency + success rate), this method weights by
+    /// the federation-peer trust signal defined in PNP-008 §7. Use it when
+    /// the federation manager needs to pick a peer whose long-term trust
+    /// matters more than its last-minute latency — e.g. initial
+    /// `FederationSync` targets. BANNED and SUSPECT peers are excluded
+    /// outright per MUST-034 / MUST-035. Peers without a reputation record
+    /// use the initial score (0.5) so new peers get a reasonable chance.
+    pub fn select_by_reputation(&self, exclude: &[PeerId]) -> Option<RelayInfo> {
+        use rand::Rng;
+        let mut rng = rand::thread_rng();
+
+        let candidates: Vec<&RelayDescriptor> = self
+            .descriptors
+            .values()
+            .filter(|d| !exclude.contains(&d.peer_id))
+            .filter(|d| self.is_reputation_eligible(&d.peer_id))
+            .collect();
+        if candidates.is_empty() {
+            return None;
+        }
+
+        let weights: Vec<f64> = candidates
+            .iter()
+            .map(|d| {
+                self.reputation(&d.peer_id)
+                    .map(|r| r.score)
+                    .unwrap_or(crate::health::REPUTATION_INITIAL_SCORE)
+                    * d.bandwidth_estimate.max(1) as f64
+            })
+            .collect();
+
+        let total: f64 = weights.iter().sum();
+        if total <= 0.0 {
+            return candidates.first().map(|d| d.to_relay_info());
+        }
+
+        let mut pick: f64 = rng.r#gen::<f64>() * total;
+        for (i, w) in weights.iter().enumerate() {
+            pick -= w;
+            if pick <= 0.0 {
+                return Some(candidates[i].to_relay_info());
+            }
+        }
+        candidates.last().map(|d| d.to_relay_info())
+    }
+
     /// Select a relay path: 1 guard + 2 random relays, with subnet diversity.
     pub fn select_path(&mut self) -> Option<[RelayInfo; 3]> {
         let guards = self.select_guards(1);
@@ -771,5 +866,83 @@ mod tests {
         let count = dir.merge_descriptors(vec![stale_desc], &our_peer_id, now);
         assert_eq!(count, 0, "stale descriptor should be rejected");
         assert_eq!(dir.len(), 0);
+    }
+
+    // -- Reputation integration (PNP-008 §7) ---------------------------------
+
+    #[test]
+    fn unknown_peer_is_reputation_neutral() {
+        let dir = RelayDirectory::new();
+        let peer = PeerId([0x11; 32]);
+        assert!(dir.reputation(&peer).is_none());
+        assert!(dir.is_reputation_eligible(&peer));
+    }
+
+    #[test]
+    fn record_reputation_event_creates_entry() {
+        use crate::health::ObservationEvent;
+        let mut dir = RelayDirectory::new();
+        let peer = PeerId([0x22; 32]);
+        dir.record_reputation_event(&peer, ObservationEvent::FederationSyncSuccess, 100);
+        let r = dir.reputation(&peer).expect("record created");
+        assert!(r.score > crate::health::REPUTATION_INITIAL_SCORE);
+    }
+
+    #[test]
+    fn banned_peer_excluded_from_weighted_select() {
+        use crate::health::ObservationEvent;
+        let mut dir = RelayDirectory::new();
+        // Two candidates, both in distinct subnets, high uptime.
+        dir.insert(make_test_descriptor(1, 1000));
+        dir.insert(make_test_descriptor(2, 1000));
+        // Hammer peer 1 with enough missed-heartbeat events to force BAN.
+        let peer1 = PeerId([1; 32]);
+        for t in 0..100u64 {
+            dir.record_reputation_event(&peer1, ObservationEvent::HeartbeatMissed, t);
+        }
+        assert!(dir.reputation(&peer1).unwrap().is_banned());
+        // 100 calls to select_random — peer1 MUST never be picked.
+        for _ in 0..100 {
+            let pick = dir.select_random(&[]).expect("a relay was selected");
+            assert_ne!(pick.peer_id, peer1, "BANNED peer must be excluded");
+        }
+    }
+
+    #[test]
+    fn select_by_reputation_excludes_banned_and_uses_score_weighting() {
+        use crate::health::ObservationEvent;
+        let mut dir = RelayDirectory::new();
+        dir.insert(make_test_descriptor(1, 1000));
+        dir.insert(make_test_descriptor(2, 1000));
+
+        // Ban peer 1.
+        let peer1 = PeerId([1; 32]);
+        for t in 0..100u64 {
+            dir.record_reputation_event(&peer1, ObservationEvent::HeartbeatMissed, t);
+        }
+        // Boost peer 2.
+        let peer2 = PeerId([2; 32]);
+        for t in 0..100u64 {
+            dir.record_reputation_event(&peer2, ObservationEvent::FederationSyncSuccess, t);
+        }
+
+        for _ in 0..50 {
+            let pick = dir
+                .select_by_reputation(&[])
+                .expect("reputation-weighted select returns");
+            assert_eq!(pick.peer_id, peer2, "only peer 2 is eligible");
+        }
+    }
+
+    #[test]
+    fn select_by_reputation_returns_none_when_all_banned() {
+        use crate::health::ObservationEvent;
+        let mut dir = RelayDirectory::new();
+        dir.insert(make_test_descriptor(1, 1000));
+        let peer1 = PeerId([1; 32]);
+        for t in 0..100u64 {
+            dir.record_reputation_event(&peer1, ObservationEvent::HeartbeatMissed, t);
+        }
+        assert!(dir.select_by_reputation(&[]).is_none());
     }
 }

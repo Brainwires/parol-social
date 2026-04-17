@@ -14,6 +14,7 @@ pub mod circuit;
 pub mod directory;
 pub mod error;
 pub mod handshake;
+pub mod health;
 pub mod onion;
 pub mod padding;
 pub mod pool;
@@ -24,6 +25,7 @@ pub mod trust_roots;
 
 pub use directory::RelayHealth;
 pub use error::RelayError;
+pub use health::{ObservationEvent, RelayFlags, RelayReputation};
 
 use async_trait::async_trait;
 use std::net::SocketAddr;

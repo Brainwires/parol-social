@@ -350,41 +350,135 @@ fn descriptor_expiry_is_seven_days() {
 #[clause("PNP-008-MUST-032")]
 #[test]
 fn reputation_ewma_formula_is_0_9_times_score_plus_0_1_times_obs() {
-    fn ewma(score: f64, obs: f64) -> f64 {
-        0.9 * score + 0.1 * obs
+    // Exercise the concrete RelayReputation EWMA rather than a local copy.
+    use parolnet_relay::health::{ObservationEvent, RelayReputation};
+    let mut r = RelayReputation::new(0);
+    r.score = 0.5;
+    r.record(ObservationEvent::FederationSyncSuccess, 1);
+    assert!((r.score - 0.55).abs() < 1e-9);
+    r.record(ObservationEvent::HeartbeatMissed, 2);
+    assert!((r.score - 0.495).abs() < 1e-9);
+    // Convergence to 1.0 under repeated successes.
+    for t in 3..500 {
+        r.record(ObservationEvent::FederationSyncSuccess, t);
     }
-    // Initial score 0.5, observation 1.0 → 0.55
-    assert!((ewma(0.5, 1.0) - 0.55).abs() < 1e-9);
-    // Initial score 0.5, observation 0.0 → 0.45
-    assert!((ewma(0.5, 0.0) - 0.45).abs() < 1e-9);
-    // Bounded: repeated 1.0 converges to 1.0
-    let mut s = 0.5;
-    for _ in 0..500 {
-        s = ewma(s, 1.0);
+    assert!(r.score > 0.99 && r.score <= 1.0);
+}
+
+#[clause("PNP-008-MUST-033")]
+#[test]
+fn reputation_event_table_matches_spec() {
+    // Spec §7.1 table — each event maps to its normalized observation.
+    use parolnet_relay::health::ObservationEvent;
+    for (event, obs) in [
+        (ObservationEvent::FederationSyncSuccess, 1.0),
+        (ObservationEvent::HeartbeatOnTime, 1.0),
+        (ObservationEvent::DescriptorSignatureValid, 1.0),
+        (ObservationEvent::HeartbeatMissed, 0.0),
+        (ObservationEvent::DescriptorSignatureInvalid, 0.0),
+        (ObservationEvent::RateLimitExceeded, 0.0),
+        (ObservationEvent::ReplayedWithinWindow, 0.0),
+    ] {
+        assert!(
+            (event.observation() - obs).abs() < 1e-9,
+            "event {:?} observation {} != spec {}",
+            event,
+            event.observation(),
+            obs
+        );
     }
-    assert!(s > 0.99 && s <= 1.0);
 }
 
 #[clause("PNP-008-MUST-034")]
 #[test]
 fn suspect_threshold_score_below_0_2_for_15_minutes() {
-    let suspect_score_threshold: f64 = 0.2;
-    let suspect_window_secs: u64 = 15 * 60;
-    assert_eq!(suspect_score_threshold, 0.2);
-    assert_eq!(suspect_window_secs, 900);
+    use parolnet_relay::health::{
+        ObservationEvent, RelayFlags, RelayReputation, SUSPECT_DWELL_SECS,
+        SUSPECT_SCORE_THRESHOLD,
+    };
+    assert!((SUSPECT_SCORE_THRESHOLD - 0.2).abs() < 1e-9);
+    assert_eq!(SUSPECT_DWELL_SECS, 900);
+
+    let mut r = RelayReputation::new(0);
+    for t in 0..30 {
+        r.record(ObservationEvent::HeartbeatMissed, t);
+    }
+    assert!(r.score < SUSPECT_SCORE_THRESHOLD);
+    // Under dwell — no SUSPECT yet.
+    assert!(!r.flags.contains(RelayFlags::SUSPECT));
+    // After dwell — SUSPECT fires.
+    r.evaluate_flags(30 + SUSPECT_DWELL_SECS + 1);
+    assert!(r.flags.contains(RelayFlags::SUSPECT));
 }
 
 #[clause("PNP-008-MUST-035")]
 #[test]
 fn banned_threshold_score_below_0_05_or_3_invalid_sigs_per_minute() {
-    let ban_score_threshold: f64 = 0.05;
-    let ban_invalid_sig_count: u32 = 3;
-    let ban_invalid_sig_window_secs: u64 = 60;
-    let ban_cooldown_secs: u64 = 24 * 3600;
-    assert_eq!(ban_score_threshold, 0.05);
-    assert_eq!(ban_invalid_sig_count, 3);
-    assert_eq!(ban_invalid_sig_window_secs, 60);
-    assert_eq!(ban_cooldown_secs, 86400);
+    use parolnet_relay::health::{
+        BANNED_COOLDOWN_SECS, BANNED_INVALID_SIG_COUNT, BANNED_INVALID_SIG_WINDOW_SECS,
+        BANNED_SCORE_THRESHOLD, ObservationEvent, RelayFlags, RelayReputation,
+    };
+    assert!((BANNED_SCORE_THRESHOLD - 0.05).abs() < 1e-9);
+    assert_eq!(BANNED_INVALID_SIG_COUNT, 3);
+    assert_eq!(BANNED_INVALID_SIG_WINDOW_SECS, 60);
+    assert_eq!(BANNED_COOLDOWN_SECS, 86_400);
+
+    // Path 1: score-based ban.
+    let mut r = RelayReputation::new(0);
+    for t in 0..100 {
+        r.record(ObservationEvent::HeartbeatMissed, t);
+    }
+    assert!(r.score < BANNED_SCORE_THRESHOLD);
+    assert!(r.flags.contains(RelayFlags::BANNED));
+
+    // Path 2: > 3 invalid signatures within 60 s.
+    let mut r2 = RelayReputation::new(0);
+    for t in [0u64, 10, 20, 30] {
+        r2.record(ObservationEvent::DescriptorSignatureInvalid, t);
+    }
+    assert!(r2.flags.contains(RelayFlags::BANNED));
+
+    // Path 2 negative: exactly 3 does not ban ("more than 3").
+    let mut r3 = RelayReputation::new(0);
+    for t in [0u64, 10, 20] {
+        r3.record(ObservationEvent::DescriptorSignatureInvalid, t);
+    }
+    assert!(!r3.flags.contains(RelayFlags::BANNED));
+}
+
+#[clause("PNP-008-MUST-035")]
+#[test]
+fn banned_peer_excluded_from_circuit_selection() {
+    // Integration: `RelayDirectory` must refuse to return a BANNED peer
+    // from `select_random`.
+    use parolnet_protocol::PeerId;
+    use parolnet_relay::directory::{RelayDescriptor, RelayDirectory};
+    use parolnet_relay::health::ObservationEvent;
+    let mut dir = RelayDirectory::new();
+    for i in 1u8..=2 {
+        let desc = RelayDescriptor {
+            peer_id: PeerId([i; 32]),
+            identity_key: [i; 32],
+            x25519_key: [i; 32],
+            addr: format!("{i}.{i}.0.1:9001").parse().unwrap(),
+            bandwidth_class: 1,
+            uptime_secs: 8 * 24 * 3600,
+            timestamp: 1_700_000_000,
+            signature: [0u8; 64],
+            bandwidth_estimate: 1000,
+            next_pubkey: None,
+        };
+        dir.insert(desc);
+    }
+    let banned = PeerId([1u8; 32]);
+    for t in 0..100u64 {
+        dir.record_reputation_event(&banned, ObservationEvent::HeartbeatMissed, t);
+    }
+    assert!(dir.reputation(&banned).unwrap().is_banned());
+    for _ in 0..100 {
+        let pick = dir.select_random(&[]).expect("a relay selected");
+        assert_ne!(pick.peer_id, banned, "MUST-035: BANNED peer excluded");
+    }
 }
 
 // -- §8 Bootstrap channels ---------------------------------------------------
@@ -736,18 +830,26 @@ fn reputation_event_observations_are_bounded_probabilities() {
 #[clause("PNP-008-MUST-036")]
 #[test]
 fn reputation_persisted_every_10_minutes() {
-    const REPUTATION_PERSIST_INTERVAL_SECS: u64 = 600;
+    use parolnet_relay::health::{REPUTATION_PERSIST_INTERVAL_SECS, RelayReputation};
     assert_eq!(REPUTATION_PERSIST_INTERVAL_SECS, 600);
+
+    let mut r = RelayReputation::new(0);
+    assert!(!r.persist_due(REPUTATION_PERSIST_INTERVAL_SECS - 1));
+    assert!(r.persist_due(REPUTATION_PERSIST_INTERVAL_SECS));
+    r.mark_persisted(REPUTATION_PERSIST_INTERVAL_SECS);
+    assert!(!r.persist_due(REPUTATION_PERSIST_INTERVAL_SECS + 1));
 }
 
 #[clause("PNP-008-MUST-037")]
 #[test]
 fn reputation_never_exported_or_synced() {
     // Architectural — no FederationSync payload carries reputation scores.
-    // Pin: the signed directory schema contains only descriptors.
+    // Pin by compile-time absence: reputation lives in `parolnet_relay::health`
+    // (a private local signal) while on-the-wire descriptor types are in
+    // `parolnet_relay::directory` and `parolnet_relay::authority`. Importing
+    // RelayReputation through the directory schema is not a valid path.
     use parolnet_relay::directory::RelayDescriptor;
-    let _d: fn() -> Vec<RelayDescriptor> = Vec::new;
-    // Presence of only descriptor fields in SignedDirectory pinned by compile.
+    let _: fn(&RelayDescriptor) -> Option<parolnet_relay::health::RelayReputation> = |_| None;
 }
 
 // -- §8 Bootstrap channels ----------------------------------------------------
