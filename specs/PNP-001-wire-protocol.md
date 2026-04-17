@@ -1,12 +1,18 @@
 # PNP-001: ParolNet Wire Protocol
 
 ### Status: CANDIDATE
-### Version: 0.4
+### Version: 0.5
 ### Date: 2026-04-17
 
 ---
 
 ## Changelog
+
+**v0.5 (2026-04-17) — Outer Relay Frame + H9 Privacy Pass token auth**
+
+- Added §4 "Outer Relay Frame" specifying the JSON envelope the relay sees on the WebSocket (wraps the CBOR envelope defined in §3). The frame is `{type, to, token, payload}`; the prior `from` field is removed — relays no longer learn per-frame sender identity.
+- Added §4.2 "Token Auth (Privacy Pass)" defining the VOPRF-backed rotating-token scheme (RFC 9578 Privacy Pass + RFC 9497 VOPRF, ciphersuite `Ristretto255-SHA512`). Epoch length 3600 s, grace window 300 s, per-client budget 8192 tokens/epoch.
+- Allocated clauses `PNP-001-MUST-048` through `PNP-001-MUST-052` for the new outer-frame / token-auth rules.
 
 **v0.4 (2026-04-17) — Identity rotation message type**
 
@@ -381,3 +387,97 @@ Multiple independently scoped AEAD contexts exist in the ParolNet stack. Each us
 | `N-SENDERKEY` | PNP-009 group sender-key AEAD | `SHA-256(signing_public_key)[0..4] \|\| chain_index (8B BE)` | 12 bytes | PNP-009 §5.4 |
 
 Implementations MUST NOT construct an AEAD nonce by any scheme other than those listed here in the context specified. **PNP-001-MUST-047** Future nonce schemes MUST be added to this catalog in a future revision of PNP-001.
+
+## 10. Outer Relay Frame
+
+The CBOR envelope defined in §3 is the *inner* wire unit — it is what end-to-end recipients decrypt. When a client pushes that envelope through the WebSocket to a relay, the envelope rides as the `payload` field of a JSON-encoded **outer relay frame**. This section normatively defines that outer frame. Logically it is a layer **above** §3 — the relay sees only the outer frame, never the plaintext of the envelope it carries.
+
+### 10.1 Outer Frame Schema
+
+The outer frame is a JSON object with four required fields:
+
+```
+OuterMessageFrame = {
+  "type"    : "message",     -- string literal
+  "to"      : hex(bstr32),   -- destination PeerId (hex-encoded)
+  "token"   : hex(bstr),     -- CBOR-serialized Privacy Pass Token (hex-encoded)
+  "payload" : hex(bstr)      -- the §3 envelope, hex-encoded
+}
+```
+
+The frame MUST carry a non-empty `token` field. There is no `from` field. **PNP-001-MUST-048** The relay therefore does not see a sender identity on any per-frame send; sender authentication is discharged at *issuance* time (§10.2), not at *spend* time.
+
+Any frame that reaches the relay without a valid, non-empty `token` field MUST be dropped silently — no error response is returned, so an adversary cannot probe which identity a frame belonged to.
+
+### 10.2 Token Auth (Privacy Pass)
+
+ParolNet relays authenticate per-frame sends with [RFC 9578] Privacy Pass tokens backed by a [RFC 9497] VOPRF. The ciphersuite is **`Ristretto255-SHA512`** (RFC 9497 §4.1).
+
+**Issuance.** A client presents its long-term Ed25519 identity to the relay over `POST /tokens/issue`:
+
+```
+TokenIssueRequest = CBOR map {
+  "ed25519_pubkey_hex"    : tstr,                -- 32-byte key, hex
+  "ed25519_sig_hex"       : tstr,                -- 64-byte signature, hex
+  "challenge_nonce_hex"   : tstr,                -- 32-byte nonce, hex
+  "blinded_bytes_list"    : [ bstr, bstr, ... ]  -- up to `budget_per_epoch`
+                                                  --   serialized BlindedElements
+}
+```
+
+The relay MUST reject any issuance request whose Ed25519 signature does not verify under the supplied public key over the supplied challenge nonce. **PNP-001-MUST-052** On success the relay runs `blind_evaluate` (RFC 9497 §3.3.2) on each `BlindedElement` under the **active epoch's** VOPRF secret and returns a `TokenIssueResponse`:
+
+```
+TokenIssueResponse = CBOR map {
+  "epoch_id"     : bstr(4),         -- opaque 4-byte epoch identifier
+  "activated_at" : uint,            -- Unix seconds the epoch started
+  "expires_at"   : uint,            -- Unix seconds it fully expires (past grace)
+  "ciphersuite"  : tstr("ristretto255-SHA512"),
+  "budget"       : uint,            -- per-epoch budget
+  "evaluated"    : [ bstr, ... ]    -- serialized EvaluationElements
+}
+```
+
+The client unblinds each `EvaluationElement` via `OprfClient::finalize` to recover the per-token output, packages each as a `Token`, and stores the batch.
+
+**Spend.** Each outer frame's `token` is the hex-encoded CBOR serialization of:
+
+```
+Token = CBOR map {
+  "epoch_id"    : bstr(4),
+  "nonce"       : bstr(32),   -- the 32-byte VOPRF input chosen at blind time
+  "evaluation"  : bstr        -- the client-unblinded VOPRF output
+}
+```
+
+On receiving an outer frame the relay MUST:
+
+1. Parse the `token` field and identify its epoch by `epoch_id`. If the epoch id matches neither the active nor the prior-within-grace epoch, reject.
+2. Recompute `OprfServer::evaluate(sk, nonce)` under the located epoch's VOPRF secret and compare against `token.evaluation` in constant time. If the comparison fails, reject. **PNP-001-MUST-049**
+3. Check the per-epoch spent-set for `nonce`. If the nonce is already present, reject. Otherwise insert it and route the frame. **PNP-001-MUST-050**
+
+All three rejection paths drop the frame silently (no error to the sender).
+
+**Epoch rotation.** Each epoch lasts **3600 seconds**. At every epoch boundary the relay generates a fresh VOPRF secret for the new epoch and retains the previous epoch's secret for a **300-second grace window** so tokens that were issued just before the boundary still verify. Once the grace window elapses, the prior secret and its spent-set MUST be dropped. **PNP-001-MUST-051**
+
+| Parameter | Value |
+|-----------|-------|
+| `epoch_secs` | 3600 |
+| `grace_secs` | 300 |
+| `budget_per_epoch` | 8192 |
+| Ciphersuite | `Ristretto255-SHA512` (RFC 9497 §4.1) |
+
+**Zeroization.** The relay's implementation MUST hold the VOPRF server secret behind a `Zeroize + ZeroizeOnDrop` wrapper so epoch rotation leaves no secret residue in freed heap memory (see `CLAUDE.md` §"Security Invariants").
+
+**Rate-limit.** Each identity is entitled to at most one `TokenIssueResponse` per active epoch; repeat requests from the same `ed25519_pubkey_hex` within a single epoch return `429 Too Many Requests`.
+
+### 10.3 Cross-References
+
+| Construct | Where |
+|-----------|-------|
+| `Token` type, `TokenAuthority`, epoch rotation | `crates/parolnet-relay/src/tokens.rs` |
+| `POST /tokens/issue` + frame router | `crates/parolnet-relay-server/src/main.rs` |
+| VOPRF crate | `voprf = "0.5"` (audited, RustCrypto-adjacent) |
+
+[RFC 9497]: https://www.rfc-editor.org/rfc/rfc9497.html
+[RFC 9578]: https://www.rfc-editor.org/rfc/rfc9578.html

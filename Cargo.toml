@@ -83,6 +83,9 @@ curve25519-dalek = "4"
 futures-util = "0.3"
 hex = "0.4"
 
+# Privacy Pass / VOPRF (H9 relay token auth — RFC 9578 / RFC 9497)
+voprf = { version = "0.5", default-features = false, features = ["ristretto255-ciphersuite", "alloc"] }
+
 # Audio codecs
 opus-rs = "0.1"
 codec2 = "0.3"

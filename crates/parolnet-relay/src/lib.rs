@@ -18,6 +18,7 @@ pub mod onion;
 pub mod padding;
 pub mod pool;
 pub mod relay_node;
+pub mod tokens;
 pub mod trust_roots;
 
 pub use directory::RelayHealth;

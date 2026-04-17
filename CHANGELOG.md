@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added — Privacy Pass relay-frame auth (PNP-001 §10, H9 commit 1 of 2)
+- New `parolnet-relay::tokens` module: epoch-rotating VOPRF (`Ristretto255-SHA512`, RFC 9497) issuer / verifier powering RFC 9578 Privacy Pass tokens for the outer relay frame. 1-hour epochs, 5-minute grace, 8192 tokens/client/epoch. Server secrets zeroize on drop per the security invariants.
+- New `POST /tokens/issue` endpoint in `parolnet-relay-server`: Ed25519-authenticated batch blind-evaluation; one batch per identity per epoch.
+- Outer relay frame `{type, to, token, payload}` replaces the prior `{type, to, from, payload}`. The `from` field is gone — relays no longer learn per-frame sender identity. Pre-launch: no legacy / dual-path.
+- Spec: PNP-001 v0.5 CANDIDATE adds §10 "Outer Relay Frame" + §10.2 "Token Auth (Privacy Pass)" with clauses `PNP-001-MUST-048` through `PNP-001-MUST-052`.
+- Conformance: 5 new tests in `pnp_001_outer_frame.rs` covering no-token drop, issue→spend round-trip, double-spend rejection, cross-epoch expiry, nonce tamper, and Ed25519 issuance guard.
+- Follow-up (commit 2 of 2): WASM exports + PWA wire-up so the client actually blinds, requests, spends, and re-provisions tokens end-to-end.
+
 ### Added — Identity Rotation (PNP-002 §8, H5)
 - New `IdentityRotationPayload` in `parolnet-protocol`: old/new PeerId, new Ed25519 pubkey, rotated_at, grace_expires_at, Ed25519 signature over canonical domain-separated byte sequence (`ParolNet-IdentityRotation-v1`).
 - `rotate_identity()` generates a new `IdentityKeyPair` and produces a signed rotation payload; `verify_identity_rotation()` checks signature under the old identity's Ed25519 public key.

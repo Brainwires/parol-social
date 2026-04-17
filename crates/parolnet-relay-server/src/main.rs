@@ -14,6 +14,7 @@ use parolnet_mesh::peer_manager::PeerManager;
 use parolnet_protocol::address::PeerId;
 use parolnet_relay::authority::EndorsedDescriptor;
 use parolnet_relay::directory::{RelayDescriptor, RelayDirectory};
+use parolnet_relay::tokens::{Suite, Token, TokenAuthority, TokenConfig};
 use parolnet_transport::{Connection, TransportError};
 use rand::seq::SliceRandom;
 use serde::{Deserialize, Serialize};
@@ -307,6 +308,10 @@ struct IncomingMessage {
     signature: Option<String>,
     /// Hex-encoded challenge nonce being responded to.
     nonce: Option<String>,
+    /// H9 Privacy Pass token (hex CBOR). REQUIRED on "message" frames —
+    /// replaces the outer `from` field (see PNP-001 §"Outer Relay Frame",
+    /// clause PNP-001-MUST-048).
+    token: Option<String>,
 }
 
 #[derive(Default, Serialize)]
@@ -599,6 +604,189 @@ async fn handle_directory_push(
     }
 
     (StatusCode::OK, Json(serde_json::json!({"merged": merged}))).into_response()
+}
+
+// ---- H9 Privacy Pass token issuance --------------------------------------
+
+/// Per-identity rate tracker: the last epoch_id the identity pulled tokens in.
+/// Caps issuance at one batch per identity per epoch (PNP-001-MUST-052 —
+/// authenticated issuance; the cap is the policy knob, not a normative clause).
+type IssueLimiter = Arc<Mutex<HashMap<[u8; 32], [u8; 4]>>>;
+
+/// CBOR shape of an inbound `POST /tokens/issue` request body.
+#[derive(Deserialize)]
+struct TokenIssueRequest {
+    /// Hex-encoded Ed25519 public key (32 bytes).
+    ed25519_pubkey_hex: String,
+    /// Hex-encoded Ed25519 signature (64 bytes) over the challenge nonce.
+    ed25519_sig_hex: String,
+    /// Hex-encoded challenge nonce (32 bytes) the client just signed.
+    challenge_nonce_hex: String,
+    /// Raw VOPRF `BlindedElement` bytes, one per requested token.
+    /// Each element is 32 bytes (compressed Ristretto255).
+    blinded_bytes_list: Vec<serde_bytes::ByteBuf>,
+}
+
+/// CBOR shape of a `POST /tokens/issue` response.
+#[derive(Serialize)]
+struct TokenIssueResponse {
+    /// 4-byte epoch identifier.
+    #[serde(with = "serde_bytes")]
+    epoch_id: Vec<u8>,
+    /// Unix seconds at which the active epoch started.
+    activated_at: u64,
+    /// Unix seconds at which the active epoch fully expires (past grace).
+    expires_at: u64,
+    /// Ciphersuite name, per RFC 9497 §4.1 ("ristretto255-SHA512").
+    ciphersuite: &'static str,
+    /// Per-epoch budget the client is authorized to claim.
+    budget: u32,
+    /// VOPRF `EvaluationElement` bytes, one per request entry.
+    evaluated: Vec<serde_bytes::ByteBuf>,
+}
+
+/// `POST /tokens/issue` — mint a batch of blind-evaluated Privacy Pass tokens.
+///
+/// Flow:
+///   1. Decode CBOR body.
+///   2. Verify Ed25519(challenge_nonce) under the supplied pubkey
+///      (PNP-001-MUST-052 — authenticated issuance).
+///   3. Cap one batch per identity per epoch.
+///   4. Deserialize each `BlindedElement` (32-byte Ristretto255).
+///   5. Call `TokenAuthority::issue` and return evaluated elements.
+async fn handle_tokens_issue(
+    authority: Arc<Mutex<TokenAuthority>>,
+    issue_limiter: IssueLimiter,
+    body: axum::body::Bytes,
+) -> impl IntoResponse {
+    let req: TokenIssueRequest = match ciborium::from_reader(body.as_ref()) {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!(error = %e, "Invalid CBOR in /tokens/issue request");
+            return (StatusCode::BAD_REQUEST, "invalid CBOR").into_response();
+        }
+    };
+
+    // 1. Decode Ed25519 material.
+    let pubkey_bytes = match hex::decode(&req.ed25519_pubkey_hex) {
+        Ok(b) => b,
+        Err(_) => return (StatusCode::BAD_REQUEST, "invalid pubkey hex").into_response(),
+    };
+    let sig_bytes = match hex::decode(&req.ed25519_sig_hex) {
+        Ok(b) => b,
+        Err(_) => return (StatusCode::BAD_REQUEST, "invalid signature hex").into_response(),
+    };
+    let nonce_bytes = match hex::decode(&req.challenge_nonce_hex) {
+        Ok(b) => b,
+        Err(_) => return (StatusCode::BAD_REQUEST, "invalid nonce hex").into_response(),
+    };
+
+    let vk_arr: [u8; 32] = match pubkey_bytes.as_slice().try_into() {
+        Ok(a) => a,
+        Err(_) => return (StatusCode::BAD_REQUEST, "pubkey must be 32 bytes").into_response(),
+    };
+    let verifying_key = match ed25519_dalek::VerifyingKey::from_bytes(&vk_arr) {
+        Ok(k) => k,
+        Err(_) => return (StatusCode::BAD_REQUEST, "invalid Ed25519 key").into_response(),
+    };
+    let sig_arr: [u8; 64] = match sig_bytes.as_slice().try_into() {
+        Ok(a) => a,
+        Err(_) => return (StatusCode::BAD_REQUEST, "sig must be 64 bytes").into_response(),
+    };
+    let signature = ed25519_dalek::Signature::from_bytes(&sig_arr);
+
+    // 2. Verify signature. PNP-001-MUST-052.
+    use ed25519_dalek::Verifier;
+    if verifying_key.verify(&nonce_bytes, &signature).is_err() {
+        tracing::warn!("Rejected /tokens/issue — signature verify failed");
+        return (StatusCode::UNAUTHORIZED, "signature verify failed").into_response();
+    }
+
+    // Advance and snapshot epoch state under the authority mutex.
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+
+    // 3. Rate-limit: one batch per identity per epoch.
+    let current_epoch: [u8; 4] = {
+        let mut a = authority.lock().await;
+        a.tick(now);
+        a.current_epoch()
+    };
+    {
+        let mut lim = issue_limiter.lock().await;
+        match lim.get(&vk_arr) {
+            Some(prior) if *prior == current_epoch => {
+                return (
+                    StatusCode::TOO_MANY_REQUESTS,
+                    "budget exhausted for this epoch",
+                )
+                    .into_response();
+            }
+            _ => {
+                lim.insert(vk_arr, current_epoch);
+            }
+        }
+    }
+
+    // 4. Deserialize blinded elements and 5. issue.
+    let mut blinded_vec = Vec::with_capacity(req.blinded_bytes_list.len());
+    for (i, bb) in req.blinded_bytes_list.iter().enumerate() {
+        match voprf::BlindedElement::<Suite>::deserialize(bb.as_ref()) {
+            Ok(b) => blinded_vec.push(b),
+            Err(e) => {
+                tracing::warn!(idx = i, error = %e, "bad BlindedElement");
+                return (
+                    StatusCode::BAD_REQUEST,
+                    format!("bad BlindedElement at index {i}"),
+                )
+                    .into_response();
+            }
+        }
+    }
+
+    let (evaluated, activated_at, expires_at) = {
+        let a = authority.lock().await;
+        let eval = a.issue(&blinded_vec);
+        (eval, a.current_activated_at(), a.current_expires_at())
+    };
+
+    let evaluated_bytes: Vec<serde_bytes::ByteBuf> = evaluated
+        .iter()
+        .map(|e| serde_bytes::ByteBuf::from(e.serialize().to_vec()))
+        .collect();
+
+    let resp = TokenIssueResponse {
+        epoch_id: current_epoch.to_vec(),
+        activated_at,
+        expires_at,
+        ciphersuite: "ristretto255-SHA512",
+        budget: {
+            let a = authority.lock().await;
+            a.budget_per_epoch()
+        },
+        evaluated: evaluated_bytes,
+    };
+
+    let mut cbor = Vec::new();
+    if ciborium::into_writer(&resp, &mut cbor).is_err() {
+        return (StatusCode::INTERNAL_SERVER_ERROR, "encode failed").into_response();
+    }
+
+    (
+        StatusCode::OK,
+        [(axum::http::header::CONTENT_TYPE, "application/cbor")],
+        cbor,
+    )
+        .into_response()
+}
+
+/// Parse a hex-encoded CBOR-serialized [`Token`] (what rides in the outer
+/// frame's `token` field).
+fn parse_outer_token(hex_str: &str) -> Option<Token> {
+    let bytes = hex::decode(hex_str).ok()?;
+    ciborium::from_reader(bytes.as_slice()).ok()
 }
 
 /// Generate time-limited TURN credentials using HMAC-SHA1 (RFC 7635-adjacent).
@@ -956,6 +1144,35 @@ async fn main() {
     let client_stats = Arc::new(ClientStats::new());
     let directory: Arc<Mutex<RelayDirectory>> = Arc::new(Mutex::new(RelayDirectory::new()));
 
+    // H9 Privacy Pass token authority. The VOPRF secret is generated once on
+    // boot and rotated on every 1-hour epoch boundary (PNP-001-MUST-051).
+    let startup_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let token_authority: Arc<Mutex<TokenAuthority>> = Arc::new(Mutex::new(TokenAuthority::new(
+        TokenConfig::default(),
+        startup_secs,
+    )));
+    let issue_limiter: IssueLimiter = Arc::new(Mutex::new(HashMap::new()));
+    // Spawn a ticker so rotation happens even when there's no /tokens/issue
+    // traffic to drive it.
+    {
+        let ta = token_authority.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(60));
+            interval.tick().await;
+            loop {
+                interval.tick().await;
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+                ta.lock().await.tick(now);
+            }
+        });
+    }
+
     // Parse peer relay URLs from PEER_RELAY_URLS env var (comma-separated)
     let peer_relay_urls: Arc<Mutex<Vec<String>>> = {
         let urls: Vec<String> = std::env::var("PEER_RELAY_URLS")
@@ -1014,7 +1231,10 @@ async fn main() {
             info!("Loaded relay identity from RELAY_SECRET_KEY env var (not persisted to disk)");
         }
         parolnet_relay_server::identity::IdentitySource::ExistingFile => {
-            info!("Loaded persistent relay identity from {}", key_file.display());
+            info!(
+                "Loaded persistent relay identity from {}",
+                key_file.display()
+            );
         }
         parolnet_relay_server::identity::IdentitySource::GeneratedAndPersisted => {
             info!(
@@ -1099,6 +1319,7 @@ async fn main() {
                 let conn_rl = conn_rate_limiter.clone();
                 let msg_rl = msg_rate_limiter.clone();
                 let tp = trusted_proxies.clone();
+                let ta = token_authority.clone();
                 move |ws: WebSocketUpgrade,
                       headers: axum::http::HeaderMap,
                       connect_info: axum::extract::ConnectInfo<std::net::SocketAddr>| async move {
@@ -1108,7 +1329,7 @@ async fn main() {
                         return StatusCode::TOO_MANY_REQUESTS.into_response();
                     }
                     ws.on_upgrade(move |socket| {
-                        handle_socket(socket, peers, store, stats, peer_manager, msg_rl)
+                        handle_socket(socket, peers, store, stats, peer_manager, msg_rl, ta)
                     })
                     .into_response()
                 }
@@ -1185,6 +1406,18 @@ async fn main() {
                         handle_directory_push(directory, our_peer_id, push_rl, client_ip, body)
                             .await
                     }
+                }
+            }),
+        )
+        .route(
+            "/tokens/issue",
+            post({
+                let ta = token_authority.clone();
+                let il = issue_limiter.clone();
+                move |body: axum::body::Bytes| {
+                    let ta = ta.clone();
+                    let il = il.clone();
+                    async move { handle_tokens_issue(ta, il, body).await }
                 }
             }),
         )
@@ -1509,6 +1742,7 @@ async fn handle_socket(
     stats: Arc<analytics::Stats>,
     peer_manager: Arc<PeerManager>,
     msg_rate_limiter: MsgRateLimiter,
+    token_authority: Arc<Mutex<TokenAuthority>>,
 ) {
     let (mut sender, mut receiver) = socket.split();
     let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
@@ -1721,38 +1955,73 @@ async fn handle_socket(
             }
 
             "message" => {
-                let from = my_peer_id.clone().unwrap_or_default();
-                if let (Some(to), Some(payload)) = (incoming.to, incoming.payload) {
-                    let outgoing = serde_json::to_string(&OutgoingMessage {
-                        msg_type: "message".into(),
-                        from: Some(from.clone()),
-                        payload: Some(payload),
-                        ..Default::default()
-                    })
-                    .unwrap();
+                // PNP-001 "Outer Relay Frame" (§ Token Auth): the frame carries
+                // a `token` field *instead of* a `from` field. The relay MUST
+                // VOPRF-verify the token and MUST reject duplicates.
+                //
+                // Clauses:
+                //   - PNP-001-MUST-048 — `token` field is mandatory.
+                //   - PNP-001-MUST-049 — VOPRF verify under current / prior
+                //     epoch key; drop otherwise (silent — no leak).
+                //   - PNP-001-MUST-050 — spent-set enforcement.
+                let (Some(to), Some(payload), Some(token_hex)) =
+                    (incoming.to, incoming.payload, incoming.token)
+                else {
+                    tracing::warn!(
+                        peer = %my_peer_id.clone().unwrap_or_default(),
+                        "dropping outer message frame missing token / to / payload"
+                    );
+                    continue;
+                };
 
-                    let peers_lock = peers.lock().await;
-                    if let Some(recipient_tx) = peers_lock.get(&to) {
-                        // Recipient online -- forward directly
-                        let _ = recipient_tx.send(Message::Text(outgoing.into()));
-                        stats.record_message_routed();
-                    } else {
-                        // Recipient offline -- buffer for later delivery
-                        drop(peers_lock);
-                        if let Some(dest_pid) = parse_peer_id(&to) {
-                            store.lock().await.store(dest_pid, outgoing);
-                            stats.record_message_queued();
-                        }
-                        let _ = tx.send(Message::Text(
-                            serde_json::to_string(&OutgoingMessage {
-                                msg_type: "queued".into(),
-                                message: Some("peer offline, message stored".into()),
-                                ..Default::default()
-                            })
-                            .unwrap()
-                            .into(),
-                        ));
+                let Some(token) = parse_outer_token(&token_hex) else {
+                    tracing::warn!("dropping outer message frame with malformed token");
+                    continue;
+                };
+
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+                let verified = {
+                    let mut a = token_authority.lock().await;
+                    a.tick(now);
+                    a.verify_and_spend(&token, now)
+                };
+                if let Err(e) = verified {
+                    tracing::warn!(error = %e, "dropping outer message frame — token rejected");
+                    continue;
+                }
+
+                // Token passed — route the payload to `to`. The outbound frame
+                // does NOT carry a `from` field; the relay is intentionally
+                // blind to sender identity on the wire.
+                let outgoing = serde_json::to_string(&OutgoingMessage {
+                    msg_type: "message".into(),
+                    payload: Some(payload),
+                    ..Default::default()
+                })
+                .unwrap();
+
+                let peers_lock = peers.lock().await;
+                if let Some(recipient_tx) = peers_lock.get(&to) {
+                    let _ = recipient_tx.send(Message::Text(outgoing.into()));
+                    stats.record_message_routed();
+                } else {
+                    drop(peers_lock);
+                    if let Some(dest_pid) = parse_peer_id(&to) {
+                        store.lock().await.store(dest_pid, outgoing);
+                        stats.record_message_queued();
                     }
+                    let _ = tx.send(Message::Text(
+                        serde_json::to_string(&OutgoingMessage {
+                            msg_type: "queued".into(),
+                            message: Some("peer offline, message stored".into()),
+                            ..Default::default()
+                        })
+                        .unwrap()
+                        .into(),
+                    ));
                 }
             }
 
