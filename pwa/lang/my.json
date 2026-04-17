@@ -177,6 +177,8 @@
   "settings.language": "ဘာသာစကား",
   "settings.relayOnlyMode": "Relay သီးသန့်မုဒ်",
   "settings.relayOnlyDescription": "ဖွင့်ထားလျှင် WebRTC ချိတ်ဆက်မှုများသည် TURN relay များမှသာ ဖြတ်သွားပါမည်။ သင့် IP လိပ်စာကို တစ်ဖက်လူများထံ ဘယ်တော့မှမဖော်ပြပါ။",
+  "settings.coverTraffic": "ဖုံးကွယ်ထားသော ဒေတာစီးဆင်းမှု",
+  "settings.coverTrafficDescription": "သင့်အမှန်တကယ် လုပ်ဆောင်မှုကို ဖုံးကွယ်ရန် တစ်စက္ကန့်ခွဲခန့်တိုင်း ကုဒ်ဖြင့်ရေးသားထားသော ငယ်ငယ်လေး စာတိုတစ်ခုကို ပို့ပေးပါသည်။ လုပ်ဆောင်ခြင်းမရှိသောအခါ တစ်စက္ကန့်လျှင် ၈ KB ခန့် ဒေတာသုံးပါသည်။",
   "settings.webrtcDisabled": "WebRTC ပိတ်ထားသည် — TURN ဆာဗာ ပြင်ဆင်ထားခြင်းမရှိပါ။",
   "settings.relayConnectedCount": "ချိတ်ဆက်ပြီး{count}",
   "settings.relayDisconnected": "ချိတ်ဆက်မှုပြတ်{count}",

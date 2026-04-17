@@ -177,6 +177,8 @@
   "settings.language": "Язык",
   "settings.relayOnlyMode": "Режим только через ретранслятор",
   "settings.relayOnlyDescription": "При включении WebRTC-соединения идут только через TURN-ретрансляторы. Ваш IP-адрес никогда не раскрывается собеседникам.",
+  "settings.coverTraffic": "Маскирующий трафик",
+  "settings.coverTrafficDescription": "Примерно каждые полсекунды отправляет небольшое зашифрованное сообщение, чтобы скрыть вашу реальную активность. В режиме ожидания расходует около 8 КБ/с.",
   "settings.webrtcDisabled": "WebRTC отключён — TURN-серверы не настроены.",
   "settings.relayConnectedCount": "Подключено{count}",
   "settings.relayDisconnected": "Отключено{count}",

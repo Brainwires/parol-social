@@ -177,6 +177,8 @@
   "settings.language": "زبان",
   "settings.relayOnlyMode": "حالت فقط رله",
   "settings.relayOnlyDescription": "وقتی فعال باشد، اتصالات WebRTC فقط از طریق رله‌های TURN عبور می‌کنند. آدرس IP شما هرگز برای مخاطبان آشکار نمی‌شود.",
+  "settings.coverTraffic": "ترافیک پوششی",
+  "settings.coverTrafficDescription": "تقریباً هر نیم‌ثانیه یک پیام رمزگذاری‌شدهٔ کوچک می‌فرستد تا فعالیت واقعی شما را پنهان کند. در حالت بی‌کار حدود ۸ کیلوبایت بر ثانیه داده مصرف می‌کند.",
   "settings.webrtcDisabled": "WebRTC غیرفعال است — سرورهای TURN پیکربندی نشده‌اند.",
   "settings.relayConnectedCount": "متصل{count}",
   "settings.relayDisconnected": "قطع{count}",

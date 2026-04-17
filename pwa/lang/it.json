@@ -177,6 +177,8 @@
   "settings.language": "Lingua",
   "settings.relayOnlyMode": "Modalita solo relay",
   "settings.relayOnlyDescription": "Quando attivata, le connessioni WebRTC passano solo attraverso i relay TURN. Il tuo indirizzo IP non viene mai esposto ai peer.",
+  "settings.coverTraffic": "Traffico di copertura",
+  "settings.coverTrafficDescription": "Invia un piccolo messaggio cifrato circa ogni mezzo secondo per nascondere la tua attivita reale. Usa circa 8 KB/s di dati quando e inattivo.",
   "settings.webrtcDisabled": "WebRTC disattivato — nessun server TURN configurato.",
   "settings.relayConnectedCount": "Connesso{count}",
   "settings.relayDisconnected": "Disconnesso{count}",

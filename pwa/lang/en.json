@@ -187,6 +187,8 @@
   "settings.language": "Language",
   "settings.relayOnlyMode": "Relay-only mode",
   "settings.relayOnlyDescription": "When enabled, WebRTC connections route through TURN relays only. Your IP address is never exposed to peers.",
+  "settings.coverTraffic": "Cover traffic",
+  "settings.coverTrafficDescription": "Emits a small encrypted message roughly every half-second to hide your real activity. Uses about 8 KB/s of data when idle.",
   "settings.webrtcDisabled": "WebRTC disabled — no TURN servers configured.",
   "btn.verifyIdentity": "Verify identity",
   "heading.verifyIdentity": "Verify identity",

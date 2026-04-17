@@ -14,6 +14,7 @@ import { initWebRTC, hasDirectConnection, sendViaWebRTC, rtcConnections,
 import { sendToRelay, connMgr, queueMessage } from './connection.js';
 import { t } from './i18n.js';
 import { MSG_TYPE_CHAT, MSG_TYPE_SYSTEM, MSG_TYPE_CALL_SIGNAL } from './protocol-constants.js';
+import { markRealSend } from './cover-traffic.js';
 
 // ── Session Persistence ──────────────────────────────────
 function persistSessions() {
@@ -228,6 +229,7 @@ export async function sendMessage() {
         const plainBytes = encoder.encode(text);
         const nowSecs = BigInt(Math.floor(Date.now() / 1000));
         relayPayload = wasm.envelope_encode(currentPeerId, MSG_TYPE_CHAT, plainBytes, nowSecs);
+        markRealSend();
         persistSessions();
         if (hasDirectConnection(currentPeerId)) {
             sent = sendViaWebRTC(currentPeerId, relayPayload);
@@ -352,6 +354,7 @@ export async function initiateCall(peerId, withVideo) {
             }));
             const nowSecs = BigInt(Math.floor(Date.now() / 1000));
             const envelope = wasm.envelope_encode(peerId, MSG_TYPE_CALL_SIGNAL, inner, nowSecs);
+            markRealSend();
             sendToRelay(peerId, envelope);
         } catch (e) {
             console.warn('[Call] envelope_encode failed:', e);
@@ -679,6 +682,7 @@ function handleScannedQR(data) {
             const nowSecs = BigInt(Math.floor(Date.now() / 1000));
             try {
                 const envelope = wasm.envelope_encode(peerId, MSG_TYPE_SYSTEM, encoder.encode('bootstrap:' + ourIk), nowSecs);
+                markRealSend();
                 persistSessions();
                 if (!sendToRelay(peerId, envelope)) {
                     queueMessage(peerId, envelope);

@@ -177,6 +177,8 @@
   "settings.language": "语言",
   "settings.relayOnlyMode": "仅中继模式",
   "settings.relayOnlyDescription": "启用后，WebRTC 连接仅通过 TURN 中继路由。你的 IP 地址不会暴露给其他节点。",
+  "settings.coverTraffic": "掩护流量",
+  "settings.coverTrafficDescription": "大约每半秒发送一条小型加密消息，以掩盖你的真实活动。空闲时每秒约消耗 8 KB 流量。",
   "settings.webrtcDisabled": "WebRTC 已禁用 — 未配置 TURN 服务器。",
   "settings.relayConnectedCount": "已连接{count}",
   "settings.relayDisconnected": "已断开{count}",

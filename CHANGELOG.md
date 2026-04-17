@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added — Wire-level cover traffic (PNP-006, H7)
+- New `pwa/src/cover-traffic.js`: NORMAL-mode timer (500ms base + ≤100ms jitter) emits `MSG_TYPE_DECOY` (0x04) envelopes to a rotating contact with an established Double Ratchet session.
+- Real sends suppress the next decoy tick via `markRealSend()` — PNP-006-MUST-005 (real data has priority over padding).
+- `dispatchByMsgType` now drops DECOY silently: no UI, no handler, no log.
+- Settings toggle under Network → WebRTC Privacy; default ON; 16-language strings.
+- No-op when no contact has a secure session yet (fails safe during bootstrap).
+- Decoy plaintext is 8 random bytes → envelope lands in the 256-byte bucket → ~512 B/s idle bandwidth.
+- LOW / HIGH modes and burst pacing (PNP-006 Table §3.1, MUST-007/008) deferred to a follow-up.
+
 ### Changed — Envelope coverage for all user-facing wire types (PNP-001)
 - Every user-facing PWA wire frame now ships as a PNP-001 padded envelope: `call_offer`, `call_reject`, `group_message`, `group_invite`, `sender_key`, `group_call_invite`, `group_file_offer`, `group_file_chunk`, and `file_accept`.
 - Removed the legacy plaintext-JSON `_pn_type` string-marker path from send and receive code. `dispatchByMsgType` is the single wire-frame dispatcher, routing on the envelope header's `msg_type` code (PNP-001 §3.4).

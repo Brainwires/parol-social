@@ -177,6 +177,8 @@
   "settings.language": "Ngôn ngữ",
   "settings.relayOnlyMode": "Chế độ chỉ dùng Relay",
   "settings.relayOnlyDescription": "Khi bật, kết nối WebRTC chỉ đi qua TURN relay. Địa chỉ IP của bạn không bao giờ bị lộ cho người khác.",
+  "settings.coverTraffic": "Lưu lượng ngụy trang",
+  "settings.coverTrafficDescription": "Gửi một tin nhắn mã hóa nhỏ khoảng mỗi nửa giây để che giấu hoạt động thật của bạn. Dùng khoảng 8 KB/giây dữ liệu khi nhàn rỗi.",
   "settings.webrtcDisabled": "WebRTC đã tắt — chưa cấu hình máy chủ TURN.",
   "settings.relayConnectedCount": "Đã kết nối{count}",
   "settings.relayDisconnected": "Mất kết nối{count}",

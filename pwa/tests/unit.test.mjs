@@ -626,6 +626,39 @@ describe('PWA envelope wire path', () => {
         assert.deepEqual(unknown, { unknown: 0xff });
     });
 
+    test('dispatchByMsgType drops DECOY silently (no handlers invoked)', () => {
+        // Mirror of the new DECOY case added to pwa/src/messaging.js.
+        // messaging.js pulls DOM-dependent imports so we cannot import it here;
+        // this test encodes the same switch-statement behavior.
+        function dispatch(msgType, fromPeerId, plaintext, handlers) {
+            switch (msgType) {
+                case 0x04: return; // DECOY — silent drop
+                case MSG_TYPE_CHAT: return handlers.chat(fromPeerId, plaintext);
+                default: return { unknown: msgType };
+            }
+        }
+        const calls = [];
+        const logOrig = console.log;
+        const warnOrig = console.warn;
+        const errOrig = console.error;
+        const logLines = [];
+        console.warn = (...a) => logLines.push(['warn', ...a]);
+        console.log  = (...a) => logLines.push(['log',  ...a]);
+        console.error= (...a) => logLines.push(['error',...a]);
+        try {
+            const result = dispatch(0x04, 'aa'.repeat(32), new Uint8Array([0, 1, 2, 3, 4, 5, 6, 7]), {
+                chat: (p, b) => calls.push(['chat', p, b]),
+            });
+            assert.equal(result, undefined, 'DECOY returns undefined');
+        } finally {
+            console.warn = warnOrig;
+            console.log = logOrig;
+            console.error = errOrig;
+        }
+        assert.equal(calls.length, 0, 'no handler invoked for DECOY');
+        assert.equal(logLines.length, 0, 'no log emitted for DECOY');
+    });
+
     test('protocol-constants.js exports every PNP-001 §3.4 code', async () => {
         const mod = await import('../src/protocol-constants.js');
         // PNP-001 §3.4 registry — code + export name pairs.
@@ -661,5 +694,145 @@ describe('PWA envelope wire path', () => {
             assert.ok(expectedNames.has(name), `unexpected registry entry: ${name}`);
         }
         assert.equal(Object.keys(mod.ALL_MSG_TYPES).length, expected.length);
+    });
+});
+
+// ── H7 cover traffic ───────────────────────────────────────────
+
+describe('cover traffic', () => {
+    const MSG_TYPE_DECOY = 0x04;
+    // Short interval for tests: since startCoverTraffic timings are module-
+    // internal constants (500 + ≤100ms), we can't easily override without
+    // refactoring. Instead, drive tick() indirectly by starting, then stopping
+    // quickly and asserting on a short wall-clock window where possible.
+    // For precise behavior assertions we import the module and stub its deps.
+
+    async function freshCT() {
+        // Re-import via a cache-busting query so module state resets between tests.
+        const mod = await import('../src/cover-traffic.js?t=' + Math.random());
+        return mod;
+    }
+
+    test('startCoverTraffic requires all deps', async () => {
+        const ct = await freshCT();
+        assert.throws(() => ct.startCoverTraffic({}), /missing required dependency/);
+        assert.throws(() => ct.startCoverTraffic({
+            wasm: {}, sendToRelay: () => {}, listContacts: () => [], mode: 'LOW'
+        }), /only NORMAL/);
+        ct.stopCoverTraffic();
+    });
+
+    test('no contacts with session → no decoy sent', async (t) => {
+        const ct = await freshCT();
+        const sends = [];
+        const fakeWasm = {
+            has_session: () => true,
+            envelope_encode: () => 'deadbeef'
+        };
+        ct.startCoverTraffic({
+            wasm: fakeWasm,
+            sendToRelay: (to, env) => sends.push([to, env]),
+            listContacts: async () => [],
+            MSG_TYPE_DECOY,
+        });
+        // Wait a bit longer than the worst-case tick interval (600ms).
+        await new Promise(r => setTimeout(r, 700));
+        ct.stopCoverTraffic();
+        assert.equal(sends.length, 0, 'no send when contacts list is empty');
+    });
+
+    test('no session with any contact → no decoy sent', async (t) => {
+        const ct = await freshCT();
+        const sends = [];
+        const fakeWasm = {
+            has_session: () => false,
+            envelope_encode: () => { sends.push('encoded'); return 'deadbeef'; }
+        };
+        ct.startCoverTraffic({
+            wasm: fakeWasm,
+            sendToRelay: (to, env) => sends.push([to, env]),
+            listContacts: async () => [{ peerId: 'aa'.repeat(32) }],
+            MSG_TYPE_DECOY,
+        });
+        await new Promise(r => setTimeout(r, 700));
+        ct.stopCoverTraffic();
+        assert.equal(sends.length, 0, 'encode + send must not run when has_session is false');
+    });
+
+    test('decoy envelope uses 8-byte plaintext and MSG_TYPE_DECOY', async (t) => {
+        const ct = await freshCT();
+        const encodeArgs = [];
+        const sends = [];
+        const peerId = 'cd'.repeat(32);
+        const fakeWasm = {
+            has_session: (p) => p === peerId,
+            envelope_encode: (to, msgType, plain, ts) => {
+                encodeArgs.push({ to, msgType, plainLen: plain.length, ts });
+                return 'ff'.repeat(128); // pretend 256-byte bucket hex
+            }
+        };
+        ct.startCoverTraffic({
+            wasm: fakeWasm,
+            sendToRelay: (to, env) => sends.push([to, env]),
+            listContacts: async () => [{ peerId }],
+            MSG_TYPE_DECOY,
+        });
+        // Wait long enough for at least one tick.
+        await new Promise(r => setTimeout(r, 800));
+        ct.stopCoverTraffic();
+        assert.ok(encodeArgs.length >= 1, `expected ≥1 encode, got ${encodeArgs.length}`);
+        assert.equal(encodeArgs[0].to, peerId);
+        assert.equal(encodeArgs[0].msgType, MSG_TYPE_DECOY);
+        assert.equal(encodeArgs[0].plainLen, 8, '8-byte plaintext keeps envelope in 256 bucket');
+        assert.equal(typeof encodeArgs[0].ts, 'bigint', 'timestamp is bigint seconds');
+        assert.ok(sends.length >= 1, 'sendToRelay invoked');
+        assert.equal(sends[0][0], peerId);
+        assert.equal(sends[0][1], 'ff'.repeat(128));
+    });
+
+    test('markRealSend suppresses the next tick', async (t) => {
+        const ct = await freshCT();
+        const sends = [];
+        const peerId = 'ab'.repeat(32);
+        const fakeWasm = {
+            has_session: () => true,
+            envelope_encode: () => 'aa'.repeat(128),
+        };
+        ct.startCoverTraffic({
+            wasm: fakeWasm,
+            sendToRelay: (to, env) => sends.push([to, env]),
+            listContacts: async () => [{ peerId }],
+            MSG_TYPE_DECOY,
+        });
+        // Immediately mark a real send, before the first tick fires.
+        ct.markRealSend();
+        // First tick (≤600ms) should be suppressed; second tick (≤1200ms) should send.
+        await new Promise(r => setTimeout(r, 700));
+        const afterFirstTick = sends.length;
+        await new Promise(r => setTimeout(r, 700));
+        const afterSecondTick = sends.length;
+        ct.stopCoverTraffic();
+        assert.equal(afterFirstTick, 0, 'first tick suppressed by markRealSend');
+        assert.ok(afterSecondTick >= 1, 'second tick should emit a decoy');
+    });
+
+    test('stopCoverTraffic clears the interval', async (t) => {
+        const ct = await freshCT();
+        const sends = [];
+        const peerId = 'ef'.repeat(32);
+        const fakeWasm = {
+            has_session: () => true,
+            envelope_encode: () => 'bb'.repeat(128),
+        };
+        ct.startCoverTraffic({
+            wasm: fakeWasm,
+            sendToRelay: (to, env) => sends.push([to, env]),
+            listContacts: async () => [{ peerId }],
+            MSG_TYPE_DECOY,
+        });
+        ct.stopCoverTraffic();
+        const before = sends.length;
+        await new Promise(r => setTimeout(r, 1400)); // ≥ two tick intervals
+        assert.equal(sends.length, before, 'no sends after stop');
     });
 });

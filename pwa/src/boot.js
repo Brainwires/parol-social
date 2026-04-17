@@ -27,7 +27,8 @@ import {
 import {
     openSettings, enableDecoyMode, executePanicWipe, enableEncryption,
     handleExportData, handleImportData, updateNetworkSettings,
-    addDuressCredential
+    addDuressCredential, setCoverTrafficEnabled, loadCoverTrafficSetting,
+    startCoverTrafficFromSettings
 } from './settings.js';
 import { initI18n, t, changeLanguage, applyToDOM } from './i18n.js';
 import { showSafetyNumberModal } from './safety-number.js';
@@ -133,6 +134,12 @@ async function onWasmReady() {
     }
     loadContacts();
     renderBootstrapQR();
+
+    // Load & start wire-level cover traffic (PNP-006). Default ON.
+    // Safe to start before relay reports connected — the timer tolerates
+    // transient "no session / no peer" conditions by skipping the tick.
+    await loadCoverTrafficSetting();
+    startCoverTrafficFromSettings();
 
     relayClient.discover().then(relays => {
         console.log('[App] Discovered', relays.length, 'relays');
@@ -402,6 +409,7 @@ window.hangupCall = hangupCall;
 window.answerIncomingCall = answerIncomingCall;
 window.enableDecoyMode = enableDecoyMode;
 window.executePanicWipe = executePanicWipe;
+window.setCoverTrafficEnabled = setCoverTrafficEnabled;
 window.addDuressCredential = addDuressCredential;
 window.toggleMute = toggleMute;
 window.toggleCamera = toggleCamera;

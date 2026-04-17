@@ -18,8 +18,9 @@ import {
     MSG_TYPE_CHAT, MSG_TYPE_SYSTEM, MSG_TYPE_FILE_CHUNK, MSG_TYPE_FILE_CONTROL,
     MSG_TYPE_CALL_SIGNAL, MSG_TYPE_GROUP_TEXT, MSG_TYPE_GROUP_CALL_SIGNAL,
     MSG_TYPE_GROUP_FILE_OFFER, MSG_TYPE_GROUP_FILE_CHUNK,
-    MSG_TYPE_SENDER_KEY_DISTRIBUTION, MSG_TYPE_GROUP_ADMIN
+    MSG_TYPE_SENDER_KEY_DISTRIBUTION, MSG_TYPE_GROUP_ADMIN, MSG_TYPE_DECOY
 } from './protocol-constants.js';
+import { markRealSend } from './cover-traffic.js';
 
 // ── Session Persistence ──────────────────────────────────
 function persistSessions() {
@@ -50,10 +51,12 @@ function encodeEnvelope(toPeerId, msgType, obj) {
 }
 
 // Send an envelope-wrapped structured payload via the best available transport
-// (direct WebRTC preferred, relay fallback).
+// (direct WebRTC preferred, relay fallback). Every real send also notifies the
+// cover-traffic timer so the next decoy tick is suppressed (PNP-006-MUST-005).
 function sendEnvelope(toPeerId, msgType, obj) {
     const env = encodeEnvelope(toPeerId, msgType, obj);
     if (!env) return false;
+    markRealSend();
     if (hasDirectConnection(toPeerId)) {
         return sendViaWebRTC(toPeerId, env);
     }
@@ -635,6 +638,7 @@ async function sendFileChunked(fileId, toPeerId) {
             });
             const nowSecs = BigInt(Math.floor(Date.now() / 1000));
             const envelope = wasm.envelope_encode(toPeerId, MSG_TYPE_FILE_CHUNK, encoder.encode(inner), nowSecs);
+            markRealSend();
             if (hasDirectConnection(toPeerId)) {
                 sendViaWebRTC(toPeerId, envelope);
             } else {
@@ -956,6 +960,11 @@ function handleGroupFileChunk(msg) {
 export function dispatchByMsgType(msgType, fromPeerId, plaintext, handlers) {
     const h = handlers || DEFAULT_DISPATCH_HANDLERS;
     switch (msgType) {
+        case MSG_TYPE_DECOY:
+            // PNP-006 cover traffic: silently drop. No UI, no handler, no log —
+            // the threat model requires decoys be indistinguishable from noise
+            // even in local diagnostics.
+            return;
         case MSG_TYPE_CHAT:
             return h.chat(fromPeerId, plaintext);
         case MSG_TYPE_SYSTEM:

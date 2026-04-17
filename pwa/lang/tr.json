@@ -177,6 +177,8 @@
   "settings.language": "Dil",
   "settings.relayOnlyMode": "Yalnızca Relay modu",
   "settings.relayOnlyDescription": "Etkinleştirildiğinde WebRTC bağlantıları yalnızca TURN aktarıcıları üzerinden yönlendirilir. IP adresiniz asla diğer kullanıcılara açığa çıkmaz.",
+  "settings.coverTraffic": "Örtü trafiği",
+  "settings.coverTrafficDescription": "Gerçek etkinliğinizi gizlemek için yaklaşık her yarım saniyede bir küçük şifreli mesaj gönderir. Boştayken yaklaşık 8 KB/s veri kullanır.",
   "settings.webrtcDisabled": "WebRTC devre dışı — TURN sunucusu yapılandırılmamış.",
   "settings.relayConnectedCount": "Bağlı{count}",
   "settings.relayDisconnected": "Bağlantı kesildi{count}",

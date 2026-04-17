@@ -177,6 +177,8 @@
   "settings.language": "言語",
   "settings.relayOnlyMode": "Relay専用モード",
   "settings.relayOnlyDescription": "有効にすると、WebRTC接続はTURNリレーのみを経由します。あなたのIPアドレスが相手に公開されることはありません。",
+  "settings.coverTraffic": "カバートラフィック",
+  "settings.coverTrafficDescription": "約0.5秒ごとに小さな暗号化メッセージを送信して、実際の通信活動を隠します。アイドル時には毎秒約8 KBのデータを使用します。",
   "settings.webrtcDisabled": "WebRTCが無効です — TURNサーバーが設定されていません。",
   "settings.relayConnectedCount": "接続中{count}",
   "settings.relayDisconnected": "切断{count}",

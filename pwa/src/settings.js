@@ -1,18 +1,71 @@
 // ParolNet PWA — Settings, Export/Import, Network, Panic Wipe
 import { wasm, cryptoStore, relayClient } from './state.js';
 import { showToast } from './utils.js';
-import { dbGet, dbPut, dbPutRaw, dbGetRaw, dbGetAllRaw, dbDelete, dbClear, ENCRYPTED_STORES } from './db.js';
+import { dbGet, dbPut, dbPutRaw, dbGetRaw, dbGetAllRaw, dbGetAll, dbDelete, dbClear, ENCRYPTED_STORES } from './db.js';
 import { showView } from './views.js';
 import { connMgr } from './connection.js';
 import { rtcConnections, updateWebRTCPrivacyUI } from './webrtc.js';
 import { exportData, importData, validateExport } from './data-export.js';
 import { t } from './i18n.js';
+import { startCoverTraffic, stopCoverTraffic } from './cover-traffic.js';
+import { sendToRelay } from './connection.js';
+
+// ── Cover Traffic (PNP-006) ────────────────────────────────
+// Default ON: the threat model requires decoy traffic to hide real activity.
+// Users may disable in bandwidth-constrained environments.
+let coverTrafficEnabled = true;
+
+function coverTrafficDeps() {
+    return {
+        mode: 'NORMAL',
+        wasm,
+        sendToRelay,
+        listContacts: () => dbGetAll('contacts'),
+    };
+}
+
+export async function loadCoverTrafficSetting() {
+    try {
+        const saved = await dbGet('settings', 'cover_traffic_enabled');
+        if (saved) coverTrafficEnabled = saved.value !== 'false';
+    } catch {}
+    return coverTrafficEnabled;
+}
+
+export function isCoverTrafficEnabled() {
+    return coverTrafficEnabled;
+}
+
+export async function setCoverTrafficEnabled(enabled) {
+    coverTrafficEnabled = !!enabled;
+    try {
+        await dbPut('settings', { key: 'cover_traffic_enabled', value: String(coverTrafficEnabled) });
+    } catch {}
+    if (coverTrafficEnabled) {
+        startCoverTraffic(coverTrafficDeps());
+    } else {
+        stopCoverTraffic();
+    }
+    updateCoverTrafficUI();
+}
+
+export function updateCoverTrafficUI() {
+    const toggle = document.getElementById('cover-traffic-toggle');
+    if (toggle) toggle.checked = coverTrafficEnabled;
+}
+
+export function startCoverTrafficFromSettings() {
+    if (coverTrafficEnabled) {
+        startCoverTraffic(coverTrafficDeps());
+    }
+}
 
 // ── Settings ────────────────────────────────────────────────
 export function openSettings() {
     showView('settings');
     updateNetworkSettings();
     updateWebRTCPrivacyUI();
+    updateCoverTrafficUI();
 
     const encSetup = document.getElementById('encryption-setup');
     const encStatus = document.getElementById('encryption-status');

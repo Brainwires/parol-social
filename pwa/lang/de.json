@@ -177,6 +177,8 @@
   "settings.language": "Sprache",
   "settings.relayOnlyMode": "Nur-Relay-Modus",
   "settings.relayOnlyDescription": "Wenn aktiviert, laufen WebRTC-Verbindungen nur ueber TURN-Relays. Deine IP-Adresse wird nie an Peers weitergegeben.",
+  "settings.coverTraffic": "Tarnverkehr",
+  "settings.coverTrafficDescription": "Sendet etwa alle halbe Sekunde eine kleine verschluesselte Nachricht, um deine echte Aktivitaet zu verbergen. Verbraucht im Leerlauf etwa 8 KB/s an Daten.",
   "settings.webrtcDisabled": "WebRTC deaktiviert — keine TURN-Server konfiguriert.",
   "settings.relayConnectedCount": "Verbunden{count}",
   "settings.relayDisconnected": "Getrennt{count}",

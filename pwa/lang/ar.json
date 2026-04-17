@@ -177,6 +177,8 @@
   "settings.language": "اللغة",
   "settings.relayOnlyMode": "وضع المُرحّل فقط",
   "settings.relayOnlyDescription": "عند التفعيل، تمر اتصالات WebRTC عبر مُرحّلات TURN فقط. لن يُكشف عنوان IP الخاص بك للطرف الآخر أبداً.",
+  "settings.coverTraffic": "حركة مرور تمويهية",
+  "settings.coverTrafficDescription": "يُرسل رسالة مشفّرة صغيرة كل نصف ثانية تقريباً لإخفاء نشاطك الحقيقي. يستهلك نحو 8 كيلوبايت/ثانية من البيانات في حالة الخمول.",
   "settings.webrtcDisabled": "WebRTC معطّل — لم يتم إعداد خوادم TURN.",
   "settings.relayConnectedCount": "متصل{count}",
   "settings.relayDisconnected": "غير متصل{count}",

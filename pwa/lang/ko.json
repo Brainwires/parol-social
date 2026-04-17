@@ -177,6 +177,8 @@
   "settings.language": "언어",
   "settings.relayOnlyMode": "릴레이 전용 모드",
   "settings.relayOnlyDescription": "활성화하면 WebRTC 연결이 TURN 릴레이만 통해 라우팅됩니다. IP 주소가 상대방에게 노출되지 않습니다.",
+  "settings.coverTraffic": "은폐 트래픽",
+  "settings.coverTrafficDescription": "약 0.5초마다 작은 암호화된 메시지를 보내 실제 활동을 숨깁니다. 유휴 상태에서 초당 약 8 KB의 데이터를 사용합니다.",
   "settings.webrtcDisabled": "WebRTC 비활성화됨 — TURN 서버가 설정되지 않았습니다.",
   "settings.relayConnectedCount": "연결됨{count}",
   "settings.relayDisconnected": "연결 끊김{count}",
