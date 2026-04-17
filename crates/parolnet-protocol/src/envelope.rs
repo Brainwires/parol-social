@@ -71,13 +71,15 @@ impl CleartextHeader {
 
 /// Encrypted payload content (PNP-001 Section 3.3).
 /// This is what's inside the encrypted portion of the envelope.
+///
+/// Field order is lexicographic per PNP-001-MUST-023 (deterministic CBOR).
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PayloadContent {
     pub body: Vec<u8>,
-    pub pad: Vec<u8>,
-    pub seq: u64,
     pub chain: u32,
     pub flags: MessageFlags,
+    pub pad: Vec<u8>,
+    pub seq: u64,
 }
 
 /// The complete envelope as transmitted on the wire.
