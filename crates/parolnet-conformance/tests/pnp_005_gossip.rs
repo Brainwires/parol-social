@@ -1,10 +1,10 @@
 //! PNP-005 conformance — gossip mesh & envelope validation.
 
 use parolnet_clause::clause;
-use parolnet_protocol::gossip::{
-    GossipEnvelope, GossipPayloadType, DEFAULT_FANOUT, DEFAULT_TTL, MAX_GOSSIP_PAYLOAD, MAX_TTL,
-};
 use parolnet_protocol::PeerId;
+use parolnet_protocol::gossip::{
+    DEFAULT_FANOUT, DEFAULT_TTL, GossipEnvelope, GossipPayloadType, MAX_GOSSIP_PAYLOAD, MAX_TTL,
+};
 
 fn sample_envelope() -> GossipEnvelope {
     GossipEnvelope {
@@ -41,9 +41,8 @@ fn v_must_be_one_or_envelope_is_rejected() {
             "version {bad} must be rejected (PNP-005-MUST-001/012)"
         );
         let bytes = e2.to_cbor().unwrap();
-        GossipEnvelope::from_cbor(&bytes).expect_err(
-            "decoder MUST reject envelope with v != 1 (PNP-005-MUST-012)",
-        );
+        GossipEnvelope::from_cbor(&bytes)
+            .expect_err("decoder MUST reject envelope with v != 1 (PNP-005-MUST-012)");
     }
 }
 
@@ -53,8 +52,8 @@ fn v_must_be_one_or_envelope_is_rejected() {
 #[test]
 fn payload_type_registry_covers_defined_codes() {
     for code in 0x01u8..=0x05u8 {
-        let t = GossipPayloadType::from_u8(code)
-            .unwrap_or_else(|| panic!("code {code:#04x} rejected"));
+        let t =
+            GossipPayloadType::from_u8(code).unwrap_or_else(|| panic!("code {code:#04x} rejected"));
         assert_eq!(t as u8, code);
     }
     assert!(GossipPayloadType::from_u8(0x06).is_none());
@@ -68,10 +67,20 @@ fn payload_type_registry_covers_defined_codes() {
 fn make_anonymous_zeros_src_and_empties_pubkey() {
     let mut e = sample_envelope();
     e.make_anonymous();
-    assert_eq!(e.src, PeerId([0u8; 32]), "MUST-005: src must be 32 zero bytes");
-    assert!(e.src_pubkey.is_empty(), "MUST-006: src_pubkey must be empty");
+    assert_eq!(
+        e.src,
+        PeerId([0u8; 32]),
+        "MUST-005: src must be 32 zero bytes"
+    );
+    assert!(
+        e.src_pubkey.is_empty(),
+        "MUST-006: src_pubkey must be empty"
+    );
     assert!(e.is_anonymous());
-    assert!(e.is_valid_structure(), "anonymous envelope must still pass structural check");
+    assert!(
+        e.is_valid_structure(),
+        "anonymous envelope must still pass structural check"
+    );
 }
 
 #[clause("PNP-005-MUST-005")]
@@ -113,9 +122,8 @@ fn ttl_has_upper_bound_fifteen() {
     let mut e = sample_envelope();
     e.ttl = 16;
     let bytes = e.to_cbor().unwrap();
-    GossipEnvelope::from_cbor(&bytes).expect_err(
-        "ttl > 15 MUST be rejected at decode time (PNP-005-MUST-025)",
-    );
+    GossipEnvelope::from_cbor(&bytes)
+        .expect_err("ttl > 15 MUST be rejected at decode time (PNP-005-MUST-025)");
 }
 
 // -- §5.5 Expiry cap (exp ≤ ts + 86400) ---------------------------------------
@@ -126,9 +134,8 @@ fn expiry_beyond_24_hours_is_rejected() {
     let mut e = sample_envelope();
     e.exp = e.ts + 86400 + 1;
     let bytes = e.to_cbor().unwrap();
-    GossipEnvelope::from_cbor(&bytes).expect_err(
-        "exp > ts + 86400 MUST be rejected (PNP-005-MUST-026)",
-    );
+    GossipEnvelope::from_cbor(&bytes)
+        .expect_err("exp > ts + 86400 MUST be rejected (PNP-005-MUST-026)");
 }
 
 // -- §5.1 Payload size bound --------------------------------------------------
@@ -140,9 +147,8 @@ fn oversize_payload_is_rejected() {
     let mut e = sample_envelope();
     e.payload = vec![0u8; MAX_GOSSIP_PAYLOAD + 1];
     let bytes = e.to_cbor().unwrap();
-    GossipEnvelope::from_cbor(&bytes).expect_err(
-        "payload > 65536 bytes MUST be rejected (PNP-005-MUST-019)",
-    );
+    GossipEnvelope::from_cbor(&bytes)
+        .expect_err("payload > 65536 bytes MUST be rejected (PNP-005-MUST-019)");
 }
 
 // -- §5.6 PoW difficulty for RELAY_DESCRIPTOR ---------------------------------
@@ -226,9 +232,8 @@ fn malformed_id_length_is_rejected_at_decode() {
     let mut e = sample_envelope();
     e.id = vec![0u8; 31]; // one byte short
     let bytes = e.to_cbor().unwrap();
-    GossipEnvelope::from_cbor(&bytes).expect_err(
-        "id field != 32 bytes MUST be rejected (PNP-005-MUST-011)",
-    );
+    GossipEnvelope::from_cbor(&bytes)
+        .expect_err("id field != 32 bytes MUST be rejected (PNP-005-MUST-011)");
 }
 
 // -- §5.2 Default fanout ------------------------------------------------------
@@ -436,7 +441,7 @@ fn anonymous_gossip_carries_sender_inside_encrypted_payload() {
 #[test]
 fn bad_signature_gossip_discarded() {
     // Ed25519 signature verification — failure MUST cause discard.
-    use ed25519_dalek::{Signature, SigningKey, VerifyingKey, Signer};
+    use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
     let sk = SigningKey::generate(&mut rand::rngs::OsRng);
     let vk: VerifyingKey = sk.verifying_key();
     let msg = b"gossip payload";
@@ -445,7 +450,10 @@ fn bad_signature_gossip_discarded() {
     let mut bad = sig.to_bytes();
     bad[0] ^= 0xFF;
     let bad_sig = Signature::from_bytes(&bad);
-    assert!(vk.verify_strict(msg, &bad_sig).is_err(), "MUST-016: bad sig MUST cause discard");
+    assert!(
+        vk.verify_strict(msg, &bad_sig).is_err(),
+        "MUST-016: bad sig MUST cause discard"
+    );
 }
 
 #[clause("PNP-005-MUST-017")]
@@ -482,7 +490,7 @@ fn forwarding_jitter_is_0_to_200ms_csprng() {
     const FORWARD_JITTER_MAX_MS: u64 = 200;
     assert_eq!(FORWARD_JITTER_MAX_MS, 200);
     // CSPRNG — draw from OsRng per MUST-024.
-    use rand::{rngs::OsRng, RngCore};
+    use rand::{RngCore, rngs::OsRng};
     let mut x = [0u8; 8];
     OsRng.fill_bytes(&mut x);
     let mut y = [0u8; 8];
@@ -496,7 +504,11 @@ fn buffer_eviction_priority_ordering() {
     // Eviction order documented in spec — oldest, lowest-ttl, etc. Pin the
     // priority field type presence.
     #[derive(Debug, PartialEq, PartialOrd)]
-    enum EvictPriority { ExpiredTtl, Oldest, LowestTtl }
+    enum EvictPriority {
+        ExpiredTtl,
+        Oldest,
+        LowestTtl,
+    }
     assert!(EvictPriority::ExpiredTtl < EvictPriority::Oldest);
     assert!(EvictPriority::Oldest < EvictPriority::LowestTtl);
 }
@@ -507,8 +519,16 @@ fn buffered_messages_delivered_after_sync() {
     // Architectural — peer reconnect: SYNC phase first, THEN deliver
     // store-and-forward buffered messages. Pin ordering via a state enum.
     #[derive(Debug, PartialEq)]
-    enum ReconnectPhase { Sync, DeliverBuffered, Active }
-    let path = [ReconnectPhase::Sync, ReconnectPhase::DeliverBuffered, ReconnectPhase::Active];
+    enum ReconnectPhase {
+        Sync,
+        DeliverBuffered,
+        Active,
+    }
+    let path = [
+        ReconnectPhase::Sync,
+        ReconnectPhase::DeliverBuffered,
+        ReconnectPhase::Active,
+    ];
     assert_eq!(path[1], ReconnectPhase::DeliverBuffered);
 }
 
@@ -545,7 +565,10 @@ fn sync_timeout_falls_back_to_active_with_dedup() {
     // Architectural — after 30s sync timeout, peers move to ACTIVE and
     // rely on dedup to suppress re-sent messages. Pin via state ordering.
     #[derive(Debug, PartialEq)]
-    enum MeshState { Sync, Active }
+    enum MeshState {
+        Sync,
+        Active,
+    }
     let order = [MeshState::Sync, MeshState::Active];
     assert_eq!(order[1], MeshState::Active);
 }

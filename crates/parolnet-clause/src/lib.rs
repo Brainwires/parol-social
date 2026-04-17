@@ -10,7 +10,7 @@
 use proc_macro::TokenStream;
 use proc_macro2::TokenStream as TokenStream2;
 use quote::quote;
-use syn::{parse_macro_input, punctuated::Punctuated, Item, LitStr, Token};
+use syn::{Item, LitStr, Token, parse_macro_input, punctuated::Punctuated};
 
 const CLAUSE_RE: &str = r"^PNP-\d{3}-(MUST|SHOULD|MAY)-\d{3}$";
 
@@ -38,8 +38,7 @@ fn validate(id: &str) -> Result<(), String> {
 
 #[proc_macro_attribute]
 pub fn clause(attr: TokenStream, item: TokenStream) -> TokenStream {
-    let args =
-        parse_macro_input!(attr with Punctuated::<LitStr, Token![,]>::parse_terminated);
+    let args = parse_macro_input!(attr with Punctuated::<LitStr, Token![,]>::parse_terminated);
     let item2 = parse_macro_input!(item as Item);
 
     let ids: Vec<String> = args.iter().map(|s| s.value()).collect();

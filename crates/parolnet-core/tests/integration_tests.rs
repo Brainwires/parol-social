@@ -31,16 +31,18 @@ fn test_end_to_end_message_exchange() {
         .expect("Bob init failed");
 
     // Alice -> Bob
-    let (header, ciphertext) = alice.encrypt(b"hello bob").expect("Alice encrypt failed");
+    let (header, ciphertext) = alice
+        .encrypt(b"hello bob", &[])
+        .expect("Alice encrypt failed");
     let plaintext = bob
-        .decrypt(&header, &ciphertext)
+        .decrypt(&header, &ciphertext, &[])
         .expect("Bob decrypt failed");
     assert_eq!(plaintext, b"hello bob");
 
     // Bob -> Alice
-    let (header2, ciphertext2) = bob.encrypt(b"hi alice").expect("Bob encrypt failed");
+    let (header2, ciphertext2) = bob.encrypt(b"hi alice", &[]).expect("Bob encrypt failed");
     let plaintext2 = alice
-        .decrypt(&header2, &ciphertext2)
+        .decrypt(&header2, &ciphertext2, &[])
         .expect("Alice decrypt failed");
     assert_eq!(plaintext2, b"hi alice");
 }

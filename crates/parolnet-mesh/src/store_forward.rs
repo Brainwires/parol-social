@@ -149,7 +149,7 @@ impl MessageStore for InMemoryStore {
         let size = envelope.encrypted_payload.len() + 16; // rough size estimate
 
         // Use dest_peer_id as the recipient
-        let recipient = envelope.header.dest_peer_id;
+        let recipient = envelope.cleartext_header.dest_peer_id;
 
         // Encrypt payload at rest with ephemeral key
         let nonce = self.next_nonce().await;
@@ -172,7 +172,7 @@ impl MessageStore for InMemoryStore {
             envelope: stored_envelope,
             stored_at: now,
             expires_at: now + ttl,
-            ttl: envelope.header.ttl(),
+            ttl: envelope.cleartext_header.ttl(),
             size,
             at_rest_nonce: nonce,
         });

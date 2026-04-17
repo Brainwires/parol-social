@@ -104,10 +104,16 @@ pub struct GroupOperation {
 /// Signal types for group voice/video calls.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum GroupCallSignalType {
-    Invite { sdp: String },
-    Join { sdp: String },
+    Invite {
+        sdp: String,
+    },
+    Join {
+        sdp: String,
+    },
     Leave,
-    Mute { muted: bool },
+    Mute {
+        muted: bool,
+    },
     EndCall,
     /// Start screen sharing (PNP-009 Section 9.7).
     ScreenShareStart {

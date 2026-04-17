@@ -19,6 +19,7 @@ pub mod call;
 pub mod client;
 pub mod config;
 pub mod decoy;
+pub mod envelope;
 pub mod error;
 pub mod ffi;
 pub mod file_transfer;
@@ -186,41 +187,41 @@ impl ParolNet {
         Ok(())
     }
 
-    /// Send a message within an established session.
+    /// Encrypt a message within an established session and return the
+    /// envelope-ready ratchet header + ciphertext.
     ///
-    /// Automatically pads the plaintext to a bucket size before encrypting,
-    /// ensuring no unpadded message reaches the transport layer.
+    /// This low-level API does not produce a PNP-001 envelope. Callers that
+    /// want the full padded wire envelope should use
+    /// [`envelope::encrypt_into_envelope`] instead.
+    ///
+    /// No `extra_aad` is bound; this path exists for session-layer unit tests
+    /// and non-envelope use cases.
     pub fn send(
         &self,
         peer_id: &PeerId,
         message: &[u8],
     ) -> Result<(RatchetHeader, Vec<u8>), CoreError> {
-        use parolnet_protocol::PaddingStrategy;
-        use parolnet_protocol::padding::BucketPadding;
-        let padder = BucketPadding;
-        let padded = padder.pad(message)?;
-        self.sessions.encrypt(peer_id, &padded)
+        self.sessions.encrypt(peer_id, message, &[])
     }
 
-    /// Decrypt a received message.
-    ///
-    /// Automatically unpads the plaintext after decrypting.
+    /// Decrypt a received ratchet message (no envelope wrapping).
     pub fn recv(
         &self,
         peer_id: &PeerId,
         header: &RatchetHeader,
         ciphertext: &[u8],
     ) -> Result<Vec<u8>, CoreError> {
-        use parolnet_protocol::PaddingStrategy;
-        use parolnet_protocol::padding::BucketPadding;
-        let padded_plaintext = self.sessions.decrypt(peer_id, header, ciphertext)?;
-        let padder = BucketPadding;
-        padder.unpad(&padded_plaintext).map_err(CoreError::Protocol)
+        self.sessions.decrypt(peer_id, header, ciphertext, &[])
     }
 
     /// Check if we have an active session with a peer.
     pub fn has_session(&self, peer_id: &PeerId) -> bool {
         self.sessions.has_session(peer_id)
+    }
+
+    /// Borrow the internal `SessionManager` (used by the envelope helpers).
+    pub fn sessions(&self) -> &SessionManager {
+        &self.sessions
     }
 
     /// Emergency: securely wipe all keys, sessions, and cached messages.
@@ -279,10 +280,7 @@ impl ParolNet {
     }
 
     /// Restore sessions from previously exported state. Returns count restored.
-    pub fn import_sessions(
-        &self,
-        data: Vec<([u8; 32], Vec<u8>)>,
-    ) -> Result<usize, CoreError> {
+    pub fn import_sessions(&self, data: Vec<([u8; 32], Vec<u8>)>) -> Result<usize, CoreError> {
         self.sessions.import_all(data)
     }
 

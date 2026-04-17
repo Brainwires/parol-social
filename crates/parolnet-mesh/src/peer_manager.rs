@@ -44,12 +44,11 @@ impl PeerManager {
         // Deliver any stored messages for this peer
         let stored = self.store.retrieve(&peer_id).await?;
         for envelope in &stored {
-            // Re-serialize header + payload + mac for delivery
+            // Re-serialize the full wire envelope (CBOR). The AEAD tag lives
+            // inside `encrypted_payload` per PNP-001 §3.1.
             let mut buf = Vec::new();
-            ciborium::into_writer(&envelope.header, &mut buf)
+            ciborium::into_writer(envelope, &mut buf)
                 .map_err(|e| MeshError::StorageError(format!("CBOR encode: {e}")))?;
-            buf.extend_from_slice(&envelope.encrypted_payload);
-            buf.extend_from_slice(&envelope.mac);
 
             if let Err(e) = conn.send(&buf).await {
                 warn!(

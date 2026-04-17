@@ -67,9 +67,9 @@ fn stored_skipped_key_deleted_after_use() {
     receiver.decrypt(&m1).unwrap();
 
     // Re-delivery of m1 after its stored key was consumed MUST fail.
-    receiver.decrypt(&m1).expect_err(
-        "MUST-016 / MUST-018: replay after key deletion must be rejected",
-    );
+    receiver
+        .decrypt(&m1)
+        .expect_err("MUST-016 / MUST-018: replay after key deletion must be rejected");
 }
 
 // -- §6.2 MAX_SKIP = 1000 resource cap ----------------------------------------

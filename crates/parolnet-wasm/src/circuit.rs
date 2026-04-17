@@ -105,8 +105,8 @@ impl WasmRelayCell {
     /// Deserialize from exactly 512 bytes.
     pub fn from_bytes(buf: &[u8; CELL_SIZE]) -> Result<Self, String> {
         let circuit_id = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]);
-        let cell_type =
-            WasmCellType::from_u8(buf[4]).ok_or_else(|| format!("unknown cell type 0x{:02x}", buf[4]))?;
+        let cell_type = WasmCellType::from_u8(buf[4])
+            .ok_or_else(|| format!("unknown cell type 0x{:02x}", buf[4]))?;
         let payload_len = u16::from_be_bytes([buf[5], buf[6]]);
         if payload_len as usize > CELL_PAYLOAD_SIZE {
             return Err(format!(
@@ -184,8 +184,7 @@ pub fn onion_wrap(
     nonce_seed: &[u8; 12],
     counter: u32,
 ) -> Result<Vec<u8>, String> {
-    let cipher =
-        ChaCha20Poly1305Cipher::new(key).map_err(|e| format!("cipher init: {e}"))?;
+    let cipher = ChaCha20Poly1305Cipher::new(key).map_err(|e| format!("cipher init: {e}"))?;
     let nonce = make_nonce(nonce_seed, counter);
     cipher
         .encrypt(&nonce, payload, &[])
@@ -199,8 +198,7 @@ pub fn onion_peel(
     nonce_seed: &[u8; 12],
     counter: u32,
 ) -> Result<Vec<u8>, String> {
-    let cipher =
-        ChaCha20Poly1305Cipher::new(key).map_err(|e| format!("cipher init: {e}"))?;
+    let cipher = ChaCha20Poly1305Cipher::new(key).map_err(|e| format!("cipher init: {e}"))?;
     let nonce = make_nonce(nonce_seed, counter);
     cipher
         .decrypt(&nonce, ciphertext, &[])
@@ -287,8 +285,8 @@ pub fn process_created(
     let shared = our_secret.diffie_hellman(&relay_public);
 
     // Verify HMAC key confirmation
-    let mut mac = HmacSha256::new_from_slice(shared.as_bytes())
-        .map_err(|e| format!("HMAC init: {e}"))?;
+    let mut mac =
+        HmacSha256::new_from_slice(shared.as_bytes()).map_err(|e| format!("HMAC init: {e}"))?;
     mac.update(CREATED_HMAC_LABEL);
     let expected_hmac = mac.finalize().into_bytes();
 
@@ -440,7 +438,11 @@ pub async fn build_circuit_impl(ws: &WasmWebSocket, ws_id: u32) -> Result<u32, S
 
     let raw = ws_recv_async(ws).await?;
     if raw.len() != CELL_SIZE {
-        return Err(format!("CREATED: expected {} bytes, got {}", CELL_SIZE, raw.len()));
+        return Err(format!(
+            "CREATED: expected {} bytes, got {}",
+            CELL_SIZE,
+            raw.len()
+        ));
     }
     let mut buf = [0u8; CELL_SIZE];
     buf.copy_from_slice(&raw);
@@ -460,7 +462,9 @@ pub async fn build_circuit_impl(ws: &WasmWebSocket, ws_id: u32) -> Result<u32, S
         // Onion-wrap the EXTEND payload through existing hops
         let payload_data = &ext_cell.payload[..ext_cell.payload_len as usize];
         // Wrap from innermost (last existing hop) to outermost (first hop)
-        let wrap_counters: Vec<u32> = (0..hop_keys.len()).map(|i| i as u32 + (hop_idx as u32 - 1)).collect();
+        let wrap_counters: Vec<u32> = (0..hop_keys.len())
+            .map(|i| i as u32 + (hop_idx as u32 - 1))
+            .collect();
         let encrypted = onion_encrypt(payload_data, &hop_keys, &wrap_counters)?;
 
         let mut wire_payload = [0u8; CELL_PAYLOAD_SIZE];
@@ -479,7 +483,11 @@ pub async fn build_circuit_impl(ws: &WasmWebSocket, ws_id: u32) -> Result<u32, S
 
         let raw = ws_recv_async(ws).await?;
         if raw.len() != CELL_SIZE {
-            return Err(format!("EXTENDED: expected {} bytes, got {}", CELL_SIZE, raw.len()));
+            return Err(format!(
+                "EXTENDED: expected {} bytes, got {}",
+                CELL_SIZE,
+                raw.len()
+            ));
         }
         let mut buf = [0u8; CELL_SIZE];
         buf.copy_from_slice(&raw);
@@ -703,9 +711,7 @@ pub fn circuit_send(circuit_id: u32, data: &[u8]) -> Result<(), JsValue> {
             .get_mut(&circuit_id)
             .ok_or_else(|| JsValue::from_str("invalid circuit id"))?;
 
-        let encrypted = circuit
-            .wrap_data(data)
-            .map_err(|e| JsValue::from_str(&e))?;
+        let encrypted = circuit.wrap_data(data).map_err(|e| JsValue::from_str(&e))?;
 
         let mut payload = [0u8; CELL_PAYLOAD_SIZE];
         let copy_len = encrypted.len().min(CELL_PAYLOAD_SIZE);
@@ -753,8 +759,7 @@ pub fn circuit_recv(circuit_id: u32) -> Result<JsValue, JsValue> {
             let ws = sockets_map
                 .get(&ws_id)
                 .ok_or_else(|| JsValue::from_str("invalid socket id"))?;
-            ws.recv()
-                .map_err(|e| JsValue::from_str(&e.to_string()))
+            ws.recv().map_err(|e| JsValue::from_str(&e.to_string()))
         })?;
 
         let Some(data) = raw else {
@@ -769,8 +774,7 @@ pub fn circuit_recv(circuit_id: u32) -> Result<JsValue, JsValue> {
 
         let mut buf = [0u8; CELL_SIZE];
         buf.copy_from_slice(&data);
-        let cell = WasmRelayCell::from_bytes(&buf)
-            .map_err(|e| JsValue::from_str(&e))?;
+        let cell = WasmRelayCell::from_bytes(&buf).map_err(|e| JsValue::from_str(&e))?;
 
         if cell.cell_type != WasmCellType::Data {
             return Ok(JsValue::NULL);
@@ -1006,8 +1010,7 @@ mod tests {
         let mut created_payload = [0u8; CELL_PAYLOAD_SIZE];
         created_payload[..32].copy_from_slice(relay_public.as_bytes());
         // HMAC
-        let mut mac =
-            HmacSha256::new_from_slice(shared.as_bytes()).unwrap();
+        let mut mac = HmacSha256::new_from_slice(shared.as_bytes()).unwrap();
         mac.update(CREATED_HMAC_LABEL);
         let hmac_result = mac.finalize().into_bytes();
         created_payload[32..64].copy_from_slice(&hmac_result);
@@ -1023,8 +1026,7 @@ mod tests {
         let client_keys = process_created(&created_cell, &client_secret).unwrap();
 
         // Relay derives keys from same shared secret
-        let relay_keys =
-            WasmHopKeys::from_shared_secret(shared.as_bytes()).unwrap();
+        let relay_keys = WasmHopKeys::from_shared_secret(shared.as_bytes()).unwrap();
 
         assert_eq!(client_keys.forward_key, relay_keys.forward_key);
         assert_eq!(client_keys.backward_key, relay_keys.backward_key);
@@ -1060,8 +1062,7 @@ mod tests {
         // Relay derives the same keys
         let client_public = PublicKey::from(&client_secret);
         let shared = relay_secret.diffie_hellman(&client_public);
-        let relay_keys =
-            WasmHopKeys::from_shared_secret(shared.as_bytes()).unwrap();
+        let relay_keys = WasmHopKeys::from_shared_secret(shared.as_bytes()).unwrap();
 
         assert_eq!(client_keys.forward_key, relay_keys.forward_key);
         assert_eq!(client_keys.backward_key, relay_keys.backward_key);

@@ -272,8 +272,8 @@ fn setup_session_pair() -> (
 #[test]
 fn test_ratchet_empty_message() {
     let (mut alice, mut bob) = setup_session_pair();
-    let (header, ct) = alice.encrypt(b"").unwrap();
-    let pt = bob.decrypt(&header, &ct).unwrap();
+    let (header, ct) = alice.encrypt(b"", &[]).unwrap();
+    let pt = bob.decrypt(&header, &ct, &[]).unwrap();
     assert_eq!(pt, b"");
 }
 
@@ -281,8 +281,8 @@ fn test_ratchet_empty_message() {
 fn test_ratchet_large_message() {
     let (mut alice, mut bob) = setup_session_pair();
     let large_msg = vec![0xCDu8; 10_000];
-    let (header, ct) = alice.encrypt(&large_msg).unwrap();
-    let pt = bob.decrypt(&header, &ct).unwrap();
+    let (header, ct) = alice.encrypt(&large_msg, &[]).unwrap();
+    let pt = bob.decrypt(&header, &ct, &[]).unwrap();
     assert_eq!(pt, large_msg);
 }
 
@@ -293,12 +293,12 @@ fn test_ratchet_many_sequential() {
     let mut messages = Vec::new();
     for i in 0u32..100 {
         let msg = format!("message number {}", i);
-        let (header, ct) = alice.encrypt(msg.as_bytes()).unwrap();
+        let (header, ct) = alice.encrypt(msg.as_bytes(), &[]).unwrap();
         messages.push((header, ct, msg));
     }
 
     for (header, ct, expected) in &messages {
-        let pt = bob.decrypt(header, ct).unwrap();
+        let pt = bob.decrypt(header, ct, &[]).unwrap();
         assert_eq!(pt, expected.as_bytes());
     }
 }
@@ -307,15 +307,15 @@ fn test_ratchet_many_sequential() {
 fn test_ratchet_replay_fails() {
     let (mut alice, mut bob) = setup_session_pair();
 
-    let (header, ct) = alice.encrypt(b"one-time message").unwrap();
+    let (header, ct) = alice.encrypt(b"one-time message", &[]).unwrap();
     // First decryption should succeed
-    let pt = bob.decrypt(&header, &ct).unwrap();
+    let pt = bob.decrypt(&header, &ct, &[]).unwrap();
     assert_eq!(pt, b"one-time message");
 
     // Second decryption of the same (header, ciphertext) should fail
     // because the message key was consumed.
     assert!(
-        bob.decrypt(&header, &ct).is_err(),
+        bob.decrypt(&header, &ct, &[]).is_err(),
         "replay of consumed message key should fail"
     );
 }
@@ -327,14 +327,14 @@ fn test_ratchet_max_skip_overflow() {
     // Encrypt 1002 messages on Alice's side (indices 0..1001)
     let mut all = Vec::new();
     for _ in 0..1002 {
-        let (header, ct) = alice.encrypt(b"skip me").unwrap();
+        let (header, ct) = alice.encrypt(b"skip me", &[]).unwrap();
         all.push((header, ct));
     }
 
     // Try to decrypt only the last message (#1001).
     // Bob needs to skip 1001 message keys, but MAX_SKIP is 1000 — should error.
     let (ref header, ref ct) = all[1001];
-    let result = bob.decrypt(header, ct);
+    let result = bob.decrypt(header, ct, &[]);
     assert!(
         result.is_err(),
         "decrypting message #1001 should fail because MAX_SKIP (1000) would be exceeded"
@@ -353,7 +353,7 @@ fn test_ratchet_larger_gap_reorder() {
     let mut ciphertexts = Vec::new();
     for i in 0u32..6 {
         let msg = format!("msg-{}", i);
-        let (header, ct) = alice.encrypt(msg.as_bytes()).unwrap();
+        let (header, ct) = alice.encrypt(msg.as_bytes(), &[]).unwrap();
         ciphertexts.push((header, ct, msg));
     }
 
@@ -361,7 +361,7 @@ fn test_ratchet_larger_gap_reorder() {
     let order = [0, 5, 1, 2, 3, 4];
     for &idx in &order {
         let (ref header, ref ct, ref expected) = ciphertexts[idx];
-        let pt = bob.decrypt(header, ct).unwrap();
+        let pt = bob.decrypt(header, ct, &[]).unwrap();
         assert_eq!(pt, expected.as_bytes(), "message {} failed to decrypt", idx);
     }
 }
@@ -376,14 +376,14 @@ fn test_ratchet_reverse_order() {
     let mut ciphertexts = Vec::new();
     for i in 0u32..10 {
         let msg = format!("reverse-{}", i);
-        let (header, ct) = alice.encrypt(msg.as_bytes()).unwrap();
+        let (header, ct) = alice.encrypt(msg.as_bytes(), &[]).unwrap();
         ciphertexts.push((header, ct, msg));
     }
 
     // Bob decrypts in reverse order: 9, 8, 7, ..., 0
     for idx in (0..10).rev() {
         let (ref header, ref ct, ref expected) = ciphertexts[idx];
-        let pt = bob.decrypt(header, ct).unwrap();
+        let pt = bob.decrypt(header, ct, &[]).unwrap();
         assert_eq!(
             pt,
             expected.as_bytes(),
@@ -403,7 +403,7 @@ fn test_ratchet_exact_max_skip_succeeds() {
     let mut ciphertexts = Vec::new();
     for i in 0u32..1001 {
         let msg = format!("skip-{}", i);
-        let (header, ct) = alice.encrypt(msg.as_bytes()).unwrap();
+        let (header, ct) = alice.encrypt(msg.as_bytes(), &[]).unwrap();
         ciphertexts.push((header, ct, msg));
     }
 
@@ -411,14 +411,14 @@ fn test_ratchet_exact_max_skip_succeeds() {
     // This should succeed (the existing test shows #1001 fails)
     let (ref header, ref ct, ref expected) = ciphertexts[1000];
     let pt = bob
-        .decrypt(header, ct)
+        .decrypt(header, ct, &[])
         .expect("decrypting message #1000 (exactly MAX_SKIP) should succeed");
     assert_eq!(pt, expected.as_bytes());
 
     // Now Bob should be able to decrypt message #0 from the skipped keys
     let (ref header0, ref ct0, ref expected0) = ciphertexts[0];
     let pt0 = bob
-        .decrypt(header0, ct0)
+        .decrypt(header0, ct0, &[])
         .expect("decrypting message #0 from skipped keys should succeed");
     assert_eq!(pt0, expected0.as_bytes());
 }
@@ -430,30 +430,30 @@ fn test_ratchet_ooo_across_dh_ratchet() {
     let (mut alice, mut bob) = setup_session_pair();
 
     // Alice encrypts msg0
-    let (h0, ct0) = alice.encrypt(b"msg0").unwrap();
+    let (h0, ct0) = alice.encrypt(b"msg0", &[]).unwrap();
     // Bob decrypts msg0 (establishes receiving chain)
-    let pt0 = bob.decrypt(&h0, &ct0).unwrap();
+    let pt0 = bob.decrypt(&h0, &ct0, &[]).unwrap();
     assert_eq!(pt0, b"msg0");
 
     // Bob encrypts reply0 (triggers DH ratchet)
-    let (rh0, rct0) = bob.encrypt(b"reply0").unwrap();
+    let (rh0, rct0) = bob.encrypt(b"reply0", &[]).unwrap();
     // Alice decrypts reply0
-    let rpt0 = alice.decrypt(&rh0, &rct0).unwrap();
+    let rpt0 = alice.decrypt(&rh0, &rct0, &[]).unwrap();
     assert_eq!(rpt0, b"reply0");
 
     // Alice encrypts msg1, msg2, msg3 (new DH ratchet)
-    let (h1, ct1) = alice.encrypt(b"msg1").unwrap();
-    let (h2, ct2) = alice.encrypt(b"msg2").unwrap();
-    let (h3, ct3) = alice.encrypt(b"msg3").unwrap();
+    let (h1, ct1) = alice.encrypt(b"msg1", &[]).unwrap();
+    let (h2, ct2) = alice.encrypt(b"msg2", &[]).unwrap();
+    let (h3, ct3) = alice.encrypt(b"msg3", &[]).unwrap();
 
     // Bob decrypts msg3 first (skip 2), then msg1, then msg2
-    let pt3 = bob.decrypt(&h3, &ct3).unwrap();
+    let pt3 = bob.decrypt(&h3, &ct3, &[]).unwrap();
     assert_eq!(pt3, b"msg3");
 
-    let pt1 = bob.decrypt(&h1, &ct1).unwrap();
+    let pt1 = bob.decrypt(&h1, &ct1, &[]).unwrap();
     assert_eq!(pt1, b"msg1");
 
-    let pt2 = bob.decrypt(&h2, &ct2).unwrap();
+    let pt2 = bob.decrypt(&h2, &ct2, &[]).unwrap();
     assert_eq!(pt2, b"msg2");
 }
 

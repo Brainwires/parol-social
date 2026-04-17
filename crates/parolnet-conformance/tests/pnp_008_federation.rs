@@ -12,7 +12,7 @@ use parolnet_protocol::address::PeerId;
 use parolnet_relay::authority::{AuthorityEndorsement, EndorsedDescriptor, SignedDirectory};
 use parolnet_relay::directory::RelayDescriptor;
 use parolnet_relay::trust_roots::{
-    is_trusted_authority, network_id, AUTHORITY_PUBKEYS, AUTHORITY_THRESHOLD,
+    AUTHORITY_PUBKEYS, AUTHORITY_THRESHOLD, is_trusted_authority, network_id,
 };
 
 use ed25519_dalek::{Signer, SigningKey};
@@ -193,7 +193,10 @@ fn iblt_tier_sizes_match_spec_table() {
     assert_eq!(tiers[1], (400, 3));
     assert_eq!(tiers[2], (2000, 4));
     let max_cells: usize = tiers.iter().map(|(c, _)| *c).max().unwrap();
-    assert_eq!(max_cells, 2000, "MUST-025: implementations MUST cap at 2000");
+    assert_eq!(
+        max_cells, 2000,
+        "MUST-025: implementations MUST cap at 2000"
+    );
 }
 
 // -- §5.1, §5.3, §5.4 Federation peer bounds ---------------------------------
@@ -378,9 +381,7 @@ fn bootstrap_channels_do_not_grant_trust_only_descriptors() {
     };
     // sk1 is NOT a trusted authority by default → untrusted channel payload
     // MUST NOT be accepted.
-    assert!(!desc
-        .verify_threshold(AUTHORITY_PUBKEYS, 1)
-        .unwrap_or(false));
+    assert!(!desc.verify_threshold(AUTHORITY_PUBKEYS, 1).unwrap_or(false));
 }
 
 #[clause("PNP-008-MUST-042")]
@@ -493,8 +494,8 @@ fn signed_directory_signature_covers_deterministic_cbor_hash() {
 #[clause("PNP-008-MUST-001")]
 #[test]
 fn descriptor_signature_is_ed25519_over_deterministic_cbor() {
-    use parolnet_relay::directory::RelayDescriptor;
     use parolnet_protocol::PeerId;
+    use parolnet_relay::directory::RelayDescriptor;
     let desc = RelayDescriptor {
         peer_id: PeerId([1u8; 32]),
         identity_key: [1u8; 32],
@@ -509,7 +510,11 @@ fn descriptor_signature_is_ed25519_over_deterministic_cbor() {
     };
     // signable_bytes is deterministic — two calls yield identical bytes.
     assert_eq!(desc.signable_bytes(), desc.signable_bytes());
-    assert_eq!(desc.signature.len(), 64, "MUST-001: Ed25519 signature = 64 bytes");
+    assert_eq!(
+        desc.signature.len(),
+        64,
+        "MUST-001: Ed25519 signature = 64 bytes"
+    );
 }
 
 // -- §4 Federation messages ride a dedicated transport ------------------------
@@ -536,7 +541,11 @@ fn requested_digests_not_fabricated_in_response() {
     let local: std::collections::HashSet<[u8; 32]> = [[1u8; 32]].into_iter().collect();
     let requested: Vec<[u8; 32]> = vec![[1u8; 32], [2u8; 32]];
     let matched: Vec<_> = requested.iter().filter(|d| local.contains(*d)).collect();
-    assert_eq!(matched.len(), 1, "MUST-009: unknown digests MUST be omitted");
+    assert_eq!(
+        matched.len(),
+        1,
+        "MUST-009: unknown digests MUST be omitted"
+    );
 }
 
 // -- §4.3 BridgeAnnouncement not forwarded ------------------------------------
@@ -547,8 +556,10 @@ fn bridge_announcement_not_gossiped() {
     // 0x08 BridgeAnnouncement MUST NOT appear in gossip or FederationSync.
     // Pin: GossipPayloadType does NOT include 0x08.
     use parolnet_protocol::gossip::GossipPayloadType;
-    assert!(GossipPayloadType::from_u8(0x08).is_none(),
-        "MUST-012: BridgeAnnouncement MUST NOT be a valid gossip type");
+    assert!(
+        GossipPayloadType::from_u8(0x08).is_none(),
+        "MUST-012: BridgeAnnouncement MUST NOT be a valid gossip type"
+    );
 }
 
 // -- §4.3 distribution_token is private ---------------------------------------
@@ -608,7 +619,10 @@ fn unverifiable_peer_descriptor_closes_transport() {
     assert!(e.verify().unwrap(), "valid endorsement verifies");
     let mut bad = e;
     bad.signature[0] ^= 0xFF;
-    assert!(!bad.verify().unwrap(), "MUST-019: unverifiable endorsement MUST close transport");
+    assert!(
+        !bad.verify().unwrap(),
+        "MUST-019: unverifiable endorsement MUST close transport"
+    );
 }
 
 // -- §5.3 Failure reset requires 300s ACTIVE ---------------------------------
@@ -649,7 +663,10 @@ fn failed_validations_accumulate_in_malformed_contrib() {
     // Pin via the score semantics: malformed events decrease score.
     let mut score = 1.0f64;
     score = 0.9 * score + 0.1 * 0.0; // one malformed observation
-    assert!(score < 1.0, "MUST-029: malformed validations MUST drop score");
+    assert!(
+        score < 1.0,
+        "MUST-029: malformed validations MUST drop score"
+    );
 }
 
 #[clause("PNP-008-MUST-030")]
@@ -658,8 +675,8 @@ fn same_peer_id_descriptor_deduplication() {
     // Architectural — when a descriptor with a known peer_id arrives, the
     // receiver compares timestamps and keeps the newer. Pin: descriptor
     // carries a u64 timestamp field.
-    use parolnet_relay::directory::RelayDescriptor;
     use parolnet_protocol::PeerId;
+    use parolnet_relay::directory::RelayDescriptor;
     let desc = RelayDescriptor {
         peer_id: PeerId([5u8; 32]),
         identity_key: [0u8; 32],
@@ -831,7 +848,10 @@ fn client_routes_directory_traffic_via_bridge_until_public_reachable() {
     // a public relay is confirmed reachable. Pin via state enum presence
     // (design invariant).
     let bridge_only: bool = true;
-    assert!(bridge_only, "MUST-055: bridge-pinning defeats censor-then-direct attack");
+    assert!(
+        bridge_only,
+        "MUST-055: bridge-pinning defeats censor-then-direct attack"
+    );
 }
 
 #[clause("PNP-008-MUST-056")]
@@ -862,8 +882,16 @@ fn reconnection_after_partition_triggers_full_federation_sync() {
     // perform FederationSync. Pin via the state-machine transition:
     // PARTITIONED → SYNC (not PARTITIONED → ACTIVE).
     #[derive(PartialEq, Debug)]
-    enum PartitionState { Partitioned, Sync, Active }
-    let path = [PartitionState::Partitioned, PartitionState::Sync, PartitionState::Active];
+    enum PartitionState {
+        Partitioned,
+        Sync,
+        Active,
+    }
+    let path = [
+        PartitionState::Partitioned,
+        PartitionState::Sync,
+        PartitionState::Active,
+    ];
     assert_eq!(path[1], PartitionState::Sync);
 }
 
@@ -883,8 +911,8 @@ fn reputation_never_used_as_published_signal() {
     // Architectural — reputation is a local input only. No wire message
     // carries reputation scores. Pin: the AuthorityEndorsement and
     // SignedDirectory schemas contain no reputation field.
-    use parolnet_relay::directory::RelayDescriptor;
     use parolnet_protocol::PeerId;
+    use parolnet_relay::directory::RelayDescriptor;
     let desc = RelayDescriptor {
         peer_id: PeerId([0u8; 32]),
         identity_key: [0u8; 32],

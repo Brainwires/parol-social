@@ -157,7 +157,7 @@ fn test_pow_difficulty_zero() {
 
 fn make_test_envelope(dest: PeerId) -> Envelope {
     Envelope {
-        header: CleartextHeader {
+        cleartext_header: CleartextHeader {
             version: 1,
             msg_type: 0x01,
             dest_peer_id: dest,
@@ -166,8 +166,13 @@ fn make_test_envelope(dest: PeerId) -> Envelope {
             ttl_and_hops: 7 << 8,
             source_hint: None,
         },
+        ratchet_header: parolnet_crypto::RatchetHeader {
+            ratchet_key: [0u8; 32],
+            previous_chain_length: 0,
+            message_number: 0,
+        },
         encrypted_payload: vec![0xEE; 64],
-        mac: [0xFF; 16],
+        padding: vec![],
     }
 }
 
@@ -196,8 +201,8 @@ async fn test_store_limit_eviction() {
     // Store more than MAX_MESSAGES_PER_PEER
     for i in 0..260u16 {
         let mut env = make_test_envelope(peer);
-        env.header.message_id[0] = (i & 0xFF) as u8;
-        env.header.message_id[1] = (i >> 8) as u8;
+        env.cleartext_header.message_id[0] = (i & 0xFF) as u8;
+        env.cleartext_header.message_id[1] = (i >> 8) as u8;
         store.store(&env, Duration::from_secs(3600)).await.unwrap();
     }
 
@@ -307,12 +312,12 @@ async fn test_store_multiple_peers() {
     // Store 2 messages for peer_a, 3 for peer_b, 1 for peer_c
     for i in 0..2u8 {
         let mut env = make_test_envelope(peer_a);
-        env.header.message_id[0] = i;
+        env.cleartext_header.message_id[0] = i;
         store.store(&env, Duration::from_secs(3600)).await.unwrap();
     }
     for i in 0..3u8 {
         let mut env = make_test_envelope(peer_b);
-        env.header.message_id[0] = i;
+        env.cleartext_header.message_id[0] = i;
         store.store(&env, Duration::from_secs(3600)).await.unwrap();
     }
     {
@@ -344,16 +349,16 @@ async fn test_store_eviction_order() {
     // Store exactly MAX_MESSAGES_PER_PEER (256) messages
     for i in 0..256u16 {
         let mut env = make_test_envelope(peer);
-        env.header.message_id[0] = (i & 0xFF) as u8;
-        env.header.message_id[1] = (i >> 8) as u8;
+        env.cleartext_header.message_id[0] = (i & 0xFF) as u8;
+        env.cleartext_header.message_id[1] = (i >> 8) as u8;
         store.store(&env, Duration::from_secs(3600)).await.unwrap();
     }
     assert_eq!(store.count_for_peer(&peer).await, 256);
 
     // Store one more — should trigger eviction, count stays at 256
     let mut env = make_test_envelope(peer);
-    env.header.message_id[0] = 0xFF;
-    env.header.message_id[1] = 0xFF;
+    env.cleartext_header.message_id[0] = 0xFF;
+    env.cleartext_header.message_id[1] = 0xFF;
     store.store(&env, Duration::from_secs(3600)).await.unwrap();
     assert_eq!(store.count_for_peer(&peer).await, 256);
 }

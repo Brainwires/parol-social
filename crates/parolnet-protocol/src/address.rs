@@ -125,12 +125,14 @@ impl BridgeAddress {
     /// Format: `bridge:{host}:{port}[;front={front_domain}][;fp={hex_fingerprint}]`
     pub fn from_qr_string(s: &str) -> Result<Self, ProtocolError> {
         let s = s.trim();
-        let rest = s
-            .strip_prefix("bridge:")
-            .ok_or_else(|| ProtocolError::InvalidBridgeAddress("must start with 'bridge:'".into()))?;
+        let rest = s.strip_prefix("bridge:").ok_or_else(|| {
+            ProtocolError::InvalidBridgeAddress("must start with 'bridge:'".into())
+        })?;
 
         if rest.is_empty() {
-            return Err(ProtocolError::InvalidBridgeAddress("missing host and port".into()));
+            return Err(ProtocolError::InvalidBridgeAddress(
+                "missing host and port".into(),
+            ));
         }
 
         // Split into main part (host:port) and optional params (;key=value)
@@ -150,9 +152,9 @@ impl BridgeAddress {
             return Err(ProtocolError::InvalidBridgeAddress("empty host".into()));
         }
 
-        let port: u16 = port_str
-            .parse()
-            .map_err(|_| ProtocolError::InvalidBridgeAddress(format!("invalid port: {port_str}")))?;
+        let port: u16 = port_str.parse().map_err(|_| {
+            ProtocolError::InvalidBridgeAddress(format!("invalid port: {port_str}"))
+        })?;
 
         let mut front_domain = None;
         let mut fingerprint = None;
@@ -167,9 +169,7 @@ impl BridgeAddress {
                         ProtocolError::InvalidBridgeAddress(format!("invalid fingerprint hex: {e}"))
                     })?;
                     let fp: [u8; 32] = fp_bytes.try_into().map_err(|_| {
-                        ProtocolError::InvalidBridgeAddress(
-                            "fingerprint must be 32 bytes".into(),
-                        )
+                        ProtocolError::InvalidBridgeAddress("fingerprint must be 32 bytes".into())
                     })?;
                     fingerprint = Some(fp);
                 }
@@ -209,8 +209,8 @@ mod tests {
 
     #[test]
     fn bridge_address_with_front_domain() {
-        let addr = BridgeAddress::new("1.2.3.4".into(), 9000)
-            .with_front_domain("cdn.example.com".into());
+        let addr =
+            BridgeAddress::new("1.2.3.4".into(), 9000).with_front_domain("cdn.example.com".into());
         assert_eq!(addr.ws_url(), "wss://cdn.example.com/ws");
         assert_eq!(addr.http_url(), "https://cdn.example.com");
     }
@@ -227,8 +227,7 @@ mod tests {
     #[test]
     fn bridge_qr_with_fingerprint() {
         let fp = [0xABu8; 32];
-        let addr = BridgeAddress::new("relay.example.org".into(), 8443)
-            .with_fingerprint(fp);
+        let addr = BridgeAddress::new("relay.example.org".into(), 8443).with_fingerprint(fp);
         let qr = addr.to_qr_string();
         let parsed = BridgeAddress::from_qr_string(&qr).unwrap();
         assert_eq!(parsed.fingerprint, Some(fp));

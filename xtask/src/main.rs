@@ -105,8 +105,8 @@ fn collect_spec_clauses(root: &Path) -> Result<BTreeMap<String, ClauseSet>> {
         if !fname.starts_with("PNP-") {
             continue;
         }
-        let text = std::fs::read_to_string(path)
-            .with_context(|| format!("read {}", path.display()))?;
+        let text =
+            std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
         for cap in re.captures_iter(&text) {
             let spec = format!("PNP-{}", &cap[1]);
             let id = cap[0].to_string();
@@ -198,7 +198,10 @@ fn run_clauses(check: bool, report: bool) -> Result<()> {
     }
     rows.sort_by(|a, b| a.spec.cmp(&b.spec));
 
-    println!("{:<10}  {:>12}  {:>14}  {:>11}", "Spec", "MUST", "SHOULD", "MAY");
+    println!(
+        "{:<10}  {:>12}  {:>14}  {:>11}",
+        "Spec", "MUST", "SHOULD", "MAY"
+    );
     println!("{}", "-".repeat(54));
     let mut total_must = 0usize;
     let mut total_must_cov = 0usize;
@@ -263,19 +266,24 @@ fn run_clauses(check: bool, report: bool) -> Result<()> {
                 uncovered_must.len()
             );
             let limit = std::env::var("XTASK_FULL").is_ok();
-            let shown = if limit { uncovered_must.len() } else { 20.min(uncovered_must.len()) };
+            let shown = if limit {
+                uncovered_must.len()
+            } else {
+                20.min(uncovered_must.len())
+            };
             for id in uncovered_must.iter().take(shown) {
                 eprintln!("  uncovered: {id}");
             }
             if !limit && uncovered_must.len() > 20 {
-                eprintln!("  ... {} more (set XTASK_FULL=1 to see all)", uncovered_must.len() - 20);
+                eprintln!(
+                    "  ... {} more (set XTASK_FULL=1 to see all)",
+                    uncovered_must.len() - 20
+                );
             }
             std::process::exit(1);
         }
         if should_pct < 80.0 {
-            eprintln!(
-                "\nclause check FAILED: SHOULD coverage {should_pct:.1}% < 80% threshold"
-            );
+            eprintln!("\nclause check FAILED: SHOULD coverage {should_pct:.1}% < 80% threshold");
             std::process::exit(1);
         }
         println!("\nclause check PASSED");

@@ -34,14 +34,12 @@ pub mod vectors {
         let mut p = vectors_root();
         p.push(spec);
         p.push(name);
-        std::fs::read_to_string(&p)
-            .unwrap_or_else(|e| panic!("load vector {}: {e}", p.display()))
+        std::fs::read_to_string(&p).unwrap_or_else(|e| panic!("load vector {}: {e}", p.display()))
     }
 
     pub fn load<T: DeserializeOwned>(spec: &str, name: &str) -> T {
         let raw = load_raw(spec, name);
-        serde_json::from_str(&raw)
-            .unwrap_or_else(|e| panic!("parse vector {spec}/{name}: {e}"))
+        serde_json::from_str(&raw).unwrap_or_else(|e| panic!("parse vector {spec}/{name}: {e}"))
     }
 }
 

@@ -58,18 +58,12 @@ fn mediacall_padding_interval_is_20ms() {
 #[clause("PNP-006-MUST-019")]
 #[test]
 fn jitter_bounds_match_spec_table() {
-    assert_eq!(
-        BandwidthMode::Low.jitter_max(),
-        Duration::from_millis(500)
-    );
+    assert_eq!(BandwidthMode::Low.jitter_max(), Duration::from_millis(500));
     assert_eq!(
         BandwidthMode::Normal.jitter_max(),
         Duration::from_millis(100)
     );
-    assert_eq!(
-        BandwidthMode::High.jitter_max(),
-        Duration::from_millis(30)
-    );
+    assert_eq!(BandwidthMode::High.jitter_max(), Duration::from_millis(30));
     assert_eq!(
         BandwidthMode::MediaCall.jitter_max(),
         Duration::from_millis(5)
@@ -185,10 +179,7 @@ fn default_sni_is_a_real_cdn_domain() {
         DEFAULT_SNI.contains('.'),
         "MUST-032: SNI MUST contain a dotted domain"
     );
-    assert!(
-        !DEFAULT_SNI.is_empty(),
-        "MUST-032: SNI MUST NOT be empty"
-    );
+    assert!(!DEFAULT_SNI.is_empty(), "MUST-032: SNI MUST NOT be empty");
     // Pin the current default — a change here forces a spec+test review.
     assert_eq!(DEFAULT_SNI, "cdn.jsdelivr.net");
 }
@@ -392,7 +383,12 @@ fn user_can_select_bandwidth_mode() {
     // Architectural — BandwidthMode is a public enum; user-facing API
     // accepts any variant. Pin via variant construction.
     use parolnet_transport::noise::BandwidthMode;
-    for m in [BandwidthMode::Low, BandwidthMode::Normal, BandwidthMode::High, BandwidthMode::MediaCall] {
+    for m in [
+        BandwidthMode::Low,
+        BandwidthMode::Normal,
+        BandwidthMode::High,
+        BandwidthMode::MediaCall,
+    ] {
         let _ = m;
     }
 }
@@ -402,8 +398,16 @@ fn user_can_select_bandwidth_mode() {
 fn padding_interval_always_has_jitter_applied() {
     use parolnet_transport::noise::BandwidthMode;
     // Each mode has a non-zero jitter_max. Pin per-mode.
-    for m in [BandwidthMode::Low, BandwidthMode::Normal, BandwidthMode::High, BandwidthMode::MediaCall] {
-        assert!(m.jitter_max().as_millis() > 0, "MUST-006: {m:?} MUST have jitter");
+    for m in [
+        BandwidthMode::Low,
+        BandwidthMode::Normal,
+        BandwidthMode::High,
+        BandwidthMode::MediaCall,
+    ] {
+        assert!(
+            m.jitter_max().as_millis() > 0,
+            "MUST-006: {m:?} MUST have jitter"
+        );
     }
 }
 
@@ -585,7 +589,10 @@ fn at_least_three_fingerprint_profiles_supported() {
     use parolnet_transport::tls_camouflage::FingerprintProfile;
     // Current impl ships Chrome + Firefox; registry is expandable.
     let profiles = [FingerprintProfile::chrome(), FingerprintProfile::firefox()];
-    assert!(profiles.len() >= 2, "SHOULD-010: ≥3 profiles target; 2 present, extensible");
+    assert!(
+        profiles.len() >= 2,
+        "SHOULD-010: ≥3 profiles target; 2 present, extensible"
+    );
 }
 
 #[clause("PNP-006-SHOULD-011")]

@@ -1,12 +1,20 @@
 # PNP-001: ParolNet Wire Protocol
 
 ### Status: CANDIDATE
-### Version: 0.2
+### Version: 0.3
 ### Date: 2026-04-17
 
 ---
 
 ## Changelog
+
+**v0.3 (2026-04-17) — Wire-level envelope padding + AAD binding**
+
+- §3.1 Envelope Structure rewritten: envelope is now a 4-element CBOR array `[cleartext_header, ratchet_header, encrypted_payload, padding]`. The Double Ratchet header is carried explicitly so the receiver can advance state before AEAD decryption. Padding is applied to the serialized envelope (wire level), not inside the plaintext payload, so the final CBOR byte sequence lands exactly on a bucket boundary.
+- §3.3 Encrypted Payload: removed the `pad` field from the plaintext CBOR map. Padding is now a sibling field of the ciphertext at the envelope level, not a field inside the ciphertext. The plaintext map is now `{body, chain, flags, seq}` in lexicographic order.
+- §3.5 MAC: the 16-byte AEAD tag is now the trailing 16 bytes of the `encrypted_payload` byte-string (in-place, as produced by ChaCha20-Poly1305 / AES-256-GCM). There is no separate `mac` field on the wire.
+- §3.6 Padding Scheme rewritten: padding is applied to the serialized envelope. The sender iteratively sizes `padding` so that `len(CBOR(envelope))` equals exactly the chosen bucket size. A single fixpoint iteration suffices to absorb the CBOR `bstr` length-prefix tier delta.
+- PNP-001-MUST-007 (AAD binding) now reads as: AEAD AAD is `ratchet_public_key || CBOR(cleartext_header)`. The session AEAD tag therefore binds both the Double Ratchet identity of the message and every relay-visible field.
 
 **v0.2 (2026-04-17) — Harmonization pass**
 
@@ -50,17 +58,27 @@ The key words "MUST", "MUST NOT", "REQUIRED", "SHALL", "SHALL NOT", "SHOULD", "S
 
 ### 3.1 Envelope Structure
 
-Every envelope on the wire is a contiguous byte sequence with three logical sections:
+Every envelope on the wire is a single definite-length CBOR array with four elements. The final serialized byte sequence is the envelope as it appears on the wire.
 
 ```
-+--------------------+------------------------------+----------+
-|  Cleartext Header  |     Encrypted Payload        |   MAC    |
-|    (variable)      |       (variable)             | (16 B)   |
-+--------------------+------------------------------+----------+
-|<------------- padded to bucket size --------------------------->|
+Envelope = CBOR Array(4 items):
+  [0] cleartext_header    : CBOR array (see §3.2)
+  [1] ratchet_header      : CBOR array [ratchet_pub(32B), prev_chain_len, msg_number]
+  [2] encrypted_payload   : bstr   -- ciphertext including 16-byte AEAD tag (§3.5)
+  [3] padding             : bstr   -- wire-level random padding (§3.6)
 ```
 
-The total envelope, including all three sections, MUST equal exactly one of the bucket sizes: 256, 1024, 4096, or 16384 bytes. **PNP-001-MUST-001**
+```
++-----------+-----------+---------------------+------------+
+| cleartext | ratchet   | encrypted_payload   |  padding   |
+| header    | header    | (ciphertext||tag)   | (bstr)     |
++-----------+-----------+---------------------+------------+
+|<---------- total CBOR length == bucket size ------------>|
+```
+
+The total envelope (the serialized CBOR array, including its own outer length prefixes) MUST equal exactly one of the bucket sizes: 256, 1024, 4096, or 16384 bytes. **PNP-001-MUST-001**
+
+Using an array (rather than a map) at the outer level keeps the envelope compact enough that small messages still fit in the 256-byte bucket after accounting for the cleartext header, the ratchet header, and AEAD overhead. The ratchet header is carried on the wire so the receiver can advance the Double Ratchet state before AEAD decryption; it is NOT covered by the session AEAD tag but it IS covered through the `ratchet_public_key` component of the AEAD AAD (see §3.3 / MUST-007).
 
 ### 3.2 Cleartext Header
 
@@ -98,15 +116,16 @@ Field details:
 The encrypted payload carries the actual message content. It is encrypted using the session AEAD (ChaCha20-Poly1305 or AES-256-GCM) derived from the Double Ratchet session state. **PNP-001-MUST-004**
 
 ```
-Encrypted Payload (before encryption) = CBOR Map:
+Plaintext (before encryption) = CBOR Map (keys in lexicographic order):
   {
     "body"    : bstr,       -- The application-layer content.
-    "pad"     : bstr,       -- Random padding bytes (see Section 3.6).
-    "seq"     : uint64,     -- Sequence number within the Double Ratchet chain.
     "chain"   : uint32,     -- Ratchet chain index.
-    "flags"   : uint8       -- Bitfield (see below).
+    "flags"   : uint8,      -- Bitfield (see below).
+    "seq"     : uint64      -- Sequence number within the Double Ratchet chain.
   }
 ```
+
+The plaintext CBOR map MUST NOT contain a `pad` field. Wire-level padding is carried as a sibling of `encrypted_payload` at the envelope level (see §3.1 and §3.6); it is NOT inside the AEAD ciphertext.
 
 Flags bitfield:
 
@@ -126,7 +145,15 @@ nonce (12 bytes) = chain_index (4 bytes, big-endian) || seq_number (8 bytes, big
 
 **PNP-001-MUST-006**
 
-The AEAD additional authenticated data (AAD) MUST be the serialized cleartext header bytes. **PNP-001-MUST-007**
+The AEAD additional authenticated data (AAD) MUST be the concatenation of the sender's current Double Ratchet public key (the `ratchet_public_key` field from the wire ratchet header, 32 bytes) followed by the serialized CBOR bytes of the cleartext header:
+
+```
+AAD = ratchet_public_key || CBOR(cleartext_header)
+```
+
+**PNP-001-MUST-007**
+
+This construction makes the AEAD tag tamper-evident with respect to (a) every relay-visible field in the cleartext header, and (b) the Double Ratchet identity of the sending state. A relay cannot rewrite `dest_peer_id`, `msg_type`, `message_id`, `timestamp`, `ttl_and_hops`, or `source_hint` without causing AEAD tag verification to fail on the receiver. An attacker cannot attach a stolen ciphertext to a different ratchet public key without the same tag failure. The `ratchet_header` fields `previous_chain_length` and `message_number` are NOT part of AAD; they are used only to drive the receiver's key-derivation step, whose output becomes the AEAD key itself — any tampering there produces a key that does not match the sender and therefore also fails AEAD verification.
 
 ### 3.4 Message Types
 
@@ -158,26 +185,27 @@ Implementations MUST treat unrecognized message type codes as DECOY and silently
 
 ### 3.5 MAC
 
-The final 16 bytes of every envelope are the AEAD authentication tag produced during encryption. This tag authenticates both the cleartext header (as AAD) and the encrypted payload. **PNP-001-MUST-009**
+The AEAD tag is the trailing 16 bytes of `encrypted_payload` (produced in-place by ChaCha20-Poly1305 or AES-256-GCM). There is NO separate `mac` field on the wire. The tag authenticates the ciphertext and the AAD defined in §3.3 (`ratchet_public_key || CBOR(cleartext_header)`). **PNP-001-MUST-009**
 
 ### 3.6 Padding Scheme
 
-All envelopes MUST be padded to the next bucket size that can accommodate the header, encrypted payload, and 16-byte MAC. **PNP-001-MUST-010** The bucket sizes are:
+All envelopes MUST be padded to the smallest bucket size that can accommodate the complete envelope after CBOR serialization. **PNP-001-MUST-010** The bucket sizes are:
 
 ```
 BUCKET_SIZES = [256, 1024, 4096, 16384]
 ```
 
+Padding is applied to the serialized envelope (wire level), NOT to the plaintext inside the AEAD. The `padding` field of the envelope absorbs whatever bytes are needed so that the final CBOR byte sequence is exactly one bucket size long. The padding bytes are cryptographically random — a relay MUST NOT be able to distinguish padding from any other `bstr` content on the wire.
+
 The padding procedure is:
 
-1. Serialize the cleartext header to bytes: `H`.
-2. Serialize the plaintext payload (without the `pad` field) to bytes: `P_partial`.
-3. Compute `needed = len(H) + overhead(AEAD) + len(P_partial) + CBOR_overhead_for_pad + 16`.
-4. Select the smallest bucket size `B` such that `B >= needed`. If no bucket size is large enough, the message MUST be fragmented. **PNP-001-MUST-011**
-5. Compute `pad_length = B - needed`.
-6. Generate `pad_length` cryptographically random bytes and set the `pad` field. **PNP-001-MUST-012**
-7. Encrypt the complete payload (including `pad`).
-8. The final envelope MUST be exactly `B` bytes. **PNP-001-MUST-013**
+1. Serialize the cleartext header to CBOR bytes: `H`.
+2. Encrypt the plaintext map (per §3.3) under the session AEAD using `AAD = ratchet_public_key || H`. Let the ciphertext (including the 16-byte tag) be `C`.
+3. Serialize the envelope `[cleartext_header, ratchet_header, C, bstr(0)]` (empty padding) to CBOR bytes and measure its length `L0`.
+4. Select the smallest bucket size `B` such that `B >= L0`. If `L0` exceeds the largest bucket, the message MUST be fragmented. **PNP-001-MUST-011**
+5. Compute an initial `pad_length = B - L0 - cbor_bstr_header_size(B - L0)` and fill `pad_length` cryptographically random bytes into the `padding` field. **PNP-001-MUST-012**
+6. Re-serialize the envelope and measure its length `L1`. If `L1 != B` (this happens when growing `padding` crossed a CBOR `bstr` length-prefix tier boundary at 24 / 256 / 65536 bytes), adjust `pad_length` by `B - L1` and re-serialize once. One fixpoint iteration is sufficient because the CBOR length-prefix overhead is monotonic in `pad_length`.
+7. The final envelope bytes MUST be exactly `B` bytes long. **PNP-001-MUST-013**
 
 Implementations MUST NOT leak the original message size through timing, error responses, or any other side channel. **PNP-001-MUST-014**
 

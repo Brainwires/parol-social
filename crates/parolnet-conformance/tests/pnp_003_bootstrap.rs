@@ -2,8 +2,7 @@
 
 use parolnet_clause::clause;
 use parolnet_transport::ble::{
-    BleConfig, BleState, BLE_MTU, CHARACTERISTIC_UUID, HANDSHAKE_CHARACTERISTIC_UUID,
-    SERVICE_UUID,
+    BLE_MTU, BleConfig, BleState, CHARACTERISTIC_UUID, HANDSHAKE_CHARACTERISTIC_UUID, SERVICE_UUID,
 };
 
 // -- §5.7 Bluetooth bootstrap UUID -------------------------------------------
@@ -26,9 +25,7 @@ fn ble_characteristic_uuids_share_service_namespace() {
         CHARACTERISTIC_UUID.starts_with("b51e4c00-50ef-4e6c-9a83-"),
         "characteristic UUID MUST sit in the same service namespace"
     );
-    assert!(
-        HANDSHAKE_CHARACTERISTIC_UUID.starts_with("b51e4c00-50ef-4e6c-9a83-"),
-    );
+    assert!(HANDSHAKE_CHARACTERISTIC_UUID.starts_with("b51e4c00-50ef-4e6c-9a83-"),);
     assert_ne!(CHARACTERISTIC_UUID, HANDSHAKE_CHARACTERISTIC_UUID);
     assert_ne!(SERVICE_UUID, CHARACTERISTIC_UUID);
 }
@@ -355,7 +352,10 @@ fn qr_presenter_accepts_only_one_bootstrap_per_seed() {
     let first = used_seeds.insert(seed);
     let second = used_seeds.insert(seed);
     assert!(first, "first bootstrap with seed MUST succeed");
-    assert!(!second, "MUST-040: second bootstrap with same seed MUST be rejected");
+    assert!(
+        !second,
+        "MUST-040: second bootstrap with same seed MUST be rejected"
+    );
 }
 
 // -- §6 BLE link-layer security -----------------------------------------------
@@ -539,7 +539,10 @@ fn qr_cleared_from_display_after_use() {
     // Architectural — QR state machine transitions to Cleared after the
     // handshake completes or times out. Pin via state presence.
     #[derive(Debug, PartialEq)]
-    enum QrState { Active, Cleared }
+    enum QrState {
+        Active,
+        Cleared,
+    }
     let path = [QrState::Active, QrState::Cleared];
     assert_eq!(path[1], QrState::Cleared);
 }

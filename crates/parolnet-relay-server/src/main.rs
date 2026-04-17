@@ -631,8 +631,7 @@ async fn handle_turn_credentials() -> impl IntoResponse {
     use sha1::Sha1;
     type HmacSha1 = Hmac<Sha1>;
 
-    let mut mac =
-        HmacSha1::new_from_slice(secret.as_bytes()).expect("HMAC accepts any key length");
+    let mut mac = HmacSha1::new_from_slice(secret.as_bytes()).expect("HMAC accepts any key length");
     mac.update(username.as_bytes());
     let result = mac.finalize();
     let credential = base64::Engine::encode(
@@ -644,12 +643,20 @@ async fn handle_turn_credentials() -> impl IntoResponse {
     let uris: Vec<String> = {
         let explicit = std::env::var("TURN_URIS").unwrap_or_default();
         if !explicit.trim().is_empty() {
-            explicit.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect()
+            explicit
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect()
         } else {
             let host = std::env::var("TURN_DOMAIN")
                 .ok()
                 .filter(|s| !s.is_empty())
-                .or_else(|| std::env::var("TURN_EXTERNAL_IP").ok().filter(|s| !s.is_empty()))
+                .or_else(|| {
+                    std::env::var("TURN_EXTERNAL_IP")
+                        .ok()
+                        .filter(|s| !s.is_empty())
+                })
                 .unwrap_or_default();
             if host.is_empty() {
                 vec![]
@@ -919,7 +926,9 @@ async fn main() {
 
     // Bridge mode configuration
     let bridge_mode = std::env::var("BRIDGE_MODE").unwrap_or_default() == "true";
-    let bridge_front_domain: Option<String> = std::env::var("BRIDGE_FRONT_DOMAIN").ok().filter(|s| !s.is_empty());
+    let bridge_front_domain: Option<String> = std::env::var("BRIDGE_FRONT_DOMAIN")
+        .ok()
+        .filter(|s| !s.is_empty());
     let trusted_proxies: Arc<HashSet<IpAddr>> = {
         let ips: HashSet<IpAddr> = std::env::var("TRUSTED_PROXY_IPS")
             .unwrap_or_default()
@@ -927,7 +936,10 @@ async fn main() {
             .filter_map(|s| s.trim().parse::<IpAddr>().ok())
             .collect();
         if !ips.is_empty() {
-            info!("Configured {} trusted proxy IPs for X-Forwarded-For", ips.len());
+            info!(
+                "Configured {} trusted proxy IPs for X-Forwarded-For",
+                ips.len()
+            );
         }
         Arc::new(ips)
     };
@@ -1093,7 +1105,10 @@ async fn main() {
             }),
         )
         .route("/health", get(|| async { "OK" }))
-        .route("/turn-credentials", get(|| async { handle_turn_credentials().await }))
+        .route(
+            "/turn-credentials",
+            get(|| async { handle_turn_credentials().await }),
+        )
         .route(
             "/peers",
             get({
@@ -1373,16 +1388,16 @@ fn handle_relay_cell(
                             let client_public = x25519_dalek::PublicKey::from(client_pub);
 
                             // Generate new DH keys for this sub-hop
-                            let hop_secret = x25519_dalek::StaticSecret::random_from_rng(
-                                rand::thread_rng(),
-                            );
+                            let hop_secret =
+                                x25519_dalek::StaticSecret::random_from_rng(rand::thread_rng());
                             let hop_public = x25519_dalek::PublicKey::from(&hop_secret);
                             let shared = hop_secret.diffie_hellman(&client_public);
 
                             if let Ok(hop_keys) = HopKeys::from_shared_secret(shared.as_bytes()) {
                                 // Register the new sub-circuit hop — use a derived circuit_id
                                 // to avoid collision. We use circuit_id + hop_index.
-                                let sub_id = cell.circuit_id.wrapping_add(table.len() as u32 + 1000);
+                                let sub_id =
+                                    cell.circuit_id.wrapping_add(table.len() as u32 + 1000);
                                 table.insert(
                                     sub_id,
                                     CircuitState {
@@ -1393,9 +1408,12 @@ fn handle_relay_cell(
                                 );
 
                                 // Respond with EXTENDED containing the hop's public key
-                                let extended =
-                                    CircuitHandshake::extended_cell(cell.circuit_id, hop_public.as_bytes());
-                                let _ = tx.send(Message::Binary(extended.to_bytes().to_vec().into()));
+                                let extended = CircuitHandshake::extended_cell(
+                                    cell.circuit_id,
+                                    hop_public.as_bytes(),
+                                );
+                                let _ =
+                                    tx.send(Message::Binary(extended.to_bytes().to_vec().into()));
                                 tracing::debug!(
                                     circuit_id = cell.circuit_id,
                                     "circuit EXTEND handled (single-relay MVP)"
@@ -1439,11 +1457,9 @@ fn handle_relay_cell(
                             if let Ok(incoming) = serde_json::from_str::<serde_json::Value>(&text)
                                 && let Some(to) = incoming.get("to").and_then(|v| v.as_str())
                             {
-                                let peers_guard =
-                                    peers.blocking_lock();
+                                let peers_guard = peers.blocking_lock();
                                 if let Some(recipient_tx) = peers_guard.get(to) {
-                                    let _ = recipient_tx
-                                        .send(Message::Text(text.into()));
+                                    let _ = recipient_tx.send(Message::Text(text.into()));
                                 }
                             }
                         }

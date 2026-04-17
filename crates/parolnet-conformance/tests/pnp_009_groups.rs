@@ -127,7 +127,10 @@ fn full_mesh_8_participants_yields_28_pairwise_circuits() {
     let n: u32 = MAX_GROUP_CALL_PARTICIPANTS as u32;
     let pairs = n * (n - 1) / 2;
     assert_eq!(n, 8);
-    assert_eq!(pairs, 28, "MUST-050: full-mesh at N=8 is 28 pairwise circuits");
+    assert_eq!(
+        pairs, 28,
+        "MUST-050: full-mesh at N=8 is 28 pairwise circuits"
+    );
 }
 
 #[clause("PNP-009-MUST-054", "PNP-009-MUST-055")]
@@ -400,7 +403,10 @@ fn group_message_flag_is_0x10() {
     let mut f = MessageFlags::default();
     assert!(!f.is_group());
     f.set_group();
-    assert!(f.is_group(), "MUST-001: bit 0x10 MUST indicate group message");
+    assert!(
+        f.is_group(),
+        "MUST-001: bit 0x10 MUST indicate group message"
+    );
     assert_eq!(f.0 & 0x10, 0x10);
 }
 
@@ -417,30 +423,52 @@ fn sender_key_distribution_rides_pairwise_ratchet() {
     let dist = st.create_distribution([0u8; 32]);
     let mut buf = Vec::new();
     ciborium::into_writer(&dist, &mut buf).unwrap();
-    assert!(!buf.is_empty(), "MUST-005: distribution MUST be sendable per-recipient");
+    assert!(
+        !buf.is_empty(),
+        "MUST-005: distribution MUST be sendable per-recipient"
+    );
     // MUST-006: never broadcast through the group channel — architectural
     // invariant. There is no group-channel API for SenderKeyDistribution.
 }
 
 // -- §6.3 GroupOperation signature + admin verification -----------------------
 
-#[clause("PNP-009-MUST-020", "PNP-009-MUST-021", "PNP-009-MUST-022", "PNP-009-MUST-023", "PNP-009-MUST-071")]
+#[clause(
+    "PNP-009-MUST-020",
+    "PNP-009-MUST-021",
+    "PNP-009-MUST-022",
+    "PNP-009-MUST-023",
+    "PNP-009-MUST-071"
+)]
 #[test]
 fn group_operation_signed_and_admin_verified() {
-    use parolnet_protocol::group::{GroupOperation, GroupOpType};
+    use parolnet_protocol::group::{GroupOpType, GroupOperation};
     // GroupOperation carries a 64-byte Ed25519 signature field.
     let op = GroupOperation {
         group_id: GroupId([0u8; 32]),
         version: 1,
-        op: GroupOpType::AddMember { peer_id: PeerId([1u8; 32]) },
+        op: GroupOpType::AddMember {
+            peer_id: PeerId([1u8; 32]),
+        },
         admin_peer_id: PeerId([2u8; 32]),
         signature: vec![0u8; 64],
         timestamp: 1_700_000_000,
     };
-    assert_eq!(op.signature.len(), 64, "MUST-020: Ed25519 signature MUST be 64 bytes");
+    assert_eq!(
+        op.signature.len(),
+        64,
+        "MUST-020: Ed25519 signature MUST be 64 bytes"
+    );
     // MUST-021/022/023/071: unsigned ops (empty sig) MUST be discarded.
-    let unsigned = GroupOperation { signature: vec![], ..op.clone() };
-    assert_eq!(unsigned.signature.len(), 0, "MUST-023: unsigned op MUST be rejected");
+    let unsigned = GroupOperation {
+        signature: vec![],
+        ..op.clone()
+    };
+    assert_eq!(
+        unsigned.signature.len(),
+        0,
+        "MUST-023: unsigned op MUST be rejected"
+    );
 }
 
 // -- §6.4 GroupOperations ride gossip 0x04 (members only) ---------------------
@@ -470,7 +498,12 @@ fn member_removal_triggers_sender_key_rotation() {
 
 // -- §7.2 Rotation steps ------------------------------------------------------
 
-#[clause("PNP-009-MUST-029", "PNP-009-MUST-031", "PNP-009-MUST-032", "PNP-009-MUST-033")]
+#[clause(
+    "PNP-009-MUST-029",
+    "PNP-009-MUST-031",
+    "PNP-009-MUST-032",
+    "PNP-009-MUST-033"
+)]
 #[test]
 fn rotation_generates_fresh_signing_pair_and_zeroizes_old() {
     use parolnet_crypto::sender_key::SenderKeyState;
@@ -491,7 +524,9 @@ fn adding_member_triggers_two_way_sender_key_distribution() {
     // sender key distribution handshake. Pin via op type + distribution
     // transport: both sides MUST exchange sender keys.
     use parolnet_protocol::group::GroupOpType;
-    let _add = GroupOpType::AddMember { peer_id: PeerId([9u8; 32]) };
+    let _add = GroupOpType::AddMember {
+        peer_id: PeerId([9u8; 32]),
+    };
     // Existing + new member both perform create_distribution().
     use parolnet_crypto::sender_key::SenderKeyState;
     let existing = SenderKeyState::new();
@@ -505,10 +540,14 @@ fn adding_member_triggers_two_way_sender_key_distribution() {
 #[clause("PNP-009-MUST-037")]
 #[test]
 fn group_plaintext_padded_before_encryption() {
-    use parolnet_protocol::padding::BucketPadding;
     use parolnet_protocol::PaddingStrategy;
+    use parolnet_protocol::padding::BucketPadding;
     let padded = BucketPadding.pad(b"group message").unwrap();
-    assert_eq!(padded.len(), 256, "MUST-037: group plaintext MUST be padded per PaddingStrategy");
+    assert_eq!(
+        padded.len(),
+        256,
+        "MUST-037: group plaintext MUST be padded per PaddingStrategy"
+    );
 }
 
 #[clause("PNP-009-MUST-039")]
@@ -517,7 +556,11 @@ fn group_sender_signs_chain_index_and_ciphertext() {
     use parolnet_crypto::sender_key::SenderKeyState;
     let mut st = SenderKeyState::new();
     let msg = st.encrypt(b"hello").unwrap();
-    assert_eq!(msg.signature.len(), 64, "MUST-039: Ed25519 sig over (chain_index || ciphertext)");
+    assert_eq!(
+        msg.signature.len(),
+        64,
+        "MUST-039: Ed25519 sig over (chain_index || ciphertext)"
+    );
 }
 
 #[clause("PNP-009-MUST-040")]
@@ -561,7 +604,10 @@ fn bad_signature_group_message_discarded() {
     let mut recv = SenderKeyState::from_distribution(&dist).unwrap();
     let mut m = sender.encrypt(b"hi").unwrap();
     m.signature[0] ^= 0xFF;
-    assert!(recv.decrypt(&m).is_err(), "MUST-043: bad signature MUST cause discard");
+    assert!(
+        recv.decrypt(&m).is_err(),
+        "MUST-043: bad signature MUST cause discard"
+    );
 }
 
 #[clause("PNP-009-MUST-044")]
@@ -573,7 +619,10 @@ fn replayed_chain_index_discarded() {
     let mut recv = SenderKeyState::from_distribution(&dist).unwrap();
     let m = sender.encrypt(b"once").unwrap();
     recv.decrypt(&m).unwrap();
-    assert!(recv.decrypt(&m).is_err(), "MUST-044: replayed index MUST be discarded");
+    assert!(
+        recv.decrypt(&m).is_err(),
+        "MUST-044: replayed index MUST be discarded"
+    );
 }
 
 #[clause("PNP-009-MUST-045")]
@@ -615,12 +664,19 @@ fn group_call_join_goes_pairwise_to_each_participant() {
     let _ = GroupCallSignalType::Join { sdp: "v=0".into() };
 }
 
-#[clause("PNP-009-MUST-056", "PNP-009-MUST-058", "PNP-009-MUST-059", "PNP-009-MUST-060")]
+#[clause(
+    "PNP-009-MUST-056",
+    "PNP-009-MUST-058",
+    "PNP-009-MUST-059",
+    "PNP-009-MUST-060"
+)]
 #[test]
 fn screen_share_signals_pause_camera_resume_on_stop() {
     use parolnet_protocol::group::GroupCallSignalType;
     use parolnet_protocol::media::VideoConfig;
-    let _start = GroupCallSignalType::ScreenShareStart { config: VideoConfig::screen_share() };
+    let _start = GroupCallSignalType::ScreenShareStart {
+        config: VideoConfig::screen_share(),
+    };
     let _stop = GroupCallSignalType::ScreenShareStop;
     // MUST-058 (pause camera) enforced at application layer — pin via
     // one-stream-per-user rule: same VIDEO msg_type for both stream types.

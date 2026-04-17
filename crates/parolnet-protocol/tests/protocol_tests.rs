@@ -135,9 +135,14 @@ fn make_test_header() -> CleartextHeader {
 
 fn make_test_envelope() -> Envelope {
     Envelope {
-        header: make_test_header(),
+        cleartext_header: make_test_header(),
+        ratchet_header: parolnet_crypto::RatchetHeader {
+            ratchet_key: [0x77u8; 32],
+            previous_chain_length: 0,
+            message_number: 0,
+        },
         encrypted_payload: vec![0xEE; 64],
-        mac: [0xFF; 16],
+        padding: vec![0u8; 0],
     }
 }
 
@@ -178,10 +183,20 @@ fn test_codec_envelope_roundtrip() {
     let bytes = codec.encode(&envelope).unwrap();
     let decoded = codec.decode(&bytes).unwrap();
 
-    assert_eq!(decoded.header.version, envelope.header.version);
-    assert_eq!(decoded.header.dest_peer_id, envelope.header.dest_peer_id);
+    assert_eq!(
+        decoded.cleartext_header.version,
+        envelope.cleartext_header.version
+    );
+    assert_eq!(
+        decoded.cleartext_header.dest_peer_id,
+        envelope.cleartext_header.dest_peer_id
+    );
     assert_eq!(decoded.encrypted_payload, envelope.encrypted_payload);
-    assert_eq!(decoded.mac, envelope.mac);
+    assert_eq!(
+        decoded.ratchet_header.ratchet_key,
+        envelope.ratchet_header.ratchet_key
+    );
+    assert_eq!(decoded.padding, envelope.padding);
 }
 
 #[test]
@@ -200,12 +215,13 @@ fn test_codec_rejects_invalid_version() {
 }
 
 #[test]
-fn test_envelope_total_size() {
+fn test_envelope_cbor_size_nonzero() {
+    // The encoded envelope is a CBOR map; the size depends on header, payload,
+    // and padding. It MUST be non-empty and strictly larger than the fixed
+    // 16-byte AEAD tag carried in `encrypted_payload`.
     let envelope = make_test_envelope();
-    let size = envelope.total_size();
-    assert!(size > 0);
-    // 4 (header len prefix) + header CBOR + 64 (payload) + 16 (MAC)
-    assert!(size > 84);
+    let bytes = CborCodec.encode(&envelope).unwrap();
+    assert!(bytes.len() > 16);
 }
 
 // ── MessageFlags Tests ──────────────────────────────────────────
@@ -333,34 +349,14 @@ fn test_ttl_increment_at_max() {
 }
 
 #[test]
-fn test_envelope_is_valid_size_true() {
-    // Build an envelope and adjust encrypted_payload so total_size() hits a bucket size
-    let header = CleartextHeader {
-        version: 1,
-        msg_type: 0x01,
-        dest_peer_id: PeerId([0xAB; 32]),
-        message_id: [0xCD; 16],
-        timestamp: CleartextHeader::coarsen_timestamp(1700000000),
-        ttl_and_hops: 7 << 8,
-        source_hint: None,
-    };
-
-    // Compute header CBOR size to figure out how large encrypted_payload must be
-    let header_cbor_len = parolnet_protocol::codec::encode_header(&header)
-        .unwrap()
-        .len();
-    // total_size = 4 + header_cbor_len + encrypted_payload.len() + 16
-    // We want total_size == 1024
-    let payload_len = 1024 - 4 - header_cbor_len - 16;
-
-    let envelope = Envelope {
-        header,
-        encrypted_payload: vec![0xEE; payload_len],
-        mac: [0xFF; 16],
-    };
-
-    assert_eq!(envelope.total_size(), 1024);
-    assert!(envelope.is_valid_size());
+fn test_envelope_valid_bucket_size_check() {
+    // Envelope::is_valid_size_for_wire is a pure length predicate.
+    assert!(Envelope::is_valid_size_for_wire(256));
+    assert!(Envelope::is_valid_size_for_wire(1024));
+    assert!(Envelope::is_valid_size_for_wire(4096));
+    assert!(Envelope::is_valid_size_for_wire(16384));
+    assert!(!Envelope::is_valid_size_for_wire(100));
+    assert!(!Envelope::is_valid_size_for_wire(0));
 }
 
 #[test]

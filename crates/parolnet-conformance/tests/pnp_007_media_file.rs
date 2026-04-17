@@ -1,10 +1,10 @@
 //! PNP-007 conformance — media codecs, call state, file transfer.
 
 use parolnet_clause::clause;
-use parolnet_protocol::file::{FileAction, FileControl, FileOffer, DEFAULT_CHUNK_SIZE};
+use parolnet_protocol::file::{DEFAULT_CHUNK_SIZE, FileAction, FileControl, FileOffer};
 use parolnet_protocol::media::{
-    AudioCodec, CallSignalMessage, CallState, MediaSource, VideoCodec, VideoConfig,
-    CODEC2_BANDWIDTH_THRESHOLD_KBPS,
+    AudioCodec, CODEC2_BANDWIDTH_THRESHOLD_KBPS, CallSignalMessage, CallState, MediaSource,
+    VideoCodec, VideoConfig,
 };
 
 // -- §6.4 Codec negotiation threshold ----------------------------------------
@@ -81,7 +81,12 @@ fn default_video_config_is_vp8_baseline() {
 
 // -- §4 Call state machine states ---------------------------------------------
 
-#[clause("PNP-007-MUST-049", "PNP-007-MUST-050", "PNP-007-MUST-051", "PNP-007-MUST-052")]
+#[clause(
+    "PNP-007-MUST-049",
+    "PNP-007-MUST-050",
+    "PNP-007-MUST-051",
+    "PNP-007-MUST-052"
+)]
 #[test]
 fn call_state_machine_has_required_states() {
     // Every state enumerated in §4.3 MUST be expressible.
@@ -241,7 +246,7 @@ fn media_data_and_data_are_distinct_cell_variants_with_shared_size() {
     // MUST-003: relays MUST forward MEDIA_DATA with same processing as DATA.
     // Enforced at wire layer by: both variants produce identical 512-byte
     // cells through RelayCell::to_bytes().
-    use parolnet_relay::{CellType, RelayCell, CELL_PAYLOAD_SIZE};
+    use parolnet_relay::{CELL_PAYLOAD_SIZE, CellType, RelayCell};
     let data_cell = RelayCell {
         circuit_id: 1,
         cell_type: CellType::Data,
@@ -401,7 +406,7 @@ fn video_fragment_fits_within_one_cell_payload() {
 #[clause("PNP-007-MUST-034")]
 #[test]
 fn video_frame_fragments_roundtrip() {
-    use parolnet_core::video::{fragment_video_frame, reassemble_video_frame, VideoFrame};
+    use parolnet_core::video::{VideoFrame, fragment_video_frame, reassemble_video_frame};
     use parolnet_protocol::media::{MediaSource, VideoCodec};
 
     let frame = VideoFrame {
@@ -418,9 +423,11 @@ fn video_frame_fragments_roundtrip() {
     // Last fragment MUST be identifiable (MUST-034: RTP M bit set on last
     // fragment). Pinned here via total_fragments metadata that allows the
     // receiver to detect the end of a frame.
-    assert_eq!(frags.last().unwrap().fragment_index, frags[0].total_fragments - 1);
-    let reassembled =
-        reassemble_video_frame(&mut frags, VideoCodec::VP8, 320, 240).unwrap();
+    assert_eq!(
+        frags.last().unwrap().fragment_index,
+        frags[0].total_fragments - 1
+    );
+    let reassembled = reassemble_video_frame(&mut frags, VideoCodec::VP8, 320, 240).unwrap();
     assert_eq!(reassembled.data, frame.data);
 }
 
@@ -490,7 +497,7 @@ fn call_manager_reports_active_call_count() {
 #[clause("PNP-007-MUST-001")]
 #[test]
 fn media_traffic_is_indistinguishable_from_text_on_the_wire() {
-    use parolnet_relay::{CellType, RelayCell, CELL_PAYLOAD_SIZE, CELL_SIZE};
+    use parolnet_relay::{CELL_PAYLOAD_SIZE, CELL_SIZE, CellType, RelayCell};
     let data = RelayCell {
         circuit_id: 1,
         cell_type: CellType::Data,
@@ -561,13 +568,16 @@ fn mute_sends_comfort_noise_at_same_rate() {
     use parolnet_transport::noise::BandwidthMode;
     assert_eq!(BandwidthMode::MediaCall.padding_interval().as_millis(), 20);
     use parolnet_protocol::media::CallSignalMessage;
-    let _ = CallSignalMessage::Mute { call_id: [0u8; 16], muted: true };
+    let _ = CallSignalMessage::Mute {
+        call_id: [0u8; 16],
+        muted: true,
+    };
 }
 
 #[clause("PNP-007-MUST-026")]
 #[test]
 fn video_frames_packetized_with_fragmentation() {
-    use parolnet_core::video::{fragment_video_frame, MAX_FRAGMENT_SIZE, VideoFrame};
+    use parolnet_core::video::{MAX_FRAGMENT_SIZE, VideoFrame, fragment_video_frame};
     use parolnet_protocol::media::{MediaSource, VideoCodec};
     let big = VideoFrame {
         data: vec![0u8; MAX_FRAGMENT_SIZE * 3 + 100],
@@ -630,14 +640,14 @@ fn audio_and_video_use_separate_srtp_contexts_and_distinct_ssrc() {
 #[clause("PNP-007-MUST-058")]
 #[test]
 fn file_chunk_ratchet_advances_per_chunk() {
-    use parolnet_crypto::double_ratchet::DoubleRatchetSession;
     use parolnet_crypto::RatchetSession;
+    use parolnet_crypto::double_ratchet::DoubleRatchetSession;
     use x25519_dalek::{PublicKey, StaticSecret};
     let bob_sk = StaticSecret::random_from_rng(rand::rngs::OsRng);
     let bob_pub: [u8; 32] = *PublicKey::from(&bob_sk).as_bytes();
     let mut alice = DoubleRatchetSession::initialize_initiator([1u8; 32], &bob_pub).unwrap();
-    let (_, ct1) = alice.encrypt(b"chunk1").unwrap();
-    let (_, ct2) = alice.encrypt(b"chunk2").unwrap();
+    let (_, ct1) = alice.encrypt(b"chunk1", &[]).unwrap();
+    let (_, ct2) = alice.encrypt(b"chunk2", &[]).unwrap();
     assert_ne!(ct1, ct2);
 }
 
@@ -654,17 +664,17 @@ fn file_receiver_reassembles_and_verifies_sha256_on_final_chunk() {
 #[clause("PNP-007-MUST-065")]
 #[test]
 fn resume_requires_intact_ratchet_session() {
-    use parolnet_crypto::double_ratchet::DoubleRatchetSession;
     use parolnet_crypto::RatchetSession;
+    use parolnet_crypto::double_ratchet::DoubleRatchetSession;
     use x25519_dalek::{PublicKey, StaticSecret};
     let bob_sk = StaticSecret::random_from_rng(rand::rngs::OsRng);
     let bob_pub: [u8; 32] = *PublicKey::from(&bob_sk).as_bytes();
     let mut alice = DoubleRatchetSession::initialize_initiator([2u8; 32], &bob_pub).unwrap();
-    let (h, ct) = alice.encrypt(b"chunk").unwrap();
+    let (h, ct) = alice.encrypt(b"chunk", &[]).unwrap();
     drop(alice);
     let bob_sk2 = StaticSecret::random_from_rng(rand::rngs::OsRng);
     let mut fresh = DoubleRatchetSession::initialize_responder([2u8; 32], bob_sk2).unwrap();
-    assert!(fresh.decrypt(&h, &ct).is_err());
+    assert!(fresh.decrypt(&h, &ct, &[]).is_err());
 }
 
 #[clause("PNP-007-MUST-068")]
@@ -702,7 +712,7 @@ fn mediacall_transmits_without_burst_smoothing() {
 #[clause("PNP-007-MUST-074", "PNP-007-MUST-075")]
 #[test]
 fn padding_cell_sized_to_audio_frame_profile() {
-    use parolnet_relay::{RelayCell, CELL_PAYLOAD_SIZE};
+    use parolnet_relay::{CELL_PAYLOAD_SIZE, RelayCell};
     let pad = RelayCell::padding(0);
     assert_eq!(pad.payload.len(), CELL_PAYLOAD_SIZE);
     assert_eq!(CELL_PAYLOAD_SIZE, 505);
@@ -730,7 +740,12 @@ fn mediacall_profile_resembles_streaming_video() {
     assert!(BandwidthMode::MediaCall.jitter_max().as_millis() <= 5);
 }
 
-#[clause("PNP-007-MUST-081", "PNP-007-MUST-082", "PNP-007-MUST-083", "PNP-007-MUST-084")]
+#[clause(
+    "PNP-007-MUST-081",
+    "PNP-007-MUST-082",
+    "PNP-007-MUST-083",
+    "PNP-007-MUST-084"
+)]
 #[test]
 fn post_hangup_padding_persists_5_to_30_seconds_before_normal_mode() {
     const POST_HANGUP_MIN_SECS: u64 = 5;

@@ -177,8 +177,7 @@ pub fn get_public_key() -> String {
 #[wasm_bindgen]
 pub fn sign_bytes(data_hex: &str) -> Result<String, JsError> {
     use ed25519_dalek::Signer;
-    let data = hex::decode(data_hex)
-        .map_err(|e| JsError::new(&format!("invalid hex: {e}")))?;
+    let data = hex::decode(data_hex).map_err(|e| JsError::new(&format!("invalid hex: {e}")))?;
     let state = STATE.lock().unwrap_or_else(|e| e.into_inner());
     let client = state
         .client
@@ -257,6 +256,83 @@ pub fn send_message(peer_id_hex: &str, plaintext: &str) -> Result<JsValue, JsErr
     serde_wasm_bindgen::to_value(&result).map_err(|e| JsError::new(&format!("serialize: {e}")))
 }
 
+/// Encode a PNP-001 envelope: encrypt `plaintext` for `dest_peer_id_hex`,
+/// serialize to CBOR, and pad the final frame to one of the bucket sizes
+/// (256 / 1024 / 4096 / 16384 bytes).
+///
+/// Returns the on-wire envelope as a hex string.
+#[wasm_bindgen]
+pub fn envelope_encode(
+    dest_peer_id_hex: &str,
+    msg_type: u8,
+    plaintext: &[u8],
+    now_secs: u64,
+) -> Result<String, JsError> {
+    let peer_id_bytes = decode_32(dest_peer_id_hex)?;
+    let dest_peer_id = parolnet_protocol::address::PeerId(peer_id_bytes);
+
+    let state = STATE.lock().unwrap_or_else(|e| e.into_inner());
+    let client = state
+        .client
+        .as_ref()
+        .ok_or_else(|| JsError::new("not initialized — call initialize() first"))?;
+
+    let bytes = parolnet_core::envelope::encrypt_for_peer(
+        client.sessions(),
+        &dest_peer_id,
+        msg_type,
+        plaintext,
+        now_secs,
+    )
+    .map_err(|e| JsError::new(&format!("{e}")))?;
+
+    Ok(hex::encode(bytes))
+}
+
+/// Decode a PNP-001 envelope: unpad, CBOR-decode, and decrypt the payload
+/// using the Double Ratchet session keyed by `source_peer_id_hex`.
+///
+/// Returns an object `{ source_hint, msg_type, plaintext_hex, timestamp }`.
+/// `source_hint` is either the hex-encoded 32-byte sender hint or `null`.
+#[wasm_bindgen]
+pub fn envelope_decode(source_peer_id_hex: &str, envelope_hex: &str) -> Result<JsValue, JsError> {
+    let peer_id_bytes = decode_32(source_peer_id_hex)?;
+    let source_peer_id = parolnet_protocol::address::PeerId(peer_id_bytes);
+
+    let envelope_bytes =
+        hex::decode(envelope_hex).map_err(|e| JsError::new(&format!("invalid hex: {e}")))?;
+
+    let state = STATE.lock().unwrap_or_else(|e| e.into_inner());
+    let client = state
+        .client
+        .as_ref()
+        .ok_or_else(|| JsError::new("not initialized — call initialize() first"))?;
+
+    let decoded = parolnet_core::envelope::decrypt_for_peer(
+        client.sessions(),
+        &source_peer_id,
+        &envelope_bytes,
+    )
+    .map_err(|e| JsError::new(&format!("{e}")))?;
+
+    #[derive(serde::Serialize)]
+    struct DecodedJs {
+        source_hint: Option<String>,
+        msg_type: u8,
+        plaintext_hex: String,
+        timestamp: u64,
+    }
+
+    let result = DecodedJs {
+        source_hint: decoded.source_hint.map(|p| hex::encode(p.0)),
+        msg_type: decoded.msg_type,
+        plaintext_hex: hex::encode(&decoded.plaintext),
+        timestamp: decoded.timestamp,
+    };
+
+    serde_wasm_bindgen::to_value(&result).map_err(|e| JsError::new(&format!("serialize: {e}")))
+}
+
 /// Check if a session exists for a peer.
 #[wasm_bindgen]
 pub fn has_session(peer_id_hex: &str) -> bool {
@@ -322,8 +398,7 @@ pub fn import_sessions(json_data: &str) -> Result<u32, JsError> {
     let mut pairs = Vec::with_capacity(map.len());
     for (pid_hex, data_hex) in &map {
         let pid = decode_32(pid_hex)?;
-        let data =
-            hex::decode(data_hex).map_err(|e| JsError::new(&format!("invalid hex: {e}")))?;
+        let data = hex::decode(data_hex).map_err(|e| JsError::new(&format!("invalid hex: {e}")))?;
         pairs.push((pid, data));
     }
 
@@ -1564,8 +1639,8 @@ pub fn get_webrtc_privacy_config(privacy_mode: bool) -> String {
 #[wasm_bindgen]
 pub fn parse_bridge_address(bridge_str: &str) -> Result<String, JsValue> {
     use parolnet_protocol::BridgeAddress;
-    let addr = BridgeAddress::from_qr_string(bridge_str)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
+    let addr =
+        BridgeAddress::from_qr_string(bridge_str).map_err(|e| JsValue::from_str(&e.to_string()))?;
     let json = serde_json::json!({
         "host": addr.host,
         "port": addr.port,

@@ -150,9 +150,7 @@ impl GroupCall {
     /// Stop screen sharing for a participant.
     pub fn stop_screen_share(&mut self, peer_id: &PeerId) -> Result<(), CoreError> {
         if self.screen_sharer.as_ref() != Some(peer_id) {
-            return Err(CoreError::SessionError(
-                "participant is not sharing".into(),
-            ));
+            return Err(CoreError::SessionError("participant is not sharing".into()));
         }
         self.screen_sharer = None;
         if let Some(p) = self.participants.get_mut(peer_id) {

@@ -60,13 +60,26 @@ pub trait KdfChain: Zeroize + Send {
 ///
 /// Provides forward secrecy and future secrecy: compromise of current
 /// keys does not reveal past or future message content.
+///
+/// The `extra_aad` parameter on `encrypt`/`decrypt` allows higher layers to
+/// bind additional context (e.g., a serialized cleartext envelope header)
+/// into the AEAD authentication tag. Callers that have no external context
+/// to bind pass an empty slice. The internal AAD becomes
+/// `header.ratchet_key || extra_aad` so both the ratchet-key binding required
+/// for nonce-derivation integrity and the external context are authenticated
+/// by the same tag.
 pub trait RatchetSession: Send {
-    fn encrypt(&mut self, plaintext: &[u8]) -> Result<(RatchetHeader, Vec<u8>), CryptoError>;
+    fn encrypt(
+        &mut self,
+        plaintext: &[u8],
+        extra_aad: &[u8],
+    ) -> Result<(RatchetHeader, Vec<u8>), CryptoError>;
 
     fn decrypt(
         &mut self,
         header: &RatchetHeader,
         ciphertext: &[u8],
+        extra_aad: &[u8],
     ) -> Result<Vec<u8>, CryptoError>;
 }
 

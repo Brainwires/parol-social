@@ -2,9 +2,9 @@
 
 use parolnet_clause::clause;
 use parolnet_conformance::vectors;
-use parolnet_protocol::padding::{select_bucket, BucketPadding};
+use parolnet_protocol::padding::{BucketPadding, select_bucket};
 use parolnet_protocol::{
-    envelope::CleartextHeader, message::MessageType, BUCKET_SIZES, PaddingStrategy, PeerId,
+    BUCKET_SIZES, PaddingStrategy, PeerId, envelope::CleartextHeader, message::MessageType,
 };
 use proptest::prelude::*;
 use serde::Deserialize;
@@ -15,8 +15,8 @@ use serde::Deserialize;
 #[test]
 fn message_type_registry_round_trips_every_defined_code() {
     for code in [
-        0x01u8, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D,
-        0x0E, 0x0F, 0x10, 0x11,
+        0x01u8, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F,
+        0x10, 0x11,
     ] {
         let t = MessageType::from_u8(code)
             .unwrap_or_else(|| panic!("code {code:#04x} rejected by registry"));
@@ -57,9 +57,9 @@ fn padded_envelope_size_is_always_a_bucket() {
 #[test]
 fn oversize_payload_is_rejected() {
     let payload = vec![0u8; 16_381];
-    BucketPadding.pad(&payload).expect_err(
-        "payload + 4-byte length prefix > 16384 must be rejected per PNP-001-MUST-014",
-    );
+    BucketPadding
+        .pad(&payload)
+        .expect_err("payload + 4-byte length prefix > 16384 must be rejected per PNP-001-MUST-014");
 }
 
 #[clause("PNP-001-MUST-012")]
@@ -104,7 +104,15 @@ fn cleartext_header_coarsens_timestamp_to_300s_boundary() {
 #[clause("PNP-001-SHOULD-002")]
 #[test]
 fn default_envelope_ttl_is_seven() {
-    let h = CleartextHeader::new(1, 0x01, PeerId([0u8; 32]), [0u8; 16], 1_700_000_000, 7, None);
+    let h = CleartextHeader::new(
+        1,
+        0x01,
+        PeerId([0u8; 32]),
+        [0u8; 16],
+        1_700_000_000,
+        7,
+        None,
+    );
     assert_eq!(h.ttl(), 7);
     assert_eq!(h.hop_count(), 0);
 }
@@ -143,7 +151,7 @@ struct BucketVectorExpected {
 
 // -- §3.1 Header codec round-trip --------------------------------------------
 
-use parolnet_protocol::codec::{decode_header, encode_header, ReplayCache};
+use parolnet_protocol::codec::{ReplayCache, decode_header, encode_header};
 
 #[clause("PNP-001-MUST-002", "PNP-001-MUST-007", "PNP-001-MUST-026")]
 #[test]
@@ -225,18 +233,22 @@ use parolnet_protocol::envelope::Envelope;
 
 #[clause("PNP-001-MUST-009", "PNP-001-MUST-037")]
 #[test]
-fn envelope_mac_verification_is_constant_time() {
-    let env = Envelope {
-        header: CleartextHeader::new(1, 0x01, PeerId([0u8; 32]), [0u8; 16], 0, 7, None),
-        encrypted_payload: vec![0u8; 32],
-        mac: [0x77u8; 16],
-    };
-    assert!(env.verify_mac(&[0x77u8; 16]));
-    assert!(!env.verify_mac(&[0x00u8; 16]));
-    // Flip one bit in the expected MAC — MUST still reject.
-    let mut nearly = [0x77u8; 16];
-    nearly[7] ^= 0x01;
-    assert!(!env.verify_mac(&nearly));
+fn envelope_mac_verification_via_aead() {
+    // With the H1 wire-level design, the AEAD tag rides inside
+    // `encrypted_payload` (final 16 bytes). Verification is delegated to the
+    // AEAD primitive, which is constant-time by construction.
+    use parolnet_crypto::Aead;
+    use parolnet_crypto::aead::ChaCha20Poly1305Cipher;
+    let cipher = ChaCha20Poly1305Cipher::new(&[0x42u8; 32]).unwrap();
+    let nonce = [0u8; 12];
+    let ct = cipher.encrypt(&nonce, b"body", b"aad").unwrap();
+    assert!(cipher.decrypt(&nonce, &ct, b"aad").is_ok());
+
+    // Flip a byte in the authentication tag — MUST reject.
+    let mut tampered = ct.clone();
+    let last = tampered.len() - 1;
+    tampered[last] ^= 0x01;
+    assert!(cipher.decrypt(&nonce, &tampered, b"aad").is_err());
 }
 
 // -- §6.6 AEAD layering — ChaCha20-Poly1305 is the default session-layer -----
@@ -246,11 +258,19 @@ fn envelope_mac_verification_is_constant_time() {
 fn chacha20_poly1305_is_the_default_session_aead() {
     // The Aead trait is implemented by ChaCha20Poly1305Cipher; verify it
     // exists and key/nonce lengths match the spec (32-byte key, 12-byte nonce).
-    use parolnet_crypto::aead::ChaCha20Poly1305Cipher;
     use parolnet_crypto::Aead;
+    use parolnet_crypto::aead::ChaCha20Poly1305Cipher;
     let cipher = ChaCha20Poly1305Cipher::new(&[0u8; 32]).unwrap();
-    assert_eq!(cipher.key_len(), 32, "MUST-044: ChaCha20-Poly1305 key MUST be 32 bytes");
-    assert_eq!(cipher.nonce_len(), 12, "MUST-044: ChaCha20-Poly1305 nonce MUST be 12 bytes");
+    assert_eq!(
+        cipher.key_len(),
+        32,
+        "MUST-044: ChaCha20-Poly1305 key MUST be 32 bytes"
+    );
+    assert_eq!(
+        cipher.nonce_len(),
+        12,
+        "MUST-044: ChaCha20-Poly1305 nonce MUST be 12 bytes"
+    );
 }
 
 // -- §3.6 No compression before encryption ------------------------------------
@@ -325,34 +345,20 @@ use parolnet_protocol::message::MessageFlags;
 #[clause("PNP-001-MUST-001")]
 #[test]
 fn total_envelope_size_equals_a_bucket() {
-    // Construct envelopes sized to each bucket and verify is_valid_size().
-    // Any non-bucket size MUST fail validity check (MUST-036).
+    // Bucket-size validity is a pure length predicate on the wire bytes.
     for bucket in BUCKET_SIZES {
-        // Header encodes to a deterministic length; compute then size payload.
-        let h = CleartextHeader::new(1, 0x01, PeerId([0u8; 32]), [0u8; 16], 0, 7, None);
-        use parolnet_protocol::codec::encode_header;
-        let header_len = encode_header(&h).unwrap().len();
-        let payload_len = bucket - 4 - header_len - 16;
-        let env = Env {
-            header: h,
-            encrypted_payload: vec![0u8; payload_len],
-            mac: [0u8; 16],
-        };
-        assert!(env.is_valid_size(), "bucket {bucket} MUST be a valid envelope size");
-        assert_eq!(env.total_size(), bucket);
+        assert!(
+            Env::is_valid_size_for_wire(bucket),
+            "bucket {bucket} MUST be a valid envelope wire size"
+        );
     }
 }
 
 #[clause("PNP-001-MUST-036")]
 #[test]
 fn envelope_off_bucket_fails_size_check() {
-    let env = Env {
-        header: CleartextHeader::new(1, 0x01, PeerId([0u8; 32]), [0u8; 16], 0, 7, None),
-        encrypted_payload: vec![0u8; 123], // random non-bucket
-        mac: [0u8; 16],
-    };
     assert!(
-        !env.is_valid_size(),
+        !Env::is_valid_size_for_wire(123),
         "MUST-036: receiver MUST treat non-bucket total size as invalid"
     );
 }
@@ -362,13 +368,16 @@ fn envelope_off_bucket_fails_size_check() {
 #[clause("PNP-001-MUST-004")]
 #[test]
 fn session_aead_cipher_available() {
-    use parolnet_crypto::aead::ChaCha20Poly1305Cipher;
     use parolnet_crypto::Aead;
+    use parolnet_crypto::aead::ChaCha20Poly1305Cipher;
     let c = ChaCha20Poly1305Cipher::new(&[0u8; 32]).unwrap();
     let nonce = [0u8; 12];
     let ct = c.encrypt(&nonce, b"hello", b"aad").unwrap();
     let pt = c.decrypt(&nonce, &ct, b"aad").unwrap();
-    assert_eq!(pt, b"hello", "MUST-004: session AEAD MUST encrypt and decrypt payload");
+    assert_eq!(
+        pt, b"hello",
+        "MUST-004: session AEAD MUST encrypt and decrypt payload"
+    );
 }
 
 // -- §3.3 Reserved flag bits MUST be zero -------------------------------------
@@ -379,14 +388,22 @@ fn reserved_flag_bits_default_to_zero() {
     let f = MessageFlags::default();
     // Bits 4-7 = reserved. Default() yields 0x00; setters only touch 0,1,2,3,4(group).
     // Verify only defined bit setters are exposed by exercising each bit <=4.
-    assert_eq!(f.0 & 0b1110_0000, 0, "MUST-005: bits 5-7 reserved, MUST be zero");
+    assert_eq!(
+        f.0 & 0b1110_0000,
+        0,
+        "MUST-005: bits 5-7 reserved, MUST be zero"
+    );
     let mut all = MessageFlags::default();
     all.set_decoy();
     all.set_requires_ack();
     all.set_fragment();
     all.set_final_fragment();
     all.set_group();
-    assert_eq!(all.0 & 0b1110_0000, 0, "MUST-005: no setter MUST set reserved bits");
+    assert_eq!(
+        all.0 & 0b1110_0000,
+        0,
+        "MUST-005: no setter MUST set reserved bits"
+    );
 }
 
 // -- §3.7 Decoy construction --------------------------------------------------
@@ -433,8 +450,14 @@ fn decoy_populates_message_id_and_ttl_normally() {
         7,
         None,
     );
-    assert_eq!(h.message_id, mid, "MUST-018: decoy MUST populate message_id");
-    assert_eq!(h.timestamp, 1_700_000_100, "MUST-018: decoy MUST coarsen timestamp");
+    assert_eq!(
+        h.message_id, mid,
+        "MUST-018: decoy MUST populate message_id"
+    );
+    assert_eq!(
+        h.timestamp, 1_700_000_100,
+        "MUST-018: decoy MUST coarsen timestamp"
+    );
     assert_eq!(h.ttl(), 7, "MUST-018: decoy MUST populate TTL normally");
 }
 
@@ -448,7 +471,10 @@ fn relay_cannot_distinguish_decoy_from_real_wire_shape() {
     use parolnet_protocol::codec::encode_header;
     let a = encode_header(&real).unwrap();
     let b = encode_header(&decoy).unwrap();
-    assert_eq!(a, b, "MUST-019: relay sees identical header for real and decoy when type=0x01");
+    assert_eq!(
+        a, b,
+        "MUST-019: relay sees identical header for real and decoy when type=0x01"
+    );
 }
 
 // -- §4 Deterministic CBOR rules (MUST-020 through MUST-025) -------------------
@@ -474,14 +500,21 @@ fn map_keys_are_text_strings_in_lex_order() {
     let map = v.as_map().expect("MUST-023: payload encodes as a CBOR map");
     let mut keys: Vec<String> = map
         .iter()
-        .map(|(k, _)| k.as_text().expect("MUST-023: map keys MUST be text strings").to_string())
+        .map(|(k, _)| {
+            k.as_text()
+                .expect("MUST-023: map keys MUST be text strings")
+                .to_string()
+        })
         .collect();
     let sorted = {
         let mut s = keys.clone();
         s.sort();
         s
     };
-    assert_eq!(keys, sorted, "MUST-023: map keys MUST appear in lexicographic order");
+    assert_eq!(
+        keys, sorted,
+        "MUST-023: map keys MUST appear in lexicographic order"
+    );
     keys.clear();
 }
 
@@ -500,9 +533,18 @@ fn ciborium_uses_definite_length_encoding() {
     let mut buf = Vec::new();
     ciborium::into_writer(&p, &mut buf).unwrap();
     let first = buf[0];
-    assert_ne!(first, 0xBF, "MUST-020: indefinite-length map start MUST NOT appear");
-    assert_ne!(first, 0x5F, "MUST-022: indefinite byte string start MUST NOT appear");
-    assert_ne!(first, 0x7F, "MUST-020: indefinite text string start MUST NOT appear");
+    assert_ne!(
+        first, 0xBF,
+        "MUST-020: indefinite-length map start MUST NOT appear"
+    );
+    assert_ne!(
+        first, 0x5F,
+        "MUST-022: indefinite byte string start MUST NOT appear"
+    );
+    assert_ne!(
+        first, 0x7F,
+        "MUST-020: indefinite text string start MUST NOT appear"
+    );
 }
 
 #[clause("PNP-001-MUST-021")]
@@ -529,7 +571,10 @@ fn duplicate_map_keys_rejected() {
     // fields — MUST fail. We test the shape assertion via a shape validator:
     // at minimum, a deterministic encoder round-trip MUST NOT produce duplicate keys.
     if let Ok(m) = r {
-        assert!(m.len() <= 1, "MUST-024: duplicate-key map MUST collapse or reject");
+        assert!(
+            m.len() <= 1,
+            "MUST-024: duplicate-key map MUST collapse or reject"
+        );
     }
 }
 
@@ -560,7 +605,15 @@ fn unknown_map_keys_are_ignored_for_forward_compat() {
 #[test]
 fn sender_stores_only_coarsened_timestamp() {
     // Given a wall-clock time, constructor MUST floor to 300s boundary.
-    let h = CleartextHeader::new(1, 0x01, PeerId([0u8; 32]), [0u8; 16], 1_700_000_123, 7, None);
+    let h = CleartextHeader::new(
+        1,
+        0x01,
+        PeerId([0u8; 32]),
+        [0u8; 16],
+        1_700_000_123,
+        7,
+        None,
+    );
     assert!(h.is_timestamp_coarsened());
     assert_eq!(h.timestamp % 300, 0);
     assert!(h.timestamp <= 1_700_000_123);
@@ -574,7 +627,10 @@ fn sender_generates_random_message_id_per_envelope() {
     for _ in 0..32 {
         let mut id = [0u8; 16];
         rand::thread_rng().fill_bytes(&mut id);
-        assert!(ids.insert(id), "MUST-028: message_id MUST be random per envelope");
+        assert!(
+            ids.insert(id),
+            "MUST-028: message_id MUST be random per envelope"
+        );
     }
 }
 
@@ -583,7 +639,10 @@ fn sender_generates_random_message_id_per_envelope() {
 fn sender_pads_envelope_to_bucket() {
     for len in [0usize, 10, 100, 500, 2000, 8000] {
         let padded = BucketPadding.pad(&vec![0u8; len]).unwrap();
-        assert!(BUCKET_SIZES.contains(&padded.len()), "MUST-030: sender MUST pad");
+        assert!(
+            BUCKET_SIZES.contains(&padded.len()),
+            "MUST-030: sender MUST pad"
+        );
     }
 }
 
@@ -603,7 +662,10 @@ fn relay_hop_increment_does_not_modify_other_fields() {
     );
     let mut h1 = h0.clone();
     h1.increment_hop();
-    assert_eq!(h1.version, h0.version, "MUST-033: relay MUST NOT modify version");
+    assert_eq!(
+        h1.version, h0.version,
+        "MUST-033: relay MUST NOT modify version"
+    );
     assert_eq!(h1.msg_type, h0.msg_type);
     assert_eq!(h1.dest_peer_id.0, h0.dest_peer_id.0);
     assert_eq!(h1.message_id, h0.message_id);
@@ -617,15 +679,20 @@ fn relay_hop_increment_does_not_modify_other_fields() {
 fn relay_cannot_decrypt_payload() {
     // The Envelope type exposes no decrypt() method reachable from relay code.
     // Pin: there is no public API on Envelope that returns plaintext.
-    // Architectural invariant — verified by compilation: if a future refactor
-    // exposed a decrypt method on Envelope, it would need to be removed.
+    // A relay can construct an Envelope and observe the cleartext header but
+    // cannot recover the payload without session-layer keys.
     let env = Env {
-        header: CleartextHeader::new(1, 0x01, PeerId([0u8; 32]), [0u8; 16], 0, 7, None),
+        cleartext_header: CleartextHeader::new(1, 0x01, PeerId([0u8; 32]), [0u8; 16], 0, 7, None),
+        ratchet_header: parolnet_crypto::RatchetHeader {
+            ratchet_key: [0u8; 32],
+            previous_chain_length: 0,
+            message_number: 0,
+        },
         encrypted_payload: vec![0x99u8; 32],
-        mac: [0u8; 16],
+        padding: vec![],
     };
-    // The only operation a relay can do is verify_mac and observe the header.
-    assert!(env.verify_mac(&[0u8; 16]));
+    // Relay observes headers only — no inherent plaintext path.
+    assert_eq!(env.cleartext_header.version, 1);
 }
 
 // -- §3.8 Receiver timestamp window -30min..+5min ----------------------------
@@ -648,8 +715,14 @@ fn receiver_timestamp_window_is_minus_30_to_plus_5_minutes() {
     assert!(within(ok_past, now));
     assert!(within(ok_future, now));
     assert!(within(now_coarse, now));
-    assert!(!within(bad_past, now), "MUST-039: >30 min past MUST be discarded");
-    assert!(!within(bad_future, now), "MUST-039: >5 min future MUST be discarded");
+    assert!(
+        !within(bad_past, now),
+        "MUST-039: >30 min past MUST be discarded"
+    );
+    assert!(
+        !within(bad_future, now),
+        "MUST-039: >5 min future MUST be discarded"
+    );
 }
 
 // -- §9.1 Nonce uniqueness (no reuse, no schemes outside catalog) -------------
@@ -657,19 +730,24 @@ fn receiver_timestamp_window_is_minus_30_to_plus_5_minutes() {
 #[clause("PNP-001-MUST-041")]
 #[test]
 fn double_ratchet_nonces_do_not_repeat_within_session() {
-    use parolnet_crypto::double_ratchet::DoubleRatchetSession;
     use parolnet_crypto::RatchetSession;
+    use parolnet_crypto::double_ratchet::DoubleRatchetSession;
     use x25519_dalek::{PublicKey as X25519Pub, StaticSecret};
     let bob_sk = StaticSecret::random_from_rng(rand::rngs::OsRng);
     let bob_pub: [u8; 32] = *X25519Pub::from(&bob_sk).as_bytes();
     let mut alice = DoubleRatchetSession::initialize_initiator([0x42u8; 32], &bob_pub).unwrap();
     let mut nonces: std::collections::HashSet<[u8; 12]> = Default::default();
     for i in 0..32 {
-        let (_h, ct) = alice.encrypt(format!("msg{i}").as_bytes()).unwrap();
+        let (_h, ct) = alice.encrypt(format!("msg{i}").as_bytes(), &[]).unwrap();
         // Nonce is first 12 bytes of ct? No — nonce is derived from header chain/seq.
         // Instead, verify uniqueness via a different angle: ciphertexts differ.
-        assert!(nonces.insert([ct[0], ct[1], ct[2], ct[3], ct[4], ct[5], ct[6], ct[7], ct[8], ct[9], ct[10], ct[11]]),
-            "MUST-041: no (key, nonce) pair may repeat across encrypt calls");
+        assert!(
+            nonces.insert([
+                ct[0], ct[1], ct[2], ct[3], ct[4], ct[5], ct[6], ct[7], ct[8], ct[9], ct[10],
+                ct[11]
+            ]),
+            "MUST-041: no (key, nonce) pair may repeat across encrypt calls"
+        );
     }
 }
 
@@ -685,7 +763,11 @@ fn session_rekeys_on_sequence_number_overflow() {
         chain: 0,
         flags: MessageFlags(0),
     };
-    assert_eq!(p.seq, u64::MAX, "MUST-042: seq type MUST accommodate 2^64 overflow check");
+    assert_eq!(
+        p.seq,
+        u64::MAX,
+        "MUST-042: seq type MUST accommodate 2^64 overflow check"
+    );
 }
 
 // -- §6.6 AEAD negotiation ----------------------------------------------------
@@ -696,8 +778,8 @@ fn no_aead_downgrade_without_explicit_negotiation() {
     // Architectural: the session AEAD is pinned at session creation and not
     // renegotiated mid-session. Both cipher types exist; the choice is made
     // at PNP-002 handshake time. Verify both ciphers compile-present.
-    use parolnet_crypto::aead::{Aes256GcmCipher, ChaCha20Poly1305Cipher};
     use parolnet_crypto::Aead;
+    use parolnet_crypto::aead::{Aes256GcmCipher, ChaCha20Poly1305Cipher};
     let chacha = ChaCha20Poly1305Cipher::new(&[0u8; 32]).unwrap();
     let aes = Aes256GcmCipher::new(&[0u8; 32]).unwrap();
     assert_eq!(chacha.key_len(), 32);
@@ -718,7 +800,11 @@ fn no_sub_bucket_timing_fields_in_envelope() {
     // it is always coarsened by the constructor.
     for raw in [1u64, 151, 299, 300, 301, 1_000_000_001] {
         let h = CleartextHeader::new(1, 0x01, PeerId([0u8; 32]), [0u8; 16], raw, 7, None);
-        assert_eq!(h.timestamp % 300, 0, "MUST-046: MUST NOT leak sub-bucket timing");
+        assert_eq!(
+            h.timestamp % 300,
+            0,
+            "MUST-046: MUST NOT leak sub-bucket timing"
+        );
     }
 }
 
@@ -727,13 +813,17 @@ fn no_sub_bucket_timing_fields_in_envelope() {
 #[clause("PNP-001-MUST-047")]
 #[test]
 fn aead_nonce_length_is_12_bytes_for_all_cataloged_schemes() {
-    use parolnet_crypto::aead::{Aes256GcmCipher, ChaCha20Poly1305Cipher};
     use parolnet_crypto::Aead;
+    use parolnet_crypto::aead::{Aes256GcmCipher, ChaCha20Poly1305Cipher};
     let chacha = ChaCha20Poly1305Cipher::new(&[0u8; 32]).unwrap();
     let aes = Aes256GcmCipher::new(&[0u8; 32]).unwrap();
     // All cataloged nonce schemes (N-SESSION, N-HANDSHAKE, N-ONION, N-SENDERKEY)
     // are 12 bytes. Any non-12-byte scheme would fall outside the catalog.
-    assert_eq!(chacha.nonce_len(), 12, "MUST-047: all nonce schemes are 12 bytes");
+    assert_eq!(
+        chacha.nonce_len(),
+        12,
+        "MUST-047: all nonce schemes are 12 bytes"
+    );
     assert_eq!(aes.nonce_len(), 12);
 }
 
@@ -753,7 +843,10 @@ fn dest_peer_id_is_32_byte_peerid_shape() {
 #[test]
 fn source_hint_defaults_to_none_when_omitted() {
     let h = CleartextHeader::new(1, 0x01, PeerId([0u8; 32]), [0u8; 16], 0, 7, None);
-    assert!(h.source_hint.is_none(), "SHOULD-003: source_hint omitted → None/null");
+    assert!(
+        h.source_hint.is_none(),
+        "SHOULD-003: source_hint omitted → None/null"
+    );
 }
 
 #[clause("PNP-001-SHOULD-004")]
@@ -805,7 +898,10 @@ fn decoy_flag_does_not_alter_envelope_structure() {
     let nondecoy = MessageFlags(0);
     let mut decoy = MessageFlags(0);
     decoy.set_decoy();
-    assert_eq!(std::mem::size_of_val(&nondecoy), std::mem::size_of_val(&decoy));
+    assert_eq!(
+        std::mem::size_of_val(&nondecoy),
+        std::mem::size_of_val(&decoy)
+    );
 }
 
 #[clause("PNP-001-SHOULD-009")]
@@ -813,7 +909,7 @@ fn decoy_flag_does_not_alter_envelope_structure() {
 fn onion_routing_available_for_destination_privacy() {
     // The onion relay crate exists and exposes multi-hop wrap to hide the final
     // destination from intermediate relays. Architectural pin.
-    use parolnet_relay::onion::{onion_encrypt, HopKeys};
+    use parolnet_relay::onion::{HopKeys, onion_encrypt};
     let keys = [HopKeys::from_shared_secret(&[0u8; 32]).unwrap()];
     let _ = onion_encrypt(b"test", &keys, &[0u32]).unwrap();
 }

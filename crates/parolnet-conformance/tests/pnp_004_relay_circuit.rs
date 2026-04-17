@@ -2,9 +2,10 @@
 
 use parolnet_clause::clause;
 use parolnet_relay::circuit::EstablishedCircuit;
-use parolnet_relay::onion::{onion_decrypt, onion_encrypt, HopKeys};
+use parolnet_relay::onion::{HopKeys, onion_decrypt, onion_encrypt};
 use parolnet_relay::{
-    CellType, RelayCell, AEAD_TAG_SIZE, CELL_PAYLOAD_SIZE, CELL_SIZE, MAX_DATA_PAYLOAD, REQUIRED_HOPS,
+    AEAD_TAG_SIZE, CELL_PAYLOAD_SIZE, CELL_SIZE, CellType, MAX_DATA_PAYLOAD, REQUIRED_HOPS,
+    RelayCell,
 };
 
 fn sample_cell() -> RelayCell {
@@ -26,7 +27,11 @@ fn cell_is_exactly_512_bytes() {
     assert_eq!(CELL_SIZE, 512);
     let cell = sample_cell();
     let bytes = cell.to_bytes();
-    assert_eq!(bytes.len(), 512, "MUST-001: cells MUST be exactly 512 bytes");
+    assert_eq!(
+        bytes.len(),
+        512,
+        "MUST-001: cells MUST be exactly 512 bytes"
+    );
 }
 
 #[clause("PNP-004-MUST-001")]
@@ -86,8 +91,7 @@ fn padding_and_data_cells_have_identical_wire_size() {
 #[test]
 fn cell_type_registry_covers_defined_codes() {
     for code in 0x01u8..=0x09 {
-        let t = CellType::from_u8(code)
-            .unwrap_or_else(|| panic!("code {code:#04x} rejected"));
+        let t = CellType::from_u8(code).unwrap_or_else(|| panic!("code {code:#04x} rejected"));
         assert_eq!(t as u8, code);
     }
     assert!(CellType::from_u8(0x00).is_none());
@@ -180,13 +184,8 @@ fn onion_ciphertext_tampering_is_rejected() {
     wrapped[0] ^= 0xFF;
 
     let outer = &keys[0];
-    parolnet_relay::onion::onion_peel(
-        &wrapped,
-        &outer.forward_key,
-        &outer.forward_nonce_seed,
-        0,
-    )
-    .expect_err("MUST-024: AEAD tag MUST reject tampered ciphertext");
+    parolnet_relay::onion::onion_peel(&wrapped, &outer.forward_key, &outer.forward_nonce_seed, 0)
+        .expect_err("MUST-024: AEAD tag MUST reject tampered ciphertext");
 }
 
 // -- §5.2 Reverse direction: exit → OP encrypts, OP peels 3 times -------------
@@ -238,7 +237,10 @@ fn established_circuit_wrap_increments_counters() {
     let a = circ.wrap_data(b"one").unwrap();
     let b = circ.wrap_data(b"one").unwrap();
     // Same plaintext, different counter -> different ciphertext.
-    assert_ne!(a, b, "MUST-021: per-cell counter advance MUST change ciphertext");
+    assert_ne!(
+        a, b,
+        "MUST-021: per-cell counter advance MUST change ciphertext"
+    );
 }
 
 // -- §5.1 CID 0 is reserved ---------------------------------------------------
@@ -395,12 +397,8 @@ fn forward_ciphertext_cannot_be_decrypted_as_backward() {
     let ct = onion_encrypt(b"hi", &keys, &[0, 0, 0]).unwrap();
     let outer = &keys[0];
     // Try peeling with backward_key — MUST fail.
-    let out = parolnet_relay::onion::onion_peel(
-        &ct,
-        &outer.backward_key,
-        &outer.backward_nonce_seed,
-        0,
-    );
+    let out =
+        parolnet_relay::onion::onion_peel(&ct, &outer.backward_key, &outer.backward_nonce_seed, 0);
     assert!(out.is_err());
 }
 
@@ -494,11 +492,11 @@ fn onion_layer_aead_is_not_negotiable() {
 // PNP-004 expansion — cell rules, circuit lifecycle, relay policy.
 // =============================================================================
 
+use parolnet_protocol::PeerId;
 use parolnet_relay::directory::{
-    RelayDescriptor, DESCRIPTOR_REFRESH_SECS, MAX_DESCRIPTOR_AGE_SECS,
+    DESCRIPTOR_REFRESH_SECS, MAX_DESCRIPTOR_AGE_SECS, RelayDescriptor,
 };
 use parolnet_relay::relay_node::MAX_RELAY_EARLY;
-use parolnet_protocol::PeerId;
 
 // -- §3.1 Padding bytes are NOT interpreted ------------------------------------
 
@@ -526,7 +524,12 @@ fn padding_bytes_are_not_interpreted_by_receiver() {
 
 // -- §3.5 EXTEND resolution --------------------------------------------------
 
-#[clause("PNP-004-MUST-005", "PNP-004-MUST-006", "PNP-004-MUST-007", "PNP-004-MUST-008")]
+#[clause(
+    "PNP-004-MUST-005",
+    "PNP-004-MUST-006",
+    "PNP-004-MUST-007",
+    "PNP-004-MUST-008"
+)]
 #[test]
 fn extend_uses_peer_id_not_ip() {
     // EXTEND cell payload carries a 32-byte PeerId for next-hop lookup.
@@ -558,7 +561,10 @@ fn stream_id_scope_is_per_circuit() {
         payload: [0u8; CELL_PAYLOAD_SIZE],
         payload_len: 0,
     };
-    assert_ne!(a.circuit_id, b.circuit_id, "MUST-009: distinct circuits MUST have distinct CIDs");
+    assert_ne!(
+        a.circuit_id, b.circuit_id,
+        "MUST-009: distinct circuits MUST have distinct CIDs"
+    );
 }
 
 // -- §4 Nonce scheme N-ONION, counter overflow -------------------------------
@@ -574,8 +580,14 @@ fn onion_nonce_scheme_is_n_onion() {
     let ct_a = onion_encrypt(plain, &[hk.clone()], &[0u32]).unwrap();
     let ct_b = onion_encrypt(plain, &[hk.clone()], &[0u32]).unwrap();
     let ct_c = onion_encrypt(plain, &[hk], &[1u32]).unwrap();
-    assert_eq!(ct_a, ct_b, "MUST-018: same (key, counter) MUST produce same nonce");
-    assert_ne!(ct_a, ct_c, "MUST-018: different counter MUST produce different nonce");
+    assert_eq!(
+        ct_a, ct_b,
+        "MUST-018: same (key, counter) MUST produce same nonce"
+    );
+    assert_ne!(
+        ct_a, ct_c,
+        "MUST-018: different counter MUST produce different nonce"
+    );
 }
 
 #[clause("PNP-004-MUST-019", "PNP-004-MUST-056")]
@@ -612,7 +624,10 @@ fn created_key_confirmation_must_verify_before_op_proceeds() {
 fn circuits_build_incrementally_hop_by_hop() {
     // REQUIRED_HOPS = 3 per PNP-004. OP builds hop 1, then extends to hop 2,
     // then to hop 3. Pin constant.
-    assert_eq!(REQUIRED_HOPS, 3, "MUST-026: circuits build incrementally across 3 hops");
+    assert_eq!(
+        REQUIRED_HOPS, 3,
+        "MUST-026: circuits build incrementally across 3 hops"
+    );
 }
 
 #[clause("PNP-004-MUST-028", "PNP-004-MUST-029")]
@@ -645,7 +660,10 @@ fn relay_assigns_fresh_cid_on_extend() {
     // outgoing connection when extending.
     let a: u32 = 0xAAAA_BBBB;
     let b: u32 = 0xCCCC_DDDD;
-    assert_ne!(a, b, "MUST-031: EXTEND MUST assign a non-colliding outgoing CID");
+    assert_ne!(
+        a, b,
+        "MUST-031: EXTEND MUST assign a non-colliding outgoing CID"
+    );
 }
 
 // -- §5.5 Cell dispatch rules -------------------------------------------------
@@ -716,7 +734,10 @@ fn relay_descriptor_fields_are_complete_and_signed() {
     };
     let bytes = desc.signable_bytes();
     assert!(!bytes.is_empty(), "MUST-041: descriptor MUST be signable");
-    assert!(bytes.len() > 64, "MUST-041: descriptor carries peer_id + keys + addr + counters");
+    assert!(
+        bytes.len() > 64,
+        "MUST-041: descriptor carries peer_id + keys + addr + counters"
+    );
 }
 
 #[clause("PNP-004-MUST-042")]
@@ -748,8 +769,9 @@ fn descriptors_propagate_via_gossip() {
 fn op_hop_1_comes_from_guard_set() {
     // Architectural: RelayDirectory::select_guards returns the guard set.
     // select_path picks hop 1 from guards. Pin via method presence (compile).
-    let _dir_fn: fn(&mut parolnet_relay::directory::RelayDirectory) -> Option<[parolnet_relay::RelayInfo; 3]> =
-        |d| d.select_path();
+    let _dir_fn: fn(
+        &mut parolnet_relay::directory::RelayDirectory,
+    ) -> Option<[parolnet_relay::RelayInfo; 3]> = |d| d.select_path();
     // Compilation means select_path exists; it uses select_guards internally.
 }
 
@@ -759,8 +781,10 @@ fn hops_2_and_3_selected_randomly_excluding_guard() {
     // Architectural — select_random(&exclude) in RelayDirectory takes an
     // exclusion list that includes the previously-selected hops.
     // Pinned via function signature compile-time check.
-    let _f: fn(&parolnet_relay::directory::RelayDirectory, &[PeerId]) -> Option<parolnet_relay::RelayInfo> =
-        |d, ex| d.select_random(ex);
+    let _f: fn(
+        &parolnet_relay::directory::RelayDirectory,
+        &[PeerId],
+    ) -> Option<parolnet_relay::RelayInfo> = |d, ex| d.select_random(ex);
 }
 
 #[clause("PNP-004-MUST-047")]
@@ -842,7 +866,10 @@ fn replay_cells_fail_aead_and_are_rejected() {
     assert_eq!(ok, plain);
     // Decrypt with wrong counter — MUST fail.
     let bad = onion_peel(&ct, &hk.forward_key, &hk.forward_nonce_seed, 6);
-    assert!(bad.is_err(), "MUST-053: stale counter MUST fail AEAD verification");
+    assert!(
+        bad.is_err(),
+        "MUST-053: stale counter MUST fail AEAD verification"
+    );
 }
 
 #[clause("PNP-004-MUST-054", "PNP-004-MUST-055")]
@@ -850,7 +877,10 @@ fn replay_cells_fail_aead_and_are_rejected() {
 fn relay_early_counter_is_bounded() {
     // OP sets counter to 3 (per-circuit extension limit). Implementation
     // permits up to MAX_RELAY_EARLY = 8 per circuit total.
-    assert_eq!(MAX_RELAY_EARLY, 8, "MUST-055: RELAY_EARLY counter MUST be enforced");
+    assert_eq!(
+        MAX_RELAY_EARLY, 8,
+        "MUST-055: RELAY_EARLY counter MUST be enforced"
+    );
     // MUST-054 says OP sets initial counter to 3 (1 per EXTEND, 3 hops);
     // pin via REQUIRED_HOPS.
     assert_eq!(REQUIRED_HOPS, 3);

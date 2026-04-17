@@ -1989,10 +1989,11 @@ fn test_message_flags() {
 
 // ── Padding Enforcement Tests ──────────────────────────────────
 
-/// Verify that `send()` automatically pads messages to bucket sizes
-/// and `recv()` recovers the original plaintext.
+/// Verify that the PNP-001 envelope helpers pad every frame to a bucket size
+/// and that the receiver recovers the original plaintext.
 #[test]
-fn test_send_recv_padding_roundtrip() {
+fn test_envelope_padding_roundtrip() {
+    use parolnet_core::envelope::{decrypt_for_peer, encrypt_for_peer};
     use parolnet_protocol::BUCKET_SIZES;
     use rand::rngs::OsRng;
 
@@ -2019,24 +2020,23 @@ fn test_send_recv_padding_roundtrip() {
     )
     .unwrap();
 
-    // Send a short message from Alice to Bob
     let original = b"hello bob";
-    let (header, ciphertext) = alice.send(&bob.peer_id(), original).unwrap();
+    let wire = encrypt_for_peer(
+        alice.sessions(),
+        &bob.peer_id(),
+        0x01,
+        original,
+        1_700_000_000,
+    )
+    .unwrap();
 
-    // The ciphertext should be larger than the original message due to
-    // bucket padding + AEAD overhead. Verify ciphertext length is at least
-    // the smallest bucket size (padding was applied before encryption).
     assert!(
-        ciphertext.len() >= BUCKET_SIZES[0],
-        "ciphertext length {} should be >= smallest bucket size {}",
-        ciphertext.len(),
-        BUCKET_SIZES[0]
+        BUCKET_SIZES.contains(&wire.len()),
+        "wire envelope length {} is not a bucket size",
+        wire.len()
     );
 
-    // Bob decrypts and gets the original plaintext back (unpadded automatically)
-    let decrypted = bob.recv(&alice.peer_id(), &header, &ciphertext).unwrap();
-    assert_eq!(
-        decrypted, original,
-        "decrypted message must match original plaintext"
-    );
+    let decoded = decrypt_for_peer(bob.sessions(), &alice.peer_id(), &wire).unwrap();
+    assert_eq!(decoded.plaintext, original);
+    assert_eq!(decoded.msg_type, 0x01);
 }

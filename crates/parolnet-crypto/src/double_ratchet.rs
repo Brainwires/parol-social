@@ -373,8 +373,27 @@ impl Drop for DoubleRatchetSession {
     }
 }
 
+/// Build the AEAD additional-authenticated-data for the Double Ratchet
+/// session AEAD (PNP-001-MUST-007).
+///
+/// The ratchet public key is bound for nonce-derivation integrity, and the
+/// optional `extra_aad` (typically the serialized cleartext envelope header)
+/// is concatenated after it so wire-level header tampering is detected by
+/// the AEAD tag. Concatenation is unambiguous here because the ratchet-key
+/// prefix is always exactly 32 bytes.
+fn build_aad(ratchet_key: &[u8; 32], extra_aad: &[u8]) -> Vec<u8> {
+    let mut aad = Vec::with_capacity(32 + extra_aad.len());
+    aad.extend_from_slice(ratchet_key);
+    aad.extend_from_slice(extra_aad);
+    aad
+}
+
 impl RatchetSession for DoubleRatchetSession {
-    fn encrypt(&mut self, plaintext: &[u8]) -> Result<(RatchetHeader, Vec<u8>), CryptoError> {
+    fn encrypt(
+        &mut self,
+        plaintext: &[u8],
+        extra_aad: &[u8],
+    ) -> Result<(RatchetHeader, Vec<u8>), CryptoError> {
         let send_ck = self
             .send_chain_key
             .as_mut()
@@ -399,7 +418,8 @@ impl RatchetSession for DoubleRatchetSession {
         // Encrypt with ChaCha20-Poly1305
         let cipher = ChaCha20Poly1305Cipher::new(&message_key)?;
         let nonce = Self::build_nonce(&ratchet_pub, self.send_n);
-        let ciphertext = cipher.encrypt(&nonce, plaintext, &header.ratchet_key)?;
+        let aad = build_aad(&header.ratchet_key, extra_aad);
+        let ciphertext = cipher.encrypt(&nonce, plaintext, &aad)?;
 
         self.send_n += 1;
 
@@ -410,6 +430,7 @@ impl RatchetSession for DoubleRatchetSession {
         &mut self,
         header: &RatchetHeader,
         ciphertext: &[u8],
+        extra_aad: &[u8],
     ) -> Result<Vec<u8>, CryptoError> {
         // Check for skipped message key
         if let Some(mk) = self
@@ -418,7 +439,8 @@ impl RatchetSession for DoubleRatchetSession {
         {
             let cipher = ChaCha20Poly1305Cipher::new(&mk)?;
             let nonce = Self::build_nonce(&header.ratchet_key, header.message_number);
-            return cipher.decrypt(&nonce, ciphertext, &header.ratchet_key);
+            let aad = build_aad(&header.ratchet_key, extra_aad);
+            return cipher.decrypt(&nonce, ciphertext, &aad);
         }
 
         // Check if we need a DH ratchet step
@@ -453,7 +475,8 @@ impl RatchetSession for DoubleRatchetSession {
         // Decrypt
         let cipher = ChaCha20Poly1305Cipher::new(&message_key)?;
         let nonce = Self::build_nonce(&header.ratchet_key, header.message_number);
-        cipher.decrypt(&nonce, ciphertext, &header.ratchet_key)
+        let aad = build_aad(&header.ratchet_key, extra_aad);
+        cipher.decrypt(&nonce, ciphertext, &aad)
     }
 }
 
@@ -479,8 +502,8 @@ mod tests {
     fn test_alice_sends_bob_decrypts() {
         let (mut alice, mut bob) = setup_session_pair();
 
-        let (header, ct) = alice.encrypt(b"hello bob").unwrap();
-        let pt = bob.decrypt(&header, &ct).unwrap();
+        let (header, ct) = alice.encrypt(b"hello bob", &[]).unwrap();
+        let pt = bob.decrypt(&header, &ct, &[]).unwrap();
         assert_eq!(pt, b"hello bob");
     }
 
@@ -489,18 +512,18 @@ mod tests {
         let (mut alice, mut bob) = setup_session_pair();
 
         // Alice -> Bob
-        let (h1, ct1) = alice.encrypt(b"hello").unwrap();
-        let pt1 = bob.decrypt(&h1, &ct1).unwrap();
+        let (h1, ct1) = alice.encrypt(b"hello", &[]).unwrap();
+        let pt1 = bob.decrypt(&h1, &ct1, &[]).unwrap();
         assert_eq!(pt1, b"hello");
 
         // Bob -> Alice
-        let (h2, ct2) = bob.encrypt(b"hi alice").unwrap();
-        let pt2 = alice.decrypt(&h2, &ct2).unwrap();
+        let (h2, ct2) = bob.encrypt(b"hi alice", &[]).unwrap();
+        let pt2 = alice.decrypt(&h2, &ct2, &[]).unwrap();
         assert_eq!(pt2, b"hi alice");
 
         // Alice -> Bob again (new ratchet step)
-        let (h3, ct3) = alice.encrypt(b"how are you?").unwrap();
-        let pt3 = bob.decrypt(&h3, &ct3).unwrap();
+        let (h3, ct3) = alice.encrypt(b"how are you?", &[]).unwrap();
+        let pt3 = bob.decrypt(&h3, &ct3, &[]).unwrap();
         assert_eq!(pt3, b"how are you?");
     }
 
@@ -508,37 +531,37 @@ mod tests {
     fn test_multiple_messages_same_direction() {
         let (mut alice, mut bob) = setup_session_pair();
 
-        let (h1, ct1) = alice.encrypt(b"msg1").unwrap();
-        let (h2, ct2) = alice.encrypt(b"msg2").unwrap();
-        let (h3, ct3) = alice.encrypt(b"msg3").unwrap();
+        let (h1, ct1) = alice.encrypt(b"msg1", &[]).unwrap();
+        let (h2, ct2) = alice.encrypt(b"msg2", &[]).unwrap();
+        let (h3, ct3) = alice.encrypt(b"msg3", &[]).unwrap();
 
         // Decrypt in order
-        assert_eq!(bob.decrypt(&h1, &ct1).unwrap(), b"msg1");
-        assert_eq!(bob.decrypt(&h2, &ct2).unwrap(), b"msg2");
-        assert_eq!(bob.decrypt(&h3, &ct3).unwrap(), b"msg3");
+        assert_eq!(bob.decrypt(&h1, &ct1, &[]).unwrap(), b"msg1");
+        assert_eq!(bob.decrypt(&h2, &ct2, &[]).unwrap(), b"msg2");
+        assert_eq!(bob.decrypt(&h3, &ct3, &[]).unwrap(), b"msg3");
     }
 
     #[test]
     fn test_out_of_order_delivery() {
         let (mut alice, mut bob) = setup_session_pair();
 
-        let (h1, ct1) = alice.encrypt(b"msg1").unwrap();
-        let (h2, ct2) = alice.encrypt(b"msg2").unwrap();
-        let (h3, ct3) = alice.encrypt(b"msg3").unwrap();
+        let (h1, ct1) = alice.encrypt(b"msg1", &[]).unwrap();
+        let (h2, ct2) = alice.encrypt(b"msg2", &[]).unwrap();
+        let (h3, ct3) = alice.encrypt(b"msg3", &[]).unwrap();
 
         // Deliver out of order: 3, 1, 2
-        assert_eq!(bob.decrypt(&h3, &ct3).unwrap(), b"msg3");
-        assert_eq!(bob.decrypt(&h1, &ct1).unwrap(), b"msg1");
-        assert_eq!(bob.decrypt(&h2, &ct2).unwrap(), b"msg2");
+        assert_eq!(bob.decrypt(&h3, &ct3, &[]).unwrap(), b"msg3");
+        assert_eq!(bob.decrypt(&h1, &ct1, &[]).unwrap(), b"msg1");
+        assert_eq!(bob.decrypt(&h2, &ct2, &[]).unwrap(), b"msg2");
     }
 
     #[test]
     fn test_tampered_ciphertext_fails() {
         let (mut alice, mut bob) = setup_session_pair();
 
-        let (header, mut ct) = alice.encrypt(b"secret").unwrap();
+        let (header, mut ct) = alice.encrypt(b"secret", &[]).unwrap();
         ct[0] ^= 0xFF; // tamper
-        assert!(bob.decrypt(&header, &ct).is_err());
+        assert!(bob.decrypt(&header, &ct, &[]).is_err());
     }
 
     #[test]
@@ -546,8 +569,8 @@ mod tests {
         let (mut alice1, _) = setup_session_pair();
         let (mut alice2, _) = setup_session_pair();
 
-        let (_, ct1) = alice1.encrypt(b"same message").unwrap();
-        let (_, ct2) = alice2.encrypt(b"same message").unwrap();
+        let (_, ct1) = alice1.encrypt(b"same message", &[]).unwrap();
+        let (_, ct2) = alice2.encrypt(b"same message", &[]).unwrap();
         assert_ne!(ct1, ct2); // different session keys
     }
 
@@ -556,10 +579,10 @@ mod tests {
         let (mut alice, mut bob) = setup_session_pair();
 
         // Exchange some messages to advance ratchet state
-        let (h1, ct1) = alice.encrypt(b"hello").unwrap();
-        bob.decrypt(&h1, &ct1).unwrap();
-        let (h2, ct2) = bob.encrypt(b"world").unwrap();
-        alice.decrypt(&h2, &ct2).unwrap();
+        let (h1, ct1) = alice.encrypt(b"hello", &[]).unwrap();
+        bob.decrypt(&h1, &ct1, &[]).unwrap();
+        let (h2, ct2) = bob.encrypt(b"world", &[]).unwrap();
+        alice.decrypt(&h2, &ct2, &[]).unwrap();
 
         // Export Alice's session
         let exported = alice.export_bytes();
@@ -568,8 +591,8 @@ mod tests {
         let mut alice2 = DoubleRatchetSession::import_bytes(&exported).unwrap();
 
         // Alice2 should be able to send and Bob should decrypt
-        let (h3, ct3) = alice2.encrypt(b"after restore").unwrap();
-        let pt3 = bob.decrypt(&h3, &ct3).unwrap();
+        let (h3, ct3) = alice2.encrypt(b"after restore", &[]).unwrap();
+        let pt3 = bob.decrypt(&h3, &ct3, &[]).unwrap();
         assert_eq!(pt3, b"after restore");
     }
 
@@ -578,20 +601,20 @@ mod tests {
         let (mut alice, mut bob) = setup_session_pair();
 
         // Alice sends 3 messages
-        let (h1, ct1) = alice.encrypt(b"msg1").unwrap();
-        let (h2, ct2) = alice.encrypt(b"msg2").unwrap();
-        let (h3, ct3) = alice.encrypt(b"msg3").unwrap();
+        let (h1, ct1) = alice.encrypt(b"msg1", &[]).unwrap();
+        let (h2, ct2) = alice.encrypt(b"msg2", &[]).unwrap();
+        let (h3, ct3) = alice.encrypt(b"msg3", &[]).unwrap();
 
         // Bob receives msg3 first (skips 1 and 2)
-        bob.decrypt(&h3, &ct3).unwrap();
+        bob.decrypt(&h3, &ct3, &[]).unwrap();
 
         // Export Bob with skipped keys
         let exported = bob.export_bytes();
         let mut bob2 = DoubleRatchetSession::import_bytes(&exported).unwrap();
 
         // Bob2 should still decrypt skipped messages
-        assert_eq!(bob2.decrypt(&h1, &ct1).unwrap(), b"msg1");
-        assert_eq!(bob2.decrypt(&h2, &ct2).unwrap(), b"msg2");
+        assert_eq!(bob2.decrypt(&h1, &ct1, &[]).unwrap(), b"msg1");
+        assert_eq!(bob2.decrypt(&h2, &ct2, &[]).unwrap(), b"msg2");
     }
 
     #[test]

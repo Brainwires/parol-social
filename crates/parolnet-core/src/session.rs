@@ -37,10 +37,17 @@ impl SessionManager {
     }
 
     /// Encrypt a message for a peer using their Double Ratchet session.
+    ///
+    /// `extra_aad` is bound into the AEAD additional-authenticated-data alongside
+    /// the ratchet public key. Callers with no external context (e.g., simple
+    /// session-layer encrypts that do not ride inside a PNP-001 envelope) pass
+    /// an empty slice. The envelope helpers pass the serialized cleartext
+    /// header bytes (PNP-001-MUST-007).
     pub fn encrypt(
         &self,
         peer_id: &PeerId,
         plaintext: &[u8],
+        extra_aad: &[u8],
     ) -> Result<(RatchetHeader, Vec<u8>), crate::CoreError> {
         let mut sessions = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
         let session = sessions
@@ -48,7 +55,7 @@ impl SessionManager {
             .ok_or(crate::CoreError::NoSession)?;
         session
             .ratchet
-            .encrypt(plaintext)
+            .encrypt(plaintext, extra_aad)
             .map_err(crate::CoreError::Crypto)
     }
 
@@ -58,6 +65,7 @@ impl SessionManager {
         peer_id: &PeerId,
         header: &RatchetHeader,
         ciphertext: &[u8],
+        extra_aad: &[u8],
     ) -> Result<Vec<u8>, crate::CoreError> {
         let mut sessions = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
         let session = sessions
@@ -65,8 +73,24 @@ impl SessionManager {
             .ok_or(crate::CoreError::NoSession)?;
         session
             .ratchet
-            .decrypt(header, ciphertext)
+            .decrypt(header, ciphertext, extra_aad)
             .map_err(crate::CoreError::Crypto)
+    }
+
+    /// Get a mutable handle on a session via a closure.
+    ///
+    /// Used by higher-level helpers that need to call session methods
+    /// while holding the internal lock exactly once per call.
+    pub fn with_session_mut<T>(
+        &self,
+        peer_id: &PeerId,
+        f: impl FnOnce(&mut DoubleRatchetSession) -> Result<T, crate::CoreError>,
+    ) -> Result<T, crate::CoreError> {
+        let mut sessions = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
+        let session = sessions
+            .get_mut(peer_id)
+            .ok_or(crate::CoreError::NoSession)?;
+        f(&mut session.ratchet)
     }
 
     /// Check if a session exists for a peer.
@@ -107,10 +131,7 @@ impl SessionManager {
     }
 
     /// Import sessions from exported pairs.
-    pub fn import_all(
-        &self,
-        data: Vec<([u8; 32], Vec<u8>)>,
-    ) -> Result<usize, crate::CoreError> {
+    pub fn import_all(&self, data: Vec<([u8; 32], Vec<u8>)>) -> Result<usize, crate::CoreError> {
         let mut sessions = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
         let mut count = 0;
         for (peer_id_bytes, session_bytes) in data {

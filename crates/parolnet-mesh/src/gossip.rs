@@ -288,13 +288,11 @@ impl StandardGossip {
 
     /// Build a GossipEnvelope from an Envelope for broadcasting.
     fn build_gossip_envelope(&self, envelope: &Envelope) -> Result<GossipEnvelope, MeshError> {
-        // Serialize the inner Envelope header + payload as the gossip payload.
-        // Since Envelope doesn't implement Serialize, we pack header CBOR + encrypted_payload + mac.
+        // Serialize the full wire Envelope (CBOR) as the gossip payload. The
+        // AEAD tag travels inside `encrypted_payload` per PNP-001 §3.1.
         let mut payload_buf = Vec::new();
-        ciborium::into_writer(&envelope.header, &mut payload_buf)
-            .map_err(|e| MeshError::ValidationFailed(format!("CBOR encode header: {e}")))?;
-        payload_buf.extend_from_slice(&envelope.encrypted_payload);
-        payload_buf.extend_from_slice(&envelope.mac);
+        ciborium::into_writer(envelope, &mut payload_buf)
+            .map_err(|e| MeshError::ValidationFailed(format!("CBOR encode envelope: {e}")))?;
 
         // Generate message_id = SHA-256(encrypted_payload || our_peer_id || random_nonce)
         let random_nonce: [u8; 16] = rand::random();

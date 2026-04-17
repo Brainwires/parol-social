@@ -3,23 +3,22 @@
 use parolnet_clause::clause;
 use parolnet_crypto::identity::{OneTimePreKeyPair, SignedPreKey};
 use parolnet_crypto::x3dh::X3dhKeyAgreement;
-use parolnet_crypto::{
-    IdentityKeyPair, KeyAgreement, OneTimePreKey, PreKeyBundle,
-};
+use parolnet_crypto::{IdentityKeyPair, KeyAgreement, OneTimePreKey, PreKeyBundle};
 
-fn bundle_for(bob: &IdentityKeyPair, with_opk: bool) -> (PreKeyBundle, SignedPreKey, Option<OneTimePreKeyPair>) {
+fn bundle_for(
+    bob: &IdentityKeyPair,
+    with_opk: bool,
+) -> (PreKeyBundle, SignedPreKey, Option<OneTimePreKeyPair>) {
     let spk = SignedPreKey::generate(1, bob).unwrap();
     let opk = if with_opk {
         Some(OneTimePreKeyPair::generate(100))
     } else {
         None
     };
-    let one_time = opk
-        .as_ref()
-        .map(|o| OneTimePreKey {
-            id: o.id,
-            key: *o.public_key.as_bytes(),
-        });
+    let one_time = opk.as_ref().map(|o| OneTimePreKey {
+        id: o.id,
+        key: *o.public_key.as_bytes(),
+    });
     let bundle = PreKeyBundle {
         identity_key: bob.public_key_bytes(),
         signed_prekey: *spk.public_key.as_bytes(),
@@ -45,9 +44,7 @@ fn alice_rejects_bundle_with_bad_spk_signature() {
     let agreement = X3dhKeyAgreement { identity: alice };
     let err = match agreement.initiate(&bundle) {
         Err(e) => e,
-        Ok(_) => panic!(
-            "Alice MUST abort if SPK signature does not verify (PNP-002-MUST-003/004)"
-        ),
+        Ok(_) => panic!("Alice MUST abort if SPK signature does not verify (PNP-002-MUST-003/004)"),
     };
     let msg = format!("{err}");
     assert!(
@@ -204,8 +201,8 @@ fn x3dh_header_carries_no_transcript_signature() {
 
 // -- §5.4 Double Ratchet session establishment + first message ----------------
 
-use parolnet_crypto::double_ratchet::DoubleRatchetSession;
 use parolnet_crypto::RatchetSession;
+use parolnet_crypto::double_ratchet::DoubleRatchetSession;
 use x25519_dalek::{PublicKey as X25519Pub, StaticSecret};
 
 fn establish_session_pair() -> (DoubleRatchetSession, DoubleRatchetSession) {
@@ -216,18 +213,22 @@ fn establish_session_pair() -> (DoubleRatchetSession, DoubleRatchetSession) {
     // Shared secret from a notional X3DH.
     let shared = [0x42u8; 32];
 
-    let alice =
-        DoubleRatchetSession::initialize_initiator(shared, &bob_pub).unwrap();
+    let alice = DoubleRatchetSession::initialize_initiator(shared, &bob_pub).unwrap();
     let bob = DoubleRatchetSession::initialize_responder(shared, bob_sk).unwrap();
     (alice, bob)
 }
 
-#[clause("PNP-002-MUST-019", "PNP-002-MUST-020", "PNP-002-MUST-021", "PNP-002-MUST-022")]
+#[clause(
+    "PNP-002-MUST-019",
+    "PNP-002-MUST-020",
+    "PNP-002-MUST-021",
+    "PNP-002-MUST-022"
+)]
 #[test]
 fn alice_to_bob_first_message_establishes_session() {
     let (mut alice, mut bob) = establish_session_pair();
-    let (h, ct) = alice.encrypt(b"hello bob").unwrap();
-    let out = bob.decrypt(&h, &ct).unwrap();
+    let (h, ct) = alice.encrypt(b"hello bob", &[]).unwrap();
+    let out = bob.decrypt(&h, &ct, &[]).unwrap();
     assert_eq!(out, b"hello bob");
 }
 
@@ -237,12 +238,12 @@ fn alice_to_bob_first_message_establishes_session() {
 #[test]
 fn bidirectional_ratchet_messages() {
     let (mut alice, mut bob) = establish_session_pair();
-    let (h1, c1) = alice.encrypt(b"a1").unwrap();
-    assert_eq!(bob.decrypt(&h1, &c1).unwrap(), b"a1");
-    let (h2, c2) = bob.encrypt(b"b1").unwrap();
-    assert_eq!(alice.decrypt(&h2, &c2).unwrap(), b"b1");
-    let (h3, c3) = alice.encrypt(b"a2").unwrap();
-    assert_eq!(bob.decrypt(&h3, &c3).unwrap(), b"a2");
+    let (h1, c1) = alice.encrypt(b"a1", &[]).unwrap();
+    assert_eq!(bob.decrypt(&h1, &c1, &[]).unwrap(), b"a1");
+    let (h2, c2) = bob.encrypt(b"b1", &[]).unwrap();
+    assert_eq!(alice.decrypt(&h2, &c2, &[]).unwrap(), b"b1");
+    let (h3, c3) = alice.encrypt(b"a2", &[]).unwrap();
+    assert_eq!(bob.decrypt(&h3, &c3, &[]).unwrap(), b"a2");
 }
 
 // -- §5.6 Close / session state destruction (MUST-028, MUST-029) ---------------
@@ -253,14 +254,14 @@ fn bidirectional_ratchet_messages() {
 #[test]
 fn fresh_session_cannot_decrypt_prior_ciphertext() {
     let (mut alice, bob) = establish_session_pair();
-    let (h, ct) = alice.encrypt(b"secret").unwrap();
+    let (h, ct) = alice.encrypt(b"secret", &[]).unwrap();
 
     // Simulate CLOSE: drop the sessions, open new ones with different SK.
     drop(alice);
     drop(bob);
 
     let (_, mut fresh_bob) = establish_session_pair();
-    fresh_bob.decrypt(&h, &ct).expect_err(
+    fresh_bob.decrypt(&h, &ct, &[]).expect_err(
         "MUST-028/029/030: after close, a NEW handshake is REQUIRED; old ciphertext MUST NOT decrypt",
     );
 }
@@ -297,11 +298,11 @@ fn ek_is_not_reused_across_initiate_calls() {
 #[test]
 fn session_handles_out_of_order_across_ratchet() {
     let (mut alice, mut bob) = establish_session_pair();
-    let (h1, c1) = alice.encrypt(b"first").unwrap();
-    let (h2, c2) = alice.encrypt(b"second").unwrap();
+    let (h1, c1) = alice.encrypt(b"first", &[]).unwrap();
+    let (h2, c2) = alice.encrypt(b"second", &[]).unwrap();
     // Bob receives them in reverse order — MUST still decrypt both.
-    assert_eq!(bob.decrypt(&h2, &c2).unwrap(), b"second");
-    assert_eq!(bob.decrypt(&h1, &c1).unwrap(), b"first");
+    assert_eq!(bob.decrypt(&h2, &c2, &[]).unwrap(), b"second");
+    assert_eq!(bob.decrypt(&h1, &c1, &[]).unwrap(), b"first");
 }
 
 // -- §6.5 Nonce freshness (128-bit) -------------------------------------------
@@ -329,11 +330,15 @@ fn csprng_produces_distinct_nonces() {
 #[clause("PNP-002-MUST-001")]
 #[test]
 fn absent_aead_algo_defaults_to_chacha20_poly1305() {
-    use parolnet_crypto::aead::ChaCha20Poly1305Cipher;
     use parolnet_crypto::Aead;
+    use parolnet_crypto::aead::ChaCha20Poly1305Cipher;
     // Default cipher MUST be ChaCha20-Poly1305 (32-byte key, 12-byte nonce).
     let c = ChaCha20Poly1305Cipher::new(&[0u8; 32]).unwrap();
-    assert_eq!(c.key_len(), 32, "MUST-001: default AEAD MUST be ChaCha20-Poly1305");
+    assert_eq!(
+        c.key_len(),
+        32,
+        "MUST-001: default AEAD MUST be ChaCha20-Poly1305"
+    );
     assert_eq!(c.nonce_len(), 12);
 }
 
@@ -343,8 +348,8 @@ fn aead_algo_must_be_0x01_or_0x02_only() {
     // Architectural pin: the cipher registry exposes exactly ChaCha20Poly1305
     // and Aes256Gcm — nothing else. Third-party algorithms cannot be
     // introduced without a spec revision + new cipher struct.
-    use parolnet_crypto::aead::{Aes256GcmCipher, ChaCha20Poly1305Cipher};
     use parolnet_crypto::Aead;
+    use parolnet_crypto::aead::{Aes256GcmCipher, ChaCha20Poly1305Cipher};
     let chacha: Box<dyn Aead> = Box::new(ChaCha20Poly1305Cipher::new(&[0u8; 32]).unwrap());
     let aes: Box<dyn Aead> = Box::new(Aes256GcmCipher::new(&[0u8; 32]).unwrap());
     // Both accepted cipher codes have the same nonce/key shape from MUST-002.
@@ -366,7 +371,11 @@ fn initiator_verifies_bob_identity_via_spk_signature() {
     let agreement = X3dhKeyAgreement { identity: alice };
     let (_sk, header) = agreement.initiate(&bundle).unwrap();
     // Post-initiate Alice has derived SK iff she successfully verified Bob's SPK.
-    assert_eq!(header.identity_key.len(), 32, "MUST-007: verified Bob identity → 32-byte IK in header");
+    assert_eq!(
+        header.identity_key.len(),
+        32,
+        "MUST-007: verified Bob identity → 32-byte IK in header"
+    );
 }
 
 #[clause("PNP-002-MUST-008")]
@@ -375,16 +384,23 @@ fn alice_encrypts_initial_payload_with_negotiated_aead() {
     // initiate() yields (SharedSecret, header). The shared secret is then used
     // with HKDF → (init_key, init_iv) and ChaCha20-Poly1305 to encrypt Alice's
     // initial payload. Pin by driving AEAD with the X3DH shared secret.
-    use parolnet_crypto::aead::ChaCha20Poly1305Cipher;
     use parolnet_crypto::Aead;
+    use parolnet_crypto::aead::ChaCha20Poly1305Cipher;
     let bob = IdentityKeyPair::generate();
     let alice = IdentityKeyPair::generate();
     let (bundle, _, _) = bundle_for(&bob, true);
-    let (sk, _) = X3dhKeyAgreement { identity: alice }.initiate(&bundle).unwrap();
+    let (sk, _) = X3dhKeyAgreement { identity: alice }
+        .initiate(&bundle)
+        .unwrap();
     let cipher = ChaCha20Poly1305Cipher::new(&sk.0).unwrap();
-    let ct = cipher.encrypt(&[0u8; 12], b"alice-init-payload", b"").unwrap();
+    let ct = cipher
+        .encrypt(&[0u8; 12], b"alice-init-payload", b"")
+        .unwrap();
     let pt = cipher.decrypt(&[0u8; 12], &ct, b"").unwrap();
-    assert_eq!(pt, b"alice-init-payload", "MUST-008: init payload MUST encrypt with negotiated AEAD");
+    assert_eq!(
+        pt, b"alice-init-payload",
+        "MUST-008: init payload MUST encrypt with negotiated AEAD"
+    );
 }
 
 #[clause("PNP-002-MUST-009")]
@@ -404,7 +420,10 @@ fn offered_state_timeout_is_60_seconds() {
     // Pin the 60-second timeout constant. This is an architectural invariant —
     // the state machine's OFFERED→timeout transition MUST fire at 60s.
     const OFFERED_TIMEOUT_SECS: u64 = 60;
-    assert_eq!(OFFERED_TIMEOUT_SECS, 60, "MUST-010: OFFERED state 60s timeout");
+    assert_eq!(
+        OFFERED_TIMEOUT_SECS, 60,
+        "MUST-010: OFFERED state 60s timeout"
+    );
 }
 
 // -- §5.3 Responder: Bob's flow ------------------------------------------------
@@ -420,7 +439,9 @@ fn responder_verifies_spk_id_matches_current_or_recent() {
     let bob = IdentityKeyPair::generate();
     let alice = IdentityKeyPair::generate();
     let (bundle, spk, opk) = bundle_for(&bob, true);
-    let (sk_alice, header) = X3dhKeyAgreement { identity: alice }.initiate(&bundle).unwrap();
+    let (sk_alice, header) = X3dhKeyAgreement { identity: alice }
+        .initiate(&bundle)
+        .unwrap();
 
     // Give Bob the WRONG SPK secret (fresh one, not the bundled spk).
     let wrong = SignedPreKey::generate(99, &bob).unwrap();
@@ -428,7 +449,10 @@ fn responder_verifies_spk_id_matches_current_or_recent() {
     let sk_wrong = X3dhKeyAgreement { identity: bob }
         .respond(&header, &wrong.private_key, opk_sec)
         .unwrap();
-    assert_ne!(sk_alice.0, sk_wrong.0, "MUST-012: wrong SPK MUST NOT yield matching SK");
+    assert_ne!(
+        sk_alice.0, sk_wrong.0,
+        "MUST-012: wrong SPK MUST NOT yield matching SK"
+    );
 
     // Verify: with the CORRECT SPK, SKs match.
     let correct_bob = IdentityKeyPair::generate();
@@ -451,7 +475,9 @@ fn responder_derives_same_init_key() {
     let bob = IdentityKeyPair::generate();
     let (bundle, spk, opk) = bundle_for(&bob, true);
     let alice = IdentityKeyPair::generate();
-    let (sk_a, header) = X3dhKeyAgreement { identity: alice }.initiate(&bundle).unwrap();
+    let (sk_a, header) = X3dhKeyAgreement { identity: alice }
+        .initiate(&bundle)
+        .unwrap();
     let opk_sec = opk.as_ref().map(|o| &o.private_key);
     let sk_b = X3dhKeyAgreement { identity: bob }
         .respond(&header, &spk.private_key, opk_sec)
@@ -490,7 +516,9 @@ fn responder_transitions_to_accepted_state() {
     let bob = IdentityKeyPair::generate();
     let (bundle, spk, opk) = bundle_for(&bob, true);
     let alice = IdentityKeyPair::generate();
-    let (_, header) = X3dhKeyAgreement { identity: alice }.initiate(&bundle).unwrap();
+    let (_, header) = X3dhKeyAgreement { identity: alice }
+        .initiate(&bundle)
+        .unwrap();
     let opk_sec = opk.as_ref().map(|o| &o.private_key);
     X3dhKeyAgreement { identity: bob }
         .respond(&header, &spk.private_key, opk_sec)
@@ -519,9 +547,12 @@ fn rekey_message_encrypts_with_current_session() {
     // A rekey message is application-layer content that MUST ride the current
     // Double Ratchet. Pin: encrypt a "rekey" payload over the live session.
     let (mut alice, mut bob) = establish_session_pair();
-    let (h, ct) = alice.encrypt(b"REKEY:new_spk_pubkey").unwrap();
-    let out = bob.decrypt(&h, &ct).unwrap();
-    assert_eq!(out, b"REKEY:new_spk_pubkey", "MUST-024: rekey MUST travel over current session");
+    let (h, ct) = alice.encrypt(b"REKEY:new_spk_pubkey", &[]).unwrap();
+    let out = bob.decrypt(&h, &ct, &[]).unwrap();
+    assert_eq!(
+        out, b"REKEY:new_spk_pubkey",
+        "MUST-024: rekey MUST travel over current session"
+    );
 }
 
 #[clause("PNP-002-MUST-025")]
@@ -531,7 +562,8 @@ fn rekey_receiver_verifies_new_spk_signature() {
     let bob = IdentityKeyPair::generate();
     let spk = SignedPreKey::generate(42, &bob).unwrap();
     let vk = ed25519_dalek::VerifyingKey::from_bytes(&bob.public_key_bytes()).unwrap();
-    spk.verify(&vk).expect("MUST-025: new SPK signature MUST verify");
+    spk.verify(&vk)
+        .expect("MUST-025: new SPK signature MUST verify");
     // Tamper → MUST reject.
     let mut tampered = spk;
     tampered.signature[0] ^= 0xFF;
@@ -547,12 +579,16 @@ fn rekey_cutover_completes_acknowledged() {
     // Bidirectional ratchet exchange emulates the rekey ack — both sides MUST
     // continue decrypting past the cutover.
     let (mut alice, mut bob) = establish_session_pair();
-    let (h1, c1) = alice.encrypt(b"pre").unwrap();
-    assert_eq!(bob.decrypt(&h1, &c1).unwrap(), b"pre");
-    let (h2, c2) = bob.encrypt(b"ack").unwrap();
-    assert_eq!(alice.decrypt(&h2, &c2).unwrap(), b"ack");
-    let (h3, c3) = alice.encrypt(b"post").unwrap();
-    assert_eq!(bob.decrypt(&h3, &c3).unwrap(), b"post", "MUST-026: rekey MUST complete cutover");
+    let (h1, c1) = alice.encrypt(b"pre", &[]).unwrap();
+    assert_eq!(bob.decrypt(&h1, &c1, &[]).unwrap(), b"pre");
+    let (h2, c2) = bob.encrypt(b"ack", &[]).unwrap();
+    assert_eq!(alice.decrypt(&h2, &c2, &[]).unwrap(), b"ack");
+    let (h3, c3) = alice.encrypt(b"post", &[]).unwrap();
+    assert_eq!(
+        bob.decrypt(&h3, &c3, &[]).unwrap(),
+        b"post",
+        "MUST-026: rekey MUST complete cutover"
+    );
 }
 
 #[clause("PNP-002-MUST-027")]
@@ -560,7 +596,10 @@ fn rekey_cutover_completes_acknowledged() {
 fn grace_period_120_seconds_on_old_keys() {
     // Constant pin: 120-second grace period after rekey for in-flight messages.
     const REKEY_GRACE_SECS: u64 = 120;
-    assert_eq!(REKEY_GRACE_SECS, 120, "MUST-027: 120s grace period for old keys");
+    assert_eq!(
+        REKEY_GRACE_SECS, 120,
+        "MUST-027: 120s grace period for old keys"
+    );
 }
 
 // -- §5.4 Stored-key cap — MAX_SKIP -------------------------------------------
@@ -598,7 +637,10 @@ fn concurrent_pending_handshakes_are_limited() {
     // Constant pin: max pending handshakes = 32 per peer (SHOULD-007).
     // The MUST is "implementations MUST limit" — pin via RECOMMENDED ceiling.
     const MAX_PENDING_HANDSHAKES_PER_PEER: usize = 32;
-    assert_eq!(MAX_PENDING_HANDSHAKES_PER_PEER, 32, "MUST-034: MUST limit concurrent pending handshakes");
+    assert_eq!(
+        MAX_PENDING_HANDSHAKES_PER_PEER, 32,
+        "MUST-034: MUST limit concurrent pending handshakes"
+    );
 }
 
 // =============================================================================
