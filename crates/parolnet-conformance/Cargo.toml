@@ -20,6 +20,7 @@ serde_json = { workspace = true }
 ciborium = { workspace = true }
 hex = { workspace = true }
 sha2 = { workspace = true }
+subtle = "2"
 
 [dev-dependencies]
 parolnet-clause = { path = "../parolnet-clause" }
@@ -28,7 +29,7 @@ parolnet-protocol = { workspace = true }
 parolnet-transport = { workspace = true }
 parolnet-mesh = { workspace = true }
 parolnet-relay = { workspace = true }
-parolnet-core = { workspace = true }
+parolnet-core = { workspace = true, features = ["native"] }
 zeroize = { workspace = true }
 proptest = { workspace = true }
 serde = { workspace = true }
@@ -38,5 +39,6 @@ ciborium = { workspace = true }
 hex = { workspace = true }
 tokio = { workspace = true }
 rand = { workspace = true }
+rand_core = { workspace = true }
 x25519-dalek = { workspace = true }
 ed25519-dalek = { workspace = true }
