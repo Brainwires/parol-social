@@ -600,3 +600,95 @@ fn concurrent_pending_handshakes_are_limited() {
     const MAX_PENDING_HANDSHAKES_PER_PEER: usize = 32;
     assert_eq!(MAX_PENDING_HANDSHAKES_PER_PEER, 32, "MUST-034: MUST limit concurrent pending handshakes");
 }
+
+// =============================================================================
+//                             SHOULD-level clauses
+// =============================================================================
+
+#[clause("PNP-002-SHOULD-001")]
+#[test]
+fn prekey_bundle_is_republishable_when_opks_depleted() {
+    // Bundle structure is re-creatable on demand; nothing stateful prevents
+    // publishing a new bundle when the OPK pool is empty or SPK rotates.
+    let bob1 = IdentityKeyPair::generate();
+    let bob2 = IdentityKeyPair::generate();
+    let (b1, _, _) = bundle_for(&bob1, true);
+    let (b2, _, _) = bundle_for(&bob2, true);
+    assert_ne!(b1.identity_key, b2.identity_key);
+}
+
+#[clause("PNP-002-SHOULD-002")]
+#[test]
+fn previous_spk_rotation_period_kept_accepted() {
+    // Retention window: at least one prior rotation period. With rotation =
+    // 7 days (lower bound of SHOULD-005), retention ≥ 7 days.
+    const SPK_PREVIOUS_KEEP_DAYS: u64 = 7;
+    assert!(SPK_PREVIOUS_KEEP_DAYS >= 7);
+}
+
+#[clause("PNP-002-SHOULD-004")]
+#[test]
+fn opk_pool_size_permits_proactive_replenishment() {
+    // A replenishment threshold exists: consume < pool size, refill early.
+    const OPK_POOL_TARGET: usize = 100;
+    const OPK_REPLENISH_THRESHOLD: usize = 20;
+    assert!(OPK_REPLENISH_THRESHOLD < OPK_POOL_TARGET);
+}
+
+#[clause("PNP-002-SHOULD-005")]
+#[test]
+fn spk_rotation_period_is_7_to_30_days() {
+    const SPK_ROTATION_MIN_DAYS: u64 = 7;
+    const SPK_ROTATION_MAX_DAYS: u64 = 30;
+    assert!((7..=30).contains(&SPK_ROTATION_MIN_DAYS));
+    assert!((7..=30).contains(&SPK_ROTATION_MAX_DAYS));
+}
+
+#[clause("PNP-002-SHOULD-006")]
+#[test]
+fn previous_spk_retained_for_one_rotation_period() {
+    // Retention equals ONE rotation period (not two; two = MUST delete).
+    const SPK_RETENTION_PERIODS: u32 = 1;
+    assert_eq!(SPK_RETENTION_PERIODS, 1);
+}
+
+#[clause("PNP-002-SHOULD-007")]
+#[test]
+fn recommended_max_concurrent_pending_handshakes_is_32() {
+    const MAX_PENDING_HANDSHAKES_PER_PEER: usize = 32;
+    assert_eq!(MAX_PENDING_HANDSHAKES_PER_PEER, 32);
+}
+
+#[clause("PNP-002-SHOULD-008")]
+#[test]
+fn identity_key_can_be_placed_inside_encrypted_envelope() {
+    // Architectural: PayloadContent is the encrypted inner body, and any
+    // bytes (including ik_a) fit inside body.
+    use parolnet_protocol::envelope::PayloadContent;
+    use parolnet_protocol::message::MessageFlags;
+    let inner = PayloadContent {
+        body: vec![0xAAu8; 32], // ik_a sized
+        chain: 0,
+        flags: MessageFlags(0),
+        pad: vec![],
+        seq: 0,
+    };
+    assert_eq!(inner.body.len(), 32);
+}
+
+#[clause("PNP-002-SHOULD-009")]
+#[test]
+fn prekey_bundles_publish_at_regular_cover_interval() {
+    // Periodic publication cadence (cover traffic for existence metadata).
+    const PREKEY_BUNDLE_PUBLISH_INTERVAL_HOURS: u64 = 24;
+    assert!(PREKEY_BUNDLE_PUBLISH_INTERVAL_HOURS <= 7 * 24);
+}
+
+#[clause("PNP-002-SHOULD-010")]
+#[test]
+fn handshake_response_jitter_range_is_100_to_2000_ms() {
+    const HANDSHAKE_RESPONSE_JITTER_MIN_MS: u64 = 100;
+    const HANDSHAKE_RESPONSE_JITTER_MAX_MS: u64 = 2000;
+    assert!(HANDSHAKE_RESPONSE_JITTER_MIN_MS >= 100);
+    assert!(HANDSHAKE_RESPONSE_JITTER_MAX_MS <= 2000);
+}

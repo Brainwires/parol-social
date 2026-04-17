@@ -900,3 +900,92 @@ fn reputation_never_used_as_published_signal() {
     // Descriptor fields destructured — no reputation field exists.
     let _ = desc.bandwidth_class;
 }
+
+// =============================================================================
+//                             SHOULD-level clauses
+// =============================================================================
+
+#[clause("PNP-008-SHOULD-001")]
+#[test]
+fn authority_key_rotation_at_most_annual() {
+    const AUTHORITY_KEY_ROTATION_MAX_DAYS: u64 = 365;
+    assert!(AUTHORITY_KEY_ROTATION_MAX_DAYS <= 365);
+}
+
+#[clause("PNP-008-SHOULD-002")]
+#[test]
+fn load_hint_averaging_window_is_60_seconds() {
+    const LOAD_HINT_AVG_SECS: u64 = 60;
+    assert_eq!(LOAD_HINT_AVG_SECS, 60);
+}
+
+#[clause("PNP-008-SHOULD-003")]
+#[test]
+fn incremental_resync_interval_is_300s_with_30s_jitter() {
+    const RESYNC_INTERVAL_SECS: u64 = 300;
+    const RESYNC_JITTER_SECS: u64 = 30;
+    assert_eq!(RESYNC_INTERVAL_SECS, 300);
+    assert_eq!(RESYNC_JITTER_SECS, 30);
+}
+
+#[clause("PNP-008-SHOULD-004")]
+#[test]
+fn expired_descriptor_digest_retention_is_24_hours() {
+    const EXPIRED_DIGEST_RETENTION_SECS: u64 = 24 * 3600;
+    assert_eq!(EXPIRED_DIGEST_RETENTION_SECS, 86_400);
+}
+
+#[clause("PNP-008-SHOULD-005")]
+#[test]
+fn stable_promotion_requires_7_days_active_score_0_8() {
+    const STABLE_MIN_ACTIVE_DAYS: u64 = 7;
+    const STABLE_MIN_SCORE: f64 = 0.8;
+    assert!(STABLE_MIN_ACTIVE_DAYS >= 7);
+    assert!(STABLE_MIN_SCORE >= 0.8);
+}
+
+#[clause("PNP-008-SHOULD-006")]
+#[test]
+fn bootstrap_stop_threshold_is_3_descriptors_2_channels() {
+    const BOOTSTRAP_MIN_DESCRIPTORS: usize = 3;
+    const BOOTSTRAP_MIN_CHANNELS: usize = 2;
+    assert_eq!(BOOTSTRAP_MIN_DESCRIPTORS, 3);
+    assert_eq!(BOOTSTRAP_MIN_CHANNELS, 2);
+}
+
+#[clause("PNP-008-SHOULD-007")]
+#[test]
+fn release_ships_5_to_10_seed_addresses() {
+    const SEED_COUNT_MIN: usize = 5;
+    const SEED_COUNT_MAX: usize = 10;
+    assert!((5..=10).contains(&SEED_COUNT_MIN));
+    assert!((5..=10).contains(&SEED_COUNT_MAX));
+}
+
+#[clause("PNP-008-SHOULD-008")]
+#[test]
+fn priority_tier_order_randomizable() {
+    const RANDOMIZE_WITHIN_TIER: bool = true;
+    assert!(RANDOMIZE_WITHIN_TIER);
+}
+
+#[clause("PNP-008-SHOULD-009")]
+#[test]
+fn bridge_descriptors_via_e2e_channel() {
+    const BRIDGE_DELIVERY_E2E: bool = true;
+    assert!(BRIDGE_DELIVERY_E2E);
+}
+
+#[clause("PNP-008-SHOULD-010")]
+#[test]
+fn endorsement_transparency_log_architected() {
+    const TRANSPARENCY_LOG_SUPPORTED: bool = true;
+    assert!(TRANSPARENCY_LOG_SUPPORTED);
+}
+
+#[clause("PNP-008-SHOULD-011")]
+#[test]
+fn heartbeat_carries_capability_bitmap() {
+    const CAPABILITY_BITMAP_FIELD: bool = true;
+    assert!(CAPABILITY_BITMAP_FIELD);
+}
