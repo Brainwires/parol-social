@@ -1,0 +1,20 @@
+[package]
+name = "xtask"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+description = "Workspace-local tooling: spec-clause coverage, test-vector validation, release helpers."
+
+[[bin]]
+name = "xtask"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+regex = "1"
+walkdir = "2"
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = "1"

@@ -1,0 +1,15 @@
+[package]
+name = "parolnet-clause"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Compile-time #[clause(...)] attribute pinning test functions to PNP specification clause IDs."
+
+[lib]
+proc-macro = true
+
+[dependencies]
+syn = { version = "2", features = ["full", "parsing"] }
+quote = "1"
+proc-macro2 = "1"

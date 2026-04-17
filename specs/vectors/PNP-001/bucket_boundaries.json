@@ -1,0 +1,6 @@
+{
+  "clause": "PNP-001-MUST-011",
+  "description": "253-byte payload + 4-byte length prefix overflows the 256 bucket and MUST select 1024.",
+  "input": { "payload_len": 253 },
+  "expected": { "bucket": 1024 }
+}

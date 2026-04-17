@@ -1,0 +1,38 @@
+[package]
+name = "parolnet-conformance"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Spec-clause-pinned conformance test suite for PNP-001 through PNP-009."
+publish = false
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+parolnet-clause = { path = "../parolnet-clause" }
+parolnet-crypto = { workspace = true }
+parolnet-protocol = { workspace = true }
+serde = { workspace = true }
+serde_bytes = { workspace = true }
+serde_json = { workspace = true }
+ciborium = { workspace = true }
+hex = { workspace = true }
+sha2 = { workspace = true }
+
+[dev-dependencies]
+parolnet-clause = { path = "../parolnet-clause" }
+parolnet-crypto = { workspace = true }
+parolnet-protocol = { workspace = true }
+parolnet-transport = { workspace = true }
+parolnet-mesh = { workspace = true }
+parolnet-relay = { workspace = true }
+proptest = { workspace = true }
+serde = { workspace = true }
+serde_bytes = { workspace = true }
+serde_json = { workspace = true }
+ciborium = { workspace = true }
+hex = { workspace = true }
+tokio = { workspace = true }
+rand = { workspace = true }

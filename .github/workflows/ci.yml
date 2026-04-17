@@ -91,6 +91,30 @@ jobs:
         run: curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
       - run: wasm-pack build crates/parolnet-wasm --target web
 
+  conformance:
+    name: Spec Conformance (clauses + vectors)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-conformance-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-conformance-
+      - name: Conformance test suite
+        run: cargo test -p parolnet-conformance
+      - name: Spec-clause coverage report
+        # `--check` will be added here once Phase 2 reaches 100% MUST coverage.
+        # See FEDERATION-IMPLEMENTATION.md + specs/SPEC-INDEX.md for progress.
+        run: cargo xtask clauses
+      - name: Test-vector validity
+        run: cargo xtask vectors --validate
+
   msrv:
     name: MSRV (1.91.0)
     runs-on: ubuntu-latest

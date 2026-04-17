@@ -1,6 +1,9 @@
 [build]
 rustflags = ["-C", "overflow-checks=yes"]
 
+[alias]
+xtask = "run --manifest-path ./xtask/Cargo.toml --"
+
 [profile.release]
 strip = true
 lto = true
