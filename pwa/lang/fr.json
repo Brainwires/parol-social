@@ -193,6 +193,7 @@
   "settings.default": "Par defaut : {url}",
   "settings.creator": "Createur",
   "settings.member": "Membre",
+  "settings.encryptionDescription": "Chiffre toutes les données locales avec une phrase de passe. Sans cela, toute personne ayant accès à ton appareil peut lire tes messages et tes clés.",
   "settings.dataExportDescription": "Exporte tes donnees sous forme de fichier chiffre.",
 
   "file.attachment": "{fileName}",
@@ -220,6 +221,7 @@
   "confirm.confirmPassword": "Confirme le mot de passe :",
   "confirm.enterImportPassword": "Entre le mot de passe de l'export :",
 
+  "group.createDescription": "Créer un nouveau chat de groupe chiffré.",
   "group.unnamed": "Groupe sans nom",
   "group.noMessages": "Aucun message pour l'instant",
   "group.info": "{memberCount} membres",

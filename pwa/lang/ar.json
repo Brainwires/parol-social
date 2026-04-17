@@ -193,6 +193,7 @@
   "settings.default": "الافتراضي: {url}",
   "settings.creator": "المنشئ",
   "settings.member": "عضو",
+  "settings.encryptionDescription": "شفّر جميع البيانات المحلية بعبارة مرور. بدون ذلك، يمكن لأي شخص لديه وصول إلى جهازك قراءة رسائلك ومفاتيحك.",
   "settings.dataExportDescription": "صدّر بياناتك كملف مشفّر.",
 
   "file.attachment": "{fileName}",
@@ -220,6 +221,7 @@
   "confirm.confirmPassword": "تأكيد كلمة المرور:",
   "confirm.enterImportPassword": "أدخل كلمة مرور ملف التصدير:",
 
+  "group.createDescription": "أنشئ محادثة جماعية مشفّرة جديدة.",
   "group.unnamed": "مجموعة بدون اسم",
   "group.noMessages": "لا توجد رسائل بعد",
   "group.info": "{memberCount} عضو",

@@ -193,6 +193,7 @@
   "settings.default": "မူလ: {url}",
   "settings.creator": "ဖန်တီးသူ",
   "settings.member": "အဖွဲ့ဝင်",
+  "settings.encryptionDescription": "စကားဝှက်ဖြင့် ဒေသတွင်းဒေတာအားလုံးကို ကုဒ်ဝှက်ပါ။ ၎င်းမရှိပါက သင့်စက်ကို ဝင်ရောက်နိုင်သူမည်သူမဆို သင့်မက်ဆေ့ချ်များနှင့် သော့များကို ဖတ်နိုင်ပါသည်။",
   "settings.dataExportDescription": "သင့်ဒေတာကို ကုဒ်ဝှက်ထားသောဖိုင်အဖြစ် ထုတ်ပါ။",
 
   "file.attachment": "{fileName}",
@@ -220,6 +221,7 @@
   "confirm.confirmPassword": "စကားဝှက်အတည်ပြုပါ:",
   "confirm.enterImportPassword": "ထုတ်ယူမှု စကားဝှက်ထည့်ပါ:",
 
+  "group.createDescription": "ကုဒ်ဝှက်ထားသော အဖွဲ့ချက်တင်အသစ်တစ်ခု ဖန်တီးပါ။",
   "group.unnamed": "အမည်မရှိအဖွဲ့",
   "group.noMessages": "မက်ဆေ့ချ်မရှိသေးပါ",
   "group.info": "အဖွဲ့ဝင် {memberCount} ဦး",

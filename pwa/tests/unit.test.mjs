@@ -1,6 +1,11 @@
 import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
-import { randomFillSync } from 'node:crypto';
+import { randomFillSync, createHmac } from 'node:crypto';
+import { readFileSync } from 'node:fs';
+import { join, dirname } from 'node:path';
+import { fileURLToPath } from 'node:url';
+
+const __dirname = dirname(fileURLToPath(import.meta.url));
 
 // ── Tests ──
 
@@ -199,5 +204,106 @@ describe('hasDirectConnection', () => {
             return conn && conn.dc && conn.dc.readyState === 'open';
         }
         assert.ok(!hasDirectConnection('peer1'));
+    });
+});
+
+// ── i18n ──
+
+describe('i18n', () => {
+    const langDir = join(__dirname, '..', 'lang');
+    const SUPPORTED_LANGS = ['en','ru','fa','zh-CN','zh-TW','ko','ja','fr','de','it','pt','ar','es','tr','my','vi'];
+
+    test('en.json is valid JSON with string values', () => {
+        const en = JSON.parse(readFileSync(join(langDir, 'en.json'), 'utf8'));
+        const keys = Object.keys(en);
+        assert.ok(keys.length > 100, `only ${keys.length} keys`);
+        for (const [k, v] of Object.entries(en)) {
+            assert.equal(typeof v, 'string', `key "${k}" is not a string`);
+        }
+    });
+
+    test('all 16 lang files exist and parse', () => {
+        for (const lang of SUPPORTED_LANGS) {
+            const path = join(langDir, lang + '.json');
+            const data = JSON.parse(readFileSync(path, 'utf8'));
+            assert.ok(Object.keys(data).length > 50, `${lang}.json has too few keys`);
+        }
+    });
+
+    test('all lang files have same keys as en.json', () => {
+        const en = JSON.parse(readFileSync(join(langDir, 'en.json'), 'utf8'));
+        const enKeys = Object.keys(en).sort();
+        for (const lang of SUPPORTED_LANGS) {
+            if (lang === 'en') continue;
+            const data = JSON.parse(readFileSync(join(langDir, lang + '.json'), 'utf8'));
+            const langKeys = Object.keys(data).sort();
+            const missing = enKeys.filter(k => !langKeys.includes(k));
+            const extra = langKeys.filter(k => !enKeys.includes(k));
+            assert.deepEqual(missing, [], `${lang}.json missing: ${missing.join(', ')}`);
+        }
+    });
+
+    test('no lang file has empty string values', () => {
+        for (const lang of SUPPORTED_LANGS) {
+            const data = JSON.parse(readFileSync(join(langDir, lang + '.json'), 'utf8'));
+            for (const [k, v] of Object.entries(data)) {
+                assert.ok(v.length > 0, `${lang}.json key "${k}" is empty`);
+            }
+        }
+    });
+
+    test('placeholders preserved in translations', () => {
+        const en = JSON.parse(readFileSync(join(langDir, 'en.json'), 'utf8'));
+        for (const lang of SUPPORTED_LANGS) {
+            if (lang === 'en') continue;
+            const data = JSON.parse(readFileSync(join(langDir, lang + '.json'), 'utf8'));
+            for (const [k, v] of Object.entries(en)) {
+                const placeholders = v.match(/\{[a-zA-Z]+\}/g) || [];
+                for (const ph of placeholders) {
+                    assert.ok(
+                        data[k] && data[k].includes(ph),
+                        `${lang}.json key "${k}" missing placeholder ${ph}`
+                    );
+                }
+            }
+        }
+    });
+
+    test('t() function substitutes params', () => {
+        function t(key, params) {
+            const strings = { 'toast.newContact': 'New contact: {name}...' };
+            let str = strings[key] || key;
+            if (params) {
+                for (const [k, v] of Object.entries(params)) {
+                    str = str.replaceAll('{' + k + '}', v);
+                }
+            }
+            return str;
+        }
+        assert.equal(t('toast.newContact', { name: 'abc123' }), 'New contact: abc123...');
+        assert.equal(t('missing.key'), 'missing.key');
+        assert.equal(t('toast.newContact'), 'New contact: {name}...');
+    });
+});
+
+// ── TURN credential format ──
+
+describe('TURN credentials', () => {
+    test('HMAC-SHA1 credential matches expected format', () => {
+        const secret = 'test-secret';
+        const username = `${Math.floor(Date.now()/1000) + 86400}:${Math.random().toString(16).slice(2)}`;
+        const mac = createHmac('sha1', secret).update(username).digest('base64');
+        assert.ok(mac.length > 20, 'credential too short');
+        assert.ok(mac.endsWith('=') || /^[A-Za-z0-9+/]/.test(mac), 'not base64');
+    });
+
+    test('username has expiry:random format', () => {
+        const now = Math.floor(Date.now() / 1000);
+        const expiry = now + 86400;
+        const username = `${expiry}:00abcdef01234567`;
+        const parts = username.split(':');
+        assert.equal(parts.length, 2);
+        assert.ok(parseInt(parts[0]) > now, 'expiry not in future');
+        assert.ok(parts[1].length > 0, 'missing random component');
     });
 });

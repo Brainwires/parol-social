@@ -17,7 +17,9 @@
     "docker:restart": "docker compose restart",
     "docker:logs": "docker compose logs -f parolnet",
     "docker:shell": "docker compose exec parolnet sh",
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "test": "node --test pwa/tests/unit.test.mjs && node tests/pwa-test.mjs",
+    "test:unit": "node --test pwa/tests/unit.test.mjs",
+    "test:e2e": "node tests/pwa-test.mjs"
   },
   "keywords": [],
   "author": "",

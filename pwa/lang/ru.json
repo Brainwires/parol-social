@@ -193,6 +193,7 @@
   "settings.default": "По умолчанию: {url}",
   "settings.creator": "Создатель",
   "settings.member": "Участник",
+  "settings.encryptionDescription": "Зашифруйте все локальные данные с помощью парольной фразы. Без этого любой, кто получит доступ к вашему устройству, сможет прочитать ваши сообщения и ключи.",
   "settings.dataExportDescription": "Экспортируйте данные в зашифрованный файл.",
 
   "file.attachment": "{fileName}",
@@ -220,6 +221,7 @@
   "confirm.confirmPassword": "Подтвердите пароль:",
   "confirm.enterImportPassword": "Введите пароль экспорта:",
 
+  "group.createDescription": "Создать новый зашифрованный групповой чат.",
   "group.unnamed": "Группа без названия",
   "group.noMessages": "Сообщений пока нет",
   "group.info": "{memberCount} участников",

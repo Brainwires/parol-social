@@ -193,6 +193,7 @@
   "settings.default": "預設：{url}",
   "settings.creator": "建立者",
   "settings.member": "成員",
+  "settings.encryptionDescription": "使用密碼短語加密所有本機資料。如果不啟用此功能，任何能夠存取您裝置的人都可以讀取您的訊息和金鑰。",
   "settings.dataExportDescription": "將資料匯出為加密檔案。",
 
   "file.attachment": "{fileName}",
@@ -220,6 +221,7 @@
   "confirm.confirmPassword": "確認密碼：",
   "confirm.enterImportPassword": "輸入匯出時設定的密碼：",
 
+  "group.createDescription": "建立一個新的加密群組聊天。",
   "group.unnamed": "未命名群組",
   "group.noMessages": "還沒有訊息",
   "group.info": "{memberCount} 位成員",

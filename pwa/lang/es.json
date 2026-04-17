@@ -193,6 +193,7 @@
   "settings.default": "Predeterminado: {url}",
   "settings.creator": "Creador",
   "settings.member": "Miembro",
+  "settings.encryptionDescription": "Cifra todos los datos locales con una frase de contraseña. Sin esto, cualquier persona con acceso a tu dispositivo puede leer tus mensajes y claves.",
   "settings.dataExportDescription": "Exporta tus datos como un archivo cifrado.",
 
   "file.attachment": "{fileName}",
@@ -220,6 +221,7 @@
   "confirm.confirmPassword": "Confirma la contrasena:",
   "confirm.enterImportPassword": "Ingresa la contrasena de la exportacion:",
 
+  "group.createDescription": "Crear un nuevo chat de grupo cifrado.",
   "group.unnamed": "Grupo sin nombre",
   "group.noMessages": "Aun no hay mensajes",
   "group.info": "{memberCount} miembros",

@@ -193,6 +193,7 @@
   "settings.default": "پیش‌فرض: {url}",
   "settings.creator": "سازنده",
   "settings.member": "عضو",
+  "settings.encryptionDescription": "تمام داده‌های محلی را با یک عبارت عبور رمزنگاری کنید. بدون این، هر کسی که به دستگاه شما دسترسی داشته باشد می‌تواند پیام‌ها و کلیدهای شما را بخواند.",
   "settings.dataExportDescription": "داده‌هایتان را به صورت فایل رمزنگاری شده خروجی بگیرید.",
 
   "file.attachment": "{fileName}",
@@ -220,6 +221,7 @@
   "confirm.confirmPassword": "تأیید رمز عبور:",
   "confirm.enterImportPassword": "رمز عبور فایل خروجی را وارد کنید:",
 
+  "group.createDescription": "یک گفتگوی گروهی رمزنگاری شده جدید ایجاد کنید.",
   "group.unnamed": "گروه بدون نام",
   "group.noMessages": "هنوز پیامی نیست",
   "group.info": "{memberCount} عضو",

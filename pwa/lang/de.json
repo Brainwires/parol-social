@@ -193,6 +193,7 @@
   "settings.default": "Standard: {url}",
   "settings.creator": "Ersteller",
   "settings.member": "Mitglied",
+  "settings.encryptionDescription": "Verschlüssele alle lokalen Daten mit einer Passphrase. Ohne diese kann jeder mit Zugriff auf dein Gerät deine Nachrichten und Schlüssel lesen.",
   "settings.dataExportDescription": "Exportiere deine Daten als verschluesselte Datei.",
 
   "file.attachment": "{fileName}",
@@ -220,6 +221,7 @@
   "confirm.confirmPassword": "Passwort bestaetigen:",
   "confirm.enterImportPassword": "Gib das Export-Passwort ein:",
 
+  "group.createDescription": "Einen neuen verschlüsselten Gruppenchat erstellen.",
   "group.unnamed": "Unbenannte Gruppe",
   "group.noMessages": "Noch keine Nachrichten",
   "group.info": "{memberCount} Mitglieder",

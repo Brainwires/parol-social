@@ -193,6 +193,7 @@
   "settings.default": "デフォルト: {url}",
   "settings.creator": "作成者",
   "settings.member": "メンバー",
+  "settings.encryptionDescription": "パスフレーズですべてのローカルデータを暗号化します。これがないと、デバイスにアクセスできる人は誰でもメッセージと鍵を読むことができます。",
   "settings.dataExportDescription": "データを暗号化されたファイルとしてエクスポートします。",
 
   "file.attachment": "{fileName}",
@@ -220,6 +221,7 @@
   "confirm.confirmPassword": "パスワードを確認:",
   "confirm.enterImportPassword": "エクスポート時のパスワードを入力してください:",
 
+  "group.createDescription": "新しい暗号化グループチャットを作成します。",
   "group.unnamed": "名前なしグループ",
   "group.noMessages": "まだメッセージがありません",
   "group.info": "{memberCount}人のメンバー",

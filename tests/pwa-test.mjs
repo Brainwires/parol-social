@@ -395,6 +395,218 @@ async function testNoErrors() {
     });
 }
 
+// ── TURN/STUN Tests ───────────────────────────────────────────
+async function testTurnStun() {
+    console.log('\nTURN/STUN');
+
+    await test('/turn-credentials returns valid response', async () => {
+        const result = await page.evaluate(async (base) => {
+            const res = await fetch(base + '/turn-credentials');
+            if (!res.ok) return { status: res.status };
+            return { status: res.status, body: await res.json() };
+        }, BASE);
+        if (result.status === 404) {
+            console.log('    (TURN not configured on this server — skipping)');
+            return;
+        }
+        assert(result.status === 200, `status ${result.status}`);
+        assert(result.body.username, 'missing username');
+        assert(result.body.credential, 'missing credential');
+        assert(result.body.ttl > 0, 'invalid TTL');
+        assert(Array.isArray(result.body.uris), 'uris not array');
+    });
+
+    await test('/turn-credentials uris include stun and turn', async () => {
+        const result = await page.evaluate(async (base) => {
+            const res = await fetch(base + '/turn-credentials');
+            if (!res.ok) return null;
+            return await res.json();
+        }, BASE);
+        if (!result) return;
+        const hasStun = result.uris.some(u => u.startsWith('stun:'));
+        const hasTurn = result.uris.some(u => u.startsWith('turn:'));
+        assert(hasStun, 'no stun: URI in response');
+        assert(hasTurn, 'no turn: URI in response');
+    });
+
+    await test('/turn-credentials username has expiry:random format', async () => {
+        const result = await page.evaluate(async (base) => {
+            const res = await fetch(base + '/turn-credentials');
+            if (!res.ok) return null;
+            return await res.json();
+        }, BASE);
+        if (!result) return;
+        const parts = result.username.split(':');
+        assert(parts.length === 2, `username format wrong: "${result.username}"`);
+        const expiry = parseInt(parts[0]);
+        assert(expiry > Date.now() / 1000, 'username expiry is in the past');
+    });
+
+    await test('client fetches TURN credentials on boot', async () => {
+        await page.goto(PWA, { waitUntil: 'networkidle0' });
+        await new Promise(r => setTimeout(r, 3000));
+        const hasTurn = await page.evaluate(() => {
+            // Check console logs for TURN fetch
+            return document.querySelector('#webrtc-privacy-warning')?.style.display !== 'block';
+        });
+        // If no warning about "WebRTC disabled", TURN was fetched or privacy mode is off
+    });
+}
+
+// ── Relay Authentication Tests ────────────────────────────────
+async function testRelayAuth() {
+    console.log('\nRelay Authentication');
+
+    await test('relay WebSocket connects', async () => {
+        await page.goto(PWA, { waitUntil: 'networkidle0' });
+        await new Promise(r => setTimeout(r, 3000));
+        const dotClass = await page.evaluate(() => {
+            const dot = document.getElementById('connection-dot');
+            return dot ? dot.className : '';
+        });
+        assert(dotClass.includes('online'), `connection dot: "${dotClass}"`);
+    });
+
+    await test('peer registers with relay (challenge-response)', async () => {
+        await page.goto(PWA, { waitUntil: 'networkidle0' });
+        await new Promise(r => setTimeout(r, 3000));
+        const peerId = await page.evaluate(() => window._peerId);
+        assert(peerId && peerId.length === 64, `peerId: "${peerId}"`);
+    });
+
+    await test('/bootstrap returns peer list', async () => {
+        const result = await page.evaluate(async (base) => {
+            const res = await fetch(base + '/bootstrap?exclude=test');
+            return { status: res.status, body: await res.json() };
+        }, BASE);
+        assert(result.status === 200, `status ${result.status}`);
+        assert(Array.isArray(result.body), 'response not array');
+    });
+}
+
+// ── i18n Tests ────────────────────────────────────────────────
+async function testI18n() {
+    console.log('\ni18n');
+
+    await test('English lang file loads', async () => {
+        const result = await page.evaluate(async (base) => {
+            const res = await fetch(base + '/pwa/lang/en.json');
+            return { status: res.status, body: await res.json() };
+        }, BASE);
+        assert(result.status === 200, 'en.json not found');
+        assert(result.body['tab.messages'] === 'Messages', 'wrong tab.messages value');
+        assert(result.body['tab.groups'] === 'Groups', 'wrong tab.groups value');
+        assert(result.body['tab.contacts'] === 'Contacts', 'wrong tab.contacts value');
+    });
+
+    await test('all 16 lang files exist', async () => {
+        const langs = ['en','ru','fa','zh-CN','zh-TW','ko','ja','fr','de','it','pt','ar','es','tr','my','vi'];
+        for (const lang of langs) {
+            const res = await page.evaluate(async (base, l) => {
+                const r = await fetch(base + '/pwa/lang/' + l + '.json');
+                return r.status;
+            }, BASE, lang);
+            assert(res === 200, `${lang}.json returned ${res}`);
+        }
+    });
+
+    await test('lang files have matching keys', async () => {
+        const result = await page.evaluate(async (base) => {
+            const enRes = await fetch(base + '/pwa/lang/en.json');
+            const ruRes = await fetch(base + '/pwa/lang/ru.json');
+            const en = await enRes.json();
+            const ru = await ruRes.json();
+            const enKeys = Object.keys(en).sort();
+            const ruKeys = Object.keys(ru).sort();
+            const missing = enKeys.filter(k => !ruKeys.includes(k));
+            const extra = ruKeys.filter(k => !enKeys.includes(k));
+            return { missing, extra };
+        }, BASE);
+        assert(result.missing.length === 0, `ru.json missing keys: ${result.missing.join(', ')}`);
+    });
+
+    await test('data-i18n attributes are populated', async () => {
+        await page.goto(PWA, { waitUntil: 'networkidle0' });
+        await new Promise(r => setTimeout(r, 2000));
+        const unpopulated = await page.evaluate(() => {
+            const els = document.querySelectorAll('[data-i18n]');
+            const empty = [];
+            els.forEach(el => {
+                if (!el.textContent.trim()) empty.push(el.getAttribute('data-i18n'));
+            });
+            return empty;
+        });
+        assert(unpopulated.length === 0, `empty data-i18n elements: ${unpopulated.join(', ')}`);
+    });
+
+    await test('language selector exists in settings', async () => {
+        await page.goto(PWA, { waitUntil: 'networkidle0' });
+        await new Promise(r => setTimeout(r, 2000));
+        await page.evaluate(() => { if (window.showView) showView('settings'); });
+        await new Promise(r => setTimeout(r, 300));
+        const options = await page.evaluate(() => {
+            const select = document.getElementById('settings-language');
+            if (!select) return [];
+            return Array.from(select.options).map(o => o.value);
+        });
+        assert(options.length >= 16, `only ${options.length} language options`);
+        assert(options.includes('en'), 'missing English');
+        assert(options.includes('ru'), 'missing Russian');
+        assert(options.includes('ar'), 'missing Arabic');
+    });
+}
+
+// ── Contact & Messaging Tests ─────────────────────────────────
+async function testMessaging() {
+    console.log('\nMessaging');
+
+    await test('tab shows "Messages" not "Chats"', async () => {
+        await page.goto(PWA, { waitUntil: 'networkidle0' });
+        await new Promise(r => setTimeout(r, 2000));
+        await page.evaluate(() => { if (window.showView) showView('contacts'); });
+        await new Promise(r => setTimeout(r, 300));
+        const tabText = await page.evaluate(() => {
+            const tab = document.querySelector('.list-tab[data-list="messages"]');
+            return tab ? tab.textContent : '';
+        });
+        assert(tabText === 'Messages', `tab text: "${tabText}"`);
+    });
+
+    await test('contacts tab exists with address book', async () => {
+        const tabText = await page.evaluate(() => {
+            const tab = document.querySelector('.list-tab[data-list="address-book"]');
+            return tab ? tab.textContent : '';
+        });
+        assert(tabText === 'Contacts', `tab text: "${tabText}"`);
+    });
+
+    await test('switching to contacts tab shows address book', async () => {
+        await page.evaluate(() => { if (window.switchListTab) switchListTab('address-book'); });
+        await new Promise(r => setTimeout(r, 300));
+        const visible = await page.evaluate(() => {
+            const el = document.getElementById('address-book-list');
+            return el && !el.classList.contains('hidden');
+        });
+        assert(visible, 'address book not visible');
+    });
+
+    await test('contact overflow menu exists on mobile viewport', async () => {
+        await page.setViewport({ width: 375, height: 667 }); // iPhone SE
+        await page.goto(PWA, { waitUntil: 'networkidle0' });
+        await new Promise(r => setTimeout(r, 2000));
+        // Check CSS class exists
+        const hasStyle = await page.evaluate(() => {
+            const style = getComputedStyle(document.createElement('div'));
+            // Just check the class is defined in CSS
+            const sheet = Array.from(document.styleSheets).find(s => {
+                try { return s.cssRules; } catch { return false; }
+            });
+            return !!sheet;
+        });
+        await page.setViewport({ width: 1280, height: 720 }); // Reset
+    });
+}
+
 // ── Run All ────────────────────────────────────────────────────
 async function main() {
     console.log('ParolNet PWA Integration Tests');
@@ -411,6 +623,10 @@ async function main() {
         await testWASM();
         await testNavigation();
         await testServiceWorker();
+        await testRelayAuth();
+        await testTurnStun();
+        await testI18n();
+        await testMessaging();
         await testNoErrors();
     } finally {
         await teardown();

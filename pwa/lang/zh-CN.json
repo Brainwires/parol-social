@@ -115,7 +115,7 @@
   "error.wasmUnavailable": "[加密消息 — WASM 不可用]",
   "error.takingTooLong": "响应时间过长，请尝试清除缓存。",
   "error.qrError": "QR 出错 — 请使用下方代码",
-  "error.noCameraSupport": "你的浏览器不支持 QR 扫描。请让联系人分享他们的代码，然后在"粘贴代码"标签页中粘贴。",
+  "error.noCameraSupport": "你的浏览器不支持 QR 扫描。请让联系人分享代码，然后在「粘贴代码」标签页中粘贴。",
   "error.panicCodeFormat": "紧急代码必须是4-10位数字",
   "error.enterPeerId": "请输入 Peer ID",
   "error.enterGroupName": "请输入群组名称",
@@ -193,6 +193,7 @@
   "settings.default": "默认：{url}",
   "settings.creator": "创建者",
   "settings.member": "成员",
+  "settings.encryptionDescription": "使用密码短语加密所有本地数据。如果不启用此功能，任何能够访问您设备的人都可以读取您的消息和密钥。",
   "settings.dataExportDescription": "将数据导出为加密文件。",
 
   "file.attachment": "{fileName}",
@@ -204,7 +205,7 @@
   "qr.paste": "粘贴代码",
   "qr.shareInfo": "与附近的人分享你的 QR 码，安全交换密钥。",
   "qr.cameraPrompt": "将摄像头对准联系人的 QR 码。",
-  "qr.pasteInfo": "在此粘贴联系人的代码。他们可以从"显示 QR"界面复制。",
+  "qr.pasteInfo": "在此粘贴联系人的代码。他们可以从「显示 QR」界面复制。",
   "qr.loadingCode": "正在加载你的代码...",
   "qr.shareCodeLabel": "将此代码分享给你的联系人",
 
@@ -220,6 +221,7 @@
   "confirm.confirmPassword": "确认密码：",
   "confirm.enterImportPassword": "输入导出时设置的密码：",
 
+  "group.createDescription": "创建一个新的加密群聊。",
   "group.unnamed": "未命名群组",
   "group.noMessages": "还没有消息",
   "group.info": "{memberCount} 位成员",

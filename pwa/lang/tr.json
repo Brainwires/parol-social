@@ -193,6 +193,7 @@
   "settings.default": "Varsayılan: {url}",
   "settings.creator": "Oluşturucu",
   "settings.member": "Üye",
+  "settings.encryptionDescription": "Tüm yerel verileri bir parola ile şifreleyin. Bu olmadan, cihazınıza erişimi olan herkes mesajlarınızı ve anahtarlarınızı okuyabilir.",
   "settings.dataExportDescription": "Verilerinizi şifreli bir dosya olarak dışa aktarın.",
 
   "file.attachment": "{fileName}",
@@ -220,6 +221,7 @@
   "confirm.confirmPassword": "Şifreyi onaylayın:",
   "confirm.enterImportPassword": "Dışa aktarma şifresini girin:",
 
+  "group.createDescription": "Yeni bir şifreli grup sohbeti oluşturun.",
   "group.unnamed": "Adsız Grup",
   "group.noMessages": "Henüz mesaj yok",
   "group.info": "{memberCount} üye",
