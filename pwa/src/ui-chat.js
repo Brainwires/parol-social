@@ -14,6 +14,15 @@ import { initWebRTC, hasDirectConnection, sendViaWebRTC, rtcConnections,
 import { sendToRelay, connMgr, queueMessage } from './connection.js';
 import { t } from './i18n.js';
 
+// ── Session Persistence ──────────────────────────────────
+function persistSessions() {
+    if (!wasm || !wasm.export_sessions) return;
+    try {
+        const blob = wasm.export_sessions();
+        if (blob) dbPut('settings', { key: 'sessions_blob', value: blob });
+    } catch(e) { console.warn('Session persist failed:', e.message); }
+}
+
 // ── Contact List ────────────────────────────────────────────
 export async function loadContacts() {
     try {
@@ -216,6 +225,7 @@ export async function sendMessage() {
         const encoder = new TextEncoder();
         const plainBytes = encoder.encode(text);
         const encrypted = wasm.encrypt_message(currentPeerId, plainBytes);
+        persistSessions();
         const hexPayload = Array.from(encrypted).map(b => b.toString(16).padStart(2, '0')).join('');
         const encPayload = 'enc:' + hexPayload;
         relayPayload = encPayload;
@@ -614,6 +624,7 @@ function handleScannedQR(data) {
             bootstrapSecret = result.bootstrap_secret;
             sessionEstablished = true;
             console.log('[QR] Session established with:', peerId.slice(0, 8));
+            persistSessions();
         } catch(e) {
             console.warn('[QR] process_scanned_qr failed:', e);
         }

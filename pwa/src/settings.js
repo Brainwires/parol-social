@@ -106,7 +106,16 @@ export async function handleExportData() {
             console.warn('Could not export identity key:', e);
         }
 
-        const encrypted = await exportData({ stores, identity }, password);
+        let sessions = null;
+        try {
+            if (wasm && wasm.export_sessions) {
+                sessions = wasm.export_sessions();
+            }
+        } catch (e) {
+            console.warn('Could not export sessions:', e);
+        }
+
+        const encrypted = await exportData({ stores, identity, sessions }, password);
 
         const blob = new Blob([encrypted], { type: 'application/octet-stream' });
         const url = URL.createObjectURL(blob);
@@ -169,6 +178,15 @@ export async function handleImportData() {
                 } catch (e) {
                     console.warn('Could not restore identity key:', e);
                     showToast('Warning: Identity key restore failed');
+                }
+            }
+
+            if (data.sessions && wasm && wasm.import_sessions) {
+                try {
+                    wasm.import_sessions(data.sessions);
+                    await dbPut('settings', { key: 'sessions_blob', value: data.sessions });
+                } catch (e) {
+                    console.warn('Could not restore sessions:', e);
                 }
             }
 

@@ -110,6 +110,159 @@ impl DoubleRatchetSession {
             .map(|s| *PublicKey::from(s).as_bytes())
     }
 
+    /// Export session state as bytes for persistence.
+    ///
+    /// Format: version(1) || root_key(32) || send_ck_flag(1) [|| send_ck(32)]
+    ///   || recv_ck_flag(1) [|| recv_ck(32)] || dh_self_flag(1) [|| dh_self(32)]
+    ///   || dh_remote_flag(1) [|| dh_remote(32)] || send_n(4) || recv_n(4)
+    ///   || previous_send_n(4) || skipped_count(4)
+    ///   || [ratchet_key(32) || msg_num(4) || msg_key(32)]...
+    pub fn export_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(200);
+        out.push(0x01); // version
+        out.extend_from_slice(&self.root_key);
+
+        // Optional fields: flag byte then 32 bytes if present
+        if let Some(ref ck) = self.send_chain_key {
+            out.push(1);
+            out.extend_from_slice(ck);
+        } else {
+            out.push(0);
+        }
+
+        if let Some(ref ck) = self.recv_chain_key {
+            out.push(1);
+            out.extend_from_slice(ck);
+        } else {
+            out.push(0);
+        }
+
+        if let Some(ref secret) = self.dh_self {
+            out.push(1);
+            out.extend_from_slice(&secret.to_bytes());
+        } else {
+            out.push(0);
+        }
+
+        if let Some(ref pk) = self.dh_remote {
+            out.push(1);
+            out.extend_from_slice(pk.as_bytes());
+        } else {
+            out.push(0);
+        }
+
+        out.extend_from_slice(&self.send_n.to_be_bytes());
+        out.extend_from_slice(&self.recv_n.to_be_bytes());
+        out.extend_from_slice(&self.previous_send_n.to_be_bytes());
+
+        let count = self.skipped_keys.len() as u32;
+        out.extend_from_slice(&count.to_be_bytes());
+        for ((rk, n), mk) in &self.skipped_keys {
+            out.extend_from_slice(rk);
+            out.extend_from_slice(&n.to_be_bytes());
+            out.extend_from_slice(mk);
+        }
+
+        out
+    }
+
+    /// Import session state from bytes produced by `export_bytes`.
+    pub fn import_bytes(data: &[u8]) -> Result<Self, CryptoError> {
+        let err = || CryptoError::RatchetError {
+            reason: "invalid session export data".into(),
+        };
+
+        if data.is_empty() || data[0] != 0x01 {
+            return Err(err());
+        }
+
+        let mut pos = 1;
+
+        // Helper to read exactly 32 bytes
+        let read_32 = |pos: &mut usize| -> Result<[u8; 32], CryptoError> {
+            if *pos + 32 > data.len() {
+                return Err(err());
+            }
+            let mut buf = [0u8; 32];
+            buf.copy_from_slice(&data[*pos..*pos + 32]);
+            *pos += 32;
+            Ok(buf)
+        };
+
+        let read_4 = |pos: &mut usize| -> Result<u32, CryptoError> {
+            if *pos + 4 > data.len() {
+                return Err(err());
+            }
+            let val = u32::from_be_bytes(data[*pos..*pos + 4].try_into().map_err(|_| err())?);
+            *pos += 4;
+            Ok(val)
+        };
+
+        let read_flag = |pos: &mut usize| -> Result<bool, CryptoError> {
+            if *pos >= data.len() {
+                return Err(err());
+            }
+            let flag = data[*pos] != 0;
+            *pos += 1;
+            Ok(flag)
+        };
+
+        let root_key = read_32(&mut pos)?;
+
+        let send_chain_key = if read_flag(&mut pos)? {
+            Some(read_32(&mut pos)?)
+        } else {
+            None
+        };
+
+        let recv_chain_key = if read_flag(&mut pos)? {
+            Some(read_32(&mut pos)?)
+        } else {
+            None
+        };
+
+        let dh_self = if read_flag(&mut pos)? {
+            Some(StaticSecret::from(read_32(&mut pos)?))
+        } else {
+            None
+        };
+
+        let dh_remote = if read_flag(&mut pos)? {
+            Some(PublicKey::from(read_32(&mut pos)?))
+        } else {
+            None
+        };
+
+        let send_n = read_4(&mut pos)?;
+        let recv_n = read_4(&mut pos)?;
+        let previous_send_n = read_4(&mut pos)?;
+
+        let skip_count = read_4(&mut pos)? as usize;
+        if skip_count > MAX_SKIP as usize {
+            return Err(err());
+        }
+
+        let mut skipped_keys = HashMap::with_capacity(skip_count);
+        for _ in 0..skip_count {
+            let rk = read_32(&mut pos)?;
+            let n = read_4(&mut pos)?;
+            let mk = read_32(&mut pos)?;
+            skipped_keys.insert((rk, n), mk);
+        }
+
+        Ok(Self {
+            root_key,
+            send_chain_key,
+            recv_chain_key,
+            dh_self,
+            dh_remote,
+            send_n,
+            recv_n,
+            previous_send_n,
+            skipped_keys,
+        })
+    }
+
     /// Perform a DH ratchet step when receiving a new ratchet public key.
     fn dh_ratchet(&mut self, new_remote_key: &[u8; 32]) -> Result<(), CryptoError> {
         let dh_remote = PublicKey::from(*new_remote_key);
@@ -396,5 +549,55 @@ mod tests {
         let (_, ct1) = alice1.encrypt(b"same message").unwrap();
         let (_, ct2) = alice2.encrypt(b"same message").unwrap();
         assert_ne!(ct1, ct2); // different session keys
+    }
+
+    #[test]
+    fn test_export_import_roundtrip() {
+        let (mut alice, mut bob) = setup_session_pair();
+
+        // Exchange some messages to advance ratchet state
+        let (h1, ct1) = alice.encrypt(b"hello").unwrap();
+        bob.decrypt(&h1, &ct1).unwrap();
+        let (h2, ct2) = bob.encrypt(b"world").unwrap();
+        alice.decrypt(&h2, &ct2).unwrap();
+
+        // Export Alice's session
+        let exported = alice.export_bytes();
+
+        // Import into new session
+        let mut alice2 = DoubleRatchetSession::import_bytes(&exported).unwrap();
+
+        // Alice2 should be able to send and Bob should decrypt
+        let (h3, ct3) = alice2.encrypt(b"after restore").unwrap();
+        let pt3 = bob.decrypt(&h3, &ct3).unwrap();
+        assert_eq!(pt3, b"after restore");
+    }
+
+    #[test]
+    fn test_export_import_with_skipped_keys() {
+        let (mut alice, mut bob) = setup_session_pair();
+
+        // Alice sends 3 messages
+        let (h1, ct1) = alice.encrypt(b"msg1").unwrap();
+        let (h2, ct2) = alice.encrypt(b"msg2").unwrap();
+        let (h3, ct3) = alice.encrypt(b"msg3").unwrap();
+
+        // Bob receives msg3 first (skips 1 and 2)
+        bob.decrypt(&h3, &ct3).unwrap();
+
+        // Export Bob with skipped keys
+        let exported = bob.export_bytes();
+        let mut bob2 = DoubleRatchetSession::import_bytes(&exported).unwrap();
+
+        // Bob2 should still decrypt skipped messages
+        assert_eq!(bob2.decrypt(&h1, &ct1).unwrap(), b"msg1");
+        assert_eq!(bob2.decrypt(&h2, &ct2).unwrap(), b"msg2");
+    }
+
+    #[test]
+    fn test_import_invalid_data() {
+        assert!(DoubleRatchetSession::import_bytes(&[]).is_err());
+        assert!(DoubleRatchetSession::import_bytes(&[0x02]).is_err()); // wrong version
+        assert!(DoubleRatchetSession::import_bytes(&[0x01]).is_err()); // truncated
     }
 }

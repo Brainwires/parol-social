@@ -15,6 +15,15 @@ import { sendToRelay, discoverPeers, startDiscoveryInterval, connMgr } from './c
 import { loadContacts, appendMessage, answerIncomingCall, loadAddressBook } from './ui-chat.js';
 import { t } from './i18n.js';
 
+// ── Session Persistence ──────────────────────────────────
+function persistSessions() {
+    if (!wasm || !wasm.export_sessions) return;
+    try {
+        const blob = wasm.export_sessions();
+        if (blob) dbPut('settings', { key: 'sessions_blob', value: blob });
+    } catch(e) { console.warn('Session persist failed:', e.message); }
+}
+
 // ── Relay Message Handling ────────────────────────────────
 export function handleRelayMessage(msg) {
     switch (msg.type) {
@@ -980,6 +989,7 @@ export function onIncomingMessage(fromPeerId, payload) {
                 try {
                     const result = wasm.complete_bootstrap_as_presenter(theirIkHex);
                     console.log('[Bootstrap] Responder session established for:', result.peer_id);
+                    persistSessions();
                     dbPut('contacts', {
                         peerId: result.peer_id,
                         name: result.peer_id.slice(0, 8) + '...',
@@ -1007,6 +1017,7 @@ export function onIncomingMessage(fromPeerId, payload) {
                 const hexCiphertext = payload.slice(4);
                 const cipherBytes = new Uint8Array(hexCiphertext.match(/.{1,2}/g).map(b => parseInt(b, 16)));
                 const plainBytes = wasm.decrypt_message(fromPeerId, cipherBytes);
+                persistSessions();
                 const decoder = new TextDecoder();
                 messageText = decoder.decode(plainBytes);
             } catch (e) {

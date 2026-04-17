@@ -283,6 +283,63 @@ pub fn session_count() -> u32 {
         .unwrap_or(0)
 }
 
+/// Export all Double Ratchet sessions as a JSON string.
+///
+/// Returns `{"<peer_id_hex>": "<session_bytes_hex>", ...}` or empty string if no sessions.
+#[wasm_bindgen]
+pub fn export_sessions() -> Result<String, JsError> {
+    let state = STATE.lock().unwrap_or_else(|e| e.into_inner());
+    let client = state
+        .client
+        .as_ref()
+        .ok_or_else(|| JsError::new("not initialized"))?;
+
+    let pairs = client.export_sessions();
+    if pairs.is_empty() {
+        return Ok(String::new());
+    }
+
+    let map: std::collections::HashMap<String, String> = pairs
+        .into_iter()
+        .map(|(pid, data)| (hex::encode(pid), hex::encode(data)))
+        .collect();
+
+    serde_json::to_string(&map).map_err(|e| JsError::new(&format!("serialize: {e}")))
+}
+
+/// Import sessions from a JSON string previously produced by `export_sessions`.
+///
+/// Returns the number of sessions restored.
+#[wasm_bindgen]
+pub fn import_sessions(json_data: &str) -> Result<u32, JsError> {
+    if json_data.is_empty() {
+        return Ok(0);
+    }
+
+    let map: std::collections::HashMap<String, String> =
+        serde_json::from_str(json_data).map_err(|e| JsError::new(&format!("parse: {e}")))?;
+
+    let mut pairs = Vec::with_capacity(map.len());
+    for (pid_hex, data_hex) in &map {
+        let pid = decode_32(pid_hex)?;
+        let data =
+            hex::decode(data_hex).map_err(|e| JsError::new(&format!("invalid hex: {e}")))?;
+        pairs.push((pid, data));
+    }
+
+    let state = STATE.lock().unwrap_or_else(|e| e.into_inner());
+    let client = state
+        .client
+        .as_ref()
+        .ok_or_else(|| JsError::new("not initialized"))?;
+
+    let count = client
+        .import_sessions(pairs)
+        .map_err(|e| JsError::new(&format!("{e}")))?;
+
+    Ok(count as u32)
+}
+
 // ── Call Management ─────────────────────────────────────────
 
 /// Start an outgoing call to a peer. Returns the call_id as hex.

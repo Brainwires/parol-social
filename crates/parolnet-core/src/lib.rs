@@ -273,6 +273,19 @@ impl ParolNet {
         &self.group_file_manager
     }
 
+    /// Export all session state for persistence.
+    pub fn export_sessions(&self) -> Vec<([u8; 32], Vec<u8>)> {
+        self.sessions.export_all()
+    }
+
+    /// Restore sessions from previously exported state. Returns count restored.
+    pub fn import_sessions(
+        &self,
+        data: Vec<([u8; 32], Vec<u8>)>,
+    ) -> Result<usize, CoreError> {
+        self.sessions.import_all(data)
+    }
+
     /// Get the number of active sessions.
     pub fn session_count(&self) -> usize {
         self.sessions.session_count()

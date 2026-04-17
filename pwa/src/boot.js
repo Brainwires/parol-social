@@ -98,6 +98,17 @@ async function onWasmReady() {
     }
     window._peerId = peerId || null;
 
+    // Restore Double Ratchet sessions
+    try {
+        const savedSessions = await dbGet('settings', 'sessions_blob');
+        if (savedSessions && savedSessions.value && wasm.import_sessions) {
+            const count = wasm.import_sessions(savedSessions.value);
+            console.log('Sessions restored:', count);
+        }
+    } catch(e) {
+        console.warn('Session restore skipped:', e.message);
+    }
+
     if (wasm.get_peer_id) {
         const peerId = wasm.get_peer_id();
         window._peerId = peerId || window._peerId;
