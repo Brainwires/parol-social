@@ -120,6 +120,27 @@ fn envelope_flow_tampered_cleartext_header_fails_aead() {
     );
 }
 
+// -- §5 — sender anonymity (source_hint default-null) -------------------------
+
+#[clause("PNP-001-SHOULD-003")]
+#[test]
+fn envelope_flow_omits_source_hint_by_default() {
+    // H9 sealed-sender invariant: the high-level envelope helper MUST build
+    // every outbound CleartextHeader with source_hint = None unless callers
+    // explicitly opt in. Relay operators (and passive WSS observers) do not
+    // need sender identity to route messages — deliverability uses the outer
+    // transport-layer `to` field. Setting source_hint here would hand the
+    // relay a social graph for free.
+    let (mut alice, mut bob) = session_pair();
+    let dest = PeerId([0x55u8; 32]);
+    let wire = encrypt_into_envelope(&mut alice, &dest, 0x01, b"anon", 1_700_000_000).unwrap();
+    let decoded = decrypt_from_envelope(&mut bob, &wire).unwrap();
+    assert!(
+        decoded.source_hint.is_none(),
+        "SHOULD-003: encrypt_into_envelope MUST default source_hint to None"
+    );
+}
+
 // -- §3.6 — bucket selection boundary -----------------------------------------
 
 #[clause("PNP-001-MUST-013")]
