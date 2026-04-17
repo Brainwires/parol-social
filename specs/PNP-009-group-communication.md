@@ -433,13 +433,13 @@ GroupFileOffer = {
   "group_id"   : bstr(32),          -- Target group
   "file_name"  : tstr,              -- Original file name (UTF-8)
   "file_size"  : uint64,            -- Total file size in bytes
-  "chunk_size" : uint32,            -- Chunk size in bytes (default 32768)
+  "chunk_size" : uint32,            -- Chunk size in bytes (default 4096, matches PNP-007 §11.1)
   "sha256"     : bstr(32)           -- SHA-256 hash of the complete plaintext file
 }
 ```
 
 1. The `file_id` MUST be cryptographically random and unique per transfer. **PNP-009-MUST-062**
-2. The `chunk_size` MUST default to 32768 bytes (32 KiB). **PNP-009-MUST-063**
+2. The `chunk_size` MUST default to 4096 bytes, matching PNP-007 §11.1 so group file chunks fit within the 4096-byte PNP-001 envelope bucket. **PNP-009-MUST-063**
 3. The `sha256` hash MUST be computed over the plaintext file content before any chunking or encryption. **PNP-009-MUST-064**
 
 ### 10.2 File Chunks

@@ -28,6 +28,8 @@ parolnet-protocol = { workspace = true }
 parolnet-transport = { workspace = true }
 parolnet-mesh = { workspace = true }
 parolnet-relay = { workspace = true }
+parolnet-core = { workspace = true }
+zeroize = { workspace = true }
 proptest = { workspace = true }
 serde = { workspace = true }
 serde_bytes = { workspace = true }
