@@ -13,4 +13,5 @@ services:
     volumes:
       - /etc/letsencrypt/live/biscuits.parol.social:/etc/turn-certs:ro
       - /etc/letsencrypt/archive/biscuits.parol.social:/etc/letsencrypt/archive/biscuits.parol.social:ro
+      - /var/log/turnserver:/var/log/turnserver
     restart: unless-stopped
