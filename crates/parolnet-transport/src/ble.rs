@@ -12,11 +12,14 @@ use crate::TransportError;
 use async_trait::async_trait;
 use std::net::SocketAddr;
 
-/// ParolNet BLE service UUID (derived from "parolnet" namespace).
-pub const SERVICE_UUID: &str = "550e8400-e29b-41d4-a716-446655440000";
+/// ParolNet BLE service UUID (PNP-003 §5.7, PNP-003-MUST-035).
+pub const SERVICE_UUID: &str = "b51e4c00-50ef-4e6c-9a83-d2b4f0ae1c01";
 
-/// ParolNet BLE characteristic UUID for message exchange.
-pub const CHARACTERISTIC_UUID: &str = "550e8400-e29b-41d4-a716-446655440001";
+/// ParolNet BLE characteristic UUID for QR-payload exchange (PNP-003 §5.7).
+pub const CHARACTERISTIC_UUID: &str = "b51e4c00-50ef-4e6c-9a83-d2b4f0ae1c02";
+
+/// ParolNet BLE characteristic UUID for bootstrap handshake (PNP-003 §5.7).
+pub const HANDSHAKE_CHARACTERISTIC_UUID: &str = "b51e4c00-50ef-4e6c-9a83-d2b4f0ae1c03";
 
 /// Maximum BLE MTU for data transfer (typical negotiated MTU minus overhead).
 pub const BLE_MTU: usize = 244;
