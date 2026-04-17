@@ -215,5 +215,10 @@
   "btn.verifyIdentity": "Identität überprüfen",
   "heading.verifyIdentity": "Identität überprüfen",
   "safety.intro": "Vergleiche diese Ziffern mit deinem Kontakt über einen vertrauenswürdigen Kanal (Telefonat, persönlich). Wenn beide Bildschirme dieselbe Zahl zeigen, hat niemand beim Aufbau deiner Sitzung Schlüssel ausgetauscht.",
-  "safety.note": "Wenn die Zahlen abweichen, fängt möglicherweise jemand deine Nachrichten ab. Füge den Kontakt über einen neuen QR-Code von einem vertrauenswürdigen Gerät erneut hinzu."
+  "safety.note": "Wenn die Zahlen abweichen, fängt möglicherweise jemand deine Nachrichten ab. Füge den Kontakt über einen neuen QR-Code von einem vertrauenswürdigen Gerät erneut hinzu.",
+  "settings.duressTitle": "Zwangs-Passphrase",
+  "settings.duressDescription": "Lege eine separate Passphrase fest, die beim Entsperren alle Daten unbemerkt loscht. Nur unter Zwang verwenden — die App wirkt, als wurde sie normal entsperrt, zerstort aber sofort jede Nachricht, jeden Kontakt und jeden Schlussel.",
+  "settings.duressVerifyPlaceholder": "Aktuelle Passphrase",
+  "settings.duressPlaceholder": "Zwangs-Passphrase",
+  "toast.duressCodeUpdated": "Zwangs-Passphrase gespeichert"
 }

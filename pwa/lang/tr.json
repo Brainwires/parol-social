@@ -215,5 +215,10 @@
   "btn.verifyIdentity": "Kimliği doğrula",
   "heading.verifyIdentity": "Kimliği doğrula",
   "safety.intro": "Bu rakamları kişinle güvendiğin bir kanal (telefon görüşmesi, yüz yüze) üzerinden karşılaştır. İki ekranda da aynı sayı görünüyorsa, oturum kurulurken kimse anahtarları değiştirmemiştir.",
-  "safety.note": "Sayılar farklıysa biri mesajlarını dinliyor olabilir. Kişiyi güvendiğin bir cihazdaki yeni bir QR koduyla tekrar ekle."
+  "safety.note": "Sayılar farklıysa biri mesajlarını dinliyor olabilir. Kişiyi güvendiğin bir cihazdaki yeni bir QR koduyla tekrar ekle.",
+  "settings.duressTitle": "Zorlama parolası",
+  "settings.duressDescription": "Kilit açılırken yazıldığında tüm verileri sessizce silen ayrı bir parola belirleyin. Yalnızca zorlama altında kullanın — uygulama normal şekilde kilit açıyor gibi görünecek ama her mesajı, kişiyi ve anahtarı anında yok edecek.",
+  "settings.duressVerifyPlaceholder": "Mevcut parola",
+  "settings.duressPlaceholder": "Zorlama parolası",
+  "toast.duressCodeUpdated": "Zorlama parolası kaydedildi"
 }

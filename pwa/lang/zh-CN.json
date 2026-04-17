@@ -215,5 +215,10 @@
   "btn.verifyIdentity": "验证身份",
   "heading.verifyIdentity": "验证身份",
   "safety.intro": "通过你信任的渠道（电话、当面）与对方核对这些数字。如果两个屏幕上显示的数字相同，说明会话建立时没有人替换密钥。",
-  "safety.note": "如果数字不同，可能有人在拦截你的消息。请从可信设备用新的二维码重新添加联系人。"
+  "safety.note": "如果数字不同，可能有人在拦截你的消息。请从可信设备用新的二维码重新添加联系人。",
+  "settings.duressTitle": "胁迫密码短语",
+  "settings.duressDescription": "设置一个单独的密码短语，在解锁时输入它会静默擦除所有数据。仅在被胁迫时使用——应用看起来会正常解锁，但会立即销毁所有消息、联系人和密钥。",
+  "settings.duressVerifyPlaceholder": "当前密码短语",
+  "settings.duressPlaceholder": "胁迫密码短语",
+  "toast.duressCodeUpdated": "胁迫密码短语已保存"
 }

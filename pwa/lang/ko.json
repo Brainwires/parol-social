@@ -215,5 +215,10 @@
   "btn.verifyIdentity": "신원 확인",
   "heading.verifyIdentity": "신원 확인",
   "safety.intro": "신뢰할 수 있는 채널(전화 통화, 직접 만남)을 통해 상대방과 이 숫자를 비교하세요. 두 화면에 같은 숫자가 표시되면, 세션 설정 시 누구도 키를 바꿔치기하지 않은 것입니다.",
-  "safety.note": "숫자가 다르면 누군가 메시지를 가로채고 있을 수 있습니다. 신뢰할 수 있는 기기에서 새 QR 코드를 사용해 연락처를 다시 추가하세요."
+  "safety.note": "숫자가 다르면 누군가 메시지를 가로채고 있을 수 있습니다. 신뢰할 수 있는 기기에서 새 QR 코드를 사용해 연락처를 다시 추가하세요.",
+  "settings.duressTitle": "강요 시 암호문",
+  "settings.duressDescription": "잠금 해제 시 입력하면 모든 데이터를 조용히 삭제하는 별도의 암호문을 설정합니다. 강요받을 때만 사용하세요——앱은 정상적으로 잠금 해제된 것처럼 보이지만 즉시 모든 메시지, 연락처, 키를 파괴합니다.",
+  "settings.duressVerifyPlaceholder": "현재 암호문",
+  "settings.duressPlaceholder": "강요 시 암호문",
+  "toast.duressCodeUpdated": "강요 시 암호문이 저장되었습니다"
 }

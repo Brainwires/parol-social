@@ -215,5 +215,10 @@
   "btn.verifyIdentity": "Verifier identite",
   "heading.verifyIdentity": "Verifier identite",
   "safety.intro": "Compare ces chiffres avec ton contact par un canal de confiance (appel telephonique, en personne). Si les deux ecrans affichent le meme nombre, personne n a substitue de cles lors de l etablissement de ta session.",
-  "safety.note": "Si les nombres different, quelqu un pourrait intercepter tes messages. Ajoute a nouveau le contact avec un nouveau QR depuis un appareil de confiance."
+  "safety.note": "Si les nombres different, quelqu un pourrait intercepter tes messages. Ajoute a nouveau le contact avec un nouveau QR depuis un appareil de confiance.",
+  "settings.duressTitle": "Phrase de contrainte",
+  "settings.duressDescription": "Definis une phrase de passe distincte qui efface silencieusement toutes les donnees quand elle est saisie au deverrouillage. A utiliser uniquement sous la contrainte — l'appli semblera se deverrouiller normalement mais detruira aussitot chaque message, contact et cle.",
+  "settings.duressVerifyPlaceholder": "Phrase de passe actuelle",
+  "settings.duressPlaceholder": "Phrase de contrainte",
+  "toast.duressCodeUpdated": "Phrase de contrainte enregistree"
 }

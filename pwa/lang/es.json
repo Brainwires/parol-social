@@ -215,5 +215,10 @@
   "btn.verifyIdentity": "Verificar identidad",
   "heading.verifyIdentity": "Verificar identidad",
   "safety.intro": "Compara estos digitos con tu contacto por un canal de confianza (llamada telefonica, en persona). Si ambas pantallas muestran el mismo numero, nadie sustituyo las claves al establecer tu sesion.",
-  "safety.note": "Si los numeros son distintos, alguien podria estar interceptando tus mensajes. Vuelve a anadir el contacto con un codigo QR nuevo desde un dispositivo de confianza."
+  "safety.note": "Si los numeros son distintos, alguien podria estar interceptando tus mensajes. Vuelve a anadir el contacto con un codigo QR nuevo desde un dispositivo de confianza.",
+  "settings.duressTitle": "Frase de coaccion",
+  "settings.duressDescription": "Configura una frase de contraseña distinta que borra silenciosamente todos los datos al ingresarla en el desbloqueo. Usala solo bajo coaccion — la app parecera desbloquearse normalmente pero destruira de inmediato cada mensaje, contacto y clave.",
+  "settings.duressVerifyPlaceholder": "Frase de contraseña actual",
+  "settings.duressPlaceholder": "Frase de coaccion",
+  "toast.duressCodeUpdated": "Frase de coaccion guardada"
 }

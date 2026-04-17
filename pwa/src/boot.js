@@ -26,7 +26,8 @@ import {
 } from './ui-chat.js';
 import {
     openSettings, enableDecoyMode, executePanicWipe, enableEncryption,
-    handleExportData, handleImportData, updateNetworkSettings
+    handleExportData, handleImportData, updateNetworkSettings,
+    addDuressCredential
 } from './settings.js';
 import { initI18n, t, changeLanguage, applyToDOM } from './i18n.js';
 import { showSafetyNumberModal } from './safety-number.js';
@@ -158,11 +159,25 @@ export function attemptUnlock() {
     const passphrase = input ? input.value : '';
     if (!passphrase) return;
 
-    cryptoStore.unlock(passphrase, dbGetRaw).then(() => {
-        if (input) input.value = '';
-        showView('loading');
-        document.getElementById('loading-status').textContent = t('status.decrypting');
-        onWasmReady();
+    cryptoStore.unlock(passphrase, dbGetRaw).then((result) => {
+        if (result && result.ok && result.mode === 'duress') {
+            // Silent wipe. To an observer this looks identical to a normal
+            // unlock that hit the SW-update kill path — no toast, no log,
+            // no visible UI change.
+            if (input) input.value = '';
+            if (wasm) { try { wasm.panic_wipe(); } catch {} }
+            window.location.href = './kill-sw.html?panic=1&t=' + Date.now();
+            return;
+        }
+        if (result && result.ok && result.mode === 'normal') {
+            if (input) input.value = '';
+            showView('loading');
+            document.getElementById('loading-status').textContent = t('status.decrypting');
+            onWasmReady();
+            return;
+        }
+        showToast(t('toast.wrongPassphrase'));
+        if (input) { input.value = ''; input.focus(); }
     }).catch(() => {
         showToast(t('toast.wrongPassphrase'));
         if (input) { input.value = ''; input.focus(); }
@@ -387,6 +402,7 @@ window.hangupCall = hangupCall;
 window.answerIncomingCall = answerIncomingCall;
 window.enableDecoyMode = enableDecoyMode;
 window.executePanicWipe = executePanicWipe;
+window.addDuressCredential = addDuressCredential;
 window.toggleMute = toggleMute;
 window.toggleCamera = toggleCamera;
 window.connectViaPassphrase = connectViaPassphrase;

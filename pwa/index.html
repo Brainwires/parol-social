@@ -308,6 +308,15 @@
                 <button onclick="enableDecoyMode()" data-i18n="btn.enableDecoyMode">Enable Decoy Mode</button>
             </div>
             <div class="settings-section">
+                <h2 data-i18n="settings.duressTitle">Duress passphrase</h2>
+                <p style="font-size: 0.85em; opacity: 0.7; margin-bottom: 12px;" data-i18n="settings.duressDescription">Set a separate passphrase that silently wipes all data when typed at unlock. Use only under coercion — the app will appear to unlock normally but will immediately destroy every message, contact, and key.</p>
+                <input type="password" id="duress-verify-passphrase" placeholder="Current passphrase" data-i18n-placeholder="settings.duressVerifyPlaceholder"
+                    style="width:100%;padding:8px 12px;border-radius:8px;border:1px solid #444;background:#1a1a2e;color:#fff;font-size:14px;margin-bottom:8px;">
+                <input type="password" id="duress-code-input" placeholder="Duress passphrase" data-i18n-placeholder="settings.duressPlaceholder"
+                    style="width:100%;padding:8px 12px;border-radius:8px;border:1px solid #444;background:#1a1a2e;color:#fff;font-size:14px;margin-bottom:8px;">
+                <button onclick="addDuressCredential()" data-i18n="settings.duressTitle">Duress passphrase</button>
+            </div>
+            <div class="settings-section">
                 <h2 data-i18n="settings.notifications">Notifications</h2>
                 <p data-i18n="status.notificationsInfo">Enable push notifications to receive messages when the app is in the background.</p>
                 <button onclick="requestNotificationPermission()" data-i18n="btn.enableNotifications">Enable Notifications</button>

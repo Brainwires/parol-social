@@ -215,5 +215,10 @@
   "btn.verifyIdentity": "Xác minh danh tính",
   "heading.verifyIdentity": "Xác minh danh tính",
   "safety.intro": "So sánh các chữ số này với liên hệ qua một kênh bạn tin cậy (cuộc gọi điện thoại, gặp trực tiếp). Nếu cả hai màn hình hiển thị cùng một số, không ai đã thay khóa khi thiết lập phiên của bạn.",
-  "safety.note": "Nếu các con số khác nhau, có thể ai đó đang chặn tin nhắn của bạn. Thêm lại liên hệ bằng mã QR mới từ một thiết bị đáng tin cậy."
+  "safety.note": "Nếu các con số khác nhau, có thể ai đó đang chặn tin nhắn của bạn. Thêm lại liên hệ bằng mã QR mới từ một thiết bị đáng tin cậy.",
+  "settings.duressTitle": "Cụm mật khẩu cưỡng ép",
+  "settings.duressDescription": "Đặt một cụm mật khẩu riêng, khi nhập lúc mở khóa sẽ xóa sạch mọi dữ liệu một cách âm thầm. Chỉ dùng khi bị cưỡng ép — ứng dụng sẽ trông như mở khóa bình thường nhưng sẽ ngay lập tức hủy mọi tin nhắn, liên hệ và khóa.",
+  "settings.duressVerifyPlaceholder": "Cụm mật khẩu hiện tại",
+  "settings.duressPlaceholder": "Cụm mật khẩu cưỡng ép",
+  "toast.duressCodeUpdated": "Đã lưu cụm mật khẩu cưỡng ép"
 }

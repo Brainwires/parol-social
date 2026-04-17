@@ -1,11 +1,18 @@
 import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
-import { randomFillSync, createHmac } from 'node:crypto';
+import { randomFillSync, createHmac, webcrypto } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
+
+// Stub global crypto with node's webcrypto before importing CryptoStore so its
+// Web Crypto calls work under node --test.
+if (typeof globalThis.crypto === 'undefined' || !globalThis.crypto.subtle) {
+    globalThis.crypto = webcrypto;
+}
+const { CryptoStore } = await import('../crypto-store.js');
 
 // ── Tests ──
 
@@ -305,5 +312,132 @@ describe('TURN credentials', () => {
         assert.equal(parts.length, 2);
         assert.ok(parseInt(parts[0]) > now, 'expiry not in future');
         assert.ok(parts[1].length > 0, 'missing random component');
+    });
+});
+
+// ── CryptoStore duress ──
+
+describe('CryptoStore duress', () => {
+    function makeDb() {
+        const store = new Map();
+        const putRaw = async (table, entry) => { store.set(`${table}:${entry.key}`, entry.value); };
+        const getRaw = async (table, key) => {
+            const v = store.get(`${table}:${key}`);
+            return v === undefined ? null : { key, value: v };
+        };
+        return { store, putRaw, getRaw };
+    }
+
+    test('setup stores two independent verifiers', async () => {
+        const { store, putRaw, getRaw } = makeDb();
+        const cs = new CryptoStore();
+        await cs.setup('real-pass', 'duress-pass', putRaw, getRaw);
+
+        const salt = store.get('crypto_meta:salt');
+        const duressSalt = store.get('crypto_meta:duress_salt');
+        const verifier = store.get('crypto_meta:verifier');
+        const duressVerifier = store.get('crypto_meta:duress_verifier');
+
+        assert.ok(Array.isArray(salt), 'salt stored');
+        assert.equal(salt.length, 16, 'salt is 16 bytes');
+        assert.ok(Array.isArray(duressSalt), 'duress_salt stored');
+        assert.equal(duressSalt.length, 16, 'duress_salt is 16 bytes');
+        assert.ok(Array.isArray(verifier) && verifier.length > 12, 'verifier stored');
+        assert.ok(Array.isArray(duressVerifier) && duressVerifier.length > 12, 'duress_verifier stored');
+
+        // Salts must differ
+        const same = salt.every((b, i) => b === duressSalt[i]);
+        assert.ok(!same, 'salts must not be byte-wise equal');
+    });
+
+    test('unlock with real passphrase returns mode=normal', async () => {
+        const { putRaw, getRaw } = makeDb();
+        const cs = new CryptoStore();
+        await cs.setup('real-pass', 'duress-pass', putRaw, getRaw);
+
+        const cs2 = new CryptoStore();
+        const result = await cs2.unlock('real-pass', getRaw);
+        assert.deepEqual(result, { ok: true, mode: 'normal' });
+        assert.equal(cs2.isUnlocked(), true);
+    });
+
+    test('unlock with duress passphrase returns mode=duress', async () => {
+        const { putRaw, getRaw } = makeDb();
+        const cs = new CryptoStore();
+        await cs.setup('real-pass', 'duress-pass', putRaw, getRaw);
+
+        const cs2 = new CryptoStore();
+        const result = await cs2.unlock('duress-pass', getRaw);
+        assert.deepEqual(result, { ok: true, mode: 'duress' });
+        // Duress must NOT unlock the store.
+        assert.equal(cs2.isUnlocked(), false);
+    });
+
+    test('unlock with wrong passphrase returns ok=false and no mode', async () => {
+        const { putRaw, getRaw } = makeDb();
+        const cs = new CryptoStore();
+        await cs.setup('real-pass', 'duress-pass', putRaw, getRaw);
+
+        const cs2 = new CryptoStore();
+        const result = await cs2.unlock('definitely-wrong', getRaw);
+        assert.equal(result.ok, false);
+        assert.equal(result.mode, undefined);
+        assert.equal(cs2.isUnlocked(), false);
+    });
+
+    test('unlock runs both decrypt attempts regardless of which wins', async () => {
+        const { putRaw, getRaw } = makeDb();
+        const cs = new CryptoStore();
+        await cs.setup('real-pass', 'duress-pass', putRaw, getRaw);
+
+        const origDecrypt = globalThis.crypto.subtle.decrypt.bind(globalThis.crypto.subtle);
+        let count = 0;
+        globalThis.crypto.subtle.decrypt = async (...args) => { count++; return await origDecrypt(...args); };
+
+        try {
+            // Normal-success case
+            count = 0;
+            const cs2 = new CryptoStore();
+            await cs2.unlock('real-pass', getRaw);
+            assert.ok(count >= 2, `normal unlock: expected >=2 decrypt calls, got ${count}`);
+
+            // Duress case
+            count = 0;
+            const cs3 = new CryptoStore();
+            await cs3.unlock('duress-pass', getRaw);
+            assert.ok(count >= 2, `duress unlock: expected >=2 decrypt calls, got ${count}`);
+
+            // Failure case
+            count = 0;
+            const cs4 = new CryptoStore();
+            await cs4.unlock('bogus', getRaw);
+            assert.ok(count >= 2, `wrong unlock: expected >=2 decrypt calls, got ${count}`);
+        } finally {
+            globalThis.crypto.subtle.decrypt = origDecrypt;
+        }
+    });
+
+    test('legacy store without duress_verifier still unlocks on real passphrase', async () => {
+        const { putRaw, getRaw } = makeDb();
+        const cs = new CryptoStore();
+        // Back-compat path: no duress argument at all.
+        await cs.setup('real-pass', undefined, putRaw, getRaw);
+
+        const cs2 = new CryptoStore();
+        const ok = await cs2.unlock('real-pass', getRaw);
+        assert.deepEqual(ok, { ok: true, mode: 'normal' });
+
+        const cs3 = new CryptoStore();
+        const bad = await cs3.unlock('wrong', getRaw);
+        assert.equal(bad.ok, false);
+    });
+
+    test('setup throws when duressPassphrase equals passphrase', async () => {
+        const { putRaw, getRaw } = makeDb();
+        const cs = new CryptoStore();
+        await assert.rejects(
+            () => cs.setup('same', 'same', putRaw, getRaw),
+            /differ/
+        );
     });
 });

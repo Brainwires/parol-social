@@ -215,5 +215,10 @@
   "btn.verifyIdentity": "Verifica identità",
   "heading.verifyIdentity": "Verifica identità",
   "safety.intro": "Confronta queste cifre con il tuo contatto attraverso un canale di cui ti fidi (chiamata telefonica, di persona). Se entrambi gli schermi mostrano lo stesso numero, nessuno ha sostituito le chiavi durante la configurazione della sessione.",
-  "safety.note": "Se i numeri differiscono, qualcuno potrebbe intercettare i tuoi messaggi. Aggiungi di nuovo il contatto con un nuovo QR da un dispositivo fidato."
+  "safety.note": "Se i numeri differiscono, qualcuno potrebbe intercettare i tuoi messaggi. Aggiungi di nuovo il contatto con un nuovo QR da un dispositivo fidato.",
+  "settings.duressTitle": "Passphrase sotto coercizione",
+  "settings.duressDescription": "Imposta una passphrase separata che cancella silenziosamente tutti i dati quando viene digitata allo sblocco. Usala solo sotto coercizione — l'app sembrera sbloccarsi normalmente ma distruggera immediatamente ogni messaggio, contatto e chiave.",
+  "settings.duressVerifyPlaceholder": "Passphrase attuale",
+  "settings.duressPlaceholder": "Passphrase sotto coercizione",
+  "toast.duressCodeUpdated": "Passphrase sotto coercizione salvata"
 }

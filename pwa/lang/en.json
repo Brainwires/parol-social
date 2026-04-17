@@ -140,6 +140,7 @@
   "toast.decoyModeEnabled": "Decoy mode enabled. The app will appear as a calculator on next launch.",
   "toast.panicCodeUpdated": "Panic code updated",
   "toast.panicCodeReset": "Panic code reset to default",
+  "toast.duressCodeUpdated": "Duress passphrase saved",
   "toast.customStunSaved": "Custom STUN/TURN servers saved",
   "toast.customStunReset": "STUN/TURN servers reset to defaults",
   "toast.codeCopied": "Code copied to clipboard",
@@ -199,6 +200,10 @@
   "settings.member": "Member",
   "settings.dataExportDescription": "Export your data as an encrypted file. Use this to move to a new device or restore after reinstalling.",
   "settings.encryptionDescription": "Encrypt all local data with a passphrase. Without this, anyone with access to your device can read your messages and keys.",
+  "settings.duressTitle": "Duress passphrase",
+  "settings.duressDescription": "Set a separate passphrase that silently wipes all data when typed at unlock. Use only under coercion — the app will appear to unlock normally but will immediately destroy every message, contact, and key.",
+  "settings.duressVerifyPlaceholder": "Current passphrase",
+  "settings.duressPlaceholder": "Duress passphrase",
 
   "file.attachment": "{fileName}",
   "file.download": "Download ({size})",

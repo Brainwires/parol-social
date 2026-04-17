@@ -288,6 +288,37 @@ export function updateNetworkSettings() {
     }
 }
 
+// ── Duress Passphrase ─────────────────────────────────────
+// Adds or replaces a duress credential on an unlocked-and-set-up store.
+// Requires the user to re-enter their CURRENT real passphrase (crypto-store
+// intentionally does not retain it in memory) alongside the duress choice.
+export async function addDuressCredential() {
+    const realInput = document.getElementById('duress-verify-passphrase');
+    const duressInput = document.getElementById('duress-code-input');
+    const realPass = realInput ? realInput.value : '';
+    const duressPass = duressInput ? duressInput.value : '';
+
+    if (!realPass || !duressPass) {
+        showToast(t('toast.wrongPassphrase'));
+        return;
+    }
+    if (realPass === duressPass) {
+        showToast(t('toast.wrongPassphrase'));
+        return;
+    }
+
+    try {
+        await cryptoStore.addDuressCredential(realPass, duressPass, dbPutRaw, dbGetRaw);
+        if (realInput) realInput.value = '';
+        if (duressInput) duressInput.value = '';
+        showToast(t('toast.duressCodeUpdated'));
+    } catch (e) {
+        if (realInput) realInput.value = '';
+        if (duressInput) duressInput.value = '';
+        showToast(t('toast.wrongPassphrase'));
+    }
+}
+
 export function enableDecoyMode() {
     const input = document.getElementById('decoy-code-input');
     const code = input ? input.value : '00000';
