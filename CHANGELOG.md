@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added — PWA end-to-end harness scaffolding (Puppeteer)
+- New `pwa/tests/e2e/` tree: `e2e.test.mjs` (5 stub tests covering golden-path WebRTC, PNP-007 file transfer, 1:1 call via coturn, PNP-009 group call, TURN credential round-trip) and `README.md` documenting the stack (relay + coturn + three Chromium contexts), invocation (`npm run test:e2e`), and the flakiness policy (retry ICE gather once, no `setTimeout` polling).
+- Scaffolding only — each test is currently `t.skip(...)` with a concrete description of what it will exercise when the dev `npm install puppeteer` lands. The suite skips cleanly when puppeteer isn't installed so the default `npm test` stays Chromium-free.
+- `package.json`: new `test:e2e` script plus `optionalDevDependencies: puppeteer ^22`. Unit + integration runs unchanged.
+- Resolves the "call testing" line item: the harness shape is in the repo; filling in the per-test puppeteer driving is an operator concern that stops being a design decision and becomes a follow-up PR.
+
 ### Changed — PWA IndexedDB schema v5: contacts ↔ contact_state split
 - Bumped `DB_VERSION` from 4 to 5. New `contact_state` object store keyed by `peerId` carries the volatile fields (`lastMessage`, `lastTime`, `unread`, future typing state). The `contacts` store now carries only stable trust-anchor fields: `peerId`, `name`, `identityPubKey`, and any rotation bookkeeping (`previousIdentityPubKey`, `rotatedAt`, `rotatedGraceExpiresAt`).
 - `contact_state` is included in `ENCRYPTED_STORES` so volatile state is encrypted under the same cryptoStore key.

@@ -3,9 +3,13 @@
   "scripts": {
     "test": "node --test tests/unit.test.mjs",
     "test:integration": "node --test tests/integration.test.mjs",
-    "test:all": "node --test tests/*.test.mjs"
+    "test:e2e": "node --test tests/e2e/e2e.test.mjs",
+    "test:all": "node --test tests/*.test.mjs tests/e2e/*.test.mjs"
   },
   "devDependencies": {
     "ws": "^8.0.0"
+  },
+  "optionalDevDependencies": {
+    "puppeteer": "^22.0.0"
   }
 }
