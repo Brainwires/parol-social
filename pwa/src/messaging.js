@@ -1121,36 +1121,12 @@ function handleChatPlaintext(fromPeerId, plaintext) {
 }
 
 function handleSystemPlaintext(fromPeerId, plaintext) {
+    // Reserved for future SYSTEM bodies. The QR bootstrap no longer rides
+    // in a SYSTEM message body — session materialization is handled at the
+    // envelope layer (PNP-001 §5.3.1) via the cleartext source_hint.
     const body = new TextDecoder().decode(plaintext);
-    console.log('[System]', fromPeerId.slice(0, 8), body.slice(0, 40));
-    if (body.startsWith('bootstrap:')) {
-        const theirIkHex = body.slice('bootstrap:'.length);
-        if (wasm && wasm.complete_bootstrap_as_presenter && theirIkHex.length === 64) {
-            try {
-                const result = wasm.complete_bootstrap_as_presenter(theirIkHex);
-                console.log('[Bootstrap] Responder session established for:', result.peer_id);
-                persistSessions();
-                Promise.all([
-                    dbPut('contacts', {
-                        peerId: result.peer_id,
-                        name: result.peer_id.slice(0, 8) + '...',
-                        // PNP-002 §8 trust anchor for identity-rotation verification.
-                        identityPubKey: theirIkHex,
-                    }),
-                    updateContactState(result.peer_id, {
-                        lastMessage: t('contact.sessionEstablished'),
-                        lastTime: formatTime(Date.now()),
-                        unread: 0,
-                    }),
-                ]).then(async () => {
-                    showToast(t('toast.secureContact', { name: result.peer_id.slice(0, 8) }));
-                    loadContacts();
-                    showView('contacts');
-                }).catch(() => {});
-            } catch(e) {
-                console.warn('[Bootstrap] Failed to complete presenter bootstrap:', e);
-            }
-        }
+    if (body.length > 0) {
+        console.log('[System]', fromPeerId.slice(0, 8), body.slice(0, 40));
     }
 }
 
@@ -1328,51 +1304,57 @@ function hexToBytes(hex) {
     return out;
 }
 
-// PNP-001-MUST-048: the outer relay frame carries no `from` field. The
-// sealed-sender receive path tries each known session until one AEAD-
-// decrypts the envelope. The Double Ratchet's constant-time AEAD means
-// the wrong session returns the same opaque "decryption failed" shape
-// as a truly malformed frame, so the trial-decrypt leaks nothing.
-//
-// Accepts a single `payload` argument — the hex-encoded envelope. Used
-// to accept `(fromPeerId, payload)`; that call site is gone.
+// PNP-001-MUST-048 sealed-sender receive. Outer frame carries no `from`, so
+// the Rust-side `trial_decrypt` iterates all committed sessions AEAD-first;
+// if none match AND a pending_bootstrap exists (we are the QR presenter),
+// it runs §5.3.1 materialization on the cleartext source_hint. Bootstrap
+// success commits the session and returns `bootstrapped: true`, which we
+// turn into the "new secure contact" UI.
 export function onIncomingMessage(payload) {
     if (!payload || typeof payload !== 'string') return;
 
-    // Dedup on the wire-frame text alone — envelope hex is deterministic
-    // for a given ciphertext.
     const dedupKey = payload.slice(0, 128);
     if (seenGossipMessages.has(dedupKey)) return;
     markGossipSeen(dedupKey);
 
-    if (!wasm || !wasm.envelope_decode || !wasm.list_session_peer_ids) {
+    if (!wasm || !wasm.trial_decrypt) {
         console.warn('[Envelope] WASM not available — dropping frame');
         return;
     }
 
-    const candidates = wasm.list_session_peer_ids() || [];
-    let decoded = null;
-    let successPeer = null;
-    for (const candidate of candidates) {
-        try {
-            decoded = wasm.envelope_decode(candidate, payload);
-            successPeer = candidate;
-            break;
-        } catch (e) {
-            // Wrong session — try the next. Decrypt failures are expected
-            // during sealed-sender trial decode.
-            decoded = null;
-        }
-    }
-    if (!decoded) {
-        console.warn('[Envelope] no session decrypted the frame');
+    let decoded;
+    try {
+        decoded = wasm.trial_decrypt(payload);
+    } catch (e) {
+        // No committed session decrypted AND no bootstrap fallback succeeded.
+        // This is the expected path for misrouted frames and garbage traffic.
         return;
     }
     persistSessions();
 
+    const sourcePeer = decoded.source_peer_id;
+
+    if (decoded.bootstrapped) {
+        // PNP-001 §5.3.1: the responder session is now committed server-side
+        // by the WASM layer. Wire the contact on the UI side.
+        const ikHex = decoded.source_hint || null;
+        Promise.all([
+            dbPut('contacts', {
+                peerId: sourcePeer,
+                name: sourcePeer.slice(0, 8) + '...',
+                identityPubKey: ikHex,
+            }),
+            updateContactState(sourcePeer, {
+                lastMessage: t('contact.sessionEstablished'),
+                lastTime: formatTime(Date.now()),
+                unread: 0,
+            }),
+        ]).then(() => {
+            showToast(t('toast.secureContact', { name: sourcePeer.slice(0, 8) }));
+            if (currentView === 'contacts') loadContacts();
+        }).catch(err => console.warn('[Bootstrap] contact persist failed:', err));
+    }
+
     const plaintext = hexToBytes(decoded.plaintext_hex);
-    // Per PNP-001 MUST-SHOULD-003, `source_hint` is null by default; fall
-    // back to the peer whose session decrypted successfully.
-    const sourcePeer = decoded.source_hint || successPeer;
     dispatchByMsgType(decoded.msg_type, sourcePeer, plaintext);
 }

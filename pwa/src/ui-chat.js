@@ -692,13 +692,21 @@ function handleScannedQR(data) {
     ]).then(async () => {
         loadContacts();
         if (sessionEstablished && wasm && wasm.get_public_key && wasm.envelope_encode) {
+            // PNP-001 v0.9 §5.3.1 + MUST-063: the scanner's first envelope
+            // MUST carry source_hint = our Ed25519 IK so the presenter can
+            // derive BS and materialize the responder session. Without this
+            // the presenter drops the frame (no session to trial-decrypt
+            // against) and pairing stalls.
             const ourIk = wasm.get_public_key();
-            // Carry our identity key as the SYSTEM payload; the msg_type in the
-            // envelope replaces the old "__system:bootstrap:" string marker.
-            const encoder = new TextEncoder();
             const nowSecs = BigInt(Math.floor(Date.now() / 1000));
             try {
-                const envelope = wasm.envelope_encode(peerId, MSG_TYPE_SYSTEM, encoder.encode('bootstrap:' + ourIk), nowSecs);
+                const envelope = wasm.envelope_encode(
+                    peerId,
+                    MSG_TYPE_SYSTEM,
+                    new Uint8Array(0),
+                    nowSecs,
+                    ourIk,
+                );
                 markRealSend();
                 persistSessions();
                 if (!sendToRelay(peerId, envelope)) {

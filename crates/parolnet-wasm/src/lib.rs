@@ -492,6 +492,117 @@ pub fn envelope_decode(source_peer_id_hex: &str, envelope_hex: &str) -> Result<J
     serde_wasm_bindgen::to_value(&result).map_err(|e| JsError::new(&format!("serialize: {e}")))
 }
 
+/// Sealed-sender trial decrypt with PNP-001 §5.3.1 bootstrap fallback.
+///
+/// Iterates every committed session and tries to AEAD-decrypt the envelope;
+/// if none works AND we hold a `pending_bootstrap` (QR presenter awaiting
+/// scanner's first message), tries `try_bootstrap_and_decrypt` on the
+/// envelope's cleartext `source_hint`. On bootstrap success, the responder
+/// session is committed and `pending_bootstrap` is cleared (Drop zeroizes).
+///
+/// Returns `{ source_peer_id, msg_type, plaintext_hex, timestamp, bootstrapped }`.
+/// `bootstrapped = true` signals the PWA to fire the "new secure contact" UI.
+#[wasm_bindgen]
+pub fn trial_decrypt(envelope_hex: &str) -> Result<JsValue, JsError> {
+    let envelope_bytes =
+        hex::decode(envelope_hex).map_err(|e| JsError::new(&format!("invalid hex: {e}")))?;
+
+    let mut state = STATE.lock().unwrap_or_else(|e| e.into_inner());
+
+    // Scope the immutable borrow so we can mutate pending_bootstrap later.
+    let trial_result = {
+        let client = state
+            .client
+            .as_ref()
+            .ok_or_else(|| JsError::new("not initialized — call initialize() first"))?;
+
+        let mut last_err: Option<String> = None;
+        let mut success: Option<(parolnet_protocol::address::PeerId, parolnet_core::envelope::DecryptedEnvelope)> = None;
+
+        for (pid_bytes, _) in client.sessions().export_all() {
+            let pid = parolnet_protocol::address::PeerId(pid_bytes);
+            match parolnet_core::envelope::decrypt_for_peer(
+                client.sessions(),
+                &pid,
+                &envelope_bytes,
+            ) {
+                Ok(d) => {
+                    success = Some((pid, d));
+                    break;
+                }
+                Err(e) => last_err = Some(format!("{e}")),
+            }
+        }
+        (success, last_err)
+    };
+
+    if let (Some((peer_id, decoded)), _) = trial_result {
+        return serialize_trial_result(&peer_id, &decoded, false);
+    }
+
+    // No committed session decrypted. If a pending bootstrap exists, run the
+    // §5.3.1 materialization path.
+    if let Some(pending) = state.pending_bootstrap.as_ref() {
+        let our_ik = state
+            .client
+            .as_ref()
+            .expect("client present (checked above)")
+            .public_key();
+        let seed = pending.seed;
+        let ratchet_secret = pending.ratchet_secret;
+
+        let client = state.client.as_ref().unwrap();
+        match parolnet_core::envelope::try_bootstrap_and_decrypt(
+            client.sessions(),
+            &envelope_bytes,
+            &our_ik,
+            &seed,
+            &ratchet_secret,
+        ) {
+            Ok(decoded) => {
+                // Consume pending bootstrap — Drop zeroizes seed + ratchet_secret.
+                state.pending_bootstrap = None;
+                let scanner_peer = decoded
+                    .source_hint
+                    .expect("try_bootstrap_and_decrypt sets source_hint on success");
+                return serialize_trial_result(&scanner_peer, &decoded, true);
+            }
+            Err(e) => {
+                return Err(JsError::new(&format!("bootstrap fallback failed: {e}")));
+            }
+        }
+    }
+
+    Err(JsError::new(
+        "no committed session decrypted the envelope and no pending bootstrap",
+    ))
+}
+
+fn serialize_trial_result(
+    peer_id: &parolnet_protocol::address::PeerId,
+    decoded: &parolnet_core::envelope::DecryptedEnvelope,
+    bootstrapped: bool,
+) -> Result<JsValue, JsError> {
+    #[derive(serde::Serialize)]
+    struct TrialResult {
+        source_peer_id: String,
+        source_hint: Option<String>,
+        msg_type: u8,
+        plaintext_hex: String,
+        timestamp: u64,
+        bootstrapped: bool,
+    }
+    let out = TrialResult {
+        source_peer_id: hex::encode(peer_id.0),
+        source_hint: decoded.source_hint.map(|p| hex::encode(p.0)),
+        msg_type: decoded.msg_type,
+        plaintext_hex: hex::encode(&decoded.plaintext),
+        timestamp: decoded.timestamp,
+        bootstrapped,
+    };
+    serde_wasm_bindgen::to_value(&out).map_err(|e| JsError::new(&format!("serialize: {e}")))
+}
+
 /// Check if a session exists for a peer.
 #[wasm_bindgen]
 pub fn has_session(peer_id_hex: &str) -> bool {
@@ -1586,67 +1697,6 @@ pub fn process_scanned_qr(hex_data: &str) -> Result<JsValue, JsError> {
     let result = ScanResult {
         peer_id: hex::encode(their_peer_id.0),
         their_identity_key: hex::encode(&payload.ik),
-        bootstrap_secret: hex::encode(bs),
-    };
-
-    serde_wasm_bindgen::to_value(&result).map_err(|e| JsError::new(&format!("serialize: {e}")))
-}
-
-/// Complete the bootstrap as the QR **presenter** (responder side).
-///
-/// Called when the presenter receives a bootstrap handshake from the scanner,
-/// containing the scanner's identity key. Uses the stored ratchet secret from
-/// QR generation to establish the responder session.
-///
-/// `their_identity_key_hex` — the scanner's Ed25519 identity public key.
-#[wasm_bindgen]
-pub fn complete_bootstrap_as_presenter(their_identity_key_hex: &str) -> Result<JsValue, JsError> {
-    let their_ik_bytes = hex::decode(their_identity_key_hex)
-        .map_err(|e| JsError::new(&format!("invalid hex: {e}")))?;
-    if their_ik_bytes.len() != 32 {
-        return Err(JsError::new("identity key must be 32 bytes"));
-    }
-
-    let mut state = STATE.lock().unwrap_or_else(|e| e.into_inner());
-
-    let pending = state
-        .pending_bootstrap
-        .take()
-        .ok_or_else(|| JsError::new("no pending bootstrap — generate a QR first"))?;
-
-    let client = state
-        .client
-        .as_ref()
-        .ok_or_else(|| JsError::new("not initialized — call initialize() first"))?;
-
-    // Derive the same bootstrap secret the scanner derived
-    let our_ik = client.public_key();
-    let mut their_ik = [0u8; 32];
-    their_ik.copy_from_slice(&their_ik_bytes);
-
-    let bs = parolnet_core::bootstrap::derive_bootstrap_secret(&pending.seed, &our_ik, &their_ik)
-        .map_err(|e| JsError::new(&format!("{e}")))?;
-
-    // Compute scanner's PeerId
-    let their_peer_id = parolnet_protocol::address::PeerId::from_public_key(&their_ik);
-
-    // Establish responder session using our stored ratchet secret
-    client
-        .establish_responder_session(
-            their_peer_id,
-            parolnet_crypto::SharedSecret(bs),
-            pending.ratchet_secret,
-        )
-        .map_err(|e| JsError::new(&format!("{e}")))?;
-
-    #[derive(serde::Serialize)]
-    struct PresenterResult {
-        peer_id: String,
-        bootstrap_secret: String,
-    }
-
-    let result = PresenterResult {
-        peer_id: hex::encode(their_peer_id.0),
         bootstrap_secret: hex::encode(bs),
     };
 
