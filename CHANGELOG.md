@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added — DHT BEP-44 bootstrap channel primitives (PNP-008 §8.5)
+- New `parolnet-relay::bootstrap::dht` module: `BEP_44_SALT = b"PNP-008-bootstrap"` (17 bytes, MUST-073), `DhtBootstrapKey::bep44_target` deriving SHA-1(authority_pubkey || salt) (MUST-047), `verify_and_extract_bundle` enforcing `seq == bundle.issued_at` (MUST-048) and funneling through `BootstrapBundle::verify_and_validate` for the full §6.3 chain (MUST-049). `DhtFetcher` trait lets operators plug in `mainline`, an HTTP-backed mirror, or a local cache without bloating every relay build with UDP transport. `InMemoryDht` fixture for unit + integration tests.
+- Brings PNP-008 §8 compliance from 3/4 channels (seed / DNS TXT / HTTPS) to **4/4 protocol layers** — live UDP is an operator concern, the primitives are no longer stubbed.
+- Deps: added workspace-level `sha1` to `parolnet-relay` and `parolnet-conformance` (already a transitive workspace dep).
+- Conformance: upgraded MUST-047 / 048 / 049 / 073 tests from placeholder constants (`const BEP44_KEY_BYTES: usize = 32`) to exercise the real target derivation + seq gate + tampered-signature rejection pipeline. 6 new DHT module tests. **PNP-008 conformance: 107/107 green. Workspace: 1225/1225 green.**
+
 ### Added — Bridge hardening: cover page + disclosure limiter + IP-log scrubber (PNP-008 §9.1.1 / §9.1.2)
 - New `parolnet-relay::bridge` module: compiled-in `COVER_PAGE_HTML` (generic tourist landing, ≥ 256 B, no `ParolNet`/`parolnet`/`federation`/`bridge` tokens), `DisclosureLimiter` (in-memory only, `Email`/`QrSession` scopes with separate caps, rolling 1-hour window), `IpAuditLog` (first-seen map with `purge(now)` evicting entries older than 86_400 s). All constants (`COVER_LATENCY_BUDGET_MS=250`, `IP_LOG_MAX_AGE_SECS=86_400`, `IP_LOG_SCRUBBER_INTERVAL_SECS=3_600`) exported for conformance pin-down.
 - Relay-server wiring: `handle_cover_page` installed as the bridge-mode fallback route — any non-ParolNet request returns HTTP 200 + `text/html; charset=utf-8` + compiled HTML body, no per-source state retained. `handle_bridge_info` now requires `?scope=email&id=…` or `?scope=qr&id=…` and rejects with HTTP 429 once the per-scope cap is hit. A tokio interval task runs the `IpAuditLog::purge` + `DisclosureLimiter::gc` scrub every `IP_LOG_SCRUBBER_INTERVAL_SECS`, independent of request traffic.

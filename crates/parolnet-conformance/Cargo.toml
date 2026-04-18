@@ -44,5 +44,6 @@ rand = { workspace = true }
 rand_core = { workspace = true }
 x25519-dalek = { workspace = true }
 ed25519-dalek = { workspace = true }
+sha1 = { workspace = true }
 voprf = { workspace = true }
 curve25519-dalek = { workspace = true }

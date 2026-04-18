@@ -17,11 +17,16 @@
 //! - §8.7 MUST-071..076 — [`bundle`] enforces version, freshness, content-type
 
 pub mod bundle;
+pub mod dht;
 pub mod dns;
 pub mod https;
 pub mod seed;
 
 pub use bundle::{BootstrapBundle, BundleError, BUNDLE_VERSION, BUNDLE_MAX_AGE_SECS};
+pub use dht::{
+    verify_and_extract_bundle as dht_verify_and_extract_bundle, DhtBep44Value, DhtBootstrapKey,
+    DhtError, DhtFetcher, InMemoryDht, BEP_44_SALT, BEP_44_TARGET_BYTES,
+};
 
 /// Per-attempt timeout on any bootstrap channel (PNP-008-MUST-074).
 pub const CHANNEL_ATTEMPT_TIMEOUT_SECS: u64 = 10;

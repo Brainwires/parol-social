@@ -807,6 +807,7 @@ fn bootstrap_bundle_freshness_is_seven_days() {
 #[clause("PNP-008-MUST-073")]
 #[test]
 fn bootstrap_dht_bep44_salt_is_spec_constant() {
+    use parolnet_relay::bootstrap::dht::BEP_44_SALT;
     let v: serde_json::Value = serde_json::from_slice(include_bytes!(
         "../../../specs/vectors/PNP-008/bootstrap_dht_salt.json"
     ))
@@ -819,6 +820,9 @@ fn bootstrap_dht_bep44_salt_is_spec_constant() {
     let hex_form = v["salt_hex"].as_str().unwrap();
     let decoded = hex::decode(hex_form).unwrap();
     assert_eq!(decoded, salt.as_bytes());
+    // Relay-crate constant matches byte-for-byte.
+    assert_eq!(BEP_44_SALT, b"PNP-008-bootstrap");
+    assert_eq!(BEP_44_SALT.len(), 17);
 }
 
 #[clause("PNP-008-MUST-074")]
@@ -1565,28 +1569,83 @@ fn bundle_signature_verified_independently_of_tls() {
 #[clause("PNP-008-MUST-047")]
 #[test]
 fn dht_bootstrap_uses_bep44_mutable_items() {
-    // BEP-44 keyed by compiled-in Ed25519 authority pubkey. Pin constants.
-    const BEP44_KEY_BYTES: usize = 32; // Ed25519 pubkey.
-    assert_eq!(BEP44_KEY_BYTES, 32);
+    use parolnet_relay::bootstrap::dht::{DhtBootstrapKey, BEP_44_SALT, BEP_44_TARGET_BYTES};
+    use sha1::{Digest, Sha1};
+    // MUST-047: BEP-44 target hash = SHA-1(pubkey || salt), 20 bytes, keyed
+    // by an authority Ed25519 pubkey (32 B).
+    let pk = [0x11u8; 32];
+    let target = DhtBootstrapKey::new(pk).bep44_target();
+    let mut h = Sha1::new();
+    h.update(pk);
+    h.update(BEP_44_SALT);
+    assert_eq!(&target[..], &h.finalize()[..]);
+    assert_eq!(target.len(), BEP_44_TARGET_BYTES);
+    assert_eq!(BEP_44_TARGET_BYTES, 20);
 }
 
 #[clause("PNP-008-MUST-048")]
 #[test]
 fn dht_bundle_is_deterministic_cbor_with_issued_at_seq() {
-    // sequence number = issued_at truncated to seconds. Pin u64 type.
+    use ed25519_dalek::SigningKey;
+    use parolnet_relay::bootstrap::bundle::BootstrapBundle;
+    use parolnet_relay::bootstrap::dht::{verify_and_extract_bundle, DhtBep44Value, DhtError};
+    // MUST-048: the BEP-44 seq MUST equal the bundle's `issued_at` (seconds).
     let issued_at: u64 = 1_700_000_000;
-    let seq: u64 = issued_at; // already seconds-precision.
-    assert_eq!(seq, issued_at);
+    let mut seed = [0u8; 32];
+    seed[0] = 4;
+    let sk = SigningKey::from_bytes(&seed);
+    let pk = sk.verifying_key().to_bytes();
+    let bundle = BootstrapBundle::signed(vec![], issued_at, &sk);
+    let cbor = bundle.to_cbor().unwrap();
+    // Happy path: matching seq → accepted.
+    let ok = DhtBep44Value {
+        value_cbor: cbor.clone(),
+        seq: issued_at,
+        sig: [0u8; 64],
+    };
+    verify_and_extract_bundle(&ok, &[pk], issued_at).unwrap();
+    // seq drift → rejected.
+    let bad = DhtBep44Value {
+        value_cbor: cbor,
+        seq: issued_at + 1,
+        sig: [0u8; 64],
+    };
+    let err = verify_and_extract_bundle(&bad, &[pk], issued_at).unwrap_err();
+    assert!(matches!(err, DhtError::SeqMismatch { .. }));
 }
 
 #[clause("PNP-008-MUST-049")]
 #[test]
 fn dht_values_signature_verified_before_use() {
-    // Architectural — BootstrapBundle.verify() runs before descriptors are
-    // inserted into the local directory. Pin via verify-first ordering.
-    let verified: bool = true; // stand-in
-    let used: bool = verified;
-    assert!(used);
+    use ed25519_dalek::SigningKey;
+    use parolnet_relay::bootstrap::bundle::{BootstrapBundle, BundleError};
+    use parolnet_relay::bootstrap::dht::{verify_and_extract_bundle, DhtBep44Value, DhtError};
+    // MUST-049: values MUST be signature-verified before descriptors are used.
+    // Tampered CBOR body → signature invalid → bundle rejected (no descriptors
+    // returned).
+    let issued_at: u64 = 1_700_000_000;
+    let mut seed = [0u8; 32];
+    seed[0] = 9;
+    let sk = SigningKey::from_bytes(&seed);
+    let pk = sk.verifying_key().to_bytes();
+    let bundle = BootstrapBundle::signed(vec![], issued_at, &sk);
+    let mut cbor = bundle.to_cbor().unwrap();
+    // Flip a single byte in the payload to break the signature.
+    let last = cbor.len() - 1;
+    cbor[last] ^= 0xFF;
+    let tampered = DhtBep44Value {
+        value_cbor: cbor,
+        seq: issued_at,
+        sig: [0u8; 64],
+    };
+    let err = verify_and_extract_bundle(&tampered, &[pk], issued_at).unwrap_err();
+    assert!(matches!(
+        err,
+        DhtError::Bundle(BundleError::SignatureInvalid)
+            | DhtError::ValueNotCbor(_)
+            | DhtError::SeqMismatch { .. }
+            | DhtError::Bundle(BundleError::CborDecode(_))
+    ));
 }
 
 // -- §9 Bridges (private distribution) ----------------------------------------
