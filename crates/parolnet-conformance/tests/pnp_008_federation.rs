@@ -1017,6 +1017,7 @@ fn federation_close_code_registry_matches_spec() {
 #[clause("PNP-008-MUST-085")]
 #[test]
 fn bridge_cover_page_is_200_html_min_256_bytes() {
+    use parolnet_relay::bridge::{COVER_CONTENT_TYPE, COVER_MIN_BODY_BYTES, COVER_PAGE_HTML};
     let v: serde_json::Value = serde_json::from_slice(include_bytes!(
         "../../../specs/vectors/PNP-008/bridge_cover_page.json"
     ))
@@ -1027,11 +1028,16 @@ fn bridge_cover_page_is_200_html_min_256_bytes() {
         Some("text/html; charset=utf-8")
     );
     assert_eq!(v["min_body_bytes"].as_u64(), Some(256));
+    // Relay implementation must serve the compiled-in cover page that meets
+    // the spec bounds.
+    assert_eq!(COVER_CONTENT_TYPE, "text/html; charset=utf-8");
+    assert!(COVER_PAGE_HTML.len() >= COVER_MIN_BODY_BYTES);
 }
 
 #[clause("PNP-008-MUST-086")]
 #[test]
 fn bridge_cover_page_forbids_parolnet_tokens() {
+    use parolnet_relay::bridge::COVER_PAGE_HTML;
     let v: serde_json::Value = serde_json::from_slice(include_bytes!(
         "../../../specs/vectors/PNP-008/bridge_cover_page.json"
     ))
@@ -1047,17 +1053,23 @@ fn bridge_cover_page_forbids_parolnet_tokens() {
             forbidden.contains(&token),
             "token {token} MUST be forbidden in cover body"
         );
+        assert!(
+            !COVER_PAGE_HTML.contains(token),
+            "cover page leaks forbidden token {token:?}"
+        );
     }
 }
 
 #[clause("PNP-008-MUST-087")]
 #[test]
 fn bridge_cover_page_latency_budget_is_250ms() {
+    use parolnet_relay::bridge::COVER_LATENCY_BUDGET_MS;
     let v: serde_json::Value = serde_json::from_slice(include_bytes!(
         "../../../specs/vectors/PNP-008/bridge_cover_page.json"
     ))
     .unwrap();
     assert_eq!(v["cover_latency_budget_ms"].as_u64(), Some(250));
+    assert_eq!(COVER_LATENCY_BUDGET_MS, 250);
 }
 
 #[clause("PNP-008-MUST-088")]
@@ -1073,6 +1085,7 @@ fn bridge_probes_leave_no_residual_source_state() {
 #[clause("PNP-008-MUST-089")]
 #[test]
 fn bridge_disclosure_counter_ephemeral_in_memory() {
+    use parolnet_relay::bridge::{DisclosureLimiter, DisclosureScope};
     let v: serde_json::Value = serde_json::from_slice(include_bytes!(
         "../../../specs/vectors/PNP-008/bridge_disclosure_limits.json"
     ))
@@ -1085,11 +1098,25 @@ fn bridge_disclosure_counter_ephemeral_in_memory() {
         Some(false),
         "MUST-089 forbids persisting the disclosure counter across restarts"
     );
+    // Exercise the enforcement path: 4th email disclosure in one hour rejected.
+    let mut lim = DisclosureLimiter::new();
+    let scope = DisclosureScope::Email("probe@example.test".into());
+    for t in 0..3 {
+        assert!(lim.try_disclose(scope.clone(), 1_700_000_000 + t));
+    }
+    assert!(!lim.try_disclose(scope, 1_700_000_004));
+    // A freshly constructed limiter starts empty — that's the "no
+    // cross-restart persistence" invariant at the type level.
+    let fresh = DisclosureLimiter::new();
+    assert_eq!(fresh.entry_count(), 0);
 }
 
 #[clause("PNP-008-MUST-090")]
 #[test]
 fn bridge_ip_log_scrubber_purges_at_24h() {
+    use parolnet_relay::bridge::{
+        IpAuditLog, IP_LOG_MAX_AGE_SECS, IP_LOG_SCRUBBER_INTERVAL_SECS,
+    };
     let v: serde_json::Value = serde_json::from_slice(include_bytes!(
         "../../../specs/vectors/PNP-008/bridge_disclosure_limits.json"
     ))
@@ -1101,6 +1128,15 @@ fn bridge_ip_log_scrubber_purges_at_24h() {
         scrubber_interval <= 3600,
         "scrubber MUST run at least every 3600 s independent of traffic"
     );
+    assert_eq!(IP_LOG_MAX_AGE_SECS, 86_400);
+    assert!(IP_LOG_SCRUBBER_INTERVAL_SECS <= 3_600);
+    // Exercise the scrub path.
+    let mut log = IpAuditLog::new();
+    let ip: std::net::IpAddr = "198.51.100.7".parse().unwrap();
+    log.observe(ip, 1_700_000_000);
+    assert!(log.contains(&ip));
+    assert_eq!(log.purge(1_700_000_000 + IP_LOG_MAX_AGE_SECS + 1), 1);
+    assert!(!log.contains(&ip));
 }
 
 // -- §8.7 HTTPS content-type (resumes v0.4 test series) -------------------

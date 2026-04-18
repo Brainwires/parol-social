@@ -11,6 +11,7 @@
 
 pub mod authority;
 pub mod bootstrap;
+pub mod bridge;
 pub mod circuit;
 pub mod directory;
 pub mod error;

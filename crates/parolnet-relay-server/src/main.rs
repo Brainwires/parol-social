@@ -14,6 +14,10 @@ use parolnet_mesh::peer_manager::PeerManager;
 use parolnet_protocol::address::PeerId;
 use parolnet_relay::authority::EndorsedDescriptor;
 use parolnet_relay::directory::{RelayDescriptor, RelayDirectory};
+use parolnet_relay::bridge::{
+    DisclosureLimiter, DisclosureScope, IpAuditLog, COVER_CONTENT_TYPE, COVER_PAGE_HTML,
+    IP_LOG_SCRUBBER_INTERVAL_SECS,
+};
 use parolnet_relay::federation_codec::{
     CLOSE_DUP_PEER, CLOSE_OVERSIZE, CLOSE_UNKNOWN_TYPE, FEDERATION_LINK_PATH,
 };
@@ -496,12 +500,45 @@ fn get_client_ip(
     connecting_ip
 }
 
-/// GET /bridge-info — returns bridge configuration JSON.
-/// Only active when BRIDGE_MODE=true.
+/// GET /bridge-info — returns bridge configuration JSON, rate-limited per
+/// (scope_kind, scope_value) by an ephemeral in-memory disclosure counter
+/// (PNP-008-MUST-089). Only active when BRIDGE_MODE=true.
+///
+/// Query string: `?scope=email&id=<email>` or `?scope=qr&id=<session_id>`.
 async fn handle_bridge_info(
+    params: HashMap<String, String>,
     bridge_front_domain: Option<String>,
     relay_fingerprint: String,
+    limiter: Arc<Mutex<DisclosureLimiter>>,
 ) -> impl IntoResponse {
+    let scope_kind = params.get("scope").map(|s| s.as_str()).unwrap_or("");
+    let scope_id = params.get("id").cloned().unwrap_or_default();
+    let scope = match (scope_kind, scope_id.as_str()) {
+        ("email", id) if !id.is_empty() => DisclosureScope::Email(id.to_string()),
+        ("qr", id) if !id.is_empty() => DisclosureScope::QrSession(id.to_string()),
+        _ => {
+            return (
+                StatusCode::BAD_REQUEST,
+                [(axum::http::header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+                "scope and id required\n".to_string(),
+            );
+        }
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    {
+        let mut lim = limiter.lock().await;
+        if !lim.try_disclose(scope, now) {
+            // MUST-089: per-window cap reached — reject without leaking count.
+            return (
+                StatusCode::TOO_MANY_REQUESTS,
+                [(axum::http::header::CONTENT_TYPE, "application/json")],
+                "{\"error\":\"disclosure limit reached\"}".to_string(),
+            );
+        }
+    }
     let json = serde_json::json!({
         "bridge": true,
         "front_domain": bridge_front_domain,
@@ -511,6 +548,20 @@ async fn handle_bridge_info(
         StatusCode::OK,
         [(axum::http::header::CONTENT_TYPE, "application/json")],
         json.to_string(),
+    )
+}
+
+/// Fallback route for bridge-mode relays (PNP-008-MUST-085..088).
+///
+/// Any request that does not hit a known ParolNet endpoint is served the
+/// generic cover page — plain HTTP 200, `text/html`, body ≥ 256 B, no
+/// `ParolNet`/`bridge` tokens. Served without inspecting the request IP, so
+/// no per-source state is retained (MUST-088).
+async fn handle_cover_page() -> impl IntoResponse {
+    (
+        StatusCode::OK,
+        [(axum::http::header::CONTENT_TYPE, COVER_CONTENT_TYPE)],
+        COVER_PAGE_HTML,
     )
 }
 
@@ -1457,6 +1508,37 @@ async fn main() {
     let federation_manager: Arc<Mutex<FederationManager>> =
         Arc::new(Mutex::new(FederationManager::new()));
 
+    // Bridge disclosure counter (PNP-008-MUST-089). In-memory only — a
+    // process restart zeroes it, which is the whole point: a seized bridge
+    // yields no disclosure history.
+    let bridge_disclosure_limiter: Arc<Mutex<DisclosureLimiter>> =
+        Arc::new(Mutex::new(DisclosureLimiter::new()));
+
+    // Bridge IP audit log (PNP-008-MUST-054 / MUST-090). Scheduled scrubber
+    // runs independently of request traffic.
+    let bridge_ip_audit: Arc<Mutex<IpAuditLog>> = Arc::new(Mutex::new(IpAuditLog::new()));
+    if bridge_mode {
+        let audit = bridge_ip_audit.clone();
+        let limiter = bridge_disclosure_limiter.clone();
+        tokio::spawn(async move {
+            let mut interval =
+                tokio::time::interval(Duration::from_secs(IP_LOG_SCRUBBER_INTERVAL_SECS));
+            interval.tick().await;
+            loop {
+                interval.tick().await;
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+                let evicted = audit.lock().await.purge(now);
+                limiter.lock().await.gc();
+                if evicted > 0 {
+                    info!("bridge IP audit log purged {evicted} stale entries");
+                }
+            }
+        });
+    }
+
     // H9 Privacy Pass token authority. The VOPRF secret is generated once on
     // boot and rotated on every 1-hour epoch boundary (PNP-001-MUST-051).
     let startup_secs = std::time::SystemTime::now()
@@ -1871,14 +1953,18 @@ async fn main() {
     if bridge_mode {
         let bfd = bridge_front_domain.clone();
         let relay_fp = hex::encode(pubkey_bytes);
+        let limiter = bridge_disclosure_limiter.clone();
         app = app.route(
             "/bridge-info",
-            get(move || {
+            get(move |Query(params): Query<HashMap<String, String>>| {
                 let bfd = bfd.clone();
                 let fp = relay_fp.clone();
-                async move { handle_bridge_info(bfd, fp).await }
+                let limiter = limiter.clone();
+                async move { handle_bridge_info(params, bfd, fp, limiter).await }
             }),
         );
+        // MUST-085..088: serve the generic cover page for every other path.
+        app = app.fallback(get(handle_cover_page));
     }
 
     // Add /stats endpoint only when feature is enabled AND env var is set

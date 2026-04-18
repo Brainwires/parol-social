@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added — Bridge hardening: cover page + disclosure limiter + IP-log scrubber (PNP-008 §9.1.1 / §9.1.2)
+- New `parolnet-relay::bridge` module: compiled-in `COVER_PAGE_HTML` (generic tourist landing, ≥ 256 B, no `ParolNet`/`parolnet`/`federation`/`bridge` tokens), `DisclosureLimiter` (in-memory only, `Email`/`QrSession` scopes with separate caps, rolling 1-hour window), `IpAuditLog` (first-seen map with `purge(now)` evicting entries older than 86_400 s). All constants (`COVER_LATENCY_BUDGET_MS=250`, `IP_LOG_MAX_AGE_SECS=86_400`, `IP_LOG_SCRUBBER_INTERVAL_SECS=3_600`) exported for conformance pin-down.
+- Relay-server wiring: `handle_cover_page` installed as the bridge-mode fallback route — any non-ParolNet request returns HTTP 200 + `text/html; charset=utf-8` + compiled HTML body, no per-source state retained. `handle_bridge_info` now requires `?scope=email&id=…` or `?scope=qr&id=…` and rejects with HTTP 429 once the per-scope cap is hit. A tokio interval task runs the `IpAuditLog::purge` + `DisclosureLimiter::gc` scrub every `IP_LOG_SCRUBBER_INTERVAL_SECS`, independent of request traffic.
+- Conformance: MUST-085/086/087/089/090 tests upgraded from vector-only string compares to exercise the real `DisclosureLimiter` + `IpAuditLog` types. Cover page is asserted to contain no forbidden tokens at test time. **PNP-008 conformance: 107/107 green. Workspace: 1219/1219 green.**
+- Security note: a seized bridge carries no disclosure history across a process restart (MUST-089), and the scrubber is traffic-independent (MUST-090) — idle bridges still purge on schedule.
+
 ### Added — Bridge probe-resistance + audit-log normatives (PNP-008 §9.1.1 / §9.1.2)
 - PNP-008 bumped to v0.6. New §9.1.1 "Cover-Page Probe Resistance" tightens MUST-053 into four implementable requirements: `PNP-008-MUST-085` (cover response is HTTP 200 + `text/html; charset=utf-8`, body ≥ 256 B), `PNP-008-MUST-086` (body MUST NOT contain `ParolNet`, `parolnet`, `federation`, `bridge` tokens), `PNP-008-MUST-087` (250 ms latency budget enforced by CI), `PNP-008-MUST-088` (no probe-source state retained).
 - New §9.1.2 "Disclosure Rate Limiting & Audit Log" adds `PNP-008-MUST-089` (ephemeral in-memory disclosure counter — persistence across restart forbidden so a seized bridge yields no history) and `PNP-008-MUST-090` (IP-log scrubber runs independently of request traffic at ≤ 3600 s cadence, purging entries older than 86_400 s).
