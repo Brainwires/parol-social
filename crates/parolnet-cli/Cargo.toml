@@ -1,0 +1,33 @@
+[package]
+name = "parolnet-cli"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.91"
+description = "Headless ParolNet test client — QR bootstrap / messaging over the relay WS"
+
+[[bin]]
+name = "parolnet-cli"
+path = "src/main.rs"
+
+[dependencies]
+parolnet-core = { path = "../parolnet-core", features = ["native"] }
+parolnet-crypto = { path = "../parolnet-crypto" }
+parolnet-protocol = { path = "../parolnet-protocol" }
+parolnet-relay = { path = "../parolnet-relay" }
+
+clap = { version = "4", features = ["derive"] }
+tokio = { workspace = true, features = ["full"] }
+tokio-tungstenite = { workspace = true, features = ["native-tls"] }
+futures-util = "0.3"
+reqwest = { version = "0.12", default-features = false, features = ["native-tls"] }
+voprf = { workspace = true }
+ed25519-dalek = { workspace = true }
+ciborium = { workspace = true }
+serde = { workspace = true }
+serde_bytes = { workspace = true }
+serde_json = { workspace = true }
+hex = { workspace = true }
+rand = { workspace = true }
+anyhow = "1"
+tracing = { workspace = true }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }

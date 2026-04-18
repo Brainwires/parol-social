@@ -10,6 +10,7 @@ members = [
     "crates/parolnet-wasm",
     "crates/parolnet-relay-server",
     "crates/parolnet-authority-cli",
+    "crates/parolnet-cli",
     "crates/parolnet-clause",
     "crates/parolnet-conformance",
     "xtask",
