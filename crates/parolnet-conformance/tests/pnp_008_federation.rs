@@ -228,34 +228,68 @@ fn iblt_wire_cell_count_over_cap_rejected() {
 #[clause("PNP-008-MUST-015")]
 #[test]
 fn federation_peer_concurrent_cap_is_eight() {
-    let max_federation_peers: usize = 8;
-    assert_eq!(max_federation_peers, 8);
+    // Core config surfaces the cap to FederationManager.
+    use parolnet_core::FederationConfig;
+    assert_eq!(FederationConfig::default().max_active_peers, 8);
+}
+
+#[clause("PNP-008-MUST-018")]
+#[test]
+fn federation_payloads_gated_by_state_machine() {
+    // Federation payloads only legal in SYNC or ACTIVE — enforced by the
+    // PeerState::can_send_federation_payload() invariant.
+    use parolnet_mesh::federation::PeerState;
+    assert!(!PeerState::Init.can_send_federation_payload());
+    assert!(!PeerState::Handshake.can_send_federation_payload());
+    assert!(PeerState::Sync.can_send_federation_payload());
+    assert!(PeerState::Active.can_send_federation_payload());
+    assert!(!PeerState::Idle.can_send_federation_payload());
+    assert!(!PeerState::Banned.can_send_federation_payload());
+}
+
+#[clause("PNP-008-MUST-019")]
+#[test]
+fn handshake_failure_transitions_to_idle_and_counts() {
+    // MUST-019: the transport must close on unverifiable descriptor. Our
+    // state machine routes this through handshake_failed → Idle, bumping
+    // failures for the MUST-020 backoff to take effect.
+    use parolnet_mesh::federation::{FederationPeer, PeerState};
+    use parolnet_protocol::PeerId;
+    let mut p = FederationPeer::new(PeerId([7; 32]), 0);
+    p.connect(1).unwrap();
+    p.handshake_failed(2);
+    assert_eq!(p.state, PeerState::Idle);
+    assert_eq!(p.failures, 1);
 }
 
 #[clause("PNP-008-MUST-020")]
 #[test]
 fn reconnect_backoff_formula_is_30_times_two_to_failures_capped_at_3600() {
-    // delay = min(3600, 30 * 2^failures) ± jitter_25%
-    fn base_delay(failures: u32) -> u64 {
-        let raw = 30u64.saturating_mul(1u64 << failures.min(20));
-        raw.min(3600)
-    }
-    assert_eq!(base_delay(0), 30);
-    assert_eq!(base_delay(1), 60);
-    assert_eq!(base_delay(2), 120);
-    assert_eq!(base_delay(6), 1920);
-    assert_eq!(base_delay(7), 3600); // 30 * 128 = 3840 capped
-    assert_eq!(base_delay(10), 3600);
-    assert_eq!(base_delay(20), 3600); // saturating cap holds
+    use parolnet_mesh::federation::reconnect_backoff_delay;
+    assert_eq!(reconnect_backoff_delay(0, 30, 3600), 30);
+    assert_eq!(reconnect_backoff_delay(1, 30, 3600), 60);
+    assert_eq!(reconnect_backoff_delay(2, 30, 3600), 120);
+    assert_eq!(reconnect_backoff_delay(6, 30, 3600), 1920);
+    assert_eq!(reconnect_backoff_delay(7, 30, 3600), 3600);
+    assert_eq!(reconnect_backoff_delay(63, 30, 3600), 3600);
 }
 
 #[clause("PNP-008-MUST-022")]
 #[test]
 fn federation_rate_limits_are_100_per_min_descriptors_10_per_hour_syncs() {
-    let descriptor_deliveries_per_min: u32 = 100;
-    let sync_initiations_per_hour: u32 = 10;
-    assert_eq!(descriptor_deliveries_per_min, 100);
-    assert_eq!(sync_initiations_per_hour, 10);
+    use parolnet_mesh::federation::FederationPeer;
+    use parolnet_protocol::PeerId;
+    let mut p = FederationPeer::new(PeerId([1; 32]), 0);
+    // Descriptor deliveries: 100 tokens at t=0, 101st rejected.
+    for _ in 0..100 {
+        assert!(p.charge_descriptor_delivery(0));
+    }
+    assert!(!p.charge_descriptor_delivery(0));
+    // Sync initiations: 10 tokens at t=0, 11th rejected.
+    for _ in 0..10 {
+        assert!(p.charge_sync_init(0));
+    }
+    assert!(!p.charge_sync_init(0));
 }
 
 // -- §4.2 Heartbeat timing: real-type tests live below under MUST-010/011 ---
@@ -885,8 +919,28 @@ fn unverifiable_peer_descriptor_closes_transport() {
 #[clause("PNP-008-MUST-021")]
 #[test]
 fn failure_counter_resets_after_300s_active_session() {
-    const ACTIVE_SESSION_MIN_RESET_SECS: u64 = 300;
-    assert_eq!(ACTIVE_SESSION_MIN_RESET_SECS, 300);
+    use parolnet_mesh::federation::{FederationPeer, STABILIZATION_ACTIVE_SECS};
+    use parolnet_protocol::PeerId;
+    assert_eq!(STABILIZATION_ACTIVE_SECS, 300);
+
+    let mut p = FederationPeer::new(PeerId([1; 32]), 0);
+    p.connect(1).unwrap();
+    p.handshake_failed(2);
+    p.connect(3).unwrap();
+    p.handshake_failed(4);
+    assert_eq!(p.failures, 2);
+
+    p.connect(5).unwrap();
+    p.handshake_ok(6).unwrap();
+    p.sync_complete(10).unwrap();
+    p.heartbeat_seen(1, 11);
+    // Under stabilization window — failures preserved.
+    p.tick(100);
+    assert_eq!(p.failures, 2);
+    // After stabilization — failures reset.
+    p.heartbeat_seen(2, 11 + STABILIZATION_ACTIVE_SECS);
+    p.tick(11 + STABILIZATION_ACTIVE_SECS);
+    assert_eq!(p.failures, 0);
 }
 
 // -- §6 Sync: IBLT with descriptors aged ≤ 24h -------------------------------

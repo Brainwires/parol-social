@@ -12,6 +12,7 @@
 pub mod connection_pool;
 pub mod discovery;
 pub mod error;
+pub mod federation;
 pub mod gossip;
 pub mod peer_manager;
 pub mod peer_table;

@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added — H12 Phase 3 prep: FederationPeer state machine + per-peer rate limits (PNP-008 §5)
+- New `parolnet-mesh::federation` module: pure-data `PeerState` enum (INIT→HANDSHAKE→SYNC→ACTIVE→IDLE→BANNED matching PNP-008 §5 diagram), `FederationPeer` struct with transition methods (connect, handshake_ok/fail, sync_complete, heartbeat_seen, tick, ban, unban). `TransitionError::{IllegalFrom, Banned}` captures forbidden edges. No I/O — the FederationManager drives the machine from event callbacks.
+- Per-peer `TokenBucket` enforces MUST-022: `charge_descriptor_delivery` (100/min) and `charge_sync_init` (10/hr). Refill uses period-based proportional math so both fast (100/min) and slow (10/hr) rates hydrate smoothly across arbitrary elapsed-time granularities.
+- MUST-018 is structurally enforced via `PeerState::can_send_federation_payload()`: only `Sync` and `Active` admit payloads. MUST-019 routes through `handshake_failed` → IDLE + failure bump. MUST-020 via free `reconnect_backoff_delay(failures, base, max)` and `FederationPeer::reconnect_delay()`. MUST-021 (300 s stabilize) via `tick()` that clears the failure counter once `active_since` is old enough. MUST-011 heartbeat silence → auto-demote to IDLE in the same tick.
+- Conformance: MUST-015/018/019/020/021/022 tests now exercise the real types. 13 new mesh-module tests; full workspace green (37 suites, 85 conformance tests).
+- Unblocks FederationManager I/O: the state machine now has a stable, unit-tested API the manager can drive without re-deriving timer math.
+
 ### Added — H12 Phase 3 prep: FederationSync / FederationHeartbeat wire structs + sync_id replay cache (PNP-008 §4.1, §4.2, MUST-006)
 - `parolnet-protocol::federation` now carries the full wire structs: `FederationSync`, `FederationHeartbeat`, plus supporting types `SyncScope`, `HeartbeatFlags`, `LoadHint`. Each has Ed25519 `sign`/`verify` over a domain-separated (`PNP-008-FederationSync-v1`, `PNP-008-FederationHeartbeat-v1`) SHA-256 of the signable fields; `timestamp_fresh()` implements the ±300 s window from MUST-008. CBOR encode/decode roundtrips preserve signatures. `response_descriptors` carries descriptors as opaque CBOR byte blobs (`ByteBuf`) so the type can live in `parolnet-protocol` without depending on `parolnet-relay`.
 - `parolnet-mesh::replay`: new `SyncIdReplayCache` enforces MUST-006 — rejects duplicate sync_ids within a 300 s window, evicts old entries on access, hard-caps memory to 4096 entries by default.
