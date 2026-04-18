@@ -67,12 +67,19 @@ pub struct DecryptedEnvelope {
 /// `msg_type` MUST be one of the codes in the PNP-001 §3.4 registry.
 /// `now_secs` is the current wall-clock Unix timestamp; it is coarsened
 /// internally.
+///
+/// `source_hint` is the sender's PeerId to carry in the cleartext header. Per
+/// PNP-001-SHOULD-003 this SHOULD be `None` on every envelope except the
+/// scanner's bootstrap-completing first frame (PNP-001-MUST-063), where it
+/// carries the scanner's 32-byte Ed25519 identity public key packed as a
+/// PeerId so the presenter can materialize the responder session (§5.3.1).
 pub fn encrypt_into_envelope(
     session: &mut DoubleRatchetSession,
     dest_peer_id: &PeerId,
     msg_type: u8,
     plaintext: &[u8],
     now_secs: u64,
+    source_hint: Option<PeerId>,
 ) -> Result<Vec<u8>, CoreError> {
     // 1. Cleartext header.
     let mut message_id = [0u8; 16];
@@ -84,7 +91,7 @@ pub fn encrypt_into_envelope(
         message_id,
         now_secs,
         DEFAULT_TTL,
-        None, // PNP-001-SHOULD-003: omit source_hint by default
+        source_hint,
     );
 
     // 2. Serialize cleartext header for AAD binding.
@@ -235,9 +242,17 @@ pub fn encrypt_for_peer(
     msg_type: u8,
     plaintext: &[u8],
     now_secs: u64,
+    source_hint: Option<PeerId>,
 ) -> Result<Vec<u8>, CoreError> {
     sessions.with_session_mut(dest_peer_id, |ratchet| {
-        encrypt_into_envelope(ratchet, dest_peer_id, msg_type, plaintext, now_secs)
+        encrypt_into_envelope(
+            ratchet,
+            dest_peer_id,
+            msg_type,
+            plaintext,
+            now_secs,
+            source_hint,
+        )
     })
 }
 
@@ -249,6 +264,82 @@ pub fn decrypt_for_peer(
 ) -> Result<DecryptedEnvelope, CoreError> {
     sessions.with_session_mut(source_peer_id, |ratchet| {
         decrypt_from_envelope(ratchet, envelope_bytes)
+    })
+}
+
+/// PNP-001 §5.3.1 — materialize a responder Double Ratchet session from the
+/// envelope's cleartext `source_hint` and decrypt the envelope atomically.
+///
+/// Called on the QR-presenter receive path when normal trial-decrypt has
+/// exhausted every committed session. Derives the bootstrap shared secret per
+/// PNP-003 §5.1 step 7, constructs a **candidate** responder session, and
+/// attempts AEAD decryption under it. Only on AEAD success is the candidate
+/// session committed to `sessions` keyed by the scanner's PeerId.
+///
+/// Pins **PNP-001-MUST-064**: AEAD verification precedes session commit, so a
+/// forged `source_hint` cannot poison the session manager — the attacker
+/// would need the out-of-band `seed` to produce a session whose tag verifies.
+///
+/// # Arguments
+/// - `our_ik` — the presenter's 32-byte Ed25519 identity public key (same
+///   value embedded in their QR payload).
+/// - `seed` — the 32-byte QR seed from `generate_qr_payload_with_ratchet`.
+/// - `our_ratchet_secret` — the X25519 ratchet secret paired to the ratchet
+///   public key that was advertised in the QR payload.
+///
+/// Returns the decrypted envelope on success. On failure, `sessions` and the
+/// caller's pending-bootstrap state are untouched — the caller retains the
+/// ability to process a subsequent legitimate first-envelope.
+pub fn try_bootstrap_and_decrypt(
+    sessions: &SessionManager,
+    envelope_bytes: &[u8],
+    our_ik: &[u8; 32],
+    seed: &[u8; 32],
+    our_ratchet_secret: &[u8; 32],
+) -> Result<DecryptedEnvelope, CoreError> {
+    use x25519_dalek::StaticSecret;
+
+    if !BUCKET_SIZES.contains(&envelope_bytes.len()) {
+        return Err(CoreError::Protocol(
+            parolnet_protocol::ProtocolError::InvalidEnvelopeLength(envelope_bytes.len()),
+        ));
+    }
+
+    let envelope = CborCodec.decode(envelope_bytes)?;
+
+    // source_hint carries the scanner's 32-byte Ed25519 IK on the bootstrap
+    // envelope. Missing = not a bootstrap frame; caller's pending state stays
+    // intact.
+    let their_ik_peer = envelope.cleartext_header.source_hint.ok_or_else(|| {
+        CoreError::BootstrapFailed("envelope has no source_hint; cannot bootstrap".into())
+    })?;
+    let their_ik = their_ik_peer.0;
+
+    let bs = crate::bootstrap::derive_bootstrap_secret(seed, our_ik, &their_ik)?;
+
+    // Candidate session — held on the stack, not yet in the session manager.
+    let ratchet_sk = StaticSecret::from(*our_ratchet_secret);
+    let mut candidate = DoubleRatchetSession::initialize_responder(bs, ratchet_sk)
+        .map_err(CoreError::Crypto)?;
+
+    let header_bytes = encode_header(&envelope.cleartext_header)?;
+    let plaintext = candidate
+        .decrypt(
+            &envelope.ratchet_header,
+            &envelope.encrypted_payload,
+            &header_bytes,
+        )
+        .map_err(CoreError::Crypto)?;
+
+    // AEAD verified → commit session keyed by PeerId(SHA-256(their_ik)).
+    let scanner_peer_id = PeerId::from_public_key(&their_ik);
+    sessions.add_session(scanner_peer_id, candidate);
+
+    Ok(DecryptedEnvelope {
+        source_hint: Some(scanner_peer_id),
+        msg_type: envelope.cleartext_header.msg_type,
+        plaintext,
+        timestamp: envelope.cleartext_header.timestamp,
     })
 }
 
@@ -271,7 +362,8 @@ mod tests {
         let (mut alice, mut bob) = session_pair();
         let dest = PeerId([0x11u8; 32]);
         let env =
-            encrypt_into_envelope(&mut alice, &dest, 0x01, b"hello bob", 1_700_000_000).unwrap();
+            encrypt_into_envelope(&mut alice, &dest, 0x01, b"hello bob", 1_700_000_000, None)
+                .unwrap();
         assert!(BUCKET_SIZES.contains(&env.len()));
         let decoded = decrypt_from_envelope(&mut bob, &env).unwrap();
         assert_eq!(decoded.plaintext, b"hello bob");
@@ -284,7 +376,7 @@ mod tests {
         let (mut alice, mut bob) = session_pair();
         let dest = PeerId([0x11u8; 32]);
         let mut env =
-            encrypt_into_envelope(&mut alice, &dest, 0x01, b"secret", 1_700_000_000).unwrap();
+            encrypt_into_envelope(&mut alice, &dest, 0x01, b"secret", 1_700_000_000, None).unwrap();
         // Flip a byte in the middle — statistically touches the cleartext
         // header (it sits at the front of the CBOR encoding).
         env[10] ^= 0x01;

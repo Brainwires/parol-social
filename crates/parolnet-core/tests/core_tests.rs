@@ -2027,6 +2027,7 @@ fn test_envelope_padding_roundtrip() {
         0x01,
         original,
         1_700_000_000,
+        None,
     )
     .unwrap();
 

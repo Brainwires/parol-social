@@ -235,3 +235,186 @@ fn opt_in_cumulative_accounting_has_required_shape() {
     assert!(try_issue(&mut issued, ident, epoch_id + 1, 32, budget));
     assert_eq!(issued[&ident], (epoch_id + 1, 32));
 }
+
+// ---- §5.3.1 — QR bootstrap: source_hint carries scanner IK ---------------
+
+/// Build a presenter/scanner pair sharing only the QR payload. Returns
+/// (presenter_ParolNet, scanner_ParolNet, qr_seed, presenter_ratchet_secret,
+/// scanner_peer_id, scanner_ik). Mirrors the real PWA bootstrap flow:
+/// presenter generates QR → scanner scans → both have a session locally on
+/// the scanner side, while the presenter holds only pending_bootstrap.
+fn bootstrap_state() -> (
+    parolnet_core::ParolNet,
+    parolnet_core::ParolNet,
+    [u8; 32],
+    [u8; 32],
+    parolnet_protocol::address::PeerId,
+    [u8; 32],
+) {
+    use parolnet_core::ParolNetConfig;
+    use parolnet_core::bootstrap::{derive_bootstrap_secret, generate_qr_payload_with_ratchet};
+    use parolnet_crypto::SharedSecret;
+
+    let presenter = parolnet_core::ParolNet::new(ParolNetConfig::default());
+    let scanner = parolnet_core::ParolNet::new(ParolNetConfig::default());
+
+    // Presenter generates QR with ratchet key embedded.
+    let qr = generate_qr_payload_with_ratchet(&presenter.public_key(), None).unwrap();
+
+    // Scanner decodes QR payload, derives BS, and establishes initiator session.
+    let parsed = parolnet_core::bootstrap::parse_qr_payload(&qr.payload_bytes).unwrap();
+    let mut ratchet_key = [0u8; 32];
+    ratchet_key.copy_from_slice(&parsed.rk);
+    let bs = derive_bootstrap_secret(&qr.seed, &scanner.public_key(), &presenter.public_key())
+        .unwrap();
+    let presenter_peer = presenter.peer_id();
+    scanner
+        .establish_session(presenter_peer, SharedSecret(bs), &ratchet_key, true)
+        .unwrap();
+
+    let scanner_peer = scanner.peer_id();
+    let scanner_ik = scanner.public_key();
+    (presenter, scanner, qr.seed, qr.ratchet_secret, scanner_peer, scanner_ik)
+}
+
+#[clause("PNP-001-MUST-063", "PNP-001-MUST-064")]
+#[test]
+fn bootstrap_via_source_hint_establishes_responder_session() {
+    let (presenter, scanner, seed, ratchet_secret, scanner_peer, scanner_ik) = bootstrap_state();
+    assert!(
+        !presenter.has_session(&scanner_peer),
+        "precondition: presenter has no session for scanner before bootstrap"
+    );
+
+    // Scanner crafts first envelope with source_hint = their IK (MUST-063).
+    let presenter_peer = presenter.peer_id();
+    let source_hint = parolnet_protocol::address::PeerId(scanner_ik);
+    let wire = parolnet_core::envelope::encrypt_for_peer(
+        scanner.sessions(),
+        &presenter_peer,
+        0x01, // CHAT
+        b"hello from the scanner",
+        1_700_000_000,
+        Some(source_hint),
+    )
+    .unwrap();
+
+    // Presenter runs the §5.3.1 materialization path.
+    let decoded = parolnet_core::envelope::try_bootstrap_and_decrypt(
+        presenter.sessions(),
+        &wire,
+        &presenter.public_key(),
+        &seed,
+        &ratchet_secret,
+    )
+    .expect("MUST-064: valid source_hint + AEAD OK → session materializes + decrypts");
+
+    assert_eq!(decoded.plaintext, b"hello from the scanner");
+    assert_eq!(
+        decoded.source_hint,
+        Some(scanner_peer),
+        "MUST-064: returned source_hint is the PeerId of the now-committed session"
+    );
+    assert!(
+        presenter.has_session(&scanner_peer),
+        "MUST-064: AEAD success commits the candidate session to the manager"
+    );
+}
+
+#[clause("PNP-001-MUST-064")]
+#[test]
+fn bootstrap_source_hint_tamper_fails_without_committing_session() {
+    let (presenter, scanner, seed, ratchet_secret, scanner_peer, scanner_ik) = bootstrap_state();
+
+    // Scanner sends a legitimate bootstrap frame…
+    let presenter_peer = presenter.peer_id();
+    let source_hint = parolnet_protocol::address::PeerId(scanner_ik);
+    let mut wire = parolnet_core::envelope::encrypt_for_peer(
+        scanner.sessions(),
+        &presenter_peer,
+        0x01,
+        b"hi",
+        1_700_000_000,
+        Some(source_hint),
+    )
+    .unwrap();
+
+    // …but a MITM flips a byte deep in the cleartext region. The tamper
+    // may land on source_hint itself or elsewhere in the header — either way,
+    // the AEAD AAD binds the entire cleartext header (PNP-001-MUST-007), so
+    // the candidate session's decrypt MUST fail.
+    // Byte offset ~12 reliably sits inside the cleartext header array for
+    // the 256-byte bucket envelopes produced above.
+    wire[20] ^= 0x01;
+
+    let res = parolnet_core::envelope::try_bootstrap_and_decrypt(
+        presenter.sessions(),
+        &wire,
+        &presenter.public_key(),
+        &seed,
+        &ratchet_secret,
+    );
+    assert!(
+        res.is_err(),
+        "MUST-064: AEAD failure on tampered header MUST reject"
+    );
+    assert!(
+        !presenter.has_session(&scanner_peer),
+        "MUST-064: failed materialization MUST NOT commit the candidate session"
+    );
+}
+
+#[clause("PNP-001-SHOULD-013")]
+#[test]
+fn second_envelope_uses_null_source_hint_on_established_session() {
+    let (presenter, scanner, seed, ratchet_secret, scanner_peer, scanner_ik) = bootstrap_state();
+
+    // First envelope bootstraps the session (MUST-063).
+    let presenter_peer = presenter.peer_id();
+    let source_hint = parolnet_protocol::address::PeerId(scanner_ik);
+    let wire1 = parolnet_core::envelope::encrypt_for_peer(
+        scanner.sessions(),
+        &presenter_peer,
+        0x01,
+        b"first",
+        1_700_000_000,
+        Some(source_hint),
+    )
+    .unwrap();
+    let _ = parolnet_core::envelope::try_bootstrap_and_decrypt(
+        presenter.sessions(),
+        &wire1,
+        &presenter.public_key(),
+        &seed,
+        &ratchet_secret,
+    )
+    .unwrap();
+    assert!(presenter.has_session(&scanner_peer));
+
+    // Second envelope over the now-established session — SHOULD-013 says
+    // source_hint returns to null. The pure envelope path does this by
+    // default (encrypt_for_peer with source_hint = None).
+    let wire2 = parolnet_core::envelope::encrypt_for_peer(
+        scanner.sessions(),
+        &presenter_peer,
+        0x01,
+        b"second",
+        1_700_000_300,
+        None,
+    )
+    .unwrap();
+
+    // Presenter decrypts via the normal path — no materialization needed now.
+    let decoded = parolnet_core::envelope::decrypt_for_peer(
+        presenter.sessions(),
+        &scanner_peer,
+        &wire2,
+    )
+    .unwrap();
+
+    assert_eq!(decoded.plaintext, b"second");
+    assert_eq!(
+        decoded.source_hint, None,
+        "SHOULD-013: post-bootstrap envelopes default to source_hint = null"
+    );
+}

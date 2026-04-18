@@ -1,12 +1,20 @@
 # PNP-001: ParolNet Wire Protocol
 
 ### Status: CANDIDATE
-### Version: 0.8
+### Version: 0.9
 ### Date: 2026-04-18
 
 ---
 
 ## Changelog
+
+**v0.9 (2026-04-18) — QR bootstrap: scanner IK travels in `source_hint`**
+
+- SHOULD-003 (§5.1) gets an explicit bootstrap carve-out. During QR pairing the scanner's FIRST envelope to the presenter MUST set `source_hint` to the scanner's 32-byte Ed25519 identity public key. Without this, the presenter cannot derive the bootstrap shared secret (PNP-003 §5.1 step 7) and cannot materialize the responder Double Ratchet session — pairing stalls in `SECRET_SHARED` forever. This was the root cause of the "contact added on one side, never appears on the other" bug observed in the reference PWA.
+- Added §5.3.1 "Bootstrap Session Materialization" specifying the receive-side rule: the presenter derives BS from `source_hint`, constructs the candidate responder session, attempts AEAD decryption, and only on success commits the session to the session manager and consumes `pending_bootstrap`. AEAD failure drops the frame without touching session state, so a forged `source_hint` cannot poison the session table.
+- Post-bootstrap envelopes return to the default SHOULD-003 (null `source_hint`). Only the exactly-one bootstrap-completing envelope carries the IK.
+- Allocated `PNP-001-MUST-063`, `PNP-001-MUST-064`, `PNP-001-SHOULD-013`. MUST count: 64.
+- Privacy note: the scanner's IK is visible to the relay on this one frame. This is strictly no worse than `/peers/presence` (PNP-008) which exposes PeerIds post-pairing anyway, and is a necessary consequence of QR being a one-way (presenter → scanner) out-of-band channel.
 
 **v0.8 (2026-04-18) — Issuance rate limit demoted to optional**
 
@@ -351,7 +359,7 @@ Envelope processing follows this flow:
 3. A sender MUST generate a cryptographically random `message_id` for each envelope. **PNP-001-MUST-028**
 4. A sender MUST set `ttl_and_hops` with TTL in the upper 8 bits and hop count 0x00 in the lower 8 bits. **PNP-001-MUST-029**
 5. A sender SHOULD set a default TTL of 7. **PNP-001-SHOULD-002** A sender MAY use a lower TTL for latency-sensitive messages. **PNP-001-MAY-002**
-6. A sender SHOULD omit `source_hint` (encoding it as CBOR null) unless the recipient needs it for initial contact resolution. **PNP-001-SHOULD-003**
+6. A sender SHOULD omit `source_hint` (encoding it as CBOR null) unless the recipient needs it for initial contact resolution. **PNP-001-SHOULD-003** The QR-bootstrap carve-out of §5.3.1 is the single normative exception: on the scanner's first envelope after `process_scanned_qr`, `source_hint` MUST carry the scanner's 32-byte Ed25519 identity public key (**PNP-001-MUST-063**). On every envelope sent over a session already committed to the session manager, `source_hint` SHOULD return to CBOR null. **PNP-001-SHOULD-013**
 7. A sender MUST pad the envelope to the appropriate bucket size per Section 3.6. **PNP-001-MUST-030**
 8. A sender SHOULD generate decoy messages at random intervals to maintain a minimum baseline traffic rate. **PNP-001-SHOULD-004**
 
@@ -372,6 +380,20 @@ Envelope processing follows this flow:
 3. A receiver MUST check the `message_id` against a replay cache. Duplicate message IDs MUST be silently discarded. **PNP-001-MUST-038** The cache SHOULD retain entries for at least 60 minutes. **PNP-001-SHOULD-007**
 4. A receiver MUST verify the timestamp is within an acceptable window. The timestamp MUST NOT be more than 30 minutes (6 buckets) in the past or more than 1 bucket (5 minutes) in the future. Messages outside this window MUST be discarded. **PNP-001-MUST-039**
 5. A receiver SHOULD process decoy messages (is_decoy flag set) identically to real messages up to the point of application delivery, then discard them. **PNP-001-SHOULD-008**
+
+### 5.3.1 Bootstrap Session Materialization
+
+A receiver in the QR-presenter role (holding a pending bootstrap: `seed` + `ratchet_secret` from `generate_qr_payload`, and no committed session for the sender) processes an incoming envelope as follows:
+
+1. Run normal trial-decrypt against every committed session. If any session AEAD-decrypts the envelope, deliver the plaintext and stop.
+2. If no committed session decrypts, AND the receiver has a pending bootstrap, AND the envelope's `source_hint` is a 32-byte value (not CBOR null), treat `source_hint` as the scanner's Ed25519 identity public key candidate.
+3. Derive `BS = HKDF-SHA-256(salt="ParolNet_bootstrap_v1", ikm=seed, info=sorted_concat(our_IK, candidate_IK))` (PNP-003 §5.1 step 7).
+4. Construct a **candidate** responder Double Ratchet session from `BS` + `ratchet_secret`. This session MUST NOT yet be committed to the session manager.
+5. Attempt AEAD decryption of the envelope under the candidate session.
+6. **On AEAD success**: commit the candidate session to the session manager keyed by `SHA-256(candidate_IK)` (the scanner's PeerId), erase the pending bootstrap, and deliver the plaintext. **PNP-001-MUST-064**
+7. **On AEAD failure**: discard the candidate session without committing and drop the envelope silently. The pending bootstrap MUST remain intact so a subsequent legitimate first-envelope can still be processed.
+
+The atomicity of step 6 (commit-on-AEAD-success) is the security property of MUST-064: an attacker cannot poison the session manager by shipping a frame with a `source_hint` they control, because the AEAD tag verifies only under the `BS` that requires knowledge of `seed` (which was transferred out-of-band via QR). A forged `source_hint` produces a candidate session that fails AEAD immediately.
 
 ### 5.4 Replay / Seen-Message Windows
 

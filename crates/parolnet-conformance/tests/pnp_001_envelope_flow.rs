@@ -38,7 +38,7 @@ fn envelope_flow_round_trip_hits_every_bucket() {
         let plaintext = vec![0xA5u8; pt_len];
 
         let wire =
-            encrypt_into_envelope(&mut alice, &dest, 0x01, &plaintext, 1_700_000_000).unwrap();
+            encrypt_into_envelope(&mut alice, &dest, 0x01, &plaintext, 1_700_000_000, None).unwrap();
 
         assert!(
             BUCKET_SIZES.contains(&wire.len()),
@@ -68,7 +68,8 @@ fn envelope_flow_coarsens_timestamp_to_300s_boundary() {
     let (mut alice, mut bob) = session_pair();
     let dest = PeerId([0x22u8; 32]);
     // Wall-clock 1_700_000_123 is inside the bucket starting at 1_700_000_100.
-    let wire = encrypt_into_envelope(&mut alice, &dest, 0x01, b"ts", 1_700_000_123).unwrap();
+    let wire =
+        encrypt_into_envelope(&mut alice, &dest, 0x01, b"ts", 1_700_000_123, None).unwrap();
     let decoded = decrypt_from_envelope(&mut bob, &wire).unwrap();
     assert_eq!(
         decoded.timestamp, 1_700_000_100,
@@ -84,7 +85,7 @@ fn envelope_flow_coarsens_timestamp_to_300s_boundary() {
 fn envelope_flow_tampered_cleartext_header_fails_aead() {
     let (mut alice, _bob) = session_pair();
     let dest = PeerId([0x33u8; 32]);
-    let wire = encrypt_into_envelope(&mut alice, &dest, 0x01, b"secret", 1_700_000_000).unwrap();
+    let wire = encrypt_into_envelope(&mut alice, &dest, 0x01, b"secret", 1_700_000_000, None).unwrap();
 
     // Walk the first 200 bytes of the wire envelope and, for each byte,
     // flip one bit and verify decryption fails. The first ~150 bytes span
@@ -101,7 +102,7 @@ fn envelope_flow_tampered_cleartext_header_fails_aead() {
         let (mut _a, mut b) = session_pair();
         // Re-run Alice's encrypt on the fresh pair so Bob's state matches
         // the one that produced `wire`.
-        let _ = encrypt_into_envelope(&mut _a, &dest, 0x01, b"secret", 1_700_000_000).unwrap();
+        let _ = encrypt_into_envelope(&mut _a, &dest, 0x01, b"secret", 1_700_000_000, None).unwrap();
         match decrypt_from_envelope(&mut b, &tampered) {
             Ok(_) => {
                 // A tampered byte that hit padding (after AAD coverage) could
@@ -133,7 +134,7 @@ fn envelope_flow_omits_source_hint_by_default() {
     // relay a social graph for free.
     let (mut alice, mut bob) = session_pair();
     let dest = PeerId([0x55u8; 32]);
-    let wire = encrypt_into_envelope(&mut alice, &dest, 0x01, b"anon", 1_700_000_000).unwrap();
+    let wire = encrypt_into_envelope(&mut alice, &dest, 0x01, b"anon", 1_700_000_000, None).unwrap();
     let decoded = decrypt_from_envelope(&mut bob, &wire).unwrap();
     assert!(
         decoded.source_hint.is_none(),
@@ -152,7 +153,7 @@ fn envelope_flow_bucket_boundary_selection() {
     let (mut a1, mut b1) = session_pair();
     let dest = PeerId([0x44u8; 32]);
 
-    let wire_small = encrypt_into_envelope(&mut a1, &dest, 0x01, b"hi", 1_700_000_000).unwrap();
+    let wire_small = encrypt_into_envelope(&mut a1, &dest, 0x01, b"hi", 1_700_000_000, None).unwrap();
     assert_eq!(
         wire_small.len(),
         256,
@@ -166,7 +167,7 @@ fn envelope_flow_bucket_boundary_selection() {
     // header, AEAD tag, bstr length prefixes). A 200-byte plaintext reliably
     // crosses the 256 boundary.
     let plaintext = vec![0x5Au8; 200];
-    let wire_mid = encrypt_into_envelope(&mut a2, &dest, 0x01, &plaintext, 1_700_000_000).unwrap();
+    let wire_mid = encrypt_into_envelope(&mut a2, &dest, 0x01, &plaintext, 1_700_000_000, None).unwrap();
     assert_eq!(
         wire_mid.len(),
         1024,

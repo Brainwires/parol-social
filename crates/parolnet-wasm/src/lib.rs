@@ -404,15 +404,30 @@ pub fn send_message(peer_id_hex: &str, plaintext: &str) -> Result<JsValue, JsErr
 /// (256 / 1024 / 4096 / 16384 bytes).
 ///
 /// Returns the on-wire envelope as a hex string.
+///
+/// `source_hint_hex` — optional 32-byte hex-encoded sender IK to embed in the
+/// cleartext header. Per PNP-001-SHOULD-003 this SHOULD be omitted (pass
+/// `None`) except on the QR scanner's bootstrap-completing first envelope
+/// (PNP-001-MUST-063), where it carries the scanner's Ed25519 public key so
+/// the presenter can materialize the responder session (§5.3.1).
 #[wasm_bindgen]
 pub fn envelope_encode(
     dest_peer_id_hex: &str,
     msg_type: u8,
     plaintext: &[u8],
     now_secs: u64,
+    source_hint_hex: Option<String>,
 ) -> Result<String, JsError> {
     let peer_id_bytes = decode_32(dest_peer_id_hex)?;
     let dest_peer_id = parolnet_protocol::address::PeerId(peer_id_bytes);
+
+    let source_hint = match source_hint_hex {
+        Some(h) => {
+            let b = decode_32(&h)?;
+            Some(parolnet_protocol::address::PeerId(b))
+        }
+        None => None,
+    };
 
     let state = STATE.lock().unwrap_or_else(|e| e.into_inner());
     let client = state
@@ -426,6 +441,7 @@ pub fn envelope_encode(
         msg_type,
         plaintext,
         now_secs,
+        source_hint,
     )
     .map_err(|e| JsError::new(&format!("{e}")))?;
 

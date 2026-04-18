@@ -80,6 +80,7 @@ pub fn rotate_identity_for_peers(
                 MSG_TYPE_IDENTITY_ROTATE,
                 &payload_json,
                 now_secs,
+                None,
             )
         })?;
         envelopes.push(RotationEnvelope {
