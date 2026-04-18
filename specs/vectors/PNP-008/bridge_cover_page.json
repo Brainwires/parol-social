@@ -1,0 +1,15 @@
+{
+  "clauses": ["PNP-008-MUST-085", "PNP-008-MUST-086", "PNP-008-MUST-087", "PNP-008-MUST-088"],
+  "description": "Bridge cover-page probe-resistance constants.",
+  "http_status": 200,
+  "content_type": "text/html; charset=utf-8",
+  "min_body_bytes": 256,
+  "cover_latency_budget_ms": 250,
+  "forbidden_tokens": [
+    "ParolNet",
+    "parolnet",
+    "federation",
+    "bridge"
+  ],
+  "probe_source_state_retained": false
+}

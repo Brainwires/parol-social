@@ -1012,6 +1012,97 @@ fn federation_close_code_registry_matches_spec() {
     assert_eq!(CLOSE_OVERSIZE, 4003);
 }
 
+// -- §9.1.1 Bridge cover-page probe resistance (v0.6) ----------------------
+
+#[clause("PNP-008-MUST-085")]
+#[test]
+fn bridge_cover_page_is_200_html_min_256_bytes() {
+    let v: serde_json::Value = serde_json::from_slice(include_bytes!(
+        "../../../specs/vectors/PNP-008/bridge_cover_page.json"
+    ))
+    .unwrap();
+    assert_eq!(v["http_status"].as_u64(), Some(200));
+    assert_eq!(
+        v["content_type"].as_str(),
+        Some("text/html; charset=utf-8")
+    );
+    assert_eq!(v["min_body_bytes"].as_u64(), Some(256));
+}
+
+#[clause("PNP-008-MUST-086")]
+#[test]
+fn bridge_cover_page_forbids_parolnet_tokens() {
+    let v: serde_json::Value = serde_json::from_slice(include_bytes!(
+        "../../../specs/vectors/PNP-008/bridge_cover_page.json"
+    ))
+    .unwrap();
+    let forbidden: Vec<&str> = v["forbidden_tokens"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|x| x.as_str().unwrap())
+        .collect();
+    for token in ["ParolNet", "parolnet", "federation", "bridge"] {
+        assert!(
+            forbidden.contains(&token),
+            "token {token} MUST be forbidden in cover body"
+        );
+    }
+}
+
+#[clause("PNP-008-MUST-087")]
+#[test]
+fn bridge_cover_page_latency_budget_is_250ms() {
+    let v: serde_json::Value = serde_json::from_slice(include_bytes!(
+        "../../../specs/vectors/PNP-008/bridge_cover_page.json"
+    ))
+    .unwrap();
+    assert_eq!(v["cover_latency_budget_ms"].as_u64(), Some(250));
+}
+
+#[clause("PNP-008-MUST-088")]
+#[test]
+fn bridge_probes_leave_no_residual_source_state() {
+    let v: serde_json::Value = serde_json::from_slice(include_bytes!(
+        "../../../specs/vectors/PNP-008/bridge_cover_page.json"
+    ))
+    .unwrap();
+    assert_eq!(v["probe_source_state_retained"].as_bool(), Some(false));
+}
+
+#[clause("PNP-008-MUST-089")]
+#[test]
+fn bridge_disclosure_counter_ephemeral_in_memory() {
+    let v: serde_json::Value = serde_json::from_slice(include_bytes!(
+        "../../../specs/vectors/PNP-008/bridge_disclosure_limits.json"
+    ))
+    .unwrap();
+    assert_eq!(v["disclosures_per_email_per_hour"].as_u64(), Some(3));
+    assert_eq!(v["disclosures_per_qr_session"].as_u64(), Some(1));
+    assert_eq!(v["rolling_window_secs"].as_u64(), Some(3600));
+    assert_eq!(
+        v["counter_persisted_across_restart"].as_bool(),
+        Some(false),
+        "MUST-089 forbids persisting the disclosure counter across restarts"
+    );
+}
+
+#[clause("PNP-008-MUST-090")]
+#[test]
+fn bridge_ip_log_scrubber_purges_at_24h() {
+    let v: serde_json::Value = serde_json::from_slice(include_bytes!(
+        "../../../specs/vectors/PNP-008/bridge_disclosure_limits.json"
+    ))
+    .unwrap();
+    let purge_age = v["ip_log_purge_max_age_secs"].as_u64().unwrap();
+    let scrubber_interval = v["ip_log_scrubber_max_interval_secs"].as_u64().unwrap();
+    assert_eq!(purge_age, 86_400, "24-hour purge bound (MUST-054 bridge)");
+    assert!(
+        scrubber_interval <= 3600,
+        "scrubber MUST run at least every 3600 s independent of traffic"
+    );
+}
+
 // -- §8.7 HTTPS content-type (resumes v0.4 test series) -------------------
 
 #[clause("PNP-008-MUST-076")]

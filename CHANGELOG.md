@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added — Bridge probe-resistance + audit-log normatives (PNP-008 §9.1.1 / §9.1.2)
+- PNP-008 bumped to v0.6. New §9.1.1 "Cover-Page Probe Resistance" tightens MUST-053 into four implementable requirements: `PNP-008-MUST-085` (cover response is HTTP 200 + `text/html; charset=utf-8`, body ≥ 256 B), `PNP-008-MUST-086` (body MUST NOT contain `ParolNet`, `parolnet`, `federation`, `bridge` tokens), `PNP-008-MUST-087` (250 ms latency budget enforced by CI), `PNP-008-MUST-088` (no probe-source state retained).
+- New §9.1.2 "Disclosure Rate Limiting & Audit Log" adds `PNP-008-MUST-089` (ephemeral in-memory disclosure counter — persistence across restart forbidden so a seized bridge yields no history) and `PNP-008-MUST-090` (IP-log scrubber runs independently of request traffic at ≤ 3600 s cadence, purging entries older than 86_400 s).
+- Vectors under `specs/vectors/PNP-008/`: `bridge_cover_page.json`, `bridge_disclosure_limits.json`.
+- Total PNP-008 normative clauses: **90** (MUST-001..090). **PNP-008 conformance: 107/107 green.**
+- Implementation lands in commit #9; this commit is spec + vectors + clause-pinned tests only.
+
 ### Added — H12 Phase 3: federation-link wire codec + `/federation/v1` endpoint (PNP-008 §5.5 / §5.6)
 - New `parolnet-relay::federation_codec` module: `FederationFrame { Sync, Heartbeat }`, `encode_frame`/`decode_frame` implementing `len_be32 || cbor` framing (MUST-078), 2 MiB hard cap (MUST-079), unknown-type rejection (MUST-080), and the full close-code registry — `CLOSE_NORMAL=1000`, `CLOSE_DUP_PEER=4000`, `CLOSE_RATE_LIMIT=4001`, `CLOSE_UNKNOWN_TYPE=4002`, `CLOSE_OVERSIZE=4003` (MUST-084). `CodecError::close_code()` maps every wire error to its spec-mandated close code.
 - New `parolnet-relay::federation_link` module: `FederationLink` session driver with `Initiator` / `Responder` roles. `admit_inbound()` enforces MUST-083 (dedup vs. existing ACTIVE link → `DuplicatePeer` error → close 4000). `initiator_must_send_sync_first()` pins MUST-081 ordering. Helpers `duplicate_peer_shutdown()`, `rate_limit_shutdown()`, `normal_shutdown()` produce `LinkShutdown` with the correct close codes for transport-side emission.

@@ -1,11 +1,12 @@
 # PNP-008: Relay Federation & Network Resilience
 
-**Version:** 0.5
+**Version:** 0.6
 **Status:** CANDIDATE
 **Last-Updated:** 2026-04-17
 
 ## Changelog
 
+- **v0.6 (2026-04-17):** Tightened §9 Bridge Relays with explicit probe-resistance and audit-log normatives. Added §9.1.1 "Cover-Page Probe Resistance" with `PNP-008-MUST-085` through `PNP-008-MUST-088` (HTTP 200 + text/html cover body, forbidden tokens, 250 ms latency budget, no probe-source state). Added §9.1.2 "Disclosure Rate Limiting & Audit Log" with `PNP-008-MUST-089` (ephemeral in-memory disclosure counter, no cross-restart persistence) and `PNP-008-MUST-090` (scheduled ≤3600 s IP-log scrubber enforcing the 24 h purge). Clarifies MUST-052/053/054 into implementable requirements. No wire-format changes.
 - **v0.5 (2026-04-17):** Locked the federation-link on-wire shape. Added §5.5 "On-Wire Framing" with `PNP-008-MUST-077` through `PNP-008-MUST-082` (WSS on `/federation/v1`, length-prefixed CBOR frames, 2 MiB cap, unknown-type = close, initial FederationSync ordering, mid-SYNC heartbeat policy). Added §5.6 "Link Deduplication & Close" with `PNP-008-MUST-083` and `PNP-008-MUST-084` (one link per peer, close semantics). No new payload types — these clauses lock what implementations must send on an already-allocated 0x06/0x07 frame.
 - **v0.4 (2026-04-17):** Tightened §8 Bootstrap Channels with six supplemental MUST clauses (`PNP-008-MUST-071` through `PNP-008-MUST-076`) covering BootstrapBundle version gating, 7-day freshness bound, DHT BEP-44 salt constant, per-channel 10-second attempt timeout, seed-list load-without-network invariant, and HTTPS content-type rejection. Addresses stale-bundle replay, cross-network DHT collisions, and content-sniffing attacks. No wire-format changes — existing clients that already validate signatures remain interoperable once they apply the new bounds.
 - **v0.3 (2026-04-17):** Added §Presence (`GET /peers/presence`), §Peer Lookup (`GET /peers/lookup?id=`), and §Federation Presence Fetch describing the 5-min poll and 1-hr TTL federation cache that underpins H12 Phase 2 cross-relay routing (client-side Option α). Added 8 new MUST clauses `PNP-008-MUST-063` through `PNP-008-MUST-070`. No breaking changes to the v0.2 federation state machine.
@@ -426,6 +427,24 @@ struct BridgeDescriptor {
 
 **PNP-008-SHOULD-009**: Bridge descriptors SHOULD be delivered via end-to-end encrypted channels (Signal, PGP email, in-person QR) so the `BridgeAnnouncement` payload itself is confidential.
 
+### 9.1.1 Cover-Page Probe Resistance
+
+MUST-053 says a bridge SHOULD look like a web server to any prober. This subsection makes that requirement concrete enough to implement without leaking bridge-ness through HTTP response fingerprints or timing side channels.
+
+**PNP-008-MUST-085**: The cover response to any non-pluggable-transport connection MUST be an HTTP/1.1 response with status `200 OK` and `Content-Type: text/html; charset=utf-8`. The body MUST be at least 256 bytes of plausible HTML (e.g. a bundled generic landing page). Empty or single-line bodies are forbidden.
+
+**PNP-008-MUST-086**: The cover response body MUST NOT contain any of the literal tokens `ParolNet`, `parolnet`, `federation`, `bridge`, or the bridge's own peer-id hex. A receiver MUST be able to serve the same response byte-for-byte to a harmless tourist and a probing censor.
+
+**PNP-008-MUST-087**: Cover responses MUST be served within the same time budget a normal static-HTTP server would take on the hosting operator's hardware — specifically within `cover_latency_budget_ms = 250` milliseconds of the probe's first byte. Delays above the budget are themselves a side channel and MUST be rejected by CI benchmarks during release gating.
+
+**PNP-008-MUST-088**: A bridge that has just served a cover response MUST NOT treat the probing source IP specially on subsequent connections — no denylist, no alternate fingerprint, no increased latency. The censor-probing state machine is stateless at the bridge, in line with MUST-054.
+
+### 9.1.2 Disclosure Rate Limiting & Audit Log
+
+**PNP-008-MUST-089**: A bridge operator MUST maintain an ephemeral per-user-token disclosure counter covering a rolling 60-minute window. The counter MUST enforce the limits in MUST-052 (≤ 3 descriptors per email/hour, ≤ 1 per QR session) and MUST reject further disclosures with an operator-visible error. The counter MUST be held in process memory only; persistence across restarts is forbidden so that a seized bridge yields no disclosure history.
+
+**PNP-008-MUST-090**: The per-IP rate-limit audit log permitted by MUST-054 MUST be purged by a scheduled scrubber task that runs at least every 3600 seconds and removes every entry whose first-observed timestamp is older than 86_400 seconds. The scrubber MUST run independently of request traffic so that an idle bridge still purges on schedule.
+
 ### 9.2 Client Use of Bridges
 
 **PNP-008-MUST-055**: A client using a bridge MUST route all relay-directory traffic through that bridge until a public relay is confirmed reachable; fallback to direct connection MUST be a deliberate user action.
@@ -540,7 +559,7 @@ Relays verify each fetched `PresenceEntry` signature against the home relay's Ed
 
 This specification declares:
 
-- **84 MUST** clauses (`PNP-008-MUST-001` through `PNP-008-MUST-084`)
+- **90 MUST** clauses (`PNP-008-MUST-001` through `PNP-008-MUST-090`)
 - **11 SHOULD** clauses (`PNP-008-SHOULD-001` through `PNP-008-SHOULD-011`)
 - **3 MAY** clauses (`PNP-008-MAY-001` through `PNP-008-MAY-003`)
 

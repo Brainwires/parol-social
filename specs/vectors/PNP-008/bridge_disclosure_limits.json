@@ -1,0 +1,10 @@
+{
+  "clauses": ["PNP-008-MUST-089", "PNP-008-MUST-090"],
+  "description": "Bridge disclosure rate limits + IP audit-log purge cadence.",
+  "disclosures_per_email_per_hour": 3,
+  "disclosures_per_qr_session": 1,
+  "rolling_window_secs": 3600,
+  "counter_persisted_across_restart": false,
+  "ip_log_purge_max_age_secs": 86400,
+  "ip_log_scrubber_max_interval_secs": 3600
+}
