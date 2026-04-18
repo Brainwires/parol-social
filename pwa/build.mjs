@@ -8,35 +8,60 @@
 
 import * as esbuild from 'esbuild';
 import { createHash } from 'crypto';
-import { readFileSync, writeFileSync } from 'fs';
+import { readFileSync, writeFileSync, existsSync } from 'fs';
 import { execSync } from 'child_process';
-import { dirname, join } from 'path';
+import { dirname, join, basename } from 'path';
 import { fileURLToPath } from 'url';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const isWatch = process.argv.includes('--watch');
-
-// ── Files that get integrity-hashed in sw.js ────────────────
-const HASHED_FILES = ['app.js', 'styles.css', 'crypto-store.js', 'index.html'];
 
 function sha256(filePath) {
     const data = readFileSync(filePath);
     return createHash('sha256').update(data).digest('hex');
 }
 
-function patchSwHashes() {
-    const swPath = join(__dirname, 'sw.js');
-    let sw = readFileSync(swPath, 'utf8');
+// Parse the ASSETS_TO_CACHE array out of sw.source.js — so adding an entry
+// there automatically integrity-pins it. Returns an array of relative paths
+// (e.g. "app.js", "pkg/parolnet_wasm_bg.wasm", "lang/en.json").
+function parseCachedAssets(source) {
+    const m = source.match(/const ASSETS_TO_CACHE = \[([\s\S]*?)\];/);
+    if (!m) throw new Error('sw.source.js missing ASSETS_TO_CACHE array');
+    const entries = [];
+    for (const line of m[1].split('\n')) {
+        const s = line.match(/['"]([^'"]+)['"]/);
+        if (!s) continue;
+        const rel = s[1].replace(/^\.\//, '');
+        entries.push(rel);
+    }
+    return entries;
+}
 
-    for (const name of HASHED_FILES) {
-        const hash = sha256(join(__dirname, name));
-        // Match:  'filename':  'hexhash'  (with any whitespace)
-        const re = new RegExp(`'${name.replace('.', '\\.')}':\\s*'[0-9a-f]+'`);
-        sw = sw.replace(re, `'${name}': '${hash}'`);
+function patchSwHashes() {
+    const sourcePath = join(__dirname, 'sw.source.js');
+    const outPath = join(__dirname, 'sw.js');
+    const source = readFileSync(sourcePath, 'utf8');
+
+    // Hash every cached asset that resolves to a real file on disk. Entries
+    // like "./" (the app shell) and assets not yet built are silently skipped.
+    const assets = parseCachedAssets(source);
+    const hashes = {};
+    const missing = [];
+    for (const rel of assets) {
+        if (rel === '' || rel.endsWith('/')) continue;
+        const abs = join(__dirname, rel);
+        if (!existsSync(abs)) { missing.push(rel); continue; }
+        hashes[rel] = sha256(abs);
     }
 
-    writeFileSync(swPath, sw);
-    console.log('  SW hashes updated');
+    const marker = 'const RESOURCE_HASHES = __RESOURCE_HASHES__;';
+    if (!source.includes(marker)) {
+        throw new Error('sw.source.js missing placeholder line: ' + marker);
+    }
+    const out = source.replace(marker, `const RESOURCE_HASHES = ${JSON.stringify(hashes, null, 4)};`);
+
+    writeFileSync(outPath, out);
+    console.log(`  SW generated from sw.source.js (${Object.keys(hashes).length} assets hashed${missing.length ? `, ${missing.length} skipped: ${missing.join(', ')}` : ''})`);
 }
 
 function generateBuildInfo() {

@@ -8,13 +8,12 @@ const CACHE_NAME = 'parolnet-v9';
 // SHA-256 hashes of critical cached resources. On cache hit for these files,
 // the service worker verifies the cached content hasn't been tampered with.
 // If the hash doesn't match, the resource is re-fetched from the network.
-// Regenerate these hashes whenever the corresponding files change.
-const RESOURCE_HASHES = {
-    'app.js': '4e9c6d7226f07003d000ef43281a44748b01e9a9dc95298a180ee869370ddfd4',
-    'styles.css': 'a4a07e1fe925dbd2324e9cf01e9454dadd9c3409e19e39df1f4254f5682dfcc2',
-    'crypto-store.js': '290b12b0c369faeb405be244c5c616005c5ff998966c6cdf3b1591fa2129aab9',
-    'index.html': '2c68d6bed033df679c6730e2bda676c0e42d1f9a330aaddb06834e008e3e0437',
-};
+//
+// The __RESOURCE_HASHES__ token below is substituted by pwa/build.mjs at
+// build time — this file (sw.source.js) is tracked in git; the generated
+// sw.js is gitignored. Keeping the hashes out of the source prevents every
+// build from dirtying a tracked file.
+const RESOURCE_HASHES = __RESOURCE_HASHES__;
 
 // Compute SHA-256 hex digest of an ArrayBuffer.
 async function sha256Hex(buffer) {
@@ -27,11 +26,13 @@ async function sha256Hex(buffer) {
     return hex;
 }
 
-// Extract the filename from a request URL for hash lookup.
+// Produce the RESOURCE_HASHES lookup key from a request URL. The keys match
+// ASSETS_TO_CACHE entries with the leading "./" stripped, so nested paths
+// like "pkg/parolnet_wasm_bg.wasm" resolve correctly (basename alone would
+// collide across directories).
 function getResourceName(url) {
     const path = new URL(url).pathname;
-    const parts = path.split('/');
-    return parts[parts.length - 1];
+    return path.replace(/^\/+/, '');
 }
 
 // All assets that must be cached for offline operation.
