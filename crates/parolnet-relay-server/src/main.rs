@@ -885,10 +885,12 @@ fn resolve_peer_relay_identity(
 
 // ---- H9 Privacy Pass token issuance --------------------------------------
 
-/// Per-identity rate tracker: the last epoch_id the identity pulled tokens in.
-/// Caps issuance at one batch per identity per epoch (PNP-001-MUST-052 —
-/// authenticated issuance; the cap is the policy knob, not a normative clause).
-type IssueLimiter = Arc<Mutex<HashMap<[u8; 32], [u8; 4]>>>;
+/// Per-identity issuance accounting: (current_epoch_id, tokens_issued_this_epoch).
+/// Enforces the PNP-001 §10.2 budget of `budget_per_epoch` tokens per identity
+/// per epoch. Multiple batches are fine as long as the running total stays
+/// under the cap — the previous "one batch per epoch" rule was stricter than
+/// the spec requires and starved the PWA after a single refill.
+type IssueLimiter = Arc<Mutex<HashMap<[u8; 32], (u32, u32)>>>;
 
 /// CBOR shape of an inbound `POST /tokens/issue` request body.
 #[derive(Deserialize)]
@@ -985,26 +987,31 @@ async fn handle_tokens_issue(
         .unwrap_or_default()
         .as_secs();
 
-    // 3. Rate-limit: one batch per identity per epoch.
-    let current_epoch: [u8; 4] = {
+    // 3. Rate-limit: up to `budget_per_epoch` tokens per identity per epoch
+    //    (PNP-001 §10.2). Allows multiple batches as long as the running
+    //    total stays under the cap.
+    let (current_epoch, budget): ([u8; 4], u32) = {
         let mut a = authority.lock().await;
         a.tick(now);
-        a.current_epoch()
+        (a.current_epoch(), a.budget_per_epoch())
     };
+    let epoch_id_u32 = u32::from_be_bytes(current_epoch);
+    let requested = req.blinded_bytes_list.len() as u32;
     {
         let mut lim = issue_limiter.lock().await;
-        match lim.get(&vk_arr) {
-            Some(prior) if *prior == current_epoch => {
-                return (
-                    StatusCode::TOO_MANY_REQUESTS,
-                    "budget exhausted for this epoch",
-                )
-                    .into_response();
-            }
-            _ => {
-                lim.insert(vk_arr, current_epoch);
-            }
+        let entry = lim.entry(vk_arr).or_insert((epoch_id_u32, 0));
+        // Epoch changed → reset the counter for this identity.
+        if entry.0 != epoch_id_u32 {
+            *entry = (epoch_id_u32, 0);
         }
+        if entry.1.saturating_add(requested) > budget {
+            return (
+                StatusCode::TOO_MANY_REQUESTS,
+                "budget exhausted for this epoch",
+            )
+                .into_response();
+        }
+        entry.1 = entry.1.saturating_add(requested);
     }
 
     // 4. Deserialize blinded elements and 5. issue.
