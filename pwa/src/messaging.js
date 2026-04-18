@@ -25,7 +25,6 @@ import {
     MSG_TYPE_IDENTITY_ROTATE
 } from './protocol-constants.js';
 import { markRealSend } from './cover-traffic.js';
-import { isOnionActive, sendViaOnion } from './onion.js';
 
 // ── Session Persistence ──────────────────────────────────
 function persistSessions() {
