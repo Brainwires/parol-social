@@ -239,13 +239,13 @@ function setupDataChannel(peerId, dc) {
                     }
                 }
             } else if (msg.type === 'chat') {
-                onIncomingMessage(peerId, msg.payload);
+                onIncomingMessage(msg.payload);
             } else if (msg.type === 'gossip') {
                 if (!msg.msgId || !msg.payload || seenGossipMessages.has(msg.msgId)) return;
 
                 const isForUs = !msg.to || msg.to === window._peerId;
                 if (isForUs) {
-                    onIncomingMessage(msg.from || peerId, msg.payload);
+                    onIncomingMessage(msg.payload);
                 }
 
                 if (msg.ttl > 0) {
@@ -253,7 +253,7 @@ function setupDataChannel(peerId, dc) {
                 }
             }
         } catch(e) {
-            onIncomingMessage(peerId, event.data);
+            onIncomingMessage(event.data);
         }
     };
 }

@@ -707,10 +707,19 @@ function handleScannedQR(data) {
                     nowSecs,
                     ourIk,
                 );
+                console.log('[Bootstrap] sending bootstrap envelope', {
+                    to: peerId.slice(0, 8),
+                    ourIk: ourIk.slice(0, 8),
+                    envelopeBytes: envelope.length >> 1,
+                });
                 markRealSend();
                 persistSessions();
-                if (!sendToRelay(peerId, envelope)) {
+                const sent = sendToRelay(peerId, envelope);
+                if (!sent) {
+                    console.log('[Bootstrap] relay offline — queued for later send');
                     queueMessage(peerId, envelope);
+                } else {
+                    console.log('[Bootstrap] envelope handed to relay');
                 }
             } catch(e) {
                 console.warn('[Bootstrap] envelope_encode failed:', e);

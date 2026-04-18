@@ -1327,9 +1327,16 @@ export function onIncomingMessage(payload) {
         decoded = wasm.trial_decrypt(payload);
     } catch (e) {
         // No committed session decrypted AND no bootstrap fallback succeeded.
-        // This is the expected path for misrouted frames and garbage traffic.
+        // Surface the reason so bootstrap-path failures are diagnosable;
+        // ordinary misrouted-traffic drops become visible rather than silent.
+        console.warn('[Envelope] trial_decrypt failed:', e && e.message ? e.message : e);
         return;
     }
+    console.log('[Envelope] decrypted', {
+        from: decoded.source_peer_id.slice(0, 8),
+        msgType: decoded.msg_type,
+        bootstrapped: decoded.bootstrapped,
+    });
     persistSessions();
 
     const sourcePeer = decoded.source_peer_id;
