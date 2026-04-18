@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added — Envelope fragmentation & reassembly (PNP-001 §3.9)
+- New `parolnet-core::fragmentation` module. `Fragmenter::split(body, max_per_fragment, rng)` produces ordered `FragmentPiece`s sharing a random 16-byte `fragment_id` with 0-based `fragment_seq`; exactly one carries `is_final`. `Reassembler` buffers per `(sender, fragment_id)`, handles out-of-order arrival (BTreeMap in seq order), silently discards duplicates (MUST-061 first-writer-wins), enforces MUST-060 caps (8 in-flight per sender, 256 fragments per message) and MUST-059 30 s timeout via `tick(now)`.
+- WASM-compatible (no tokio); time is caller-supplied.
+- `rand_core` added to `parolnet-core` deps for the `RngCore` trait.
+- Conformance tests in `pnp_001_wire` now exercise the real `Reassembler` against the §3.9 test vectors — happy path, out-of-order, duplicate, timeout eviction, plus `Fragmenter::split` MUST-053/054/055 compliance. The temporary in-test reassembler helper added in commit #4 is dropped.
+- 15 new fragmentation module tests. PNP-001 conformance 63/63, workspace 37/37.
+
 ### Added — Bootstrap channels: seed / DNS TXT / HTTPS + BootstrapBundle verifier (PNP-008 §8)
 - New `parolnet-relay::bootstrap` module tree: `bundle.rs` (BootstrapBundle wire type + signed/verify_and_validate), `seed.rs` (compiled-in load with no-network invariant), `dns.rs` (TXT lookup via hickory-resolver with lex-order segment concat per MUST-044), `https.rs` (reqwest-based directory fetch with MUST-076 content-type gate), `mod.rs` (ChannelKind priority registry + timeout/cooldown constants).
 - `BootstrapBundle::verify_and_validate` enforces the spec-mandated ordering: **version gate (MUST-071) → Ed25519 signature (MUST-043/046/049) → freshness (MUST-072)** → descriptor enumeration. Each gate returns a distinct `BundleError` variant so channel-level retry policy can tell replay from compromise.

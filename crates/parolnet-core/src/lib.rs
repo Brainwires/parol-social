@@ -23,6 +23,7 @@ pub mod envelope;
 pub mod error;
 pub mod ffi;
 pub mod file_transfer;
+pub mod fragmentation;
 pub mod group;
 pub mod group_call;
 pub mod group_file;

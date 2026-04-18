@@ -940,150 +940,181 @@ fn bucket_padding_supports_traffic_analysis_resistance() {
     assert!(BUCKET_SIZES.contains(&16384));
 }
 
-// -- §3.9 Fragmentation (v0.6) -----------------------------------------------
+// -- §3.9 Fragmentation (v0.6) — real type: parolnet_core::fragmentation ----
 
-/// Minimal in-test reassembly driver mirroring the §3.9 algorithm so the
-/// conformance tests can assert the exact spec behaviour without depending
-/// on the implementation crate. Commit #5 will add a real implementation in
-/// `parolnet-core`; this helper pins what that implementation must do.
-mod fragment_test_support {
-    pub struct Arrival {
-        pub fragment_seq: u32,
-        pub is_final_fragment: bool,
-        pub body: Vec<u8>,
-    }
-    pub fn reassemble(arrivals: &[Arrival]) -> Option<Vec<u8>> {
-        use std::collections::BTreeMap;
-        let mut buf: BTreeMap<u32, Vec<u8>> = BTreeMap::new();
-        let mut final_seq: Option<u32> = None;
-        for a in arrivals {
-            // MUST-061: duplicate (same seq) silently discarded — first wins.
-            buf.entry(a.fragment_seq)
-                .or_insert_with(|| a.body.clone());
-            if a.is_final_fragment {
-                final_seq = Some(a.fragment_seq);
-            }
-        }
-        let final_seq = final_seq?;
-        // MUST-058: every seq from 0..=final_seq must be present.
-        for s in 0..=final_seq {
-            buf.get(&s)?;
-        }
-        let mut out = Vec::new();
-        for (_seq, slice) in buf.iter() {
-            out.extend_from_slice(slice);
-        }
-        Some(out)
-    }
+use parolnet_core::fragmentation::{
+    FragmentPiece, Fragmenter, ReassemblyResult, Reassembler, FRAGMENT_ID_BYTES,
+    MAX_FRAGMENTS_PER_MESSAGE, MAX_INFLIGHT_PER_SENDER, REASSEMBLY_TIMEOUT_SECS,
+};
+
+fn frag_arrivals_from_vector(v: &serde_json::Value) -> (PeerId, [u8; 16], Vec<FragmentPiece>) {
+    let fid: [u8; 16] = hex::decode(v["fragment_id_hex"].as_str().unwrap())
+        .unwrap()
+        .try_into()
+        .unwrap();
+    let arrivals = v["arrivals"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|a| FragmentPiece {
+            fragment_id: fid,
+            fragment_seq: a["fragment_seq"].as_u64().unwrap() as u32,
+            is_final: a["is_final_fragment"].as_bool().unwrap(),
+            body: hex::decode(a["body_hex"].as_str().unwrap()).unwrap(),
+        })
+        .collect();
+    (PeerId([0xC0; 32]), fid, arrivals)
 }
 
 #[clause("PNP-001-MUST-053", "PNP-001-MUST-054", "PNP-001-MUST-055", "PNP-001-MUST-058")]
 #[test]
 fn fragment_reassembly_happy_path() {
-    use fragment_test_support::{reassemble, Arrival};
     let v: serde_json::Value = serde_json::from_slice(include_bytes!(
         "../../../specs/vectors/PNP-001/fragment_happy_path.json"
     ))
     .unwrap();
-    let arrivals: Vec<Arrival> = v["arrivals"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|a| Arrival {
-            fragment_seq: a["fragment_seq"].as_u64().unwrap() as u32,
-            is_final_fragment: a["is_final_fragment"].as_bool().unwrap(),
-            body: hex::decode(a["body_hex"].as_str().unwrap()).unwrap(),
-        })
-        .collect();
+    let (sender, _fid, arrivals) = frag_arrivals_from_vector(&v);
+    let mut r = Reassembler::new();
+    let mut last = ReassemblyResult::Buffered;
+    for f in arrivals {
+        last = r.push(sender, f, 0);
+    }
     let expected = hex::decode(v["expected_reassembled_hex"].as_str().unwrap()).unwrap();
-    assert_eq!(reassemble(&arrivals), Some(expected));
-
-    // MUST-053: fragment_id is 16 bytes.
-    let fid = hex::decode(v["fragment_id_hex"].as_str().unwrap()).unwrap();
-    assert_eq!(fid.len(), 16);
+    assert_eq!(last, ReassemblyResult::Complete(expected));
 }
 
 #[clause("PNP-001-MUST-058")]
 #[test]
 fn fragment_reassembly_out_of_order() {
-    use fragment_test_support::{reassemble, Arrival};
     let v: serde_json::Value = serde_json::from_slice(include_bytes!(
         "../../../specs/vectors/PNP-001/fragment_out_of_order.json"
     ))
     .unwrap();
-    let arrivals: Vec<Arrival> = v["arrivals"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|a| Arrival {
-            fragment_seq: a["fragment_seq"].as_u64().unwrap() as u32,
-            is_final_fragment: a["is_final_fragment"].as_bool().unwrap(),
-            body: hex::decode(a["body_hex"].as_str().unwrap()).unwrap(),
-        })
-        .collect();
+    let (sender, _fid, arrivals) = frag_arrivals_from_vector(&v);
+    let mut r = Reassembler::new();
+    let mut last = ReassemblyResult::Buffered;
+    for f in arrivals {
+        last = r.push(sender, f, 0);
+    }
     let expected = hex::decode(v["expected_reassembled_hex"].as_str().unwrap()).unwrap();
-    // Final arrives first — the algorithm still produces the same concatenation.
-    assert_eq!(reassemble(&arrivals), Some(expected));
+    assert_eq!(last, ReassemblyResult::Complete(expected));
 }
 
 #[clause("PNP-001-MUST-061")]
 #[test]
 fn fragment_duplicate_silently_discarded() {
-    use fragment_test_support::{reassemble, Arrival};
     let v: serde_json::Value = serde_json::from_slice(include_bytes!(
         "../../../specs/vectors/PNP-001/fragment_duplicate.json"
     ))
     .unwrap();
-    let arrivals: Vec<Arrival> = v["arrivals"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|a| Arrival {
-            fragment_seq: a["fragment_seq"].as_u64().unwrap() as u32,
-            is_final_fragment: a["is_final_fragment"].as_bool().unwrap(),
-            body: hex::decode(a["body_hex"].as_str().unwrap()).unwrap(),
-        })
-        .collect();
+    let (sender, _fid, arrivals) = frag_arrivals_from_vector(&v);
+    let mut r = Reassembler::new();
+    let mut outcomes = Vec::new();
+    for f in arrivals {
+        outcomes.push(r.push(sender, f, 0));
+    }
+    assert_eq!(outcomes[0], ReassemblyResult::Buffered);
+    assert_eq!(outcomes[1], ReassemblyResult::Duplicate);
     let expected = hex::decode(v["expected_reassembled_hex"].as_str().unwrap()).unwrap();
-    // 3 arrivals, 2 unique seqs — duplicate ignored.
-    assert_eq!(arrivals.len(), 3);
-    assert_eq!(reassemble(&arrivals), Some(expected));
+    assert_eq!(outcomes[2], ReassemblyResult::Complete(expected));
+}
+
+#[clause("PNP-001-MUST-059")]
+#[test]
+fn fragment_reassembly_timeout_evicts_buffer() {
+    let mut r = Reassembler::new();
+    let sender = PeerId([1; 32]);
+    let fid = [0xab; 16];
+    r.push(
+        sender,
+        FragmentPiece {
+            fragment_id: fid,
+            fragment_seq: 0,
+            is_final: false,
+            body: vec![1, 2, 3],
+        },
+        0,
+    );
+    // Inside window — no eviction.
+    assert!(r.tick(REASSEMBLY_TIMEOUT_SECS).is_empty());
+    // Just past window — evicted.
+    let evicted = r.tick(REASSEMBLY_TIMEOUT_SECS + 1);
+    assert_eq!(evicted, vec![(sender, fid)]);
 }
 
 #[clause("PNP-001-MUST-059", "PNP-001-MUST-060")]
 #[test]
 fn fragment_reassembly_constants_match_spec() {
-    let v: serde_json::Value = serde_json::from_slice(include_bytes!(
-        "../../../specs/vectors/PNP-001/fragment_constants.json"
-    ))
-    .unwrap();
-    assert_eq!(v["reassembly_timeout_secs"].as_u64(), Some(30));
-    assert_eq!(v["max_inflight_messages_per_sender"].as_u64(), Some(8));
-    assert_eq!(v["max_fragments_per_message"].as_u64(), Some(256));
-    assert_eq!(v["fragment_id_bytes"].as_u64(), Some(16));
-    assert_eq!(v["fragment_seq_bytes"].as_u64(), Some(4));
+    // Constants match the vector fixture — pinned by parolnet_core.
+    assert_eq!(REASSEMBLY_TIMEOUT_SECS, 30);
+    assert_eq!(MAX_INFLIGHT_PER_SENDER, 8);
+    assert_eq!(MAX_FRAGMENTS_PER_MESSAGE, 256);
+    assert_eq!(FRAGMENT_ID_BYTES, 16);
 }
 
 #[clause("PNP-001-MUST-055", "PNP-001-MUST-058")]
 #[test]
 fn fragment_missing_final_bit_prevents_reassembly() {
-    use fragment_test_support::{reassemble, Arrival};
-    // No fragment sets is_final_fragment — reassembly MUST NOT complete.
-    let arrivals = vec![
-        Arrival { fragment_seq: 0, is_final_fragment: false, body: vec![0xaa] },
-        Arrival { fragment_seq: 1, is_final_fragment: false, body: vec![0xbb] },
-    ];
-    assert_eq!(reassemble(&arrivals), None);
+    let mut r = Reassembler::new();
+    let sender = PeerId([2; 32]);
+    let fid = [0xba; 16];
+    for seq in 0..2 {
+        let outcome = r.push(
+            sender,
+            FragmentPiece {
+                fragment_id: fid,
+                fragment_seq: seq,
+                is_final: false,
+                body: vec![seq as u8],
+            },
+            0,
+        );
+        assert_eq!(outcome, ReassemblyResult::Buffered);
+    }
 }
 
 #[clause("PNP-001-MUST-058")]
 #[test]
 fn fragment_missing_seq_prevents_reassembly() {
-    use fragment_test_support::{reassemble, Arrival};
-    // Final is at seq=2 but seq=1 never arrives.
-    let arrivals = vec![
-        Arrival { fragment_seq: 0, is_final_fragment: false, body: vec![0xaa] },
-        Arrival { fragment_seq: 2, is_final_fragment: true,  body: vec![0xcc] },
-    ];
-    assert_eq!(reassemble(&arrivals), None);
+    let mut r = Reassembler::new();
+    let sender = PeerId([3; 32]);
+    let fid = [0xcd; 16];
+    // Seq 0 arrives then final at seq=2 — seq=1 missing → still buffered.
+    assert_eq!(
+        r.push(
+            sender,
+            FragmentPiece { fragment_id: fid, fragment_seq: 0, is_final: false, body: vec![1] },
+            0,
+        ),
+        ReassemblyResult::Buffered
+    );
+    assert_eq!(
+        r.push(
+            sender,
+            FragmentPiece { fragment_id: fid, fragment_seq: 2, is_final: true, body: vec![3] },
+            0,
+        ),
+        ReassemblyResult::Buffered
+    );
+}
+
+#[clause("PNP-001-MUST-053", "PNP-001-MUST-054", "PNP-001-MUST-055")]
+#[test]
+fn fragmenter_split_produces_spec_compliant_fragments() {
+    use rand::rngs::StdRng;
+    use rand::SeedableRng;
+    let body: Vec<u8> = (0..1000u32).map(|i| (i & 0xff) as u8).collect();
+    let mut rng = StdRng::seed_from_u64(7);
+    let frags = Fragmenter::split(&body, 100, &mut rng).unwrap();
+    assert_eq!(frags.len(), 10);
+    // MUST-053: shared fragment_id.
+    let id = frags[0].fragment_id;
+    assert!(frags.iter().all(|f| f.fragment_id == id));
+    // MUST-054: 0-based sequential seq.
+    for (i, f) in frags.iter().enumerate() {
+        assert_eq!(f.fragment_seq as usize, i);
+    }
+    // MUST-055: exactly one is_final on the last fragment.
+    assert_eq!(frags.iter().filter(|f| f.is_final).count(), 1);
+    assert!(frags.last().unwrap().is_final);
 }
