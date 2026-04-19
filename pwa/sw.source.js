@@ -198,18 +198,130 @@ self.addEventListener('fetch', event => {
                         return networkResponse;
                     })
                     .catch(() => {
-                        // Network failed, nothing in cache
-                        return new Response(
-                            '<h1>Offline</h1><p>Not yet cached. Connect to the internet once to enable offline use.</p>',
-                            {
-                                headers: { 'Content-Type': 'text/html' },
-                                status: 503
-                            }
-                        );
+                        // Network failed and we have nothing cached.
+                        //
+                        // For document/navigation requests we own the whole
+                        // viewport, so we render a self-healing offline
+                        // screen with Retry + Reset buttons. For subresource
+                        // requests (css/js/images) we let the browser's
+                        // native network-error path run — forwarding a
+                        // fabricated 503 HTML body as a stylesheet produces
+                        // a misleading "server down" error in the console,
+                        // which is what the offline-page misattribution bug
+                        // looked like. A synthetic TypeError from a rejected
+                        // promise is the correct shape for those.
+                        const isNav =
+                            event.request.mode === 'navigate' ||
+                            (event.request.destination === '' &&
+                             (event.request.headers.get('accept') || '').includes('text/html'));
+                        if (!isNav) {
+                            return Response.error();
+                        }
+                        return new Response(offlinePageHtml(), {
+                            headers: { 'Content-Type': 'text/html; charset=utf-8' },
+                            status: 200,
+                        });
                     });
             })
     );
 });
+
+// Self-healing offline page. Inline HTML so it ships inside sw.js and needs
+// no extra cached asset to render. Offers two escape hatches: (1) Retry,
+// which is a plain reload — picks up service as soon as network is back;
+// (2) Reset App, which unregisters every service worker, clears all caches,
+// and reloads. Designed for the case where a stale SW or a misfired cache
+// miss leaves the user stranded on a fake "server down" screen.
+function offlinePageHtml() {
+    return `<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>ParolNet — offline</title>
+  <style>
+    html, body { margin: 0; padding: 0; background: #0e1116; color: #e6edf3;
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif;
+      -webkit-font-smoothing: antialiased; height: 100%; }
+    body { display: flex; align-items: center; justify-content: center; padding: 24px; }
+    .card { max-width: 420px; width: 100%; text-align: center; }
+    h1 { font-size: 24px; margin: 0 0 8px; }
+    p  { color: #9aa4b2; font-size: 15px; line-height: 1.5; margin: 0 0 18px; }
+    .row { display: flex; gap: 10px; justify-content: center; flex-wrap: wrap; }
+    button { font: inherit; cursor: pointer; padding: 12px 18px;
+      border-radius: 10px; border: 1px solid #2d333b; background: #1f242c;
+      color: #e6edf3; min-width: 140px; transition: background .15s; }
+    button:hover { background: #2a3039; }
+    button.primary { background: #2f81f7; border-color: #2f81f7; color: white; }
+    button.primary:hover { background: #1f6feb; }
+    .status { margin-top: 16px; font-size: 13px; color: #7d8590; min-height: 18px; }
+    .footnote { margin-top: 28px; font-size: 12px; color: #636c77; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h1>You're offline</h1>
+    <p>This page isn't in your offline cache and your device can't reach the server right now.
+       The ParolNet server may still be healthy — this is your browser's service worker reporting that
+       <em>this request</em> couldn't be completed.</p>
+    <div class="row">
+      <button id="retry" class="primary">Retry</button>
+      <button id="reset">Reset app</button>
+    </div>
+    <div class="status" id="status"></div>
+    <div class="footnote">Auto-retries when network comes back.</div>
+  </div>
+<script>
+(function(){
+  const status = document.getElementById('status');
+  function setStatus(msg){ status.textContent = msg || ''; }
+
+  document.getElementById('retry').addEventListener('click', () => {
+    setStatus('Reloading…');
+    location.reload();
+  });
+
+  document.getElementById('reset').addEventListener('click', async () => {
+    setStatus('Clearing service worker + caches…');
+    try {
+      if (navigator.serviceWorker) {
+        const regs = await navigator.serviceWorker.getRegistrations();
+        await Promise.all(regs.map(r => r.unregister()));
+      }
+      if (window.caches && caches.keys) {
+        const keys = await caches.keys();
+        await Promise.all(keys.map(k => caches.delete(k)));
+      }
+    } catch (e) {
+      setStatus('Reset partially failed: ' + (e && e.message ? e.message : e));
+    }
+    setStatus('Done. Reloading…');
+    // Bypass any remaining SW control by forcing a hard navigation.
+    location.href = location.pathname + '?sw-reset=' + Date.now();
+  });
+
+  // Auto-retry the moment the browser reports network is back, so users
+  // who walked into a subway tunnel don't have to tap anything when they
+  // come out.
+  window.addEventListener('online', () => {
+    setStatus('Network detected — reloading…');
+    setTimeout(() => location.reload(), 200);
+  });
+
+  // Poll every 8s to see if the origin is reachable; reload when it is.
+  async function probe() {
+    try {
+      const r = await fetch(location.origin + '/pwa/manifest.json', { cache: 'no-store' });
+      if (r && r.ok) { setStatus('Server reachable — reloading…'); location.reload(); return; }
+    } catch {}
+    setTimeout(probe, 8000);
+  }
+  setTimeout(probe, 8000);
+})();
+</script>
+</body>
+</html>`;
+}
 
 // ── Push Notifications ─────────────────────────────────────────
 // Handle incoming push messages from the network.
