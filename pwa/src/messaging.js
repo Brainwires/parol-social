@@ -112,9 +112,12 @@ export async function sendRawEnvelope(toPeerId, env) {
         }
         const ok = sendToRelay(toPeerId, env, token);
         if (ok) maybeRefill(connMgr.relayUrl);
-        if (!homeRelay) {
-            try { showToast(t('toast.peerLookupFailed')); } catch (_) {}
-        }
+        // A null homeRelay is the common case — brand-new contacts, peers on
+        // our own relay, or single-relay deployments. The home-relay send
+        // path above handles all three. Emitting a toast here surfaced a
+        // false error on every send to an uncached peer; the relay-server
+        // will bounce with "peer not connected" if the fallback genuinely
+        // can't deliver.
         return ok;
     }
 
