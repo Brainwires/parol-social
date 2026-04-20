@@ -1747,3 +1747,212 @@ describe('pending_sends persistence (pure logic)', () => {
         assert.equal(persisted.get(2).nextTryAt, now + RETRY_BACKOFF_MS);
     });
 });
+
+// ── Toast carousel auto-dismiss ─────────────────────────────────────
+//
+// Covers scenarios 1–6 from the carousel bug fix:
+//   1. Single toast auto-dismisses.
+//   2. Two arrive — visible one's running timer is NOT reset by the
+//      second toast's arrival, fires on its own schedule, chains to
+//      the next toast which then auto-dismisses.
+//   3. Four rapid toasts — queue drains completely on its own.
+//   5. Persistent toast has no timer; viewer stays.
+//   6. Full drain hides the viewer.
+//
+// We run these with a fake-timer + minimal DOM stub so the test can
+// advance virtual time without waiting 3 real seconds per step.
+describe('toast carousel auto-dismiss', () => {
+    function makeFakeClock() {
+        let now = 0;
+        let nextId = 1;
+        const timers = new Map(); // id -> { at, fn }
+        const setT = (fn, ms) => {
+            const id = nextId++;
+            timers.set(id, { at: now + ms, fn });
+            return id;
+        };
+        const clearT = (id) => { timers.delete(id); };
+        const advance = (ms) => {
+            const target = now + ms;
+            while (true) {
+                let nextDue = null;
+                for (const [id, t] of timers) {
+                    if (t.at <= target && (nextDue === null || t.at < timers.get(nextDue).at)) {
+                        nextDue = id;
+                    }
+                }
+                if (nextDue === null) break;
+                const t = timers.get(nextDue);
+                timers.delete(nextDue);
+                now = t.at;
+                t.fn();
+            }
+            now = target;
+        };
+        const pendingCount = () => timers.size;
+        return { setT, clearT, advance, pendingCount };
+    }
+
+    function makeStubDom() {
+        const elements = [];
+        const makeEl = (tag) => {
+            const el = {
+                tagName: tag,
+                style: { cssText: '', display: '' },
+                classList: {
+                    _set: new Set(),
+                    add(c) { this._set.add(c); },
+                    remove(c) { this._set.delete(c); },
+                    contains(c) { return this._set.has(c); },
+                },
+                children: [],
+                textContent: '',
+                type: '',
+                className: '',
+                id: '',
+                attrs: {},
+                addEventListener: () => {},
+                appendChild(c) { this.children.push(c); return c; },
+                setAttribute(k, v) { this.attrs[k] = v; },
+            };
+            elements.push(el);
+            return el;
+        };
+        const body = makeEl('BODY');
+        return {
+            document: {
+                createElement: makeEl,
+                body,
+            },
+            body,
+            elements,
+        };
+    }
+
+    async function setup() {
+        const clock = makeFakeClock();
+        const dom = makeStubDom();
+        const origSet = globalThis.setTimeout;
+        const origClear = globalThis.clearTimeout;
+        const origDoc = globalThis.document;
+        globalThis.setTimeout = clock.setT;
+        globalThis.clearTimeout = clock.clearT;
+        globalThis.document = dom.document;
+        // Cache-bust utils.js so each test gets fresh module-level state.
+        const mod = await import('../src/utils.js?t=' + Math.random());
+        const container = () => dom.body.children[0];
+        const bodyEl = () => container() && container().children[0];
+        const restore = () => {
+            globalThis.setTimeout = origSet;
+            globalThis.clearTimeout = origClear;
+            globalThis.document = origDoc;
+        };
+        return { clock, dom, mod, container, bodyEl, restore };
+    }
+
+    test('scenario 1: single toast auto-dismisses after its duration', async () => {
+        const { clock, mod, container, restore } = await setup();
+        try {
+            mod.showToast('A', 3000);
+            assert.equal(container().style.display, 'block');
+            clock.advance(2999);
+            assert.equal(container().style.display, 'block', 'still visible before duration');
+            clock.advance(2);
+            assert.equal(container().style.display, 'none', 'hidden after duration');
+            assert.equal(clock.pendingCount(), 0, 'no dangling timers');
+        } finally {
+            restore();
+        }
+    });
+
+    test('scenario 2: second toast does NOT reset visible timer; both drain', async () => {
+        const { clock, mod, container, bodyEl, restore } = await setup();
+        try {
+            mod.showToast('A', 3000);
+            clock.advance(500); // A has been on-screen 500ms
+            mod.showToast('B', 3000); // carousel engages
+            // A's timer must fire at its original 3000ms mark (2500ms from now),
+            // NOT get pushed back another 3000ms.
+            clock.advance(2499);
+            assert.equal(bodyEl().textContent, 'A', 'A still visible at 2999ms total');
+            clock.advance(2); // cross A's 3000ms deadline
+            assert.equal(bodyEl().textContent, 'B', 'B slid into view when A auto-dismissed');
+            assert.ok(!container().classList.contains('toast-carousel-active'), 'no longer in carousel after A dismissed');
+            clock.advance(3001); // cross B's 3000ms
+            assert.equal(container().style.display, 'none', 'B dismissed, viewer hidden');
+            assert.equal(clock.pendingCount(), 0);
+        } finally {
+            restore();
+        }
+    });
+
+    test('scenario 3: four rapid toasts drain completely on their own', async () => {
+        const { clock, mod, container, bodyEl, restore } = await setup();
+        try {
+            mod.showToast('A', 1000);
+            mod.showToast('B', 1000);
+            mod.showToast('C', 1000);
+            mod.showToast('D', 1000);
+            assert.equal(bodyEl().textContent, 'A');
+            clock.advance(1001);
+            assert.equal(bodyEl().textContent, 'B');
+            clock.advance(1001);
+            assert.equal(bodyEl().textContent, 'C');
+            clock.advance(1001);
+            assert.equal(bodyEl().textContent, 'D');
+            clock.advance(1001);
+            assert.equal(container().style.display, 'none', 'queue drained');
+            assert.equal(clock.pendingCount(), 0);
+        } finally {
+            restore();
+        }
+    });
+
+    test('scenario 4: auto-advanced destination gets a full fresh timer', async () => {
+        const { clock, mod, bodyEl, restore } = await setup();
+        try {
+            // Three info toasts, 3s each.
+            mod.showToast('A', 3000);
+            mod.showToast('B', 3000);
+            mod.showToast('C', 3000);
+            assert.equal(bodyEl().textContent, 'A');
+            clock.advance(3001); // A's 3000ms fires → B visible with fresh 3000ms timer
+            assert.equal(bodyEl().textContent, 'B');
+            clock.advance(2998); // B should still be visible (timer fires at ~3000ms from its start)
+            assert.equal(bodyEl().textContent, 'B', 'B still visible just before its timer fires');
+            clock.advance(2); // cross B's deadline
+            assert.equal(bodyEl().textContent, 'C', 'C took over with fresh timer');
+        } finally {
+            restore();
+        }
+    });
+
+    test('scenario 5: persistent toast has no timer; viewer stays', async () => {
+        const { clock, mod, container, bodyEl, restore } = await setup();
+        try {
+            mod.showToast('A', { persistent: true, duration: 1000 });
+            mod.showToast('B', 1000);
+            assert.equal(bodyEl().textContent, 'A');
+            clock.advance(5000);
+            assert.equal(bodyEl().textContent, 'A', 'persistent A did not auto-dismiss');
+            assert.equal(container().style.display, 'block');
+            assert.equal(clock.pendingCount(), 0, 'no timer on persistent visible toast');
+        } finally {
+            restore();
+        }
+    });
+
+    test('scenario 6: full drain hides the viewer, no dangling timers', async () => {
+        const { clock, mod, container, restore } = await setup();
+        try {
+            mod.showToast('A', 500);
+            mod.showToast('B', 500);
+            mod.showToast('C', 500);
+            clock.advance(10_000);
+            assert.equal(container().style.display, 'none', 'viewer hidden after full drain');
+            assert.equal(clock.pendingCount(), 0);
+        } finally {
+            restore();
+        }
+    });
+});
