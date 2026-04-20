@@ -1328,6 +1328,136 @@ button.success {
     color: var(--red);
 }
 
+/* ── Toast Carousel Viewer ──────────────────────────────────── */
+/*
+ * Base toast styling lives inline in utils.js so the tiny single-toast
+ * pill works without a stylesheet. Carousel mode (queue ≥ 2) adds the
+ * `.toast-carousel-active` class to the #toast container; these rules
+ * then expand it to a ≥1/3-viewport panel with roomy controls, using
+ * !important where needed to override the inline defaults.
+ */
+#toast.toast-carousel-active {
+    /* Center horizontally near the top; respect safe-area insets so the
+     * panel never tucks under a notch or status bar. */
+    top: calc(env(safe-area-inset-top, 0px) + 16px) !important;
+    bottom: auto !important;
+    left: 50% !important;
+    right: auto !important;
+    transform: translateX(-50%) !important;
+
+    /* ≥1/3 of the viewport, with sensible min/max widths. On narrow
+     * screens it becomes full-width minus a small margin. */
+    min-height: 33vh;
+    min-width: min(500px, calc(100vw - 24px));
+    max-width: min(600px, calc(100vw - 24px));
+    width: auto;
+
+    /* Layout: body stretches, controls pinned to the bottom. */
+    display: flex !important;
+    flex-direction: column;
+    justify-content: stretch;
+
+    /* Distinct surface — use theme tokens so light mode reads too. */
+    background: var(--bg2);
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    box-shadow: 0 12px 32px var(--shadow), 0 0 0 1px var(--border) !important;
+    backdrop-filter: blur(8px);
+    -webkit-backdrop-filter: blur(8px);
+    overflow: hidden;
+    font-size: 15px;
+}
+
+#toast.toast-carousel-active .toast-body {
+    flex: 1 1 auto;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    text-align: center;
+    padding: 24px 28px !important;
+    font-size: 1.05rem;
+    line-height: 1.5;
+    white-space: normal;
+    word-break: break-word;
+    overflow-wrap: anywhere;
+    /* Keep the level-colored background but let it fill the expanded
+     * panel; utils.js sets background:#333 (info) or #b3261e (error) via
+     * an inline cssText, so reinforce it here with a subtle overlay. */
+    background-image: linear-gradient(rgba(255, 255, 255, 0.02), rgba(255, 255, 255, 0.02));
+}
+
+#toast.toast-carousel-active .toast-controls {
+    flex: 0 0 auto;
+    display: flex !important;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    padding: 10px 12px !important;
+    background: rgba(0, 0, 0, 0.45);
+    border-top: 1px solid var(--border);
+}
+
+#toast.toast-carousel-active .toast-prev,
+#toast.toast-carousel-active .toast-next {
+    /* ≥44×44 tap target per Apple HIG / Material guidelines. */
+    min-width: 44px;
+    min-height: 44px;
+    font-size: 24px;
+    line-height: 1;
+    border-radius: var(--radius-sm);
+    background: rgba(255, 255, 255, 0.08);
+    color: #fff;
+    transition: background 120ms ease;
+}
+
+#toast.toast-carousel-active .toast-prev:hover,
+#toast.toast-carousel-active .toast-next:hover,
+#toast.toast-carousel-active .toast-prev:focus-visible,
+#toast.toast-carousel-active .toast-next:focus-visible {
+    background: rgba(255, 255, 255, 0.18);
+    outline: none;
+}
+
+#toast.toast-carousel-active .toast-counter {
+    flex: 1 1 auto;
+    text-align: center;
+    font-size: 13px;
+    font-variant-numeric: tabular-nums;
+    opacity: 0.9;
+    color: #fff;
+}
+
+#toast.toast-carousel-active .toast-clear-all {
+    min-height: 44px;
+    padding: 0 14px !important;
+    border-radius: var(--radius-sm);
+    background: rgba(231, 76, 60, 0.18);
+    color: #fff;
+    font-size: 13px;
+    margin-left: 0 !important;
+    transition: background 120ms ease;
+}
+
+#toast.toast-carousel-active .toast-clear-all:hover,
+#toast.toast-carousel-active .toast-clear-all:focus-visible {
+    background: rgba(231, 76, 60, 0.32);
+    outline: none;
+}
+
+/* Narrow phones: let the panel fill the screen width-wise. */
+@media (max-width: 480px) {
+    #toast.toast-carousel-active {
+        min-width: calc(100vw - 16px);
+        max-width: calc(100vw - 16px);
+        min-height: 38vh;
+    }
+    #toast.toast-carousel-active .toast-body {
+        padding: 20px 18px !important;
+        font-size: 1rem;
+    }
+}
+
 /* ── RTL Support ────────────────────────────────────────────── */
 [dir="rtl"] header { direction: rtl; }
 [dir="rtl"] .header-actions { margin-left: 0; margin-right: auto; }
