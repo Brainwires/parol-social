@@ -74,9 +74,9 @@ export function detectPlatform() {
 //   showToast('msg', 2000)                 → info, auto-hide 2s
 //   showToast('msg', { level, persistent, duration })
 //
-// Every toast is tap-to-dismiss; persistent toasts have no auto-hide
-// timer. Error toasts (level: 'error') default to persistent:true so
-// the user MUST acknowledge them — matches the "loud failures" rule.
+// Every toast is tap-to-dismiss. Error toasts (level: 'error') default
+// to persistent:true so the user MUST acknowledge them — matches the
+// "loud failures" rule.
 //
 // Queue behaviour:
 //   - 0 toasts: container hidden.
@@ -89,6 +89,18 @@ export function detectPlatform() {
 // entry; otherwise a 3-second info toast buried behind four errors
 // would expire before the user ever saw it. In carousel mode the
 // visible toast's timer still runs and auto-advances on expiry.
+//
+// Persistent-flag semantics:
+//   - Alone (queue length 1): persistent toasts have NO auto-hide
+//     timer — they stay until the user taps to dismiss. This keeps
+//     errors "loud" when shown individually.
+//   - In carousel (queue length ≥ 2): EVERY toast, including
+//     persistent ones, gets an auto-dismiss timer so the carousel
+//     drains itself. Persistent toasts use CAROUSEL_PERSISTENT_DURATION
+//     (8s) instead of their stored duration; non-persistent toasts use
+//     their own duration. If the queue drops back to 1 and the
+//     remaining toast is persistent, its carousel timer is cancelled
+//     and it reverts to stay-until-tapped behaviour.
 const TOAST_STYLE_BASE = 'position:fixed;bottom:80px;left:50%;transform:translateX(-50%);z-index:9999;max-width:80%;min-width:240px;display:none;font-size:14px;text-align:center;border-radius:8px;overflow:hidden;box-shadow:0 2px 10px rgba(0,0,0,0.4);';
 const TOAST_BODY_STYLE_BASE = 'padding:12px 24px;cursor:pointer;';
 const TOAST_BODY_STYLE_INFO = 'background:#333;color:#fff;';
@@ -96,6 +108,10 @@ const TOAST_BODY_STYLE_ERROR = 'background:#b3261e;color:#fff;';
 const TOAST_CONTROLS_STYLE = 'display:flex;align-items:center;justify-content:space-between;gap:8px;padding:6px 10px;background:rgba(0,0,0,0.35);color:#fff;font-size:13px;';
 const TOAST_BTN_STYLE = 'background:transparent;border:none;color:inherit;font:inherit;padding:4px 10px;cursor:pointer;border-radius:4px;min-width:32px;';
 const TOAST_COUNTER_STYLE = 'flex:1;text-align:center;opacity:0.85;';
+// Auto-dismiss duration applied to persistent toasts when they are
+// shown as part of a ≥2-entry carousel. Long enough for the user to
+// read a loud error, short enough that the carousel empties itself.
+const CAROUSEL_PERSISTENT_DURATION = 8000;
 
 // Module-level queue state.
 const toastQueue = []; // [{ id, message, level, persistent, duration, timerId }]
@@ -106,6 +122,11 @@ let toastVisibleId = null; // id of the toast currently on-screen; used to
                             // decide whether renderToast should reset the
                             // timer (identity change) or leave it running
                             // (re-render of the same toast due to a push).
+let toastVisibleInCarousel = false; // whether the visible entry was
+                                    // last rendered with queue.length ≥ 2.
+                                    // If this flips for the same visible
+                                    // id, persistent toasts need their
+                                    // carousel-timer started or cancelled.
 
 function ensureToastDom() {
     if (toastDom) return toastDom;
@@ -172,6 +193,20 @@ function clearEntryTimer(entry) {
     }
 }
 
+// Returns the auto-dismiss duration (in ms) that the visible entry
+// SHOULD have given the current queue state, or null if the entry
+// should have no timer (single persistent toast).
+function desiredTimerMsForCurrent() {
+    const entry = toastQueue[toastCurrentIndex];
+    if (!entry) return null;
+    if (entry.persistent) {
+        // Persistent-alone → stay-until-tapped. Persistent-in-carousel →
+        // auto-advance on a fixed, generous countdown.
+        return toastQueue.length >= 2 ? CAROUSEL_PERSISTENT_DURATION : null;
+    }
+    return entry.duration;
+}
+
 function startTimerForCurrent() {
     const entry = toastQueue[toastCurrentIndex];
     if (!entry) return;
@@ -179,9 +214,8 @@ function startTimerForCurrent() {
     // a new one; this prevents stacked timers when called multiple times
     // for the same visible toast.
     clearEntryTimer(entry);
-    if (entry.persistent) return;
-    // Do NOT start a timer for a toast the caller said is persistent;
-    // do NOT start one if no duration given. Otherwise fire-and-advance.
+    const ms = desiredTimerMsForCurrent();
+    if (ms == null) return;
     const myId = entry.id;
     entry.timerId = setTimeout(() => {
         // Look up by id rather than trusting toastCurrentIndex — the queue
@@ -198,7 +232,55 @@ function startTimerForCurrent() {
             const stillThere = toastQueue.find((e) => e.id === myId);
             if (stillThere) stillThere.timerId = null;
         }
-    }, entry.duration);
+    }, ms);
+}
+
+// Idempotent: inspect the visible entry + queue state and decide
+// whether its timer needs to start, stop, or be left alone. Called
+// from every renderToast so that crossovers (queue growing to 2,
+// shrinking to 1, visible identity changing) always leave the timer
+// in a consistent state.
+function reconcileTimerForCurrent() {
+    const entry = toastQueue[toastCurrentIndex];
+    if (!entry) return;
+    const inCarousel = toastQueue.length >= 2;
+    const identityChanged = entry.id !== toastVisibleId;
+    const carouselModeFlipped = inCarousel !== toastVisibleInCarousel;
+    toastVisibleId = entry.id;
+    toastVisibleInCarousel = inCarousel;
+
+    const desired = desiredTimerMsForCurrent();
+    if (desired == null) {
+        // Persistent + alone → must have NO timer. Cancel any that was
+        // started earlier (e.g. entry was in carousel mode, other toast
+        // dismissed, now it's alone again).
+        clearEntryTimer(entry);
+        return;
+    }
+    if (identityChanged) {
+        // Visible entry just changed — start a fresh timer for it.
+        startTimerForCurrent();
+        return;
+    }
+    if (carouselModeFlipped && entry.persistent) {
+        // Same persistent entry, but 1↔2 crossover just flipped its
+        // desired duration between "no timer" and CAROUSEL_PERSISTENT_
+        // DURATION. Restart so the new duration takes effect. (Non-
+        // persistent toasts use the same duration in either mode, so
+        // we leave their mid-countdown timer alone — that's what keeps
+        // "a second toast doesn't reset the visible toast's deadline"
+        // working for the info-on-info case.)
+        startTimerForCurrent();
+        return;
+    }
+    if (!entry.timerId) {
+        // Same entry, same carousel state, but no timer running (e.g.
+        // resumed after cycleToast cleared it). Start fresh.
+        startTimerForCurrent();
+    }
+    // Otherwise: timer is mid-countdown for the SAME entry in the SAME
+    // effective mode — leave it alone. A newly-arrived toast must not
+    // push the visible toast's deadline forward.
 }
 
 function renderToast() {
@@ -208,6 +290,7 @@ function renderToast() {
         dom.controls.style.display = 'none';
         if (dom.container.classList) dom.container.classList.remove('toast-carousel-active');
         toastVisibleId = null;
+        toastVisibleInCarousel = false;
         return;
     }
     if (toastCurrentIndex >= toastQueue.length) toastCurrentIndex = toastQueue.length - 1;
@@ -239,19 +322,15 @@ function renderToast() {
         dom.controls.style.display = 'none';
     }
 
-    // Only (re)start the auto-dismiss timer when the visible identity
-    // changes: initial render, cycle prev/next, or auto-advance after a
-    // dismiss. Re-renders caused by a new toast pushing into a non-front
-    // slot must not reset the on-screen toast's running timer.
-    if (entry.id !== toastVisibleId) {
-        toastVisibleId = entry.id;
-        startTimerForCurrent();
-    } else if (!entry.persistent && !entry.timerId) {
-        // Same entry, but timer is missing (e.g. just resumed after a
-        // cycle that cleared it). Restart so non-persistent toasts
-        // always have a ticking deadline when on-screen.
-        startTimerForCurrent();
-    }
+    // Reconcile the visible entry's auto-dismiss timer against current
+    // state. Handles all of:
+    //   - identity change (initial render / cycle / auto-advance)
+    //   - 1↔2 crossover for the SAME entry (persistent-alone ↔ in-carousel)
+    //   - timer-missing-for-no-reason (restart)
+    // Critically: does NOT restart a mid-countdown timer for the SAME
+    // entry in the SAME mode, so a new toast pushed into the queue
+    // cannot extend the visible toast's deadline.
+    reconcileTimerForCurrent();
 }
 
 function cycleToast(delta) {
@@ -280,6 +359,7 @@ function clearAllToasts() {
     toastQueue.length = 0;
     toastCurrentIndex = 0;
     toastVisibleId = null;
+    toastVisibleInCarousel = false;
     renderToast();
 }
 

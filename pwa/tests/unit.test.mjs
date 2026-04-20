@@ -1750,14 +1750,20 @@ describe('pending_sends persistence (pure logic)', () => {
 
 // ── Toast carousel auto-dismiss ─────────────────────────────────────
 //
-// Covers scenarios 1–6 from the carousel bug fix:
+// Covers scenarios 1–8 from the carousel bug fix:
 //   1. Single toast auto-dismisses.
 //   2. Two arrive — visible one's running timer is NOT reset by the
 //      second toast's arrival, fires on its own schedule, chains to
 //      the next toast which then auto-dismisses.
 //   3. Four rapid toasts — queue drains completely on its own.
-//   5. Persistent toast has no timer; viewer stays.
+//   4. Auto-advanced destination gets a fresh timer.
+//   5. Lone persistent toast has NO timer; viewer stays until tapped.
 //   6. Full drain hides the viewer.
+//   7. Three persistent error toasts — carousel engages, each drains
+//      after CAROUSEL_PERSISTENT_DURATION; last one left reverts to
+//      stay-until-tapped (carousel-mode exits, no timer).
+//   8. Lone persistent toast + arriving non-persistent toast → persistent
+//      gains an 8s carousel timer; queue drains once it fires.
 //
 // We run these with a fake-timer + minimal DOM stub so the test can
 // advance virtual time without waiting 3 real seconds per step.
@@ -1927,16 +1933,16 @@ describe('toast carousel auto-dismiss', () => {
         }
     });
 
-    test('scenario 5: persistent toast has no timer; viewer stays', async () => {
+    test('scenario 5: lone persistent toast has no timer; viewer stays', async () => {
         const { clock, mod, container, bodyEl, restore } = await setup();
         try {
             mod.showToast('A', { persistent: true, duration: 1000 });
-            mod.showToast('B', 1000);
             assert.equal(bodyEl().textContent, 'A');
-            clock.advance(5000);
-            assert.equal(bodyEl().textContent, 'A', 'persistent A did not auto-dismiss');
+            assert.equal(clock.pendingCount(), 0, 'no timer on lone persistent toast');
+            clock.advance(60_000);
+            assert.equal(bodyEl().textContent, 'A', 'persistent A never auto-dismissed');
             assert.equal(container().style.display, 'block');
-            assert.equal(clock.pendingCount(), 0, 'no timer on persistent visible toast');
+            assert.equal(clock.pendingCount(), 0, 'still no timer after 60s');
         } finally {
             restore();
         }
@@ -1951,6 +1957,92 @@ describe('toast carousel auto-dismiss', () => {
             clock.advance(10_000);
             assert.equal(container().style.display, 'none', 'viewer hidden after full drain');
             assert.equal(clock.pendingCount(), 0);
+        } finally {
+            restore();
+        }
+    });
+
+    test('scenario 7: three persistent errors — carousel drains on its own', async () => {
+        const { clock, mod, container, bodyEl, restore } = await setup();
+        try {
+            mod.showErrorToast('A');
+            // Lone persistent → no timer, no carousel.
+            assert.equal(bodyEl().textContent, 'A');
+            assert.equal(clock.pendingCount(), 0, 'lone persistent has no timer');
+            assert.ok(!container().classList.contains('toast-carousel-active'));
+
+            mod.showErrorToast('B');
+            // Carousel engages → A's persistent-alone (no-timer) flips
+            // into carousel-persistent (8s). B is queued, not visible.
+            assert.ok(container().classList.contains('toast-carousel-active'), 'carousel engaged at 2');
+            assert.equal(bodyEl().textContent, 'A');
+            assert.equal(clock.pendingCount(), 1, 'A picked up an 8s carousel timer');
+
+            mod.showErrorToast('C');
+            // Third persistent arrives — A still has its mid-countdown
+            // timer; it must NOT be reset by the new arrival.
+            assert.equal(bodyEl().textContent, 'A');
+            assert.equal(clock.pendingCount(), 1, 'A timer unchanged by C arriving');
+
+            // Less than 8s: A still visible.
+            clock.advance(7999);
+            assert.equal(bodyEl().textContent, 'A', 'A still visible just before 8s');
+            // Cross A's 8s deadline → B slides in with its OWN 8s timer.
+            clock.advance(2);
+            assert.equal(bodyEl().textContent, 'B', 'B visible after A auto-dismissed');
+            assert.ok(container().classList.contains('toast-carousel-active'), 'still carousel (B + C)');
+            assert.equal(clock.pendingCount(), 1, 'B has an 8s carousel timer');
+
+            // Advance past B's 8s → C is now the only toast left.
+            clock.advance(8001);
+            assert.equal(bodyEl().textContent, 'C', 'C visible after B auto-dismissed');
+            assert.ok(!container().classList.contains('toast-carousel-active'), 'carousel exited with only C left');
+            // C is persistent and alone — its carousel timer was cancelled,
+            // so it reverts to stay-until-tapped.
+            assert.equal(clock.pendingCount(), 0, 'lone persistent C has no timer');
+            assert.equal(container().style.display, 'block', 'C still visible, waiting for tap');
+
+            clock.advance(60_000);
+            assert.equal(bodyEl().textContent, 'C', 'C still waiting after a long delay');
+            assert.equal(container().style.display, 'block');
+        } finally {
+            restore();
+        }
+    });
+
+    test('scenario 8: lone persistent gains carousel timer when second toast arrives', async () => {
+        const { clock, mod, container, bodyEl, restore } = await setup();
+        try {
+            mod.showToast('A', { persistent: true, duration: 1000 });
+            // Lone persistent → no timer.
+            assert.equal(bodyEl().textContent, 'A');
+            assert.equal(clock.pendingCount(), 0, 'no timer on lone persistent');
+
+            // After a long wait, A should still be there (no silent drain).
+            clock.advance(20_000);
+            assert.equal(bodyEl().textContent, 'A', 'A unaffected by passage of time');
+            assert.equal(clock.pendingCount(), 0);
+
+            // Now a non-persistent toast arrives — carousel engages.
+            mod.showToast('B', 3000);
+            assert.ok(container().classList.contains('toast-carousel-active'));
+            assert.equal(bodyEl().textContent, 'A');
+            // A, though persistent, now has an 8s carousel timer.
+            assert.equal(clock.pendingCount(), 1, 'persistent A gained a carousel timer');
+
+            // 7999ms later: A still visible.
+            clock.advance(7999);
+            assert.equal(bodyEl().textContent, 'A', 'A still visible just before 8s');
+            // Cross 8s → A auto-dismisses, B slides in as the lone toast.
+            clock.advance(2);
+            assert.equal(bodyEl().textContent, 'B', 'B visible after A dismissed');
+            assert.ok(!container().classList.contains('toast-carousel-active'), 'carousel exited with only B left');
+            assert.equal(clock.pendingCount(), 1, 'B has its own 3s timer');
+
+            // B drains normally.
+            clock.advance(3001);
+            assert.equal(container().style.display, 'none', 'viewer hidden after B dismissed');
+            assert.equal(clock.pendingCount(), 0, 'no dangling timers');
         } finally {
             restore();
         }

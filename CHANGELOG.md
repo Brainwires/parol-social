@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed — PWA toast carousel auto-drains persistent toasts too
+- `pwa/src/utils.js`: persistent toasts still stay-until-tapped when shown **alone** (lone error bar, unchanged), but once a second toast arrives and the viewer flips into carousel mode the persistent entry picks up an 8-second auto-dismiss timer (`CAROUSEL_PERSISTENT_DURATION`) so the queue drains itself. When a persistent toast ends up as the last one left, its carousel timer is cancelled and it reverts to stay-until-tapped. Fixes "ALL AFTER ARE CAPTURED UNTIL THE USER CLOSES THE MULTI-TOAST VIEW" — error toasts piling up while silent-catch cleanup surfaces them no longer wedge the carousel open.
+- New `reconcileTimerForCurrent()` helper makes every `renderToast` idempotent w.r.t. timer state; crossovers (queue 1↔2) restart the persistent toast's timer, while mid-countdown timers on non-persistent toasts stay untouched so a newly-arrived toast can't push the visible toast's deadline forward.
+- 2 new unit scenarios in `pwa/tests/unit.test.mjs` (scenarios 7 + 8) cover three-persistent drain and lone-persistent gaining a carousel timer when a second toast arrives; existing scenarios 1–6 still pass.
+
 ### Added — PWA auto-detects browser language on first run
 - `pwa/src/i18n.js` gains an exported pure matcher `detectLocale(prefs, supported)` that iterates `navigator.languages[]` in order, trying exact match → Chinese region aliasing (`zh-HK`/`zh-MO`/`zh-Hant*` → `zh-TW`, other `zh-*` → `zh-CN`) → base-language match (`fr-CA` → `fr`, `pt-BR` → `pt`) → `en`. Matching is case-insensitive. The old `detectLanguage()` wrapper now feeds the full preference list into the matcher instead of only `navigator.language`.
 - `pwa/src/boot.js`: on first run (no saved `settings/language` entry in IndexedDB) the auto-detected choice is persisted immediately after `initI18n`, so detection runs exactly once. Any explicit selection from the settings language dropdown keeps winning on subsequent launches (the existing `window.changeLanguage` write path is untouched).
