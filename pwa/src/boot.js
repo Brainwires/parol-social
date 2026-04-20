@@ -478,6 +478,41 @@ function _drainSwInboxOnce() {
 // get a prompt retry without waiting for the next visibility change.
 export { drainSwInbox };
 
+// TODO: factor this out alongside the messaging.js `delivered/reason` shape
+// into a shared module once we add more transient reasons. For now duplicated
+// inline (only two cases) — keep in sync with messaging.js.
+function isTransientReason(reason) {
+    return reason === 'wasm-not-ready' || reason === 'no-sessions-yet';
+}
+
+// Minimal write-side of sw-inbox used only for re-buffering live frames that
+// the SW delivered directly to the page (bypassing its own inbox write path)
+// but that our handler couldn't decrypt yet. The SW's swInboxWrite has its
+// own overflow guard; this write path stays under the same cap naturally
+// because it runs inside the page, not the SW, and the next SW-side write
+// will prune if needed.
+function swInboxRebuffer(msg) {
+    return new Promise((resolve) => {
+        const req = indexedDB.open('parolnet-sw', 1);
+        req.onupgradeneeded = (e) => {
+            e.target.result.createObjectStore('sw-inbox', { keyPath: 'id', autoIncrement: true });
+        };
+        req.onsuccess = (e) => {
+            const db = e.target.result;
+            try {
+                const tx = db.transaction('sw-inbox', 'readwrite');
+                tx.objectStore('sw-inbox').add({ msg, timestamp: Date.now() });
+                tx.oncomplete = () => { db.close(); resolve(); };
+                tx.onerror = () => { db.close(); resolve(); };
+            } catch (_) {
+                db.close();
+                resolve();
+            }
+        };
+        req.onerror = () => resolve();
+    });
+}
+
 // ── Service Worker Registration ─────────────────────────────
 function registerServiceWorker() {
     if (!('serviceWorker' in navigator)) return;
@@ -486,7 +521,29 @@ function registerServiceWorker() {
         const d = event.data;
         if (!d || typeof d !== 'object') return;
         if (d.type === 'relay_msg') {
-            handleRelayMessage(d.msg);
+            // Live frame from SW (SW saw a page client so it posted directly
+            // instead of buffering). If our handler defers for a transient
+            // reason (WASM still loading, no sessions imported yet), the
+            // frame would otherwise be silently dropped — nothing in
+            // sw-inbox to retry from. Re-buffer it so the next drain pass
+            // (onWasmReady, visibilitychange, post-session-restore) picks
+            // it up. Terminal failures and delivered=true need no action;
+            // drain-layer dedup (seenGossipMessages) catches any stray
+            // re-buffer of an already-delivered frame.
+            let res;
+            try {
+                res = handleRelayMessage(d.msg);
+            } catch (e) {
+                console.warn('[SW-Live] handleRelayMessage threw:', e && e.message);
+                res = { delivered: false, reason: 'exception' };
+            }
+            if (res && res.delivered === false && isTransientReason(res.reason)) {
+                swInboxRebuffer(d.msg).then(() => {
+                    // Opportunistic retry — drainSwInbox is single-flight
+                    // coalesced so this is cheap if another drain is active.
+                    drainSwInbox().catch(() => {});
+                });
+            }
         } else if (d.type === 'relay_status') {
             const wasConnected = connMgr._swRelayConnected;
             connMgr._swRelayConnected = d.connected;

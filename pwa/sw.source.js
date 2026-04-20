@@ -577,6 +577,13 @@ async function swBroadcastOrBuffer(msg) {
     }
 }
 
+// sw-inbox eviction: hard cap with headroom. When the store hits MAX_INBOX
+// we prune oldest-first down to PRUNE_TARGET so we don't re-enter overflow
+// on every subsequent insert. Cursor iteration is by keyPath ('id',
+// autoIncrement) which is monotonically increasing = chronological.
+const MAX_INBOX = 200;
+const PRUNE_TARGET = 150;
+
 async function swInboxWrite(msg) {
     return new Promise((resolve, reject) => {
         const req = indexedDB.open('parolnet-sw', 1);
@@ -588,9 +595,20 @@ async function swInboxWrite(msg) {
             const tx = db.transaction('sw-inbox', 'readwrite');
             const store = tx.objectStore('sw-inbox');
             store.count().onsuccess = (ce) => {
-                if (ce.target.result >= 200) {
-                    store.openCursor().onsuccess = (cur) => {
-                        if (cur.target.result) cur.target.result.delete();
+                const count = ce.target.result;
+                if (count >= MAX_INBOX) {
+                    // Delete (count - PRUNE_TARGET) oldest rows in a single
+                    // cursor walk. Calling cur.continue() is what makes this
+                    // actually multi-row — the prior impl deleted one per
+                    // overflow event, never enforcing the cap.
+                    let toDelete = count - PRUNE_TARGET;
+                    store.openCursor().onsuccess = (ce2) => {
+                        const cursor = ce2.target.result;
+                        if (cursor && toDelete > 0) {
+                            cursor.delete();
+                            toDelete--;
+                            cursor.continue();
+                        }
                     };
                 }
                 store.add({ msg, timestamp: Date.now() });
