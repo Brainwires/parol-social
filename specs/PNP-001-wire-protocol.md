@@ -1,12 +1,20 @@
 # PNP-001: ParolNet Wire Protocol
 
 ### Status: CANDIDATE
-### Version: 0.9
-### Date: 2026-04-18
+### Version: 0.10
+### Date: 2026-04-19
 
 ---
 
 ## Changelog
+
+**v0.10 (2026-04-19) — Client-relay WS liveness, queued-response semantics, token epoch hygiene**
+
+- Added §10.3 "Client-Relay WebSocket Liveness" formalizing the application-layer ping/pong heartbeat between a client and its home relay. Prior drafts assumed TCP keepalive (PNP-006) would suffice, but observed stuck-state bugs in the reference PWA showed that a silently-dead WebSocket can leave `relayConnected` reading true for hours — clients kept writing to a dead socket, the relay kept the peer in its `local` presence map, and inbound messages vanished. The new ping/pong + 40 s dead-threshold + 60 s presence reap closes that window.
+- Added **PNP-001-MUST-065** (client MUST ping every 20 s), **PNP-001-MUST-066** (client MUST treat WS dead after 40 s silence from server), **PNP-001-MUST-067** (relay MUST reap `local` presence on client close within 60 s), **PNP-001-SHOULD-014** (relay SHOULD close idle client sockets at 60 s).
+- Extended §10.1 with **PNP-001-MUST-068** defining the `{type:"queued"}` response frame as a *provisional-delivery signal* (peer offline + relay accepted into store-and-forward), and **PNP-001-SHOULD-015** telling clients how to render it without alarming users.
+- Added **PNP-001-MUST-069** to §10.2 requiring clients to purge retired-epoch Privacy Pass tokens on rotation. MUST-050 already forbade the relay from accepting stale tokens; the reciprocal client obligation was missing.
+- MUST count: 69. New SHOULDs: 014, 015.
 
 **v0.9 (2026-04-18) — QR bootstrap: scanner IK travels in `source_hint`**
 
@@ -484,6 +492,21 @@ The frame MUST carry a non-empty `token` field. There is no `from` field. **PNP-
 
 Any frame that reaches the relay without a valid, non-empty `token` field MUST be dropped silently — no error response is returned, so an adversary cannot probe which identity a frame belonged to.
 
+#### 10.1.1 The `queued` Response
+
+When the sender's outer `message` frame passes token auth but the recipient is not in the relay's local `peers` map, the relay accepts the frame into store-and-forward and emits the following JSON response back to the sender:
+
+```
+QueuedResponse = {
+  "type"    : "queued",
+  "message" : "peer offline, message stored"
+}
+```
+
+The relay MUST emit `{type:"queued"}` on the sender's WebSocket IFF: (a) the outer frame passed token auth, AND (b) the recipient was not in the local `peers` map, AND (c) the relay successfully enqueued the frame into store-and-forward for later delivery. **PNP-001-MUST-068** `queued` is a **provisional-delivery signal**, not a failure. If any of (a)(b)(c) fails, the relay MUST NOT emit `queued`.
+
+Clients SHOULD render the `queued` state on a per-message basis as a visible provisional indicator (e.g. a clock icon or single tick) distinct from both "sending" (local-in-flight, not yet at the relay) and "delivered" (peer has end-to-end acknowledged). Clients MUST NOT render `queued` as an error, MUST NOT display a modal toast for it, and MUST NOT re-queue the message locally — the relay already owns the retry. **PNP-001-SHOULD-015**
+
 ### 10.2 Token Auth (Privacy Pass)
 
 ParolNet relays authenticate per-frame sends with [RFC 9578] Privacy Pass tokens backed by a [RFC 9497] VOPRF. The ciphersuite is **`Ristretto255-SHA512`** (RFC 9497 §4.1).
@@ -550,7 +573,52 @@ All three rejection paths drop the frame silently (no error to the sender).
 
 **Rate-limit.** Each identity is entitled to at most one `TokenIssueResponse` per active epoch; repeat requests from the same `ed25519_pubkey_hex` within a single epoch return `429 Too Many Requests`.
 
-### 10.3 Cross-References
+**Client-side epoch hygiene.** A client MUST NOT spend a Privacy Pass token whose `epoch_id` matches neither the relay's currently-active epoch NOR the prior-within-grace epoch. **PNP-001-MUST-069** On observing an epoch rotation (via the next `TokenIssueResponse`'s `epoch_id` changing, or via the `expires_at` timestamp of a previously-issued batch elapsing), the client MUST purge all tokens whose `epoch_id` matches a retired epoch from its local pool BEFORE the next spend. Spending a retired-epoch token is indistinguishable from a double-spend at the relay (MUST-050 drops the frame silently), so this is the only way to prevent silent message loss across epoch boundaries.
+
+### 10.3 Client-Relay WebSocket Liveness
+
+A client maintains a persistent WebSocket (`/ws`) to its home relay for the lifetime of the app session. TCP keepalive (PNP-006) guards the transport layer, but does not detect application-layer silence — a NAT rebind, a backgrounded mobile tab, or a service-worker eviction can leave the socket in a `readyState === OPEN` state while no frames flow either direction. This section defines the application-layer heartbeat and silence timeouts.
+
+**Ping / Pong frames.** The client sends a JSON frame:
+
+```
+PingFrame = {
+  "type" : "ping",
+  "ts"   : uint   -- client-local Unix milliseconds
+}
+```
+
+The relay replies with:
+
+```
+PongFrame = {
+  "type" : "pong",
+  "ts"   : uint   -- verbatim echo of the client's ts
+}
+```
+
+The `ts` echo lets the client measure round-trip time and unambiguously match pongs to pings.
+
+**Cadence.**
+
+1. Whenever its WebSocket is in `OPEN`, the client MUST send a `ping` every 20 seconds. **PNP-001-MUST-065** Missing a ping (for example because the SW was sleeping at the 20 s mark) is acceptable but SHOULD trigger an immediate catch-up ping when the client next executes.
+
+2. The client MUST treat its WebSocket as *dead* and tear it down (`close()` + schedule a fresh reconnect) if it has not received ANY frame — pong, message, queued, registered, etc. — from the relay in the last 40 seconds. **PNP-001-MUST-066** The 40 s ceiling is 2× ping interval + 1× slack; any inbound frame resets the silence timer, not just pongs, because the relay's response to other traffic is equally strong evidence of liveness.
+
+3. The relay SHOULD close client WebSockets that have sent no frame in the last 60 seconds. **PNP-001-SHOULD-014** This bounds the zombie-peer window in `local` presence.
+
+**Presence reap.** On any path that terminates the WebSocket — client-initiated close, idle-timeout close (SHOULD-014), or abrupt TCP RST — the relay MUST call `remove_local(peer_id)` on its presence authority within 60 seconds of the last observed frame. **PNP-001-MUST-067** Without this, federation presence lookups (`/peers/lookup`, PNP-008) report dead peers as online and senders send into a black hole.
+
+| Parameter | Value |
+|-----------|-------|
+| `ping_interval_secs` | 20 |
+| `dead_threshold_secs` (client-side) | 40 |
+| `idle_close_secs` (relay-side SHOULD) | 60 |
+| `presence_reap_secs` (relay-side MUST) | 60 |
+
+**Interaction with SHOULD-013 sealed-sender default.** The `ping` frame carries no `source_hint` equivalent — it is an outer-relay-frame concern, not an envelope concern, and the relay already knows the client's PeerId from the registered WebSocket session. No sealed-sender accommodation is needed.
+
+### 10.4 Cross-References
 
 | Construct | Where |
 |-----------|-------|
