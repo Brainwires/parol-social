@@ -15,6 +15,7 @@ import { showView } from './views.js';
 import { initWebRTC, hasDirectConnection, sendViaWebRTC, rtcConnections,
          seenGossipMessages, markGossipSeen } from './webrtc.js';
 import { sendToRelay, connMgr, queueMessage } from './connection.js';
+import { spendOneToken, maybeRefill } from './token-pool.js';
 import { t } from './i18n.js';
 import { MSG_TYPE_CHAT, MSG_TYPE_SYSTEM, MSG_TYPE_CALL_SIGNAL } from './protocol-constants.js';
 import { markRealSend } from './cover-traffic.js';
@@ -240,20 +241,41 @@ export async function sendMessage() {
         relayPayload = wasm.envelope_encode(currentPeerId, MSG_TYPE_CHAT, plainBytes, nowSecs);
         markRealSend();
         persistSessions();
+
+        // Prefer direct WebRTC — bypasses the relay entirely and spends no token.
         if (hasDirectConnection(currentPeerId)) {
             sent = sendViaWebRTC(currentPeerId, relayPayload);
         }
-        if (!sent) {
-            sent = sendToRelay(currentPeerId, relayPayload);
+
+        // Fallback: home-relay send. PNP-001-MUST-048: the outer frame MUST carry
+        // a Privacy Pass token. Before v0.10 this path called sendToRelay with no
+        // token → the `!token` short-circuit in connection.js made every call
+        // return false, which is why the misleading "message queued" toast was
+        // firing on every send.
+        if (!sent && connMgr.isRelayConnected()) {
+            let token = null;
+            try {
+                token = spendOneToken(connMgr.relayUrl);
+            } catch (_) {
+                // pool empty — fall through to local queue.
+            }
+            if (token) {
+                sent = sendToRelay(currentPeerId, relayPayload, token);
+                if (sent) maybeRefill(connMgr.relayUrl);
+            }
         }
     } catch (e) {
         console.error('Envelope encode failed:', e);
         showToast(t('toast.encryptionFailed'));
         return;
     }
+
     if (!sent) {
+        // Local queue only when we couldn't hand off to WebRTC or the relay —
+        // i.e., relay down OR token pool empty. flushMessageQueue() retries on
+        // reconnect. Per PNP-001-SHOULD-015 we do NOT show a modal toast;
+        // a provisional indicator belongs on the message row itself (follow-up).
         queueMessage(currentPeerId, relayPayload);
-        showToast(t('toast.messageQueued'));
     }
 
     // Broadcast via gossip mesh for redundancy

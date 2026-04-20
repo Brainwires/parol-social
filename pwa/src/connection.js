@@ -277,10 +277,11 @@ export function sendToRelay(toPeerId, payload, token) {
 const messageQueue = [];
 const MAX_QUEUE_SIZE = 200;
 const MAX_QUEUE_AGE_MS = 3600000; // 1 hour
+const RETRY_BACKOFF_MS = 5000;    // per-message head-of-line skip window
 
 export function queueMessage(toPeerId, payload) {
     if (messageQueue.length >= MAX_QUEUE_SIZE) messageQueue.shift();
-    messageQueue.push({ toPeerId, payload, timestamp: Date.now() });
+    messageQueue.push({ toPeerId, payload, timestamp: Date.now(), nextTryAt: 0 });
     console.log('[Queue] Message queued for', toPeerId.slice(0, 8), '- queue size:', messageQueue.length);
 }
 
@@ -290,10 +291,20 @@ export function flushMessageQueue() {
     // token-pool.js → connection.js. The flush path only runs on
     // reconnect so the lazy lookup cost is negligible.
     import('./token-pool.js').then(({ spendOneToken }) => {
+        const now = Date.now();
+        // Per-message nextTryAt prevents a permanently-unsendable message
+        // from starving sendable ones behind it: we iterate over a snapshot,
+        // attempt each message whose backoff has elapsed, and re-queue
+        // failures with a fresh nextTryAt so the next flush skips past them
+        // until the window reopens.
         console.log('[Queue] Flushing', messageQueue.length, 'queued messages');
         const toFlush = messageQueue.splice(0, messageQueue.length);
         for (const msg of toFlush) {
-            if (Date.now() - msg.timestamp > MAX_QUEUE_AGE_MS) continue; // expired
+            if (now - msg.timestamp > MAX_QUEUE_AGE_MS) continue; // expired
+            if (msg.nextTryAt && msg.nextTryAt > now) {
+                messageQueue.push(msg); // not yet time to retry
+                continue;
+            }
             let sent = false;
             if (hasDirectConnection(msg.toPeerId)) {
                 sent = sendViaWebRTC(msg.toPeerId, msg.payload);
@@ -304,7 +315,8 @@ export function flushMessageQueue() {
                 if (token) sent = sendToRelay(msg.toPeerId, msg.payload, token);
             }
             if (!sent) {
-                messageQueue.push(msg); // re-queue
+                msg.nextTryAt = now + RETRY_BACKOFF_MS;
+                messageQueue.push(msg); // re-queue with backoff
             }
         }
         if (messageQueue.length > 0) {

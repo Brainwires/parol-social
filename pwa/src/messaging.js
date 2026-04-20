@@ -181,7 +181,10 @@ export function handleRelayMessage(msg) {
             break;
 
         case 'queued':
-            console.log('Message queued (peer offline — relay will deliver later)');
+            // PNP-001-MUST-068: provisional-delivery signal, not a failure.
+            // PNP-001-SHOULD-015: clients MUST NOT render this as an error.
+            // A modal toast would miscommunicate the state, so we log only.
+            console.log('[Relay] queued (peer offline — relay will store-and-forward)');
             break;
 
         case 'rtc_offer':
