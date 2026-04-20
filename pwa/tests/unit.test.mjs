@@ -1176,11 +1176,47 @@ describe('relay token pool', () => {
         const mod = await freshPool();
         const { tokenPool, spendOneToken, resetTokenPool } = mod;
         resetTokenPool();
-        tokenPool.queue.push('aa', 'bb', 'cc');
+        tokenPool.currentEpochId = 'deadbeef';
+        tokenPool.queue.push(
+            { epoch_id: 'deadbeef', hex: 'aa' },
+            { epoch_id: 'deadbeef', hex: 'bb' },
+            { epoch_id: 'deadbeef', hex: 'cc' },
+        );
         assert.equal(spendOneToken(), 'aa');
         assert.equal(spendOneToken(), 'bb');
         assert.equal(spendOneToken(), 'cc');
         assert.throws(() => spendOneToken(), /empty/);
+    });
+
+    test('spendOneToken skips retired-epoch entries (PNP-001-MUST-069)', async () => {
+        const mod = await freshPool();
+        const { tokenPool, spendOneToken, spendableCount, resetTokenPool } = mod;
+        resetTokenPool();
+        tokenPool.currentEpochId = 'cafebabe';
+        tokenPool.queue.push(
+            { epoch_id: 'deadbeef', hex: 'stale1' }, // retired epoch — drop
+            { epoch_id: 'deadbeef', hex: 'stale2' }, // retired epoch — drop
+            { epoch_id: 'cafebabe', hex: 'fresh1' },
+            { epoch_id: 'cafebabe', hex: 'fresh2' },
+        );
+        assert.equal(spendableCount(), 2, 'only 2 entries match the active epoch');
+        assert.equal(spendOneToken(), 'fresh1', 'stale entries skipped, fresh one returned');
+        assert.equal(spendOneToken(), 'fresh2');
+        assert.throws(() => spendOneToken(), /empty/);
+    });
+
+    test('spendOneToken drops bare-string legacy entries without returning them', async () => {
+        const mod = await freshPool();
+        const { tokenPool, spendOneToken, resetTokenPool } = mod;
+        resetTokenPool();
+        tokenPool.currentEpochId = 'abcd1234';
+        // Simulate a back-compat restore from before epoch tagging.
+        tokenPool.queue.push('legacy-bare-hex');
+        assert.throws(
+            () => spendOneToken(),
+            /empty/,
+            'bare string tokens have unknown epoch — MUST NOT be spent',
+        );
     });
 
     test('maybeRefill is a no-op when queue is healthy and epoch has room', async () => {
@@ -1348,7 +1384,8 @@ describe('H12 Phase 2 cross-relay', () => {
         const A = 'ws://a.example/ws';
         const B = 'ws://b.example/ws';
         const poolA = tokenPoolFor(A);
-        poolA.queue.push('alpha');
+        poolA.currentEpochId = 'abcd1234';
+        poolA.queue.push({ epoch_id: 'abcd1234', hex: 'alpha' });
         // Pool B is empty — a spend should throw.
         assert.throws(() => spendOneToken(B), /empty/);
         // Pool A still has its token.

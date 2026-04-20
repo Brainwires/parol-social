@@ -126,18 +126,55 @@ export const tokenPool = new Proxy({}, {
     },
 });
 
-/** Pop one token hex off `relayUrl`'s queue FIFO. Throws if empty. */
+/**
+ * Pop one spendable token hex off `relayUrl`'s queue. PNP-001-MUST-069:
+ * refuses to return a token whose epoch doesn't match the pool's current
+ * known epoch (stale tokens are silently discarded, not returned — a stale
+ * token would be dropped by the relay anyway per MUST-050, so spending one
+ * would lose the message silently).
+ *
+ * Throws when the queue is empty *after* pruning stale entries.
+ */
 export function spendOneToken(relayUrl) {
     const p = tokenPoolFor(relayUrl);
-    if (p.queue.length === 0) {
-        throw new Error('relay token pool empty');
+    while (p.queue.length > 0) {
+        const entry = p.queue[0];
+        // Back-compat: entries may still be bare hex strings during the
+        // brief window between old-build sessions restoring state and the
+        // next refill overwriting it. Treat bare strings as "epoch
+        // unknown" and drop them so we never silently spend an unknown-
+        // epoch token.
+        if (typeof entry === 'string') {
+            p.queue.shift();
+            continue;
+        }
+        // Stale-epoch head → drop and keep looking. MUST-069.
+        if (!p.currentEpochId || entry.epoch_id !== p.currentEpochId) {
+            p.queue.shift();
+            continue;
+        }
+        p.queue.shift();
+        return entry.hex;
     }
-    return p.queue.shift();
+    throw new Error('relay token pool empty');
 }
 
-/** Queue size for a relay (or home when omitted). */
+/** Queue size for a relay (or home when omitted). Counts all entries
+ *  including any that may be stale; callers doing capacity planning should
+ *  combine this with `spendableCount`. */
 export function queueSize(relayUrl) {
     return tokenPoolFor(relayUrl).queue.length;
+}
+
+/** Number of currently-spendable tokens (matching the pool's active epoch). */
+export function spendableCount(relayUrl) {
+    const p = tokenPoolFor(relayUrl);
+    if (!p.currentEpochId) return 0;
+    let n = 0;
+    for (const e of p.queue) {
+        if (typeof e === 'object' && e.epoch_id === p.currentEpochId) n++;
+    }
+    return n;
 }
 
 /** Clear all pool state. Used by tests and by panic-wipe flows. */
@@ -352,9 +389,33 @@ export async function requestBatch(relayUrl, batchSize = DEFAULT_BATCH_SIZE) {
             return { ok: false, reason: 'unblind-returned-non-array' };
         }
 
+        // PNP-001-MUST-069: on observing a rotation (new epoch id), purge
+        // ALL queued entries whose epoch_id doesn't match the new active
+        // epoch. Without this, `spendOneToken` would hand out retired-
+        // epoch tokens to the caller and the relay would silently drop
+        // them (MUST-050), losing the message with no user-visible error.
+        const rotated = pool.currentEpochId !== null
+            && pool.currentEpochId !== epochIdHex;
+        if (rotated) {
+            const before = pool.queue.length;
+            pool.queue = pool.queue.filter(
+                e => typeof e === 'object' && e.epoch_id === epochIdHex
+            );
+            if (before - pool.queue.length > 0) {
+                console.log(
+                    '[TokenPool] purged',
+                    before - pool.queue.length,
+                    'retired-epoch tokens at rotation to',
+                    epochIdHex,
+                );
+            }
+        }
+
         pool.currentEpochId = epochIdHex;
         pool.currentExpiresAt = Number(decoded.expires_at) || 0;
-        for (const th of tokenHexes) pool.queue.push(th);
+        for (const th of tokenHexes) {
+            pool.queue.push({ epoch_id: epochIdHex, hex: th });
+        }
 
         return { ok: true, count: tokenHexes.length, epochId: epochIdHex };
     } catch (e) {
