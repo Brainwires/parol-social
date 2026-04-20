@@ -130,6 +130,23 @@ impl EpochKey {
     pub fn activated_at(&self) -> u64 {
         self.activated_at
     }
+
+    /// Reconstruct an `EpochKey` from a persisted snapshot. The underlying
+    /// `OprfServer` is rebuilt from the raw scalar bytes (RFC 9497 §3.1.1,
+    /// 32-byte Ristretto255 scalar).
+    fn restore(p: PersistedEpochKey) -> Result<Self, TokenError> {
+        let server = OprfServer::<Suite>::new_with_key(&p.secret_scalar)
+            .map_err(|e| TokenError::Internal(format!("restore voprf key: {e}")))?;
+        Ok(Self::new(p.epoch_id, p.activated_at, server))
+    }
+
+    fn to_persisted(&self) -> PersistedEpochKey {
+        PersistedEpochKey {
+            epoch_id: self.epoch_id,
+            activated_at: self.activated_at,
+            secret_scalar: self.secret_material.0.to_vec(),
+        }
+    }
 }
 
 impl Drop for EpochKey {
@@ -177,6 +194,25 @@ pub enum TokenError {
     Internal(String),
 }
 
+/// Serializable snapshot of one epoch's VOPRF key material. The relay-server
+/// layer persists a list of these across process restarts so tokens issued
+/// under a persisted key remain spendable after a crash or redeploy. The
+/// `TokenAuthority` itself stays filesystem-agnostic — the operator provides
+/// a persistence callback and (optionally) the previously-loaded list.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PersistedEpochKey {
+    pub epoch_id: EpochId,
+    pub activated_at: u64,
+    #[serde(with = "serde_bytes")]
+    pub secret_scalar: Vec<u8>,
+}
+
+/// Callback invoked when the authority's on-disk state changes (rotation on
+/// tick, or construction from persisted state). Callers implement it to write
+/// the returned snapshot to disk atomically. Receives `current` followed by
+/// `prior` (if present).
+pub type PersistHook = Box<dyn Fn(&[PersistedEpochKey]) + Send + Sync>;
+
 /// Epoch-aware VOPRF issuer and verifier.
 ///
 /// Holds the active epoch key, an optional prior key (within grace), and a
@@ -186,6 +222,7 @@ pub struct TokenAuthority {
     current: EpochKey,
     prior: Option<EpochKey>,
     spent: HashMap<EpochId, HashSet<[u8; NONCE_LEN]>>,
+    on_rotate: Option<PersistHook>,
 }
 
 impl TokenAuthority {
@@ -206,6 +243,104 @@ impl TokenAuthority {
             current,
             prior: None,
             spent,
+            on_rotate: None,
+        }
+    }
+
+    /// Reconstruct an authority from a list of previously-persisted epoch keys.
+    ///
+    /// The list is expected in `[current, prior]` order (matching
+    /// [`Self::serialize_keys`]). If the persisted `current`'s epoch_id has
+    /// been superseded by wall-clock time, rotate immediately so MUST-051 is
+    /// preserved — the loaded key becomes `prior` (within grace) and a fresh
+    /// `current` is generated. If the list is empty, falls back to
+    /// [`Self::new`] semantics.
+    ///
+    /// Fatal errors (malformed scalar bytes, unknown config) are propagated;
+    /// callers treat them the same way as relay-identity load failures.
+    pub fn from_persisted(
+        config: TokenConfig,
+        now_secs: u64,
+        persisted: Vec<PersistedEpochKey>,
+    ) -> Result<Self, TokenError> {
+        if persisted.is_empty() {
+            return Ok(Self::new(config, now_secs));
+        }
+        let mut iter = persisted.into_iter();
+        let first = iter.next().unwrap();
+        let loaded_current = EpochKey::restore(first)?;
+        let loaded_prior = match iter.next() {
+            Some(p) => Some(EpochKey::restore(p)?),
+            None => None,
+        };
+
+        let wall_epoch = Self::epoch_id_for(now_secs, config.epoch_secs);
+        let mut spent: HashMap<EpochId, HashSet<[u8; NONCE_LEN]>> = HashMap::new();
+
+        let (current, prior) = if loaded_current.epoch_id == wall_epoch {
+            // Persisted current is still the active epoch — load it directly.
+            info!(
+                epoch_id = %hex::encode(loaded_current.epoch_id),
+                activated_at = loaded_current.activated_at,
+                has_prior = loaded_prior.is_some(),
+                "Privacy Pass authority loaded from persisted keys"
+            );
+            spent.insert(loaded_current.epoch_id, HashSet::new());
+            if let Some(ref p) = loaded_prior {
+                spent.insert(p.epoch_id, HashSet::new());
+            }
+            (loaded_current, loaded_prior)
+        } else {
+            // Wall clock has crossed into a new epoch while the relay was
+            // down. Honor MUST-051: generate a fresh current and demote the
+            // loaded current to prior. Any loaded prior is discarded (it was
+            // already past grace by the time we rotated once).
+            let fresh_current = EpochKey::new(wall_epoch, now_secs, fresh_server());
+            info!(
+                new_epoch = %hex::encode(fresh_current.epoch_id),
+                retired_epoch = %hex::encode(loaded_current.epoch_id),
+                "Privacy Pass authority rotated on load (wall clock advanced)"
+            );
+            spent.insert(fresh_current.epoch_id, HashSet::new());
+            spent.insert(loaded_current.epoch_id, HashSet::new());
+            (fresh_current, Some(loaded_current))
+        };
+
+        Ok(Self {
+            config,
+            current,
+            prior,
+            spent,
+            on_rotate: None,
+        })
+    }
+
+    /// Install a hook invoked whenever `current` or `prior` changes. The hook
+    /// receives the full snapshot (`[current, prior?]`) so callers can write it
+    /// atomically without maintaining per-event deltas.
+    ///
+    /// Call sites should wire this BEFORE serving live traffic. The hook fires
+    /// on each `tick` rotation and once on install (so callers can persist the
+    /// state reconstructed from `from_persisted` or `new`).
+    pub fn set_on_rotate(&mut self, hook: PersistHook) {
+        hook(&self.serialize_keys());
+        self.on_rotate = Some(hook);
+    }
+
+    /// Emit the current on-disk snapshot — `current` followed by `prior` if
+    /// present. Safe to call at any time; ordering matches `from_persisted`.
+    pub fn serialize_keys(&self) -> Vec<PersistedEpochKey> {
+        let mut out = Vec::with_capacity(2);
+        out.push(self.current.to_persisted());
+        if let Some(ref p) = self.prior {
+            out.push(p.to_persisted());
+        }
+        out
+    }
+
+    fn emit_persist(&self) {
+        if let Some(ref hook) = self.on_rotate {
+            hook(&self.serialize_keys());
         }
     }
 
@@ -232,6 +367,7 @@ impl TokenAuthority {
     /// boundary and the old secret held only for the grace window.
     pub fn tick(&mut self, now_secs: u64) {
         let current_epoch = Self::epoch_id_for(now_secs, self.config.epoch_secs);
+        let mut changed = false;
         if current_epoch != self.current.epoch_id {
             // Rotate: current → prior, fresh → current.
             let old = std::mem::replace(
@@ -254,6 +390,7 @@ impl TokenAuthority {
                 );
             }
             self.spent.entry(self.current.epoch_id).or_default();
+            changed = true;
         }
 
         // Even without a rotation, expire the prior epoch once grace elapses.
@@ -266,7 +403,12 @@ impl TokenAuthority {
                     expired_epoch = %hex::encode(expired.epoch_id),
                     "VOPRF epoch fully expired (grace elapsed)"
                 );
+                changed = true;
             }
+        }
+
+        if changed {
+            self.emit_persist();
         }
     }
 

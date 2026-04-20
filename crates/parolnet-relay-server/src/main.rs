@@ -1160,14 +1160,56 @@ async fn main() {
 
     // H9 Privacy Pass token authority. The VOPRF secret is generated once on
     // boot and rotated on every 1-hour epoch boundary (PNP-001-MUST-051).
+    //
+    // Persistence: the authority keys are loaded from and atomically
+    // written back to a mode-0600 file (default `/data/relay-authority.cbor`,
+    // override via `RELAY_AUTHORITY_KEY_FILE`). Without this, a mid-epoch
+    // restart rotated the VOPRF secret under the same (wall-clock-derived)
+    // epoch_id and silently invalidated every client's in-pool tokens —
+    // sends appeared to succeed but never delivered.
     let startup_secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
-    let token_authority: Arc<Mutex<TokenAuthority>> = Arc::new(Mutex::new(TokenAuthority::new(
+    let authority_key_path = parolnet_relay_server::authority_keys::key_file_path();
+    let (persisted_keys, authority_source) =
+        parolnet_relay_server::authority_keys::load_or_empty(&authority_key_path)
+            .expect("failed to load persisted authority keys");
+    match authority_source {
+        parolnet_relay_server::authority_keys::AuthorityKeySource::ExistingFile => {
+            info!(
+                path = %authority_key_path.display(),
+                keys = persisted_keys.len(),
+                "Loaded persisted VOPRF authority keys"
+            );
+        }
+        parolnet_relay_server::authority_keys::AuthorityKeySource::FreshGenerated => {
+            info!(
+                path = %authority_key_path.display(),
+                "No persisted VOPRF authority keys — generating fresh"
+            );
+        }
+    }
+    let mut authority = TokenAuthority::from_persisted(
         TokenConfig::default(),
         startup_secs,
-    )));
+        persisted_keys,
+    )
+    .expect("failed to reconstruct TokenAuthority from persisted keys");
+    // Install the persist hook. Fires once immediately with the loaded/fresh
+    // state so the on-disk file exists before we accept traffic, and then on
+    // every subsequent rotation.
+    let persist_path = authority_key_path.clone();
+    authority.set_on_rotate(Box::new(move |keys| {
+        if let Err(e) = parolnet_relay_server::authority_keys::persist(&persist_path, keys) {
+            tracing::warn!(
+                path = %persist_path.display(),
+                error = %e,
+                "Failed to persist VOPRF authority keys"
+            );
+        }
+    }));
+    let token_authority: Arc<Mutex<TokenAuthority>> = Arc::new(Mutex::new(authority));
     let issue_limiter: IssueLimiter = Arc::new(Mutex::new(()));
     // Spawn a ticker so rotation happens even when there's no /tokens/issue
     // traffic to drive it.
