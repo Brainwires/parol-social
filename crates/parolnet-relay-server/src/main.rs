@@ -1,4 +1,13 @@
-use async_trait::async_trait;
+use parolnet_relay_server::frames::{IncomingMessage, OutgoingMessage};
+use parolnet_relay_server::rate_limit::{
+    ConnRateLimiter, LookupRateLimiter, LOOKUP_RATE_LIMIT, LOOKUP_RATE_WINDOW_SECS,
+    MSG_RATE_LIMIT, MSG_RATE_WINDOW_SECS, MsgRateLimiter, PUSH_RATE_LIMIT, PUSH_RATE_WINDOW_SECS,
+    PushRateLimiter, RateLimiter, WS_CONN_RATE_LIMIT, WS_CONN_RATE_WINDOW_SECS,
+};
+use parolnet_relay_server::storage::RelayMessageStore;
+use parolnet_relay_server::telemetry::{ClientStats, TelemetryBatch, handle_telemetry};
+use parolnet_relay_server::ws_conn::WsConnection;
+
 use axum::{
     Json, Router,
     extract::{
@@ -23,201 +32,19 @@ use parolnet_relay::federation_codec::{
 };
 use parolnet_relay::presence::{PresenceAuthority, PresenceConfig, PresenceEntry};
 use parolnet_relay::tokens::{Suite, Token, TokenAuthority, TokenConfig};
-use parolnet_transport::{Connection, TransportError};
 use rand::seq::SliceRandom;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use tokio::sync::{Mutex, mpsc};
 use tracing::info;
 
 type PeerMap = Arc<Mutex<HashMap<String, mpsc::UnboundedSender<Message>>>>;
 
-/// Per-IP WebSocket connection rate limiter.
-/// Max 10 new connections per minute per IP address.
-const WS_CONN_RATE_LIMIT: u32 = 10;
-const WS_CONN_RATE_WINDOW_SECS: u64 = 60;
-
-/// Per-peer message rate limiter.
-/// Max 100 messages per minute per connected peer.
-const MSG_RATE_LIMIT: u32 = 100;
-const MSG_RATE_WINDOW_SECS: u64 = 60;
-
-/// In-memory rate limiter tracking (window_start, count) per key.
-struct RateLimiter<K: std::hash::Hash + Eq> {
-    limits: std::sync::Mutex<HashMap<K, (std::time::Instant, u32)>>,
-    max_count: u32,
-    window: Duration,
-}
-
-impl<K: std::hash::Hash + Eq + Clone> RateLimiter<K> {
-    fn new(max_count: u32, window_secs: u64) -> Self {
-        Self {
-            limits: std::sync::Mutex::new(HashMap::new()),
-            max_count,
-            window: Duration::from_secs(window_secs),
-        }
-    }
-
-    /// Check if a key is rate-limited. Increments the counter.
-    /// Returns true if the request should be rejected.
-    fn is_limited(&self, key: &K) -> bool {
-        let mut limits = self.limits.lock().unwrap();
-        let now = std::time::Instant::now();
-        let entry = limits.entry(key.clone()).or_insert((now, 0));
-
-        if now.duration_since(entry.0) >= self.window {
-            *entry = (now, 1);
-            return false;
-        }
-
-        entry.1 += 1;
-        entry.1 > self.max_count
-    }
-
-    /// Periodically clean up expired entries.
-    fn cleanup(&self) {
-        let mut limits = self.limits.lock().unwrap();
-        let now = std::time::Instant::now();
-        limits.retain(|_, (start, _)| now.duration_since(*start) < self.window);
-    }
-}
-
-type ConnRateLimiter = Arc<RateLimiter<std::net::IpAddr>>;
-type MsgRateLimiter = Arc<RateLimiter<String>>;
-/// Per-IP rate limiter for POST /directory/push requests.
-/// Max 10 pushes per minute per source IP.
-type PushRateLimiter = Arc<RateLimiter<std::net::IpAddr>>;
-const PUSH_RATE_LIMIT: u32 = 10;
-const PUSH_RATE_WINDOW_SECS: u64 = 60;
-
 /// Maximum number of dynamically discovered peer relay URLs.
 const MAX_DISCOVERED_PEERS: usize = 50;
-
-/// Maximum number of buffered messages per offline peer.
-const MAX_STORED_MESSAGES_PER_PEER: usize = 256;
-/// Maximum total size of buffered messages per peer (4 MB).
-const MAX_STORED_BUFFER_SIZE: usize = 4 * 1024 * 1024;
-/// Time-to-live for buffered messages (24 hours).
-const MESSAGE_TTL: Duration = Duration::from_secs(86400);
-
-/// A JSON message buffered for an offline peer, with metadata for TTL / eviction.
-struct BufferedRelayMessage {
-    json: String,
-    stored_at: std::time::Instant,
-    size: usize,
-}
-
-/// Store-and-forward buffer for relay messages destined to offline peers.
-///
-/// Keys are typed `PeerId` values; stored payloads remain JSON strings
-/// because they are forwarded verbatim to browser WebSocket clients.
-struct RelayMessageStore {
-    buffers: HashMap<PeerId, Vec<BufferedRelayMessage>>,
-}
-
-impl RelayMessageStore {
-    fn new() -> Self {
-        Self {
-            buffers: HashMap::new(),
-        }
-    }
-
-    /// Buffer a JSON message for `peer`. Evicts oldest messages when the
-    /// per-peer count or size limit is exceeded.
-    fn store(&mut self, peer: PeerId, msg: String) {
-        let size = msg.len();
-        let buffer = self.buffers.entry(peer).or_default();
-
-        // Evict oldest messages until under count limit
-        while buffer.len() >= MAX_STORED_MESSAGES_PER_PEER {
-            buffer.remove(0);
-        }
-
-        // Evict oldest messages until under size limit
-        let mut total_size: usize = buffer.iter().map(|m| m.size).sum();
-        while total_size + size > MAX_STORED_BUFFER_SIZE && !buffer.is_empty() {
-            total_size -= buffer.remove(0).size;
-        }
-
-        buffer.push(BufferedRelayMessage {
-            json: msg,
-            stored_at: std::time::Instant::now(),
-            size,
-        });
-    }
-
-    /// Retrieve and drain all buffered messages for `peer`.
-    fn retrieve(&mut self, peer: &PeerId) -> Vec<String> {
-        self.buffers
-            .remove(peer)
-            .unwrap_or_default()
-            .into_iter()
-            .map(|m| m.json)
-            .collect()
-    }
-
-    /// Remove messages older than [`MESSAGE_TTL`]. Returns the number of
-    /// expired messages removed.
-    fn expire(&mut self) -> usize {
-        let now = std::time::Instant::now();
-        let mut expired = 0;
-
-        for buffer in self.buffers.values_mut() {
-            let before = buffer.len();
-            buffer.retain(|m| now.duration_since(m.stored_at) < MESSAGE_TTL);
-            expired += before - buffer.len();
-        }
-
-        // Remove empty peer entries
-        self.buffers.retain(|_, v| !v.is_empty());
-
-        expired
-    }
-}
-
-/// Adapter bridging a WebSocket peer's mpsc sender to the `Connection` trait,
-/// so that the PeerManager/gossip protocol can push CBOR gossip messages out
-/// over the existing relay WebSocket channels.
-struct WsConnection {
-    tx: mpsc::UnboundedSender<Message>,
-}
-
-#[async_trait]
-impl Connection for WsConnection {
-    async fn send(&self, data: &[u8]) -> Result<(), TransportError> {
-        // Encode raw bytes as a hex string wrapped in a gossip JSON message
-        let hex_data = hex::encode(data);
-        let msg = serde_json::json!({
-            "type": "gossip",
-            "payload": hex_data,
-            "from": ""
-        })
-        .to_string();
-        self.tx
-            .send(Message::Text(msg.into()))
-            .map_err(|_| TransportError::ConnectionClosed)
-    }
-
-    async fn recv(&self) -> Result<Vec<u8>, TransportError> {
-        // The relay server is push-based, not pull-based.
-        // Gossip messages arrive via handle_socket, not via recv().
-        Err(TransportError::NotAvailable(
-            "relay uses push-based messaging".into(),
-        ))
-    }
-
-    async fn close(&self) -> Result<(), TransportError> {
-        Ok(())
-    }
-
-    fn peer_addr(&self) -> Option<std::net::SocketAddr> {
-        None
-    }
-}
 
 // --- Analytics module (real implementation when feature enabled) ---
 #[cfg(feature = "analytics")]
@@ -298,178 +125,6 @@ mod analytics {
         pub fn record_message_queued(&self) {}
         pub fn record_disconnection(&self) {}
     }
-}
-
-#[derive(Deserialize)]
-struct IncomingMessage {
-    #[serde(rename = "type")]
-    msg_type: String,
-    peer_id: Option<String>,
-    to: Option<String>,
-    payload: Option<String>,
-    /// Peer IDs to exclude from gossip forwarding.
-    #[serde(default)]
-    exclude: Vec<String>,
-    /// Ed25519 public key (hex) for registration challenge-response.
-    pubkey: Option<String>,
-    /// Hex-encoded Ed25519 signature over the challenge nonce.
-    signature: Option<String>,
-    /// Hex-encoded challenge nonce being responded to.
-    nonce: Option<String>,
-    /// H9 Privacy Pass token (hex CBOR). REQUIRED on "message" frames —
-    /// replaces the outer `from` field (see PNP-001 §"Outer Relay Frame",
-    /// clause PNP-001-MUST-048).
-    token: Option<String>,
-    /// Client-local Unix milliseconds. Carried on `ping` frames (PNP-001
-    /// §10.3 MUST-065) so the relay can echo it back in the `pong` and the
-    /// client can match request↔response for RTT.
-    ts: Option<u64>,
-}
-
-#[derive(Default, Serialize)]
-struct OutgoingMessage {
-    #[serde(rename = "type")]
-    msg_type: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    peer_id: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    from: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    payload: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    message: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    online_peers: Option<usize>,
-    /// Echoed client ts on `pong` responses (PNP-001 §10.3 MUST-065).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    ts: Option<u64>,
-}
-
-// --- Client telemetry ---
-
-#[derive(Deserialize)]
-struct TelemetryEvent {
-    #[serde(rename = "type")]
-    event_type: String,
-    #[allow(dead_code)]
-    ts: u64,
-    #[allow(dead_code)]
-    meta: Option<serde_json::Value>,
-}
-
-#[derive(Deserialize)]
-struct TelemetryBatch {
-    #[allow(dead_code)]
-    ts: u64,
-    events: Vec<TelemetryEvent>,
-}
-
-struct ClientStats {
-    wasm_load_success: AtomicU64,
-    wasm_load_fail: AtomicU64,
-    relay_connects: AtomicU64,
-    relay_disconnects: AtomicU64,
-    webrtc_success: AtomicU64,
-    webrtc_fail: AtomicU64,
-    messages_sent: AtomicU64,
-    messages_received: AtomicU64,
-    sessions_established: AtomicU64,
-    errors: AtomicU64,
-    total_batches: AtomicU64,
-}
-
-impl ClientStats {
-    fn new() -> Self {
-        Self {
-            wasm_load_success: AtomicU64::new(0),
-            wasm_load_fail: AtomicU64::new(0),
-            relay_connects: AtomicU64::new(0),
-            relay_disconnects: AtomicU64::new(0),
-            webrtc_success: AtomicU64::new(0),
-            webrtc_fail: AtomicU64::new(0),
-            messages_sent: AtomicU64::new(0),
-            messages_received: AtomicU64::new(0),
-            sessions_established: AtomicU64::new(0),
-            errors: AtomicU64::new(0),
-            total_batches: AtomicU64::new(0),
-        }
-    }
-
-    #[cfg(feature = "analytics")]
-    fn to_json(&self) -> String {
-        format!(
-            r#"{{"wasm_load_success":{},"wasm_load_fail":{},"relay_connects":{},"relay_disconnects":{},"webrtc_success":{},"webrtc_fail":{},"messages_sent":{},"messages_received":{},"sessions_established":{},"errors":{},"total_batches":{}}}"#,
-            self.wasm_load_success.load(Ordering::Relaxed),
-            self.wasm_load_fail.load(Ordering::Relaxed),
-            self.relay_connects.load(Ordering::Relaxed),
-            self.relay_disconnects.load(Ordering::Relaxed),
-            self.webrtc_success.load(Ordering::Relaxed),
-            self.webrtc_fail.load(Ordering::Relaxed),
-            self.messages_sent.load(Ordering::Relaxed),
-            self.messages_received.load(Ordering::Relaxed),
-            self.sessions_established.load(Ordering::Relaxed),
-            self.errors.load(Ordering::Relaxed),
-            self.total_batches.load(Ordering::Relaxed),
-        )
-    }
-}
-
-async fn handle_telemetry(
-    client_stats: Arc<ClientStats>,
-    Json(batch): Json<TelemetryBatch>,
-) -> impl IntoResponse {
-    // Validate
-    if batch.events.len() > 500 {
-        return StatusCode::BAD_REQUEST;
-    }
-
-    client_stats.total_batches.fetch_add(1, Ordering::Relaxed);
-
-    for event in &batch.events {
-        match event.event_type.as_str() {
-            "wasm_load_success" => {
-                client_stats
-                    .wasm_load_success
-                    .fetch_add(1, Ordering::Relaxed);
-            }
-            "wasm_load_fail" => {
-                client_stats.wasm_load_fail.fetch_add(1, Ordering::Relaxed);
-            }
-            "relay_connect" => {
-                client_stats.relay_connects.fetch_add(1, Ordering::Relaxed);
-            }
-            "relay_disconnect" => {
-                client_stats
-                    .relay_disconnects
-                    .fetch_add(1, Ordering::Relaxed);
-            }
-            "webrtc_connect_success" => {
-                client_stats.webrtc_success.fetch_add(1, Ordering::Relaxed);
-            }
-            "webrtc_connect_fail" => {
-                client_stats.webrtc_fail.fetch_add(1, Ordering::Relaxed);
-            }
-            "message_sent" => {
-                client_stats.messages_sent.fetch_add(1, Ordering::Relaxed);
-            }
-            "message_received" => {
-                client_stats
-                    .messages_received
-                    .fetch_add(1, Ordering::Relaxed);
-            }
-            "session_established" => {
-                client_stats
-                    .sessions_established
-                    .fetch_add(1, Ordering::Relaxed);
-            }
-            "error" => {
-                client_stats.errors.fetch_add(1, Ordering::Relaxed);
-            }
-            _ => {}
-        }
-    }
-
-    StatusCode::OK
 }
 
 /// Validate the admin token from the Authorization header.
@@ -669,13 +324,9 @@ async fn handle_directory_push(
 }
 
 // ---- H12 Phase 2 presence + peer lookup ----------------------------------
-
-/// Per-IP rate limiter for `/peers/presence` and `/peers/lookup`
-/// (PNP-008-MUST-066 — 10 req/s per client). Implemented as 10 req per 1 s
-/// window of the shared [`RateLimiter`].
-type LookupRateLimiter = Arc<RateLimiter<std::net::IpAddr>>;
-const LOOKUP_RATE_LIMIT: u32 = 10;
-const LOOKUP_RATE_WINDOW_SECS: u64 = 1;
+//
+// `LookupRateLimiter` and its constants live in `rate_limit` now; they
+// implement PNP-008-MUST-066 (10 req/s per client) via the shared limiter.
 
 /// GET /peers/presence — return the locally-connected peers of this relay,
 /// CBOR-encoded as `Vec<PresenceEntry>`. Rate-limited per client IP.
