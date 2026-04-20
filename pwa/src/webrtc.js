@@ -24,7 +24,7 @@ let customIceServers = null;
 // trade-off when TURN is unavailable.
 let webrtcPrivacyMode = true;
 
-function getRtcConfig() {
+export function getRtcConfig() {
     const config = {
         iceServers: customIceServers || DEFAULT_STUN_SERVERS
     };
@@ -32,6 +32,10 @@ function getRtcConfig() {
         config.iceTransportPolicy = 'relay';
     }
     return config;
+}
+
+export function isWebrtcPrivacyMode() {
+    return webrtcPrivacyMode;
 }
 
 export async function loadCustomStunServers() {

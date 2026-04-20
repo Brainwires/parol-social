@@ -29,6 +29,9 @@ export function setIncomingCallInfo(v) { incomingCallInfo = v; }
 export let localStream = null;
 export function setLocalStream(v) { localStream = v; }
 
+export let remoteStream = null;
+export function setRemoteStream(v) { remoteStream = v; }
+
 export let platform = 'default';
 export function setPlatform(v) { platform = v; }
 

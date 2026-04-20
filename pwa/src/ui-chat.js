@@ -15,7 +15,8 @@ import { showView } from './views.js';
 import { initWebRTC, hasDirectConnection, sendViaWebRTC, rtcConnections,
          seenGossipMessages, markGossipSeen } from './webrtc.js';
 import { sendToRelay, connMgr, queueMessage } from './connection.js';
-import { sendRawEnvelope } from './messaging.js';
+import { sendRawEnvelope, sendCallSignal } from './messaging.js';
+import { startCallConnection, acceptCallConnection, teardownCallConnection } from './call.js';
 import { spendOneToken, maybeRefill } from './token-pool.js';
 import { t } from './i18n.js';
 import { MSG_TYPE_CHAT, MSG_TYPE_SYSTEM, MSG_TYPE_CALL_SIGNAL } from './protocol-constants.js';
@@ -382,34 +383,36 @@ export async function initiateCall(peerId, withVideo) {
         }
     }
 
-    // Notify the peer of incoming call via a PNP-001 envelope (msg_type=CALL_SIGNAL).
-    // Route through sendRawEnvelope so the outer relay frame carries a
-    // Privacy Pass token (PNP-001-MUST-048) — without it the relay silently
-    // drops the frame and the recipient never sees an incoming-call UI.
-    if (wasm && wasm.envelope_encode && wasm.has_session && wasm.has_session(peerId)) {
-        let envelope;
-        try {
-            const encoder = new TextEncoder();
-            const inner = encoder.encode(JSON.stringify({
-                action: 'offer',
-                callId: currentCallId,
-                withVideo: !!withVideo
-            }));
-            const nowSecs = BigInt(Math.floor(Date.now() / 1000));
-            envelope = wasm.envelope_encode(peerId, MSG_TYPE_CALL_SIGNAL, inner, nowSecs);
-        } catch (e) {
-            console.warn('[Call] envelope_encode failed:', e);
-            showToast(t('toast.callSignalFailed'));
-            return;
-        }
-        const ok = await sendRawEnvelope(peerId, envelope);
-        if (!ok) {
-            showToast(t('toast.callSignalFailed'));
-            stopLocalMedia();
-            return;
-        }
-    } else {
+    // Build the RTCPeerConnection, add local tracks, create offer SDP.
+    // Without this the signaling handshake completed but no RTP ever
+    // crossed the wire — the call UI flipped to "Connected" on the
+    // label-only `answer` frame while both sides sat silent.
+    if (!wasm || !wasm.envelope_encode || !wasm.has_session || !wasm.has_session(peerId)) {
         showToast(t('toast.callNoSecureSession'));
+        stopLocalMedia();
+        return;
+    }
+
+    let offerSdp;
+    try {
+        offerSdp = await startCallConnection(peerId, currentCallId, !!withVideo);
+    } catch (e) {
+        showToast(t('toast.callSignalFailed'));
+        stopLocalMedia();
+        return;
+    }
+
+    // CALL_SIGNAL `offer` now carries the SDP. sendCallSignal wraps the
+    // payload in a token-authenticated PNP-001 envelope via sendRawEnvelope.
+    const ok = await sendCallSignal(peerId, 'offer', {
+        callId: currentCallId,
+        withVideo: !!withVideo,
+        sdp: offerSdp,
+    });
+    if (!ok) {
+        showToast(t('toast.callSignalFailed'));
+        stopLocalMedia();
+        teardownCallConnection(peerId);
         return;
     }
 
@@ -451,22 +454,27 @@ export async function answerIncomingCall(callId, opts) {
         try { wasm.answer_call(callId); } catch (e) { console.warn('[Call] answer_call:', e); }
     }
 
-    // Tell the caller we accepted so their UI can transition from
-    // "Calling..." to "Connected" and start the call timer. Without this
-    // the caller never knows the callee picked up.
-    if (peerId && wasm && wasm.envelope_encode && wasm.has_session && wasm.has_session(peerId)) {
+    // Apply the offer SDP, build the answer SDP, and ship it back to the
+    // caller so their PC transitions out of have-local-offer. Without the
+    // SDP exchange no ICE/DTLS/RTP flows.
+    const offerSdp = opts && opts.offerSdp;
+    if (peerId && offerSdp) {
+        let answerSdp;
         try {
-            const inner = new TextEncoder().encode(JSON.stringify({
-                action: 'answer',
-                callId,
-                withVideo,
-            }));
-            const nowSecs = BigInt(Math.floor(Date.now() / 1000));
-            const envelope = wasm.envelope_encode(peerId, MSG_TYPE_CALL_SIGNAL, inner, nowSecs);
-            await sendRawEnvelope(peerId, envelope);
+            answerSdp = await acceptCallConnection(peerId, callId, offerSdp, withVideo);
         } catch (e) {
-            console.warn('[Call] answer-signal encode failed:', e);
+            showToast(t('toast.callConnectionFailed'));
+            stopLocalMedia();
+            if (wasm && wasm.hangup_call) { try { wasm.hangup_call(callId); } catch {} }
+            return;
         }
+        await sendCallSignal(peerId, 'answer', {
+            callId,
+            withVideo,
+            sdp: answerSdp,
+        });
+    } else {
+        console.warn('[Call] answerIncomingCall: missing peerId or offerSdp');
     }
 
     const statusEl = document.getElementById('call-status');
@@ -474,7 +482,18 @@ export async function answerIncomingCall(callId, opts) {
     startCallTimer();
 }
 
-export function hangupCall() {
+export async function hangupCall() {
+    // Notify the remote side BEFORE local teardown. Otherwise the peer
+    // sits in a "Connected" state until their PC state-change fires —
+    // and with all media going over TURN that can take several seconds.
+    if (currentCallId && currentPeerId) {
+        try {
+            await sendCallSignal(currentPeerId, 'hangup', { callId: currentCallId });
+        } catch (e) {
+            console.warn('[Call] hangup signal failed:', e && e.message);
+        }
+        teardownCallConnection(currentPeerId);
+    }
     if (wasm && wasm.hangup_call && currentCallId) {
         try { wasm.hangup_call(currentCallId); } catch(e) { console.warn(e); }
     }
@@ -484,7 +503,7 @@ export function hangupCall() {
     showView(currentPeerId ? 'chat' : 'contacts');
 }
 
-function stopLocalMedia() {
+export function stopLocalMedia() {
     if (localStream) {
         localStream.getTracks().forEach(t => t.stop());
         setLocalStream(null);
@@ -508,7 +527,7 @@ function startCallTimer() {
     }, 1000);
 }
 
-function stopCallTimer() {
+export function stopCallTimer() {
     if (callTimerInterval) {
         clearInterval(callTimerInterval);
         callTimerInterval = null;

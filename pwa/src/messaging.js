@@ -15,7 +15,9 @@ import { sendToRelay, discoverPeers, startDiscoveryInterval, connMgr } from './c
 import { spendOneToken, maybeRefill, requestBatch, queueSize } from './token-pool.js';
 import { lookupHomeRelay } from './peer-relay-cache.js';
 import { isOnionActive, sendViaOnion } from './onion.js';
-import { loadContacts, appendMessage, answerIncomingCall, loadAddressBook } from './ui-chat.js';
+import { loadContacts, appendMessage, answerIncomingCall, loadAddressBook,
+         stopLocalMedia, stopCallTimer } from './ui-chat.js';
+import { completeCallConnection, addRemoteIce, teardownCallConnection } from './call.js';
 import { t } from './i18n.js';
 import {
     MSG_TYPE_CHAT, MSG_TYPE_SYSTEM, MSG_TYPE_FILE_CHUNK, MSG_TYPE_FILE_CONTROL,
@@ -143,6 +145,26 @@ export async function sendRawEnvelope(toPeerId, env) {
     const ok = connMgr.sendToRelayUrl(homeRelay, toPeerId, env, token);
     if (ok) maybeRefill(homeRelay);
     return ok;
+}
+
+// Call-signaling helper. Wraps a `{action, callId, ...payload}` body in a
+// PNP-001 CALL_SIGNAL envelope and hands it to sendRawEnvelope so the
+// outer frame inherits the Privacy Pass token + WebRTC-first / onion /
+// cross-relay dispatch cascade. Exported so call.js can fire ICE/hangup
+// signals without re-implementing the envelope + transport plumbing.
+export async function sendCallSignal(peerId, action, payload = {}) {
+    if (!wasm || !wasm.envelope_encode || !wasm.has_session || !wasm.has_session(peerId)) {
+        return false;
+    }
+    try {
+        const inner = new TextEncoder().encode(JSON.stringify({ action, ...payload }));
+        const nowSecs = BigInt(Math.floor(Date.now() / 1000));
+        const envelope = wasm.envelope_encode(peerId, MSG_TYPE_CALL_SIGNAL, inner, nowSecs);
+        return await sendRawEnvelope(peerId, envelope);
+    } catch (e) {
+        console.warn('[CallSignal] encode failed:', e && e.message);
+        return false;
+    }
 }
 
 // ── Relay Message Handling ────────────────────────────────
@@ -744,7 +766,15 @@ async function sendFileChunked(fileId, toPeerId) {
 // ── Incoming Call Notification ──────────────────────────────
 
 function handleIncomingCall(msg) {
-    setIncomingCallInfo({ from: msg.from, callId: msg.callId, withVideo: !!msg.withVideo });
+    setIncomingCallInfo({
+        from: msg.from,
+        callId: msg.callId,
+        withVideo: !!msg.withVideo,
+        // Offer SDP is required on the callee side to build the answer
+        // in acceptCallConnection(). Stashed here so acceptIncomingCall()
+        // can hand it to answerIncomingCall() unmodified.
+        offerSdp: msg.sdp || null,
+    });
     showIncomingCallNotification(msg.from, msg.callId);
 }
 
@@ -767,7 +797,10 @@ export function acceptIncomingCall() {
     if (notif) notif.classList.add('hidden');
     setCurrentPeerId(incomingCallInfo.from);
     setCurrentCallId(incomingCallInfo.callId);
-    answerIncomingCall(incomingCallInfo.callId, { withVideo: !!incomingCallInfo.withVideo });
+    answerIncomingCall(incomingCallInfo.callId, {
+        withVideo: !!incomingCallInfo.withVideo,
+        offerSdp: incomingCallInfo.offerSdp,
+    });
     showView('call');
     const nameEl = document.getElementById('call-peer-name');
     if (nameEl) nameEl.textContent = incomingCallInfo.from.slice(0, 16) + '...';
@@ -1165,18 +1198,44 @@ function handleFileControlPlaintext(fromPeerId, plaintext) {
 function handleCallSignalPlaintext(fromPeerId, plaintext) {
     const obj = parseJsonPlaintext(plaintext);
     if (!obj) return;
-    if (obj.action === 'offer') {
-        handleIncomingCall({ ...obj, from: fromPeerId });
-    } else if (obj.action === 'answer') {
-        // Caller side: callee accepted. Flip the "Calling..." status so the
-        // UI reflects that the other side picked up. The call timer was
-        // already started by initiateCall.
-        const statusEl = document.getElementById('call-status');
-        if (statusEl) statusEl.textContent = 'Connected';
-    } else if (obj.action === 'reject') {
-        showToast(t('toast.callDeclined'));
-    } else {
-        console.warn('[CallSignal] unknown action:', obj.action);
+    switch (obj.action) {
+        case 'offer':
+            handleIncomingCall({ ...obj, from: fromPeerId });
+            break;
+        case 'answer': {
+            // Caller side: callee accepted. Apply their SDP so RTP actually
+            // starts flowing, then flip the "Calling..." label. Without the
+            // setRemoteDescription the PC stays in have-local-offer state
+            // forever and no media crosses.
+            completeCallConnection(fromPeerId, obj.sdp).catch(e => {
+                console.warn('[CallSignal] completeCallConnection failed:', e && e.message);
+                showErrorToast(t('toast.callConnectionFailed'));
+            });
+            const statusEl = document.getElementById('call-status');
+            if (statusEl) statusEl.textContent = 'Connected';
+            break;
+        }
+        case 'ice':
+            addRemoteIce(fromPeerId, obj.candidate).catch(e => {
+                console.warn('[CallSignal] addRemoteIce failed:', e && e.message);
+            });
+            break;
+        case 'hangup':
+            // Remote ended the call. Mirror hangupCall's local cleanup so
+            // both sides end up in the same post-call state: PC closed,
+            // local media stopped, timer halted, view reset.
+            teardownCallConnection(fromPeerId);
+            stopLocalMedia();
+            stopCallTimer();
+            setCurrentCallId(null);
+            showView(currentPeerId ? 'chat' : 'contacts');
+            showToast(t('toast.callEnded'));
+            break;
+        case 'reject':
+            showToast(t('toast.callDeclined'));
+            break;
+        default:
+            console.warn('[CallSignal] unknown action:', obj.action);
     }
 }
 
