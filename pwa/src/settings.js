@@ -8,7 +8,7 @@ import { rtcConnections, updateWebRTCPrivacyUI } from './webrtc.js';
 import { exportData, importData, validateExport } from './data-export.js';
 import { t } from './i18n.js';
 import { startCoverTraffic, stopCoverTraffic } from './cover-traffic.js';
-import { sendToRelay } from './connection.js';
+import { sendRawEnvelope } from './messaging.js';
 import { enableOnion, disableOnion, isOnionActive } from './onion.js';
 
 // ── Cover Traffic (PNP-006) ────────────────────────────────
@@ -20,7 +20,7 @@ function coverTrafficDeps() {
     return {
         mode: 'NORMAL',
         wasm,
-        sendToRelay,
+        sendRawEnvelope,
         listContacts: () => dbGetAll('contacts'),
     };
 }
@@ -623,16 +623,17 @@ export async function regenerateIdentity() {
     window._peerId = result.new_peer_id_hex;
     if (connMgr && connMgr.registerPeer) connMgr.registerPeer(result.new_peer_id_hex);
 
-    // Deliver one envelope per contact. Transport-layer: prefer direct RTC,
-    // fall back to relay. Errors per-contact are logged but do not abort
-    // the rest of the batch — a failed delivery means the contact sees
-    // the rotation the next time they reach us on the old PeerId.
+    // Deliver one envelope per contact. sendRawEnvelope prefers direct RTC
+    // and falls back to the token-gated relay path. Errors per-contact are
+    // logged but do not abort the rest of the batch — a failed delivery
+    // means the contact sees the rotation the next time they reach us on
+    // the old PeerId.
     const envelopes = Array.isArray(result.per_contact_envelopes) ? result.per_contact_envelopes : [];
     for (const pair of envelopes) {
         if (!Array.isArray(pair) || pair.length !== 2) continue;
         const [peerIdHex, envelopeHex] = pair;
         try {
-            sendToRelay(peerIdHex, envelopeHex);
+            await sendRawEnvelope(peerIdHex, envelopeHex);
         } catch (e) {
             console.warn('[Rotate] send to', peerIdHex && peerIdHex.slice(0, 8), 'failed:', e && e.message);
         }

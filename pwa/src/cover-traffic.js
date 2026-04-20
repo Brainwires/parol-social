@@ -81,8 +81,11 @@ async function emitDecoy(deps) {
         const envelope = wasm.envelope_encode(target, MSG_TYPE_DECOY, plaintext, nowSecs);
         if (!envelope) return false;
         // Decoys go ONLY through the relay path (PNP-006: the observer being
-        // confused is the WSS watcher). Do not duplicate via WebRTC.
-        deps.sendToRelay(target, envelope);
+        // confused is the WSS watcher). Do not duplicate via WebRTC. The
+        // deps-injected `sendRawEnvelope` spends a Privacy Pass token from
+        // the home pool per PNP-001-MUST-048; if the pool is empty the
+        // decoy is dropped silently (cover traffic is best-effort).
+        await deps.sendRawEnvelope(target, envelope);
         decoySentCount++;
         return true;
     } catch {
@@ -116,12 +119,12 @@ async function tick(deps) {
  * @param {object} opts
  * @param {'NORMAL'} [opts.mode='NORMAL'] - Only NORMAL is supported for now.
  * @param {object} opts.wasm - The loaded WASM module (must expose envelope_encode + has_session).
- * @param {function} opts.sendToRelay - (toPeerId, envelopeHex) => void | boolean
+ * @param {function} opts.sendRawEnvelope - async (toPeerId, envelopeHex) => boolean
  * @param {function} opts.listContacts - async () => Array<{ peerId }>
  */
 export function startCoverTraffic(opts) {
     if (running) return;
-    if (!opts || !opts.wasm || !opts.sendToRelay || !opts.listContacts) {
+    if (!opts || !opts.wasm || !opts.sendRawEnvelope || !opts.listContacts) {
         throw new Error('startCoverTraffic: missing required dependency');
     }
     if (opts.mode && opts.mode !== 'NORMAL') {

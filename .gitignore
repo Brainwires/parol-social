@@ -15,3 +15,4 @@ docker-compose.override.yml
 .claude/worktrees/
 dist/
 dist-verify/
+relay-data/

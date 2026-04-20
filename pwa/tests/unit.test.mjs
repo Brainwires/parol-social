@@ -883,7 +883,7 @@ describe('cover traffic', () => {
         const ct = await freshCT();
         assert.throws(() => ct.startCoverTraffic({}), /missing required dependency/);
         assert.throws(() => ct.startCoverTraffic({
-            wasm: {}, sendToRelay: () => {}, listContacts: () => [], mode: 'LOW'
+            wasm: {}, sendRawEnvelope: async () => true, listContacts: () => [], mode: 'LOW'
         }), /only NORMAL/);
         ct.stopCoverTraffic();
     });
@@ -897,7 +897,7 @@ describe('cover traffic', () => {
         };
         ct.startCoverTraffic({
             wasm: fakeWasm,
-            sendToRelay: (to, env) => sends.push([to, env]),
+            sendRawEnvelope: async (to, env) => { sends.push([to, env]); return true; },
             listContacts: async () => [],
             MSG_TYPE_DECOY,
         });
@@ -916,7 +916,7 @@ describe('cover traffic', () => {
         };
         ct.startCoverTraffic({
             wasm: fakeWasm,
-            sendToRelay: (to, env) => sends.push([to, env]),
+            sendRawEnvelope: async (to, env) => { sends.push([to, env]); return true; },
             listContacts: async () => [{ peerId: 'aa'.repeat(32) }],
             MSG_TYPE_DECOY,
         });
@@ -939,7 +939,7 @@ describe('cover traffic', () => {
         };
         ct.startCoverTraffic({
             wasm: fakeWasm,
-            sendToRelay: (to, env) => sends.push([to, env]),
+            sendRawEnvelope: async (to, env) => { sends.push([to, env]); return true; },
             listContacts: async () => [{ peerId }],
             MSG_TYPE_DECOY,
         });
@@ -951,7 +951,7 @@ describe('cover traffic', () => {
         assert.equal(encodeArgs[0].msgType, MSG_TYPE_DECOY);
         assert.equal(encodeArgs[0].plainLen, 8, '8-byte plaintext keeps envelope in 256 bucket');
         assert.equal(typeof encodeArgs[0].ts, 'bigint', 'timestamp is bigint seconds');
-        assert.ok(sends.length >= 1, 'sendToRelay invoked');
+        assert.ok(sends.length >= 1, 'sendRawEnvelope invoked');
         assert.equal(sends[0][0], peerId);
         assert.equal(sends[0][1], 'ff'.repeat(128));
     });
@@ -966,7 +966,7 @@ describe('cover traffic', () => {
         };
         ct.startCoverTraffic({
             wasm: fakeWasm,
-            sendToRelay: (to, env) => sends.push([to, env]),
+            sendRawEnvelope: async (to, env) => { sends.push([to, env]); return true; },
             listContacts: async () => [{ peerId }],
             MSG_TYPE_DECOY,
         });
@@ -992,7 +992,7 @@ describe('cover traffic', () => {
         };
         ct.startCoverTraffic({
             wasm: fakeWasm,
-            sendToRelay: (to, env) => sends.push([to, env]),
+            sendRawEnvelope: async (to, env) => { sends.push([to, env]); return true; },
             listContacts: async () => [{ peerId }],
             MSG_TYPE_DECOY,
         });

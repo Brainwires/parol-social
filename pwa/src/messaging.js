@@ -74,26 +74,33 @@ function encodeEnvelope(toPeerId, msgType, obj) {
 async function sendEnvelope(toPeerId, msgType, obj) {
     const env = encodeEnvelope(toPeerId, msgType, obj);
     if (!env) return false;
+    return sendRawEnvelope(toPeerId, env);
+}
+
+/// Transport dispatch for a pre-encoded PNP-001 envelope. Shared by every
+/// call site that already has envelope bytes in hand — call-signal offers
+/// (bootstrap source_hint envelopes, file chunks, identity-rotation
+/// notifications, cover-traffic decoys, etc.). All of those MUST spend a
+/// Privacy Pass token before the outer frame leaves the client per
+/// PNP-001-MUST-048; this helper centralizes that discipline so none of
+/// them can forget it again.
+///
+/// The WebRTC-first / onion / home-relay / cross-relay cascade is identical
+/// to `sendEnvelope`; only the encoding step is pulled out.
+export async function sendRawEnvelope(toPeerId, env) {
+    if (!env) return false;
     markRealSend();
     if (hasDirectConnection(toPeerId)) {
         return sendViaWebRTC(toPeerId, env);
     }
-    // High-anonymity mode: route relay traffic through the 3-hop onion
-    // circuit instead of the direct SW WebSocket. The onion module has
-    // already replaced the SW-owned socket with its own main-thread
-    // socket in this mode. Onion takes priority over the home-relay and
-    // cross-relay paths — it's an explicit user preference.
     if (isOnionActive()) {
         return sendViaOnion(toPeerId, env);
     }
 
-    // Resolve which relay the recipient is home-connected to.
     let homeRelay = null;
     try { homeRelay = await lookupHomeRelay(toPeerId); } catch (_) { homeRelay = null; }
 
     if (!homeRelay || homeRelay === connMgr.relayUrl) {
-        // Home-relay send path — either cache miss or the peer lives on
-        // our relay.
         let token;
         try {
             token = spendOneToken(connMgr.relayUrl);
@@ -105,23 +112,17 @@ async function sendEnvelope(toPeerId, msgType, obj) {
         }
         const ok = sendToRelay(toPeerId, env, token);
         if (ok) maybeRefill(connMgr.relayUrl);
-        // Lookup failed: show a toast once to surface the fallback.
         if (!homeRelay) {
-            // Only warn if we actually didn't find it and aren't on the
-            // recipient's home relay — on a miss we don't know which is
-            // which, so we show the toast.
             try { showToast(t('toast.peerLookupFailed')); } catch (_) {}
         }
         return ok;
     }
 
-    // Cross-relay path. Open (or reuse) the outbound connection.
     const opened = await connMgr.openOutbound(homeRelay);
     if (!opened) {
         showToast(t('toast.peerLookupFailed'));
         return false;
     }
-    // If this relay's token pool is empty, fetch a batch before sending.
     if (queueSize(homeRelay) === 0) {
         const res = await requestBatch(homeRelay);
         if (!res || !res.ok) {
@@ -722,12 +723,10 @@ async function sendFileChunked(fileId, toPeerId) {
             });
             const nowSecs = BigInt(Math.floor(Date.now() / 1000));
             const envelope = wasm.envelope_encode(toPeerId, MSG_TYPE_FILE_CHUNK, encoder.encode(inner), nowSecs);
-            markRealSend();
-            if (hasDirectConnection(toPeerId)) {
-                sendViaWebRTC(toPeerId, envelope);
-            } else {
-                sendToRelay(toPeerId, envelope);
-            }
+            // sendRawEnvelope picks WebRTC when available, falls back to the
+            // token-gated relay path. Without the token the relay silently
+            // dropped every chunk — file transfers were a no-op.
+            await sendRawEnvelope(toPeerId, envelope);
             chunkIndex++;
             if (chunkIndex % 10 === 0) {
                 await new Promise(r => setTimeout(r, 0));

@@ -15,6 +15,7 @@ import { showView } from './views.js';
 import { initWebRTC, hasDirectConnection, sendViaWebRTC, rtcConnections,
          seenGossipMessages, markGossipSeen } from './webrtc.js';
 import { sendToRelay, connMgr, queueMessage } from './connection.js';
+import { sendRawEnvelope } from './messaging.js';
 import { spendOneToken, maybeRefill } from './token-pool.js';
 import { t } from './i18n.js';
 import { MSG_TYPE_CHAT, MSG_TYPE_SYSTEM, MSG_TYPE_CALL_SIGNAL } from './protocol-constants.js';
@@ -373,7 +374,11 @@ export async function initiateCall(peerId, withVideo) {
     }
 
     // Notify the peer of incoming call via a PNP-001 envelope (msg_type=CALL_SIGNAL).
+    // Route through sendRawEnvelope so the outer relay frame carries a
+    // Privacy Pass token (PNP-001-MUST-048) — without it the relay silently
+    // drops the frame and the recipient never sees an incoming-call UI.
     if (wasm && wasm.envelope_encode && wasm.has_session && wasm.has_session(peerId)) {
+        let envelope;
         try {
             const encoder = new TextEncoder();
             const inner = encoder.encode(JSON.stringify({
@@ -382,12 +387,16 @@ export async function initiateCall(peerId, withVideo) {
                 withVideo: !!withVideo
             }));
             const nowSecs = BigInt(Math.floor(Date.now() / 1000));
-            const envelope = wasm.envelope_encode(peerId, MSG_TYPE_CALL_SIGNAL, inner, nowSecs);
-            markRealSend();
-            sendToRelay(peerId, envelope);
+            envelope = wasm.envelope_encode(peerId, MSG_TYPE_CALL_SIGNAL, inner, nowSecs);
         } catch (e) {
             console.warn('[Call] envelope_encode failed:', e);
             showToast(t('toast.callSignalFailed'));
+            return;
+        }
+        const ok = await sendRawEnvelope(peerId, envelope);
+        if (!ok) {
+            showToast(t('toast.callSignalFailed'));
+            stopLocalMedia();
             return;
         }
     } else {
@@ -734,11 +743,13 @@ function handleScannedQR(data) {
                     ourIk: ourIk.slice(0, 8),
                     envelopeBytes: envelope.length >> 1,
                 });
-                markRealSend();
                 persistSessions();
-                const sent = sendToRelay(peerId, envelope);
+                // sendRawEnvelope handles markRealSend internally and spends
+                // a Privacy Pass token; without it the relay silently drops
+                // the frame and the presenter never materializes our session.
+                const sent = await sendRawEnvelope(peerId, envelope);
                 if (!sent) {
-                    console.log('[Bootstrap] relay offline — queued for later send');
+                    console.log('[Bootstrap] relay offline / no token — queued for later send');
                     queueMessage(peerId, envelope);
                 } else {
                     console.log('[Bootstrap] envelope handed to relay');
