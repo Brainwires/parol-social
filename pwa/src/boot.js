@@ -33,7 +33,7 @@ import {
     addManualRelay,
     loadOnionModeSetting, setOnionModeEnabled, enableOnionModeFromBoot
 } from './settings.js';
-import { initI18n, t, changeLanguage, applyToDOM } from './i18n.js';
+import { initI18n, t, changeLanguage, applyToDOM, getCurrentLang } from './i18n.js';
 import { showSafetyNumberModal } from './safety-number.js';
 
 // ── WASM Loading ────────────────────────────────────────────
@@ -489,13 +489,21 @@ document.addEventListener('DOMContentLoaded', async () => {
     setPlatform(detectPlatform());
     document.body.classList.add(`platform-${platform}`);
 
-    // Load saved language preference, then init i18n
+    // Load saved language preference, then init i18n. On first run (no
+    // saved pref) initI18n picks the best match for navigator.languages —
+    // we then persist that choice so detection only runs once and user
+    // overrides made through settings keep winning on subsequent launches.
     let savedLang = null;
     try {
         const langSetting = await dbGet('settings', 'language');
         if (langSetting && langSetting.value) savedLang = langSetting.value;
     } catch {}
     await initI18n(savedLang).catch(() => {});
+    if (!savedLang) {
+        const detected = getCurrentLang();
+        dbPut('settings', { key: 'language', value: detected }).catch(() => {});
+        savedLang = detected;
+    }
 
     // Set language selector to current value
     const langSelect = document.getElementById('settings-language');

@@ -297,6 +297,49 @@ describe('i18n', () => {
         }
     });
 
+    test('detectLocale: exact match beats base match', async () => {
+        const { detectLocale } = await import('../src/i18n.js');
+        assert.equal(detectLocale(['zh-CN', 'en'], SUPPORTED_LANGS), 'zh-CN');
+        assert.equal(detectLocale(['zh-TW'], SUPPORTED_LANGS), 'zh-TW');
+        assert.equal(detectLocale(['en-US', 'fr'], SUPPORTED_LANGS), 'en');
+    });
+
+    test('detectLocale: first preference wins', async () => {
+        const { detectLocale } = await import('../src/i18n.js');
+        assert.equal(detectLocale(['fr-CA', 'en-US'], SUPPORTED_LANGS), 'fr');
+        assert.equal(detectLocale(['de-AT', 'ja'], SUPPORTED_LANGS), 'de');
+    });
+
+    test('detectLocale: Chinese region aliasing', async () => {
+        const { detectLocale } = await import('../src/i18n.js');
+        assert.equal(detectLocale(['zh-HK'], SUPPORTED_LANGS), 'zh-TW');
+        assert.equal(detectLocale(['zh-MO'], SUPPORTED_LANGS), 'zh-TW');
+        assert.equal(detectLocale(['zh-Hant-HK'], SUPPORTED_LANGS), 'zh-TW');
+        assert.equal(detectLocale(['zh-Hans'], SUPPORTED_LANGS), 'zh-CN');
+        assert.equal(detectLocale(['zh-SG'], SUPPORTED_LANGS), 'zh-CN');
+        assert.equal(detectLocale(['zh'], SUPPORTED_LANGS), 'zh-CN');
+    });
+
+    test('detectLocale: Portuguese regions fold to pt', async () => {
+        const { detectLocale } = await import('../src/i18n.js');
+        assert.equal(detectLocale(['pt-BR'], SUPPORTED_LANGS), 'pt');
+        assert.equal(detectLocale(['pt-PT'], SUPPORTED_LANGS), 'pt');
+    });
+
+    test('detectLocale: unknown tag falls back to en', async () => {
+        const { detectLocale } = await import('../src/i18n.js');
+        assert.equal(detectLocale(['xx-YY'], SUPPORTED_LANGS), 'en');
+        assert.equal(detectLocale(['qqx'], SUPPORTED_LANGS), 'en');
+        assert.equal(detectLocale([], SUPPORTED_LANGS), 'en');
+        assert.equal(detectLocale(null, SUPPORTED_LANGS), 'en');
+    });
+
+    test('detectLocale: case-insensitive matching', async () => {
+        const { detectLocale } = await import('../src/i18n.js');
+        assert.equal(detectLocale(['ZH-cn'], SUPPORTED_LANGS), 'zh-CN');
+        assert.equal(detectLocale(['FR'], SUPPORTED_LANGS), 'fr');
+    });
+
     test('t() function substitutes params', () => {
         function t(key, params) {
             const strings = { 'toast.newContact': 'New contact: {name}...' };

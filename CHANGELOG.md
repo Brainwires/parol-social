@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added — PWA auto-detects browser language on first run
+- `pwa/src/i18n.js` gains an exported pure matcher `detectLocale(prefs, supported)` that iterates `navigator.languages[]` in order, trying exact match → Chinese region aliasing (`zh-HK`/`zh-MO`/`zh-Hant*` → `zh-TW`, other `zh-*` → `zh-CN`) → base-language match (`fr-CA` → `fr`, `pt-BR` → `pt`) → `en`. Matching is case-insensitive. The old `detectLanguage()` wrapper now feeds the full preference list into the matcher instead of only `navigator.language`.
+- `pwa/src/boot.js`: on first run (no saved `settings/language` entry in IndexedDB) the auto-detected choice is persisted immediately after `initI18n`, so detection runs exactly once. Any explicit selection from the settings language dropdown keeps winning on subsequent launches (the existing `window.changeLanguage` write path is untouched).
+- 6 new unit tests cover the matcher (exact, first-pref-wins, zh aliasing, pt-* folding, unknown→en, case-insensitivity).
+
 ### Removed — Per-identity token issuance rate limit (PNP-001 v0.8)
 - Dropped the `/tokens/issue` per-(identity, epoch) budget cap from the relay-server. Operationally it was gating legitimate browser reloads faster than it was stopping abuse: identity creation is free in PNP-002 (Ed25519 keygen, no registration), so an attacker just rotates identities and the cap never touches them. Meanwhile any user with a persistent browser identity could exhaust the budget across a handful of page loads. The per-frame defenses that actually matter — MUST-050 per-epoch spent-set (replay protection) and MUST-052 Ed25519 signature gate at issuance — stand on their own without the cap; network-layer abuse is the job of fail2ban on the deployment host.
 - **PNP-001 v0.8:** the §10.2 clause relaxes from `MUST-063` (cumulative cap REQUIRED) to `MAY-005` (cumulative cap OPTIONAL). The MAY form retains the exact accounting shape a re-enabled implementation must use (running total, 429 without advance, epoch-reset) so interop stays stable if abuse telemetry later justifies turning it back on. MUST count drops 63 → 62.

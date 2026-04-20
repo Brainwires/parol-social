@@ -14,6 +14,7 @@ let currentLang = 'en';
 
 export async function initI18n(savedLang) {
     currentLang = savedLang || detectLanguage();
+    if (!SUPPORTED_LANGS.includes(currentLang)) currentLang = 'en';
     // Always load English first so missing-key fallback works even after
     // switching to another language whose catalog lacks a new key.
     try {
@@ -66,19 +67,57 @@ export async function changeLanguage(lang) {
     applyToDOM();
 }
 
-function detectLanguage() {
-    const nav = navigator.language || navigator.userLanguage || 'en';
-    // Exact match first
-    if (SUPPORTED_LANGS.includes(nav)) return nav;
-    // Try base language (e.g. 'zh-CN' from 'zh-Hans-CN')
-    const base = nav.split('-')[0];
-    // Special handling for Chinese
-    if (base === 'zh') {
-        if (nav.includes('TW') || nav.includes('Hant')) return 'zh-TW';
-        return 'zh-CN';
+// Pure, testable matcher: given the browser's ordered preference list and
+// the set of supported locale codes, return the best match or 'en'.
+//   Rules:
+//     1. Exact match on a preferred tag (case-insensitive).
+//     2. Chinese region aliasing: zh-Hant / zh-HK / zh-TW / zh-MO → zh-TW;
+//        any other zh-* (Hans, CN, SG, …) → zh-CN.
+//     3. Base-language match (e.g. 'fr-CA' → 'fr', 'pt-BR' → 'pt').
+//     4. Fallback: 'en'.
+//   The first preference that yields any match wins; we do not skip ahead
+//   to a later preference merely because the earlier one only matched at
+//   the base level — that's what the user actually asked for.
+export function detectLocale(prefs, supported) {
+    if (!Array.isArray(prefs) || prefs.length === 0) prefs = ['en'];
+    if (!Array.isArray(supported) || supported.length === 0) return 'en';
+    const supportedLower = supported.map(s => s.toLowerCase());
+    const origByLower = new Map(supported.map(s => [s.toLowerCase(), s]));
+
+    for (const raw of prefs) {
+        if (!raw || typeof raw !== 'string') continue;
+        const pref = raw.trim();
+        if (!pref) continue;
+        const lower = pref.toLowerCase();
+
+        // 1. Exact match.
+        if (supportedLower.includes(lower)) return origByLower.get(lower);
+
+        const base = lower.split('-')[0];
+
+        // 2. Chinese region aliasing.
+        if (base === 'zh') {
+            const isTraditional = /(^|-)hant(-|$)/.test(lower)
+                || /-(hk|tw|mo)(-|$)/.test(lower);
+            if (isTraditional && supportedLower.includes('zh-tw')) {
+                return origByLower.get('zh-tw');
+            }
+            if (supportedLower.includes('zh-cn')) return origByLower.get('zh-cn');
+        }
+
+        // 3. Base-language match.
+        if (supportedLower.includes(base)) return origByLower.get(base);
     }
-    if (SUPPORTED_LANGS.includes(base)) return base;
-    return 'en';
+
+    // 4. Fallback.
+    return supportedLower.includes('en') ? origByLower.get('en') : supported[0];
+}
+
+function detectLanguage() {
+    const prefs = (typeof navigator !== 'undefined' && Array.isArray(navigator.languages) && navigator.languages.length)
+        ? navigator.languages
+        : [ (typeof navigator !== 'undefined' && (navigator.language || navigator.userLanguage)) || 'en' ];
+    return detectLocale(prefs, SUPPORTED_LANGS);
 }
 
 export function applyToDOM() {
