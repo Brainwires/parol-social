@@ -117,6 +117,11 @@
   "error.enterGroupName": "نام گروه را وارد کنید",
   "error.enterContactCode": "کد مخاطبتان را بچسبانید",
   "error.alreadyMember": "از قبل عضو است",
+  "toast.clearAll": "Clear all",
+  "toast.carouselPrev": "Previous",
+  "toast.carouselNext": "Next",
+  "toast.carouselCounter": "{current} of {total}",
+
   "toast.starting": "راه‌اندازی ParolNet...",
   "toast.bootstrapReceived": "داده‌های اولیه دریافت شد",
   "toast.wrongPassphrase": "عبارت رمز اشتباه است",

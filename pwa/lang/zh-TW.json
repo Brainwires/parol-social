@@ -117,6 +117,11 @@
   "error.enterGroupName": "請輸入群組名稱",
   "error.enterContactCode": "請貼上聯絡人的代碼",
   "error.alreadyMember": "已經是成員",
+  "toast.clearAll": "Clear all",
+  "toast.carouselPrev": "Previous",
+  "toast.carouselNext": "Next",
+  "toast.carouselCounter": "{current} of {total}",
+
   "toast.starting": "正在啟動 ParolNet...",
   "toast.bootstrapReceived": "已收到引導資料",
   "toast.wrongPassphrase": "密碼短語錯誤",

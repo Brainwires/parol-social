@@ -123,6 +123,11 @@
   "error.enterContactCode": "Paste the code from your contact",
   "error.alreadyMember": "Already a member",
 
+  "toast.clearAll": "Clear all",
+  "toast.carouselPrev": "Previous",
+  "toast.carouselNext": "Next",
+  "toast.carouselCounter": "{current} of {total}",
+
   "toast.starting": "Starting ParolNet...",
   "toast.bootstrapReceived": "Bootstrap data received",
   "toast.wrongPassphrase": "Wrong passphrase",

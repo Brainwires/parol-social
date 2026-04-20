@@ -117,6 +117,11 @@
   "error.enterGroupName": "请输入群组名称",
   "error.enterContactCode": "请粘贴联系人的代码",
   "error.alreadyMember": "已经是成员",
+  "toast.clearAll": "Clear all",
+  "toast.carouselPrev": "Previous",
+  "toast.carouselNext": "Next",
+  "toast.carouselCounter": "{current} of {total}",
+
   "toast.starting": "正在启动 ParolNet...",
   "toast.bootstrapReceived": "已收到引导数据",
   "toast.wrongPassphrase": "密码短语错误",

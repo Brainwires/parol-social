@@ -117,6 +117,11 @@
   "error.enterGroupName": "Nhập tên nhóm",
   "error.enterContactCode": "Dán mã từ liên hệ của bạn",
   "error.alreadyMember": "Đã là thành viên",
+  "toast.clearAll": "Clear all",
+  "toast.carouselPrev": "Previous",
+  "toast.carouselNext": "Next",
+  "toast.carouselCounter": "{current} of {total}",
+
   "toast.starting": "Đang khởi động ParolNet...",
   "toast.bootstrapReceived": "Đã nhận dữ liệu khởi tạo",
   "toast.wrongPassphrase": "Sai cụm mật khẩu",

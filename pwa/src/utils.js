@@ -1,5 +1,7 @@
 // ParolNet PWA — Utility Functions
 
+import { t } from './i18n.js';
+
 // ── Safe Math Parser (replaces eval/new Function) ──────────
 export function safeEval(expr) {
     const sanitized = expr.replace(/[^0-9+\-*/().]/g, '');
@@ -76,13 +78,170 @@ export function detectPlatform() {
 // timer. Error toasts (level: 'error') default to persistent:true so
 // the user MUST acknowledge them — matches the "loud failures" rule.
 //
-// Rapid successive calls reuse a single DOM node (message overwrites).
-// That's an accepted tradeoff: we lose intermediate toast text but we
-// NEVER silently drop the caller's error — the latest failure is
-// always on screen.
-const TOAST_STYLE_BASE = 'position:fixed;bottom:80px;left:50%;transform:translateX(-50%);padding:12px 24px;border-radius:8px;font-size:14px;z-index:9999;max-width:80%;text-align:center;display:none;cursor:pointer;';
-const TOAST_STYLE_INFO = 'background:#333;color:#fff;';
-const TOAST_STYLE_ERROR = 'background:#b3261e;color:#fff;';
+// Queue behaviour:
+//   - 0 toasts: container hidden.
+//   - 1 toast: plain bar, tap dismisses.
+//   - 2+ toasts: carousel row below the bar (prev / counter / next /
+//     clear-all). Tap body dismisses current and advances; arrows
+//     cycle non-destructively.
+// Auto-hide timers only run while a toast is the currently-visible
+// entry; otherwise a 3-second info toast buried behind four errors
+// would expire before the user ever saw it.
+const TOAST_STYLE_BASE = 'position:fixed;bottom:80px;left:50%;transform:translateX(-50%);z-index:9999;max-width:80%;min-width:240px;display:none;font-size:14px;text-align:center;border-radius:8px;overflow:hidden;box-shadow:0 2px 10px rgba(0,0,0,0.4);';
+const TOAST_BODY_STYLE_BASE = 'padding:12px 24px;cursor:pointer;';
+const TOAST_BODY_STYLE_INFO = 'background:#333;color:#fff;';
+const TOAST_BODY_STYLE_ERROR = 'background:#b3261e;color:#fff;';
+const TOAST_CONTROLS_STYLE = 'display:flex;align-items:center;justify-content:space-between;gap:8px;padding:6px 10px;background:rgba(0,0,0,0.35);color:#fff;font-size:13px;';
+const TOAST_BTN_STYLE = 'background:transparent;border:none;color:inherit;font:inherit;padding:4px 10px;cursor:pointer;border-radius:4px;min-width:32px;';
+const TOAST_COUNTER_STYLE = 'flex:1;text-align:center;opacity:0.85;';
+
+// Module-level queue state.
+const toastQueue = []; // [{ id, message, level, persistent, duration, timerId }]
+let toastCurrentIndex = 0;
+let toastNextId = 1;
+let toastDom = null; // { container, body, controls, prevBtn, nextBtn, counter, clearBtn }
+
+function ensureToastDom() {
+    if (toastDom) return toastDom;
+
+    const container = document.createElement('div');
+    container.id = 'toast';
+    container.style.cssText = TOAST_STYLE_BASE;
+
+    const body = document.createElement('div');
+    body.className = 'toast-body';
+    body.style.cssText = TOAST_BODY_STYLE_BASE + TOAST_BODY_STYLE_INFO;
+    body.addEventListener('click', () => dismissCurrent());
+
+    const controls = document.createElement('div');
+    controls.className = 'toast-controls';
+    controls.style.cssText = TOAST_CONTROLS_STYLE;
+    controls.style.display = 'none';
+
+    const prevBtn = document.createElement('button');
+    prevBtn.type = 'button';
+    prevBtn.className = 'toast-prev';
+    prevBtn.textContent = '\u2039';
+    prevBtn.style.cssText = TOAST_BTN_STYLE;
+    prevBtn.setAttribute('aria-label', t('toast.carouselPrev'));
+    prevBtn.addEventListener('click', (e) => { e.stopPropagation(); cycleToast(-1); });
+
+    const counter = document.createElement('span');
+    counter.className = 'toast-counter';
+    counter.style.cssText = TOAST_COUNTER_STYLE;
+
+    const nextBtn = document.createElement('button');
+    nextBtn.type = 'button';
+    nextBtn.className = 'toast-next';
+    nextBtn.textContent = '\u203A';
+    nextBtn.style.cssText = TOAST_BTN_STYLE;
+    nextBtn.setAttribute('aria-label', t('toast.carouselNext'));
+    nextBtn.addEventListener('click', (e) => { e.stopPropagation(); cycleToast(1); });
+
+    const clearBtn = document.createElement('button');
+    clearBtn.type = 'button';
+    clearBtn.className = 'toast-clear-all';
+    clearBtn.style.cssText = TOAST_BTN_STYLE + 'margin-left:8px;';
+    clearBtn.textContent = t('toast.clearAll');
+    clearBtn.setAttribute('aria-label', t('toast.clearAll'));
+    clearBtn.addEventListener('click', (e) => { e.stopPropagation(); clearAllToasts(); });
+
+    controls.appendChild(prevBtn);
+    controls.appendChild(counter);
+    controls.appendChild(nextBtn);
+    controls.appendChild(clearBtn);
+
+    container.appendChild(body);
+    container.appendChild(controls);
+    document.body.appendChild(container);
+
+    toastDom = { container, body, controls, prevBtn, nextBtn, counter, clearBtn };
+    return toastDom;
+}
+
+function clearEntryTimer(entry) {
+    if (entry && entry.timerId) {
+        clearTimeout(entry.timerId);
+        entry.timerId = null;
+    }
+}
+
+function startTimerForCurrent() {
+    const entry = toastQueue[toastCurrentIndex];
+    if (!entry || entry.persistent || entry.timerId) return;
+    const myId = entry.id;
+    entry.timerId = setTimeout(() => {
+        // Confirm this entry is still the current one before dismissing;
+        // if the user cycled away, the timer should have been cancelled,
+        // but guard anyway.
+        const cur = toastQueue[toastCurrentIndex];
+        if (cur && cur.id === myId) {
+            dismissCurrent();
+        }
+    }, entry.duration);
+}
+
+function renderToast() {
+    const dom = ensureToastDom();
+    if (toastQueue.length === 0) {
+        dom.container.style.display = 'none';
+        dom.controls.style.display = 'none';
+        return;
+    }
+    if (toastCurrentIndex >= toastQueue.length) toastCurrentIndex = toastQueue.length - 1;
+    if (toastCurrentIndex < 0) toastCurrentIndex = 0;
+
+    const entry = toastQueue[toastCurrentIndex];
+    dom.body.style.cssText = TOAST_BODY_STYLE_BASE + (entry.level === 'error' ? TOAST_BODY_STYLE_ERROR : TOAST_BODY_STYLE_INFO);
+    dom.body.textContent = entry.message;
+    dom.container.style.display = 'block';
+
+    if (toastQueue.length >= 2) {
+        dom.controls.style.display = 'flex';
+        dom.counter.textContent = t('toast.carouselCounter', {
+            current: String(toastCurrentIndex + 1),
+            total: String(toastQueue.length),
+        });
+        // Re-apply translatable labels on each render so language
+        // changes mid-session take effect on already-built controls.
+        dom.prevBtn.setAttribute('aria-label', t('toast.carouselPrev'));
+        dom.nextBtn.setAttribute('aria-label', t('toast.carouselNext'));
+        dom.clearBtn.textContent = t('toast.clearAll');
+        dom.clearBtn.setAttribute('aria-label', t('toast.clearAll'));
+    } else {
+        dom.controls.style.display = 'none';
+    }
+
+    startTimerForCurrent();
+}
+
+function cycleToast(delta) {
+    if (toastQueue.length < 2) return;
+    // Pause timer on the outgoing toast so its countdown resets when it
+    // next becomes current — otherwise a half-expired info toast would
+    // vanish shortly after the user cycled back to it.
+    clearEntryTimer(toastQueue[toastCurrentIndex]);
+    const n = toastQueue.length;
+    toastCurrentIndex = ((toastCurrentIndex + delta) % n + n) % n;
+    renderToast();
+}
+
+function dismissCurrent() {
+    if (toastQueue.length === 0) return;
+    const removed = toastQueue.splice(toastCurrentIndex, 1)[0];
+    clearEntryTimer(removed);
+    if (toastCurrentIndex >= toastQueue.length) {
+        toastCurrentIndex = Math.max(0, toastQueue.length - 1);
+    }
+    renderToast();
+}
+
+function clearAllToasts() {
+    for (const entry of toastQueue) clearEntryTimer(entry);
+    toastQueue.length = 0;
+    toastCurrentIndex = 0;
+    renderToast();
+}
 
 export function showToast(message, opts) {
     // Back-compat: legacy numeric second arg is duration.
@@ -99,23 +258,15 @@ export function showToast(message, opts) {
     }
     if (duration === undefined) duration = 3000;
 
-    let toast = document.getElementById('toast');
-    if (!toast) {
-        toast = document.createElement('div');
-        toast.id = 'toast';
-        document.body.appendChild(toast);
-        toast.addEventListener('click', () => {
-            toast.style.display = 'none';
-            if (toast._timeout) { clearTimeout(toast._timeout); toast._timeout = null; }
-        });
-    }
-    toast.style.cssText = TOAST_STYLE_BASE + (level === 'error' ? TOAST_STYLE_ERROR : TOAST_STYLE_INFO);
-    toast.textContent = message;
-    toast.style.display = 'block';
-    if (toast._timeout) { clearTimeout(toast._timeout); toast._timeout = null; }
-    if (!persistent) {
-        toast._timeout = setTimeout(() => { toast.style.display = 'none'; }, duration);
-    }
+    toastQueue.push({
+        id: toastNextId++,
+        message: String(message),
+        level,
+        persistent,
+        duration,
+        timerId: null,
+    });
+    renderToast();
 }
 
 export function showErrorToast(message) {

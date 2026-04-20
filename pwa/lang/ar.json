@@ -117,6 +117,11 @@
   "error.enterGroupName": "أدخل اسم المجموعة",
   "error.enterContactCode": "الصق الرمز من جهة اتصالك",
   "error.alreadyMember": "عضو بالفعل",
+  "toast.clearAll": "Clear all",
+  "toast.carouselPrev": "Previous",
+  "toast.carouselNext": "Next",
+  "toast.carouselCounter": "{current} of {total}",
+
   "toast.starting": "جارٍ تشغيل ParolNet...",
   "toast.bootstrapReceived": "تم استلام البيانات الأولية",
   "toast.wrongPassphrase": "عبارة المرور خاطئة",

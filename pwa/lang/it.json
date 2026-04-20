@@ -117,6 +117,11 @@
   "error.enterGroupName": "Inserisci un nome per il gruppo",
   "error.enterContactCode": "Incolla il codice del tuo contatto",
   "error.alreadyMember": "Gia membro",
+  "toast.clearAll": "Clear all",
+  "toast.carouselPrev": "Previous",
+  "toast.carouselNext": "Next",
+  "toast.carouselCounter": "{current} of {total}",
+
   "toast.starting": "Avvio di ParolNet...",
   "toast.bootstrapReceived": "Dati di bootstrap ricevuti",
   "toast.wrongPassphrase": "Passphrase errata",

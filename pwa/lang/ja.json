@@ -117,6 +117,11 @@
   "error.enterGroupName": "グループ名を入力してください",
   "error.enterContactCode": "連絡先の方からもらったコードを貼り付けてください",
   "error.alreadyMember": "すでにメンバーです",
+  "toast.clearAll": "Clear all",
+  "toast.carouselPrev": "Previous",
+  "toast.carouselNext": "Next",
+  "toast.carouselCounter": "{current} of {total}",
+
   "toast.starting": "ParolNetを起動しています...",
   "toast.bootstrapReceived": "初期データを受信しました",
   "toast.wrongPassphrase": "パスフレーズが違います",

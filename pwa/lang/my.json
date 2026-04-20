@@ -117,6 +117,11 @@
   "error.enterGroupName": "အဖွဲ့အမည်ထည့်ပါ",
   "error.enterContactCode": "အဆက်အသွယ်ထံမှရသောကုဒ်ကို ကပ်ပါ",
   "error.alreadyMember": "အဖွဲ့ဝင်ဖြစ်ပြီးသားဖြစ်သည်",
+  "toast.clearAll": "Clear all",
+  "toast.carouselPrev": "Previous",
+  "toast.carouselNext": "Next",
+  "toast.carouselCounter": "{current} of {total}",
+
   "toast.starting": "ParolNet စတင်နေသည်...",
   "toast.bootstrapReceived": "အစပြုဒေတာလက်ခံရရှိပြီ",
   "toast.wrongPassphrase": "စကားဝှက်မှားနေသည်",

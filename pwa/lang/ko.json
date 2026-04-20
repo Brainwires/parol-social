@@ -117,6 +117,11 @@
   "error.enterGroupName": "그룹 이름을 입력하세요",
   "error.enterContactCode": "연락처의 코드를 붙여넣으세요",
   "error.alreadyMember": "이미 멤버입니다",
+  "toast.clearAll": "Clear all",
+  "toast.carouselPrev": "Previous",
+  "toast.carouselNext": "Next",
+  "toast.carouselCounter": "{current} of {total}",
+
   "toast.starting": "ParolNet 시작 중...",
   "toast.bootstrapReceived": "부트스트랩 데이터 수신 완료",
   "toast.wrongPassphrase": "비밀문구가 틀렸습니다",
