@@ -20,6 +20,8 @@
 //! The CLI is deliberately single-threaded around the relay socket so the
 //! event ordering in the logs matches what actually happened on the wire.
 
+mod peer;
+
 use anyhow::{Context, Result, anyhow};
 use clap::{Parser, Subcommand};
 use ed25519_dalek::{Signer, SigningKey};
@@ -34,11 +36,12 @@ use parolnet_core::{ParolNet, ParolNetConfig};
 use parolnet_crypto::{IdentityKeyPair, SharedSecret};
 use parolnet_protocol::address::PeerId;
 use parolnet_relay::tokens::Token;
+use peer::{PeerEvt, PeerHandle};
 use rand::RngCore;
 use rand::rngs::OsRng;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::Mutex;
 use tokio_tungstenite::tungstenite::protocol::Message;
 use voprf::{OprfClient, Ristretto255};
@@ -91,6 +94,39 @@ enum Cmd {
         #[arg(long, default_value = "10")]
         timeout_secs: u64,
     },
+    /// Bootstrap two peers and exchange N messages in each direction,
+    /// reporting per-message round-trip timing. Exits non-zero on any drop.
+    RoundTrip {
+        #[arg(long)]
+        relay: String,
+        #[arg(long)]
+        http: String,
+        /// How many messages each direction (default 10).
+        #[arg(long, default_value = "10")]
+        count: usize,
+        /// Overall test timeout.
+        #[arg(long, default_value = "30")]
+        timeout_secs: u64,
+    },
+    /// Bootstrap + round-trip, then idle both sockets (sending only pings)
+    /// for N seconds, then send one more message each direction. Verifies
+    /// that MUST-065 heartbeats keep the relay's presence alive through
+    /// long idle windows so post-idle sends deliver immediately.
+    IdleResume {
+        #[arg(long)]
+        relay: String,
+        #[arg(long)]
+        http: String,
+        /// Idle duration between round-trip and post-idle send (default 120s).
+        #[arg(long, default_value = "120")]
+        idle_secs: u64,
+        /// Round-trip size before idle (default 3 each direction).
+        #[arg(long, default_value = "3")]
+        count: usize,
+        /// Overall test timeout. Must be > idle_secs.
+        #[arg(long, default_value = "180")]
+        timeout_secs: u64,
+    },
 }
 
 #[tokio::main]
@@ -117,6 +153,19 @@ async fn main() -> Result<()> {
             http,
             timeout_secs,
         } => run_demo(&relay, &http, timeout_secs).await,
+        Cmd::RoundTrip {
+            relay,
+            http,
+            count,
+            timeout_secs,
+        } => run_round_trip(&relay, &http, count, timeout_secs).await,
+        Cmd::IdleResume {
+            relay,
+            http,
+            idle_secs,
+            count,
+            timeout_secs,
+        } => run_idle_resume(&relay, &http, idle_secs, count, timeout_secs).await,
     }
 }
 
@@ -757,4 +806,443 @@ fn clone_identity(k: &IdentityKeyPair) -> IdentityKeyPair {
 fn sign_with_identity(identity: &IdentityKeyPair, message: &[u8]) -> ed25519_dalek::Signature {
     let sk = SigningKey::from_bytes(&identity.secret_bytes());
     sk.sign(message)
+}
+
+// ──────────────────────── round-trip orchestrator ─────────────────────────
+//
+// Spin up two PeerHandle-backed sides, run the full bootstrap (scanner →
+// presenter source_hint frame), then exchange `count` chat messages each
+// direction. Fails fast if any message fails to arrive.
+
+struct BootstrappedPair {
+    presenter: PeerHandle,
+    scanner: PeerHandle,
+    presenter_id: PeerId,
+    scanner_id: PeerId,
+    presenter_client: ParolNet,
+    scanner_client: ParolNet,
+    presenter_identity: IdentityKeyPair,
+    scanner_identity: IdentityKeyPair,
+}
+
+/// Bootstrap two fresh identities and return live PeerHandles with sessions
+/// established in both directions (scanner is initiator, presenter
+/// materializes via source_hint).
+async fn bootstrap_pair(relay_url: &str, http_base: &str) -> Result<BootstrappedPair> {
+    // Presenter side.
+    let presenter_identity = IdentityKeyPair::generate();
+    let presenter_id = PeerId::from_public_key(&presenter_identity.public_key_bytes());
+    let presenter_client =
+        ParolNet::from_identity(ParolNetConfig::default(), clone_identity(&presenter_identity));
+    let qr = generate_qr_payload_with_ratchet(&presenter_client.public_key(), None)?;
+    let qr_seed = qr.seed;
+    let qr_ratchet = qr.ratchet_secret;
+    let qr_parsed = parse_qr_payload(&qr.payload_bytes)?;
+
+    let mut presenter =
+        PeerHandle::connect(relay_url, clone_identity(&presenter_identity)).await?;
+    wait_registered(&mut presenter).await?;
+    tracing::info!("[P] registered peer_id={}", hex::encode(presenter_id.0));
+
+    // Scanner side — establish initiator session from QR.
+    let scanner_identity = IdentityKeyPair::generate();
+    let scanner_id = PeerId::from_public_key(&scanner_identity.public_key_bytes());
+    let scanner_client =
+        ParolNet::from_identity(ParolNetConfig::default(), clone_identity(&scanner_identity));
+    let scanner_ik = scanner_client.public_key();
+    let mut ratchet_pub = [0u8; 32];
+    if qr_parsed.rk.len() != 32 {
+        return Err(anyhow!("QR missing ratchet key"));
+    }
+    ratchet_pub.copy_from_slice(&qr_parsed.rk);
+    let mut presenter_ik_bytes = [0u8; 32];
+    if qr_parsed.ik.len() != 32 {
+        return Err(anyhow!("QR missing IK"));
+    }
+    presenter_ik_bytes.copy_from_slice(&qr_parsed.ik);
+    let bs = derive_bootstrap_secret(&qr_seed, &scanner_ik, &presenter_ik_bytes)?;
+    scanner_client.establish_session(presenter_id, SharedSecret(bs), &ratchet_pub, true)?;
+
+    let mut scanner = PeerHandle::connect(relay_url, clone_identity(&scanner_identity)).await?;
+    wait_registered(&mut scanner).await?;
+    tracing::info!("[S] registered peer_id={}", hex::encode(scanner_id.0));
+
+    // Scanner sends bootstrap envelope (source_hint = scanner_IK, MUST-063).
+    let token = issue_one_token(http_base, &scanner_identity).await?;
+    let now_secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)?
+        .as_secs();
+    let bootstrap_envelope = encrypt_for_peer(
+        scanner_client.sessions(),
+        &presenter_id,
+        0x03,
+        b"round-trip bootstrap",
+        now_secs,
+        Some(PeerId(scanner_identity.public_key_bytes())),
+    )?;
+    scanner
+        .send(presenter_id, encode_token_hex(&token)?, bootstrap_envelope)
+        .await?;
+
+    // Presenter waits for the bootstrap frame and materializes its session.
+    let mut pending_bootstrap = Some((qr_seed, qr_ratchet));
+    let presenter_ik = presenter_client.public_key();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return Err(anyhow!("[P] bootstrap frame never arrived"));
+        }
+        let Some(evt) = presenter.next_evt(remaining).await else { continue };
+        match evt {
+            PeerEvt::Inbound { envelope } => {
+                let (from, _decoded, bootstrapped) = try_decrypt_as_presenter(
+                    presenter_client.sessions(),
+                    &envelope,
+                    &presenter_ik,
+                    &mut pending_bootstrap,
+                )?;
+                if !bootstrapped || from != scanner_id {
+                    return Err(anyhow!("[P] unexpected bootstrap source"));
+                }
+                tracing::info!("[P] bootstrap OK, session materialized from scanner");
+                break;
+            }
+            PeerEvt::Disconnected | PeerEvt::RelayError(_) => {
+                return Err(anyhow!("[P] lost connection during bootstrap"));
+            }
+            _ => continue,
+        }
+    }
+
+    Ok(BootstrappedPair {
+        presenter,
+        scanner,
+        presenter_id,
+        scanner_id,
+        presenter_client,
+        scanner_client,
+        presenter_identity,
+        scanner_identity,
+    })
+}
+
+async fn wait_registered(h: &mut PeerHandle) -> Result<()> {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return Err(anyhow!("never registered"));
+        }
+        match h.next_evt(remaining).await {
+            Some(PeerEvt::Registered) => return Ok(()),
+            Some(PeerEvt::Disconnected) | Some(PeerEvt::RelayError(_)) => {
+                return Err(anyhow!("disconnected before registration"));
+            }
+            Some(_) | None => continue,
+        }
+    }
+}
+
+/// Send `count` chats from `sender` to `recipient`, awaiting each envelope
+/// on `recipient`. Returns per-message latency in milliseconds.
+async fn exchange_one_direction(
+    label: &str,
+    count: usize,
+    http_base: &str,
+    sender: &mut PeerHandle,
+    recipient: &mut PeerHandle,
+    sender_client: &ParolNet,
+    recipient_client: &ParolNet,
+    sender_identity: &IdentityKeyPair,
+    recipient_peer_id: PeerId,
+    sender_peer_id: PeerId,
+) -> Result<Vec<u128>> {
+    let mut latencies = Vec::with_capacity(count);
+    for i in 0..count {
+        let body = format!("{label} msg #{i}");
+        let now_secs = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
+        let envelope = encrypt_for_peer(
+            sender_client.sessions(),
+            &recipient_peer_id,
+            0x01, // MSG_TYPE_CHAT
+            body.as_bytes(),
+            now_secs,
+            None,
+        )?;
+        let token = issue_one_token(http_base, sender_identity).await?;
+
+        let sent_at = std::time::Instant::now();
+        sender
+            .send(recipient_peer_id, encode_token_hex(&token)?, envelope)
+            .await?;
+
+        // Drain any spurious sender events (pong, queued) without blocking the
+        // recipient loop — the main signal is the recipient's Inbound event.
+        let arrived = wait_for_inbound_from(recipient, recipient_client, sender_peer_id).await?;
+        let latency_ms = sent_at.elapsed().as_millis();
+        latencies.push(latency_ms);
+        if arrived != body {
+            return Err(anyhow!(
+                "[{label}] msg #{i} corrupted: expected {:?}, got {:?}",
+                body, arrived
+            ));
+        }
+        tracing::info!("[{label}] #{i} delivered in {}ms", latency_ms);
+    }
+    Ok(latencies)
+}
+
+/// Drain events from `peer` until an Inbound arrives and decrypts from the
+/// expected sender. Times out after 15s.
+async fn wait_for_inbound_from(
+    peer: &mut PeerHandle,
+    client: &ParolNet,
+    expected_from: PeerId,
+) -> Result<String> {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return Err(anyhow!("timeout waiting for inbound message"));
+        }
+        match peer.next_evt(remaining).await {
+            Some(PeerEvt::Inbound { envelope }) => {
+                let decoded = decrypt_for_peer(client.sessions(), &expected_from, &envelope)
+                    .context("decrypt_for_peer")?;
+                return Ok(String::from_utf8_lossy(&decoded.plaintext).to_string());
+            }
+            Some(PeerEvt::Disconnected) => {
+                return Err(anyhow!("peer disconnected while awaiting inbound"));
+            }
+            Some(PeerEvt::RelayError(m)) => {
+                return Err(anyhow!("relay error: {m}"));
+            }
+            Some(_) | None => continue,
+        }
+    }
+}
+
+fn summarize_latencies(label: &str, latencies: &[u128]) {
+    if latencies.is_empty() {
+        println!("  {label:<20} (empty)");
+        return;
+    }
+    let min = latencies.iter().min().copied().unwrap_or(0);
+    let max = latencies.iter().max().copied().unwrap_or(0);
+    let sum: u128 = latencies.iter().sum();
+    let avg = sum / latencies.len() as u128;
+    println!(
+        "  {label:<20} n={:>3}  min={:>4}ms  avg={:>4}ms  max={:>4}ms",
+        latencies.len(),
+        min,
+        avg,
+        max
+    );
+}
+
+async fn run_round_trip(
+    relay_url: &str,
+    http_base: &str,
+    count: usize,
+    timeout_secs: u64,
+) -> Result<()> {
+    let fut = async {
+        let mut pair = bootstrap_pair(relay_url, http_base).await?;
+
+        let s2p = exchange_one_direction(
+            "S→P",
+            count,
+            http_base,
+            &mut pair.scanner,
+            &mut pair.presenter,
+            &pair.scanner_client,
+            &pair.presenter_client,
+            &pair.scanner_identity,
+            pair.presenter_id,
+            pair.scanner_id,
+        )
+        .await?;
+        let p2s = exchange_one_direction(
+            "P→S",
+            count,
+            http_base,
+            &mut pair.presenter,
+            &mut pair.scanner,
+            &pair.presenter_client,
+            &pair.scanner_client,
+            &pair.presenter_identity,
+            pair.scanner_id,
+            pair.presenter_id,
+        )
+        .await?;
+
+        println!("\n════════════════════════════════════════════════════════════");
+        println!("  ROUND-TRIP PASS ✅  {} each direction", count);
+        summarize_latencies("scanner→presenter", &s2p);
+        summarize_latencies("presenter→scanner", &p2s);
+        println!("════════════════════════════════════════════════════════════\n");
+
+        pair.presenter.close().await;
+        pair.scanner.close().await;
+        Ok::<(), anyhow::Error>(())
+    };
+
+    match tokio::time::timeout(Duration::from_secs(timeout_secs), fut).await {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(e)) => {
+            println!("\n  ROUND-TRIP FAIL ❌  {e}\n");
+            Err(e)
+        }
+        Err(_) => {
+            let msg = format!("ROUND-TRIP TIMED OUT after {}s", timeout_secs);
+            println!("\n  {}\n", msg);
+            Err(anyhow!(msg))
+        }
+    }
+}
+
+// ──────────────────────── idle-resume orchestrator ────────────────────────
+
+async fn run_idle_resume(
+    relay_url: &str,
+    http_base: &str,
+    idle_secs: u64,
+    count: usize,
+    timeout_secs: u64,
+) -> Result<()> {
+    if timeout_secs <= idle_secs {
+        return Err(anyhow!(
+            "timeout_secs ({timeout_secs}) must exceed idle_secs ({idle_secs})"
+        ));
+    }
+    let fut = async {
+        let mut pair = bootstrap_pair(relay_url, http_base).await?;
+
+        // Pre-idle: short round-trip to confirm both directions are live.
+        let _pre_s2p = exchange_one_direction(
+            "pre-S→P",
+            count,
+            http_base,
+            &mut pair.scanner,
+            &mut pair.presenter,
+            &pair.scanner_client,
+            &pair.presenter_client,
+            &pair.scanner_identity,
+            pair.presenter_id,
+            pair.scanner_id,
+        )
+        .await?;
+        let _pre_p2s = exchange_one_direction(
+            "pre-P→S",
+            count,
+            http_base,
+            &mut pair.presenter,
+            &mut pair.scanner,
+            &pair.presenter_client,
+            &pair.scanner_client,
+            &pair.presenter_identity,
+            pair.scanner_id,
+            pair.presenter_id,
+        )
+        .await?;
+
+        // Idle window: drain any incidental events (pongs) both sides while
+        // sending nothing but heartbeats. If the relay's idle-close fires or
+        // MUST-065 heartbeats aren't maintaining presence, the next send
+        // will fail.
+        println!(
+            "  Idling both peers for {}s (heartbeats only, no sends)...",
+            idle_secs
+        );
+        let idle_end = tokio::time::Instant::now() + Duration::from_secs(idle_secs);
+        let mut pongs_p = 0usize;
+        let mut pongs_s = 0usize;
+        loop {
+            let remaining = idle_end.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            // Poll each side with a tight timeout so we alternate.
+            let slice = std::cmp::min(remaining, Duration::from_secs(1));
+            tokio::select! {
+                biased;
+                evt = pair.presenter.evt_rx.recv() => {
+                    match evt {
+                        Some(PeerEvt::Pong { .. }) => { pongs_p += 1; }
+                        Some(PeerEvt::Disconnected) | Some(PeerEvt::RelayError(_)) => {
+                            return Err(anyhow!("[P] lost connection during idle"));
+                        }
+                        None => return Err(anyhow!("[P] channel closed during idle")),
+                        _ => {}
+                    }
+                }
+                evt = pair.scanner.evt_rx.recv() => {
+                    match evt {
+                        Some(PeerEvt::Pong { .. }) => { pongs_s += 1; }
+                        Some(PeerEvt::Disconnected) | Some(PeerEvt::RelayError(_)) => {
+                            return Err(anyhow!("[S] lost connection during idle"));
+                        }
+                        None => return Err(anyhow!("[S] channel closed during idle")),
+                        _ => {}
+                    }
+                }
+                _ = tokio::time::sleep(slice) => {}
+            }
+        }
+        println!("  Idle done. Pongs received: P={pongs_p}  S={pongs_s}");
+
+        // Post-idle: one message each direction. If the relay closed us or
+        // reaped presence, these will either fail to send or come back queued.
+        let post_s2p = exchange_one_direction(
+            "post-S→P",
+            1,
+            http_base,
+            &mut pair.scanner,
+            &mut pair.presenter,
+            &pair.scanner_client,
+            &pair.presenter_client,
+            &pair.scanner_identity,
+            pair.presenter_id,
+            pair.scanner_id,
+        )
+        .await?;
+        let post_p2s = exchange_one_direction(
+            "post-P→S",
+            1,
+            http_base,
+            &mut pair.presenter,
+            &mut pair.scanner,
+            &pair.presenter_client,
+            &pair.scanner_client,
+            &pair.presenter_identity,
+            pair.scanner_id,
+            pair.presenter_id,
+        )
+        .await?;
+
+        println!("\n════════════════════════════════════════════════════════════");
+        println!("  IDLE-RESUME PASS ✅  idle={idle_secs}s");
+        summarize_latencies("post-idle S→P", &post_s2p);
+        summarize_latencies("post-idle P→S", &post_p2s);
+        println!("  heartbeat pongs during idle: P={pongs_p}  S={pongs_s}");
+        println!("════════════════════════════════════════════════════════════\n");
+
+        pair.presenter.close().await;
+        pair.scanner.close().await;
+        Ok::<(), anyhow::Error>(())
+    };
+
+    match tokio::time::timeout(Duration::from_secs(timeout_secs), fut).await {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(e)) => {
+            println!("\n  IDLE-RESUME FAIL ❌  {e}\n");
+            Err(e)
+        }
+        Err(_) => {
+            let msg = format!("IDLE-RESUME TIMED OUT after {}s", timeout_secs);
+            println!("\n  {}\n", msg);
+            Err(anyhow!(msg))
+        }
+    }
 }
