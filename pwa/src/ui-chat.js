@@ -16,7 +16,7 @@ import { initWebRTC, hasDirectConnection, sendViaWebRTC, rtcConnections,
          seenGossipMessages, markGossipSeen } from './webrtc.js';
 import { sendToRelay, connMgr, queueMessage } from './connection.js';
 import { sendRawEnvelope, sendCallSignal } from './messaging.js';
-import { startCallConnection, acceptCallConnection, teardownCallConnection } from './call.js';
+import { startCallConnection, acceptCallConnection, teardownCallConnection, setCallStatus } from './call.js';
 import { spendOneToken, maybeRefill } from './token-pool.js';
 import { t } from './i18n.js';
 import { MSG_TYPE_CHAT, MSG_TYPE_SYSTEM, MSG_TYPE_CALL_SIGNAL } from './protocol-constants.js';
@@ -350,6 +350,33 @@ export function appendMessage(msg) {
 // ── Call UI ─────────────────────────────────────────────────
 let callTimerInterval = null;
 let callStartTime = null;
+// 60s outbound-call no-answer watchdog. Set on initiateCall after the
+// offer signal is shipped; cleared on incoming answer, on any hangup
+// (local or remote), and on connection-failed events. The timer lives
+// at module scope because the handful of events that clear it are all
+// in different functions — a closure over initiateCall would require
+// exporting a cancel handle anyway.
+let noAnswerTimer = null;
+
+export function clearNoAnswerTimer() {
+    if (noAnswerTimer) {
+        clearTimeout(noAnswerTimer);
+        noAnswerTimer = null;
+    }
+}
+
+// Fired from call.js when pc.connectionState === 'failed'. Registered once
+// at module load (see below). Using a window event avoids the circular
+// import that would result from call.js pulling hangupCall out of this
+// module.
+if (typeof window !== 'undefined' && !window._parolnetCallFailedWired) {
+    window._parolnetCallFailedWired = true;
+    window.addEventListener('parolnet:call-failed', () => {
+        // hangupCall is async but we don't need to await — it fires the
+        // hangup signal and tears down locally either way.
+        hangupCall().catch(e => console.warn('[Call] failure hangup:', e && e.message));
+    });
+}
 
 export async function initiateCall(peerId, withVideo) {
     if (!peerId) peerId = currentPeerId;
@@ -420,8 +447,21 @@ export async function initiateCall(peerId, withVideo) {
     const nameEl = document.getElementById('call-peer-name');
     if (nameEl) nameEl.textContent = peerId.length > 20 ? peerId.slice(0, 16) + '...' : peerId;
 
-    const statusEl = document.getElementById('call-status');
-    if (statusEl) statusEl.textContent = 'Calling...';
+    setCallStatus('Calling...');
+
+    // 60s no-answer watchdog. Cleared by:
+    //   - answer signal arrival (messaging.js calls clearNoAnswerTimer)
+    //   - manual hangup (hangupCall clears it)
+    //   - remote hangup (messaging.js clears it before teardown)
+    //   - connection-failed event (hangupCall path via window event)
+    // On fire: surface a toast and trigger full hangup — hangupCall
+    // already handles the signal + teardown + nav-back.
+    clearNoAnswerTimer();
+    noAnswerTimer = setTimeout(() => {
+        noAnswerTimer = null;
+        showErrorToast(t('toast.callNoAnswer'));
+        hangupCall().catch(e => console.warn('[Call] no-answer hangup:', e && e.message));
+    }, 60000);
 
     startCallTimer();
 }
@@ -477,12 +517,15 @@ export async function answerIncomingCall(callId, opts) {
         console.warn('[Call] answerIncomingCall: missing peerId or offerSdp');
     }
 
-    const statusEl = document.getElementById('call-status');
-    if (statusEl) statusEl.textContent = 'Connected';
+    // Status will also be driven by pc.onconnectionstatechange once the
+    // PC reaches 'connected'; setting it here is the callee's provisional
+    // label for the gap between answer-SDP emit and first ICE pair success.
+    setCallStatus('Connected');
     startCallTimer();
 }
 
 export async function hangupCall() {
+    clearNoAnswerTimer();
     // Notify the remote side BEFORE local teardown. Otherwise the peer
     // sits in a "Connected" state until their PC state-change fires —
     // and with all media going over TURN that can take several seconds.

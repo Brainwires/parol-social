@@ -16,8 +16,9 @@ import { spendOneToken, maybeRefill, requestBatch, queueSize } from './token-poo
 import { lookupHomeRelay } from './peer-relay-cache.js';
 import { isOnionActive, sendViaOnion } from './onion.js';
 import { loadContacts, appendMessage, answerIncomingCall, loadAddressBook,
-         stopLocalMedia, stopCallTimer } from './ui-chat.js';
-import { completeCallConnection, addRemoteIce, teardownCallConnection } from './call.js';
+         stopLocalMedia, stopCallTimer, clearNoAnswerTimer } from './ui-chat.js';
+import { completeCallConnection, addRemoteIce, teardownCallConnection,
+         setCallStatus } from './call.js';
 import { t } from './i18n.js';
 import {
     MSG_TYPE_CHAT, MSG_TYPE_SYSTEM, MSG_TYPE_FILE_CHUNK, MSG_TYPE_FILE_CONTROL,
@@ -1207,12 +1208,15 @@ function handleCallSignalPlaintext(fromPeerId, plaintext) {
             // starts flowing, then flip the "Calling..." label. Without the
             // setRemoteDescription the PC stays in have-local-offer state
             // forever and no media crosses.
+            clearNoAnswerTimer();
             completeCallConnection(fromPeerId, obj.sdp).catch(e => {
                 console.warn('[CallSignal] completeCallConnection failed:', e && e.message);
                 showErrorToast(t('toast.callConnectionFailed'));
             });
-            const statusEl = document.getElementById('call-status');
-            if (statusEl) statusEl.textContent = 'Connected';
+            // Provisional label flip. The PC will also drive this via
+            // onconnectionstatechange → 'connected'; setCallStatus is
+            // idempotent so whichever path wins the race is fine.
+            setCallStatus('Connected');
             break;
         }
         case 'ice':
@@ -1224,6 +1228,7 @@ function handleCallSignalPlaintext(fromPeerId, plaintext) {
             // Remote ended the call. Mirror hangupCall's local cleanup so
             // both sides end up in the same post-call state: PC closed,
             // local media stopped, timer halted, view reset.
+            clearNoAnswerTimer();
             teardownCallConnection(fromPeerId);
             stopLocalMedia();
             stopCallTimer();

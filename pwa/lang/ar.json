@@ -281,6 +281,8 @@
   "toast.callNoSecureSession": "Cannot start call: no secure session with this contact",
   "toast.callEnded": "Call ended.",
   "toast.callConnectionFailed": "Couldn't establish the call connection.",
+  "toast.callNoAnswer": "لا يوجد رد",
+  "toast.callConnectionLost": "انقطع الاتصال بالمكالمة",
   "toast.qrUnrecognized": "Unrecognized QR code",
   "toast.qrSelf": "That's your own QR code!"
 }

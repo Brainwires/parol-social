@@ -37,6 +37,17 @@ function filterIceCandidateInPrivacyMode(candidateStr) {
     return candidateStr.includes('typ host') || candidateStr.includes('typ srflx');
 }
 
+// Idempotent status-label setter. Called from both the PC state-change
+// handler here and the answer-signal path in messaging.js — whichever
+// arrives first wins, the other is a no-op overwrite of the same text.
+// Kept inside call.js (rather than imported from ui-chat.js) because
+// ui-chat.js already imports from this module; importing back would
+// create a circular dependency on the ui-chat side.
+export function setCallStatus(text) {
+    const el = document.getElementById('call-status');
+    if (el) el.textContent = text;
+}
+
 function attachRemoteTrack(event) {
     const stream = event.streams && event.streams[0];
     if (!stream) return;
@@ -74,7 +85,39 @@ function createCallPc(peerId, callId) {
     pc.ontrack = attachRemoteTrack;
 
     pc.onconnectionstatechange = () => {
-        console.log('[Call]', peerId.slice(0, 8), 'pc state:', pc.connectionState);
+        const state = pc.connectionState;
+        console.log('[Call]', peerId.slice(0, 8), 'pc state:', state);
+        // Drive the status label from the PC lifecycle. Idempotent — the
+        // answer-signal path in messaging.js may flip to 'Connected' first,
+        // which is fine: setCallStatus just mirrors into #call-status.
+        if (state === 'connecting') {
+            // Only the caller should show 'Ringing...' — the callee's
+            // answerIncomingCall has already flipped the label to
+            // 'Connected' by this point, and PC 'connecting' fires on
+            // both sides. Gate on 'Calling...' so we only advance the
+            // caller's label and don't regress the callee's.
+            const el = document.getElementById('call-status');
+            if (el && el.textContent === 'Calling...') {
+                setCallStatus('Ringing...');
+            }
+        } else if (state === 'connected') {
+            setCallStatus('Connected');
+        } else if (state === 'failed') {
+            // Only react if we still own this PC — teardown races with the
+            // state-change event and we don't want to fire a toast after
+            // the user already hung up.
+            if (callPeerConnections.get(peerId) && callPeerConnections.get(peerId).pc === pc) {
+                showErrorToast(t('toast.callConnectionLost'));
+                // ui-chat.js owns hangup semantics (remote signal + teardown
+                // + timer + view nav). Cross-module import from call.js back
+                // into ui-chat.js would create a cycle — ui-chat.js already
+                // imports from call.js — so we dispatch a window event and
+                // let ui-chat.js's module-scoped listener invoke hangupCall.
+                window.dispatchEvent(new CustomEvent('parolnet:call-failed', {
+                    detail: { peerId },
+                }));
+            }
+        }
     };
 
     if (localStream) {

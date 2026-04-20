@@ -497,7 +497,10 @@ header button:hover {
 
 .call-controls {
     position: absolute;
-    bottom: 40px;
+    /* Keep the hangup/mute/camera row above the home-indicator gesture bar
+       on iOS and Android edge-to-edge devices. env() falls back to 0px
+       on browsers without safe-area support so desktop layout is unchanged. */
+    bottom: calc(40px + env(safe-area-inset-bottom, 0px));
     display: flex;
     gap: 24px;
     z-index: 3;
