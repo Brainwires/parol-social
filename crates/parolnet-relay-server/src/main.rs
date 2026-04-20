@@ -320,6 +320,10 @@ struct IncomingMessage {
     /// replaces the outer `from` field (see PNP-001 §"Outer Relay Frame",
     /// clause PNP-001-MUST-048).
     token: Option<String>,
+    /// Client-local Unix milliseconds. Carried on `ping` frames (PNP-001
+    /// §10.3 MUST-065) so the relay can echo it back in the `pong` and the
+    /// client can match request↔response for RTT.
+    ts: Option<u64>,
 }
 
 #[derive(Default, Serialize)]
@@ -336,6 +340,9 @@ struct OutgoingMessage {
     message: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     online_peers: Option<usize>,
+    /// Echoed client ts on `pong` responses (PNP-001 §10.3 MUST-065).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ts: Option<u64>,
 }
 
 // --- Client telemetry ---
@@ -2223,20 +2230,41 @@ async fn handle_socket(
     let mut ping_interval = tokio::time::interval(Duration::from_secs(30));
     ping_interval.tick().await; // consume the immediate first tick
 
+    // PNP-001 §10.3 SHOULD-014 + MUST-067: the relay SHOULD close client
+    // WebSockets idle ≥60s and MUST reap presence within 60s of close. We
+    // track the wall-clock time of the last inbound frame (any type) and
+    // let the idle watchdog break the loop if it's been silent too long.
+    // The normal close path below already calls `remove_local`, so breaking
+    // the loop on idle suffices to honor both clauses.
+    let mut last_inbound = std::time::Instant::now();
+    const CLIENT_IDLE_CLOSE_SECS: u64 = 60;
+
     // Read messages from WebSocket, multiplexed with ping keepalive
     loop {
         let ws_msg = tokio::select! {
             msg_opt = receiver.next() => {
                 match msg_opt {
-                    Some(Ok(msg @ Message::Text(_))) => msg,
-                    Some(Ok(msg @ Message::Binary(_))) => msg,
-                    Some(Ok(Message::Pong(_))) => continue,
+                    Some(Ok(msg @ Message::Text(_))) => { last_inbound = std::time::Instant::now(); msg }
+                    Some(Ok(msg @ Message::Binary(_))) => { last_inbound = std::time::Instant::now(); msg }
+                    Some(Ok(Message::Pong(_))) => { last_inbound = std::time::Instant::now(); continue; }
                     Some(Ok(Message::Close(_))) | None => break,
-                    Some(Ok(_)) => continue,
+                    Some(Ok(_)) => { last_inbound = std::time::Instant::now(); continue; }
                     Some(Err(_)) => break,
                 }
             }
             _ = ping_interval.tick() => {
+                // SHOULD-014: close if the client hasn't spoken in ≥60s.
+                // Skip for unregistered connections in the first few seconds
+                // of the handshake — they haven't sent `register` yet.
+                if my_peer_id.is_some()
+                    && last_inbound.elapsed() > Duration::from_secs(CLIENT_IDLE_CLOSE_SECS)
+                {
+                    tracing::info!(
+                        "closing idle client WS (no inbound frame in {}s)",
+                        CLIENT_IDLE_CLOSE_SECS
+                    );
+                    break;
+                }
                 // Send a ping through the channel to the send task
                 if tx.send(Message::Ping(vec![].into())).is_err() {
                     break; // send task died, connection is dead
@@ -2554,6 +2582,37 @@ async fn handle_socket(
                         let _ = recipient_tx.send(Message::Text(json.into()));
                         stats.record_message_routed();
                     }
+                }
+            }
+
+            "ping" => {
+                // PNP-001 §10.3 MUST-065: application-layer heartbeat.
+                // Reply with {type:"pong","ts":<echoed client ts>}. The ts
+                // echo is what lets the client match request↔response for
+                // RTT measurement; we never compute anything from it
+                // server-side. Any inbound frame (ping or not) already
+                // refreshed `last_inbound` at the top of the loop, so the
+                // idle-close timer is incidentally reset too.
+                let _ = tx.send(Message::Text(
+                    serde_json::to_string(&OutgoingMessage {
+                        msg_type: "pong".into(),
+                        ts: incoming.ts,
+                        ..Default::default()
+                    })
+                    .unwrap()
+                    .into(),
+                ));
+                // Refresh presence liveness on every ping so
+                // /peers/presence stays current even if the user hasn't
+                // sent a real message in a while.
+                if let Some(ref pid_hex) = my_peer_id
+                    && let Some(mesh_pid) = parse_peer_id(pid_hex)
+                {
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs();
+                    presence_authority.lock().await.upsert_local(mesh_pid, now);
                 }
             }
 
