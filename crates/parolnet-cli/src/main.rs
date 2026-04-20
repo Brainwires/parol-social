@@ -127,6 +127,20 @@ enum Cmd {
         #[arg(long, default_value = "180")]
         timeout_secs: u64,
     },
+    /// Bootstrap two clients, then shuttle synthetic CALL_SIGNAL envelopes
+    /// (msg_type 0x0B) — offer / answer / ice / hangup / reject — through
+    /// the real relay and assert byte-exact round-trip of the inner JSON.
+    /// Also verifies that a CALL_SIGNAL to an unregistered peer is not
+    /// mis-delivered. Gives us a Rust-side regression surface for 1:1
+    /// voice/video signaling independent of the browser.
+    CallSignalLoopback {
+        #[arg(long)]
+        relay: String,
+        #[arg(long)]
+        http: String,
+        #[arg(long, default_value = "30")]
+        timeout_secs: u64,
+    },
 }
 
 #[tokio::main]
@@ -166,6 +180,11 @@ async fn main() -> Result<()> {
             count,
             timeout_secs,
         } => run_idle_resume(&relay, &http, idle_secs, count, timeout_secs).await,
+        Cmd::CallSignalLoopback {
+            relay,
+            http,
+            timeout_secs,
+        } => run_call_signal_loopback(&relay, &http, timeout_secs).await,
     }
 }
 
@@ -832,15 +851,16 @@ async fn bootstrap_pair(relay_url: &str, http_base: &str) -> Result<Bootstrapped
     // Presenter side.
     let presenter_identity = IdentityKeyPair::generate();
     let presenter_id = PeerId::from_public_key(&presenter_identity.public_key_bytes());
-    let presenter_client =
-        ParolNet::from_identity(ParolNetConfig::default(), clone_identity(&presenter_identity));
+    let presenter_client = ParolNet::from_identity(
+        ParolNetConfig::default(),
+        clone_identity(&presenter_identity),
+    );
     let qr = generate_qr_payload_with_ratchet(&presenter_client.public_key(), None)?;
     let qr_seed = qr.seed;
     let qr_ratchet = qr.ratchet_secret;
     let qr_parsed = parse_qr_payload(&qr.payload_bytes)?;
 
-    let mut presenter =
-        PeerHandle::connect(relay_url, clone_identity(&presenter_identity)).await?;
+    let mut presenter = PeerHandle::connect(relay_url, clone_identity(&presenter_identity)).await?;
     wait_registered(&mut presenter).await?;
     tracing::info!("[P] registered peer_id={}", hex::encode(presenter_id.0));
 
@@ -869,9 +889,7 @@ async fn bootstrap_pair(relay_url: &str, http_base: &str) -> Result<Bootstrapped
 
     // Scanner sends bootstrap envelope (source_hint = scanner_IK, MUST-063).
     let token = issue_one_token(http_base, &scanner_identity).await?;
-    let now_secs = SystemTime::now()
-        .duration_since(UNIX_EPOCH)?
-        .as_secs();
+    let now_secs = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
     let bootstrap_envelope = encrypt_for_peer(
         scanner_client.sessions(),
         &presenter_id,
@@ -893,7 +911,9 @@ async fn bootstrap_pair(relay_url: &str, http_base: &str) -> Result<Bootstrapped
         if remaining.is_zero() {
             return Err(anyhow!("[P] bootstrap frame never arrived"));
         }
-        let Some(evt) = presenter.next_evt(remaining).await else { continue };
+        let Some(evt) = presenter.next_evt(remaining).await else {
+            continue;
+        };
         match evt {
             PeerEvt::Inbound { envelope } => {
                 let (from, _decoded, bootstrapped) = try_decrypt_as_presenter(
@@ -985,7 +1005,8 @@ async fn exchange_one_direction(
         if arrived != body {
             return Err(anyhow!(
                 "[{label}] msg #{i} corrupted: expected {:?}, got {:?}",
-                body, arrived
+                body,
+                arrived
             ));
         }
         tracing::info!("[{label}] #{i} delivered in {}ms", latency_ms);
@@ -1241,6 +1262,333 @@ async fn run_idle_resume(
         }
         Err(_) => {
             let msg = format!("IDLE-RESUME TIMED OUT after {}s", timeout_secs);
+            println!("\n  {}\n", msg);
+            Err(anyhow!(msg))
+        }
+    }
+}
+
+// ───────────────────── call-signal loopback orchestrator ──────────────────
+//
+// Shuttles synthetic CALL_SIGNAL frames (msg_type = 0x0B, PNP-001 §3.4)
+// through the real relay and asserts the inner JSON round-trips byte-exactly.
+// The inner payload shape mirrors pwa/src/messaging.js::sendCallSignal —
+// a JSON object with `action` plus action-specific fields. From the
+// transport's point of view the bytes are opaque; the only thing we assert
+// is bytes-in == bytes-out after traversing token auth + padding +
+// sealed-sender + relay routing. That is exactly the signal we want: if the
+// outer envelope, token flow, or relay routing ever regresses for
+// CALL_SIGNAL, this test catches it without a browser.
+
+/// CALL_SIGNAL message-type code from PNP-001 §3.4 (mirrors MSG_TYPE_CALL_SIGNAL
+/// in pwa/src/protocol-constants.js).
+const MSG_TYPE_CALL_SIGNAL: u8 = 0x0B;
+
+/// One synthetic CALL_SIGNAL action to push through the relay. `label` is
+/// just for failure messages; `inner` is the opaque JSON blob the PWA would
+/// have produced client-side.
+struct CallSignalCase {
+    label: &'static str,
+    inner: Vec<u8>,
+}
+
+fn call_signal_cases() -> Vec<CallSignalCase> {
+    // Each `inner` is exactly what pwa/src/messaging.js::sendCallSignal
+    // encodes: JSON.stringify({ action, ...payload }). Byte-exact
+    // round-trip of these bytes is the transport-layer invariant we
+    // assert — the inner format is opaque to the envelope/relay/token
+    // machinery, so this test stays valid even if the inner schema
+    // evolves.
+    let dummy_sdp =
+        "v=0\r\no=- 0 0 IN IP4 0.0.0.0\r\ns=-\r\nt=0 0\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\n";
+    let dummy_candidate =
+        "candidate:1 1 UDP 2113667327 192.0.2.1 54321 typ host generation 0 ufrag abc network-id 1";
+
+    vec![
+        CallSignalCase {
+            label: "offer",
+            inner: serde_json::to_vec(&serde_json::json!({
+                "action": "offer",
+                "callId": "call-loopback-0001",
+                "withVideo": false,
+                "sdp": dummy_sdp,
+            }))
+            .expect("offer json"),
+        },
+        CallSignalCase {
+            label: "answer",
+            inner: serde_json::to_vec(&serde_json::json!({
+                "action": "answer",
+                "callId": "call-loopback-0001",
+                "withVideo": false,
+                "sdp": dummy_sdp,
+            }))
+            .expect("answer json"),
+        },
+        CallSignalCase {
+            label: "ice",
+            inner: serde_json::to_vec(&serde_json::json!({
+                "action": "ice",
+                "callId": "call-loopback-0001",
+                "candidate": {
+                    "candidate": dummy_candidate,
+                    "sdpMid": "0",
+                    "sdpMLineIndex": 0,
+                    "usernameFragment": "abc",
+                },
+            }))
+            .expect("ice json"),
+        },
+        CallSignalCase {
+            label: "hangup",
+            inner: serde_json::to_vec(&serde_json::json!({
+                "action": "hangup",
+                "callId": "call-loopback-0001",
+            }))
+            .expect("hangup json"),
+        },
+        CallSignalCase {
+            label: "reject",
+            inner: serde_json::to_vec(&serde_json::json!({
+                "action": "reject",
+                "callId": "call-loopback-0001",
+            }))
+            .expect("reject json"),
+        },
+    ]
+}
+
+/// Encrypt+send one CALL_SIGNAL envelope from `sender` to `recipient_peer_id`
+/// and wait for `recipient` to receive, decrypt, and expose the inner bytes.
+/// Returns the decrypted inner bytes from the recipient side so the caller
+/// can assert a byte-exact round-trip.
+#[allow(clippy::too_many_arguments)]
+async fn send_and_receive_call_signal(
+    label: &str,
+    inner_bytes: &[u8],
+    http_base: &str,
+    sender: &mut PeerHandle,
+    recipient: &mut PeerHandle,
+    sender_client: &ParolNet,
+    recipient_client: &ParolNet,
+    sender_identity: &IdentityKeyPair,
+    recipient_peer_id: PeerId,
+    sender_peer_id: PeerId,
+) -> Result<Vec<u8>> {
+    let now_secs = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
+    let envelope = encrypt_for_peer(
+        sender_client.sessions(),
+        &recipient_peer_id,
+        MSG_TYPE_CALL_SIGNAL,
+        inner_bytes,
+        now_secs,
+        None,
+    )
+    .with_context(|| format!("[{label}] encrypt_for_peer"))?;
+    let token = issue_one_token(http_base, sender_identity).await?;
+
+    sender
+        .send(recipient_peer_id, encode_token_hex(&token)?, envelope)
+        .await
+        .with_context(|| format!("[{label}] sender.send"))?;
+
+    // Drain recipient events until we get an Inbound that decrypts from
+    // the expected sender. Mirrors wait_for_inbound_from but returns the
+    // raw plaintext bytes AND asserts the msg_type is CALL_SIGNAL, which
+    // is part of the contract we care about.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return Err(anyhow!("[{label}] timeout waiting for CALL_SIGNAL inbound"));
+        }
+        match recipient.next_evt(remaining).await {
+            Some(PeerEvt::Inbound { envelope }) => {
+                let decoded =
+                    decrypt_for_peer(recipient_client.sessions(), &sender_peer_id, &envelope)
+                        .with_context(|| format!("[{label}] decrypt_for_peer"))?;
+                if decoded.msg_type != MSG_TYPE_CALL_SIGNAL {
+                    return Err(anyhow!(
+                        "[{label}] wrong msg_type: expected {:#x}, got {:#x}",
+                        MSG_TYPE_CALL_SIGNAL,
+                        decoded.msg_type
+                    ));
+                }
+                return Ok(decoded.plaintext);
+            }
+            Some(PeerEvt::Disconnected) => {
+                return Err(anyhow!("[{label}] recipient disconnected"));
+            }
+            Some(PeerEvt::RelayError(m)) => {
+                return Err(anyhow!("[{label}] relay error: {m}"));
+            }
+            Some(_) | None => continue,
+        }
+    }
+}
+
+async fn run_call_signal_loopback(
+    relay_url: &str,
+    http_base: &str,
+    timeout_secs: u64,
+) -> Result<()> {
+    let fut = async {
+        let mut pair = bootstrap_pair(relay_url, http_base).await?;
+
+        // Part 1: each action type, scanner → presenter, byte-exact.
+        for case in call_signal_cases() {
+            let round_tripped = send_and_receive_call_signal(
+                case.label,
+                &case.inner,
+                http_base,
+                &mut pair.scanner,
+                &mut pair.presenter,
+                &pair.scanner_client,
+                &pair.presenter_client,
+                &pair.scanner_identity,
+                pair.presenter_id,
+                pair.scanner_id,
+            )
+            .await?;
+            if round_tripped != case.inner {
+                return Err(anyhow!(
+                    "[{}] inner payload corrupted: {} bytes in, {} bytes out",
+                    case.label,
+                    case.inner.len(),
+                    round_tripped.len()
+                ));
+            }
+            tracing::info!(
+                "[call-signal] {:<7} OK ({} bytes round-tripped byte-exact)",
+                case.label,
+                case.inner.len()
+            );
+        }
+
+        // Part 2: also exercise the reverse direction for `hangup` so we
+        // prove the relay routes CALL_SIGNAL P→S, not just S→P. (Every
+        // action already works outbound-from-scanner; we only need one
+        // reverse case to catch a direction-specific regression.)
+        let hangup_inner = serde_json::to_vec(&serde_json::json!({
+            "action": "hangup",
+            "callId": "call-loopback-reverse",
+        }))
+        .expect("reverse hangup json");
+        let round_tripped = send_and_receive_call_signal(
+            "hangup(P→S)",
+            &hangup_inner,
+            http_base,
+            &mut pair.presenter,
+            &mut pair.scanner,
+            &pair.presenter_client,
+            &pair.scanner_client,
+            &pair.presenter_identity,
+            pair.scanner_id,
+            pair.presenter_id,
+        )
+        .await?;
+        if round_tripped != hangup_inner {
+            return Err(anyhow!("[hangup(P→S)] inner payload corrupted"));
+        }
+        tracing::info!(
+            "[call-signal] hangup(P→S) OK ({} bytes round-tripped byte-exact)",
+            hangup_inner.len()
+        );
+
+        // Part 3: CALL_SIGNAL to an unknown peer. The relay cannot route
+        // to a never-registered PeerId; it either drops with error or
+        // parks in store-and-forward. Either way, the legitimate presenter
+        // MUST NOT receive it. We send from scanner to a random PeerId,
+        // then poll the presenter briefly and assert no Inbound arrives.
+        //
+        // Note: the scanner doesn't have a session with the unknown peer,
+        // so encrypt_for_peer would fail. The failure mode we care about
+        // is transport-level mis-delivery, so we synthesize a transport
+        // frame by reusing a valid scanner→presenter envelope but
+        // addressing the outer `to` field to a random PeerId. If the
+        // relay ever mis-routes based on something other than the outer
+        // `to`, the presenter would see an Inbound here — it must not.
+        let unknown_peer = {
+            let mut b = [0u8; 32];
+            OsRng.fill_bytes(&mut b);
+            PeerId(b)
+        };
+        let now_secs = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
+        let synth_envelope = encrypt_for_peer(
+            pair.scanner_client.sessions(),
+            &pair.presenter_id,
+            MSG_TYPE_CALL_SIGNAL,
+            b"{\"action\":\"offer\",\"callId\":\"stray\"}",
+            now_secs,
+            None,
+        )?;
+        let token = issue_one_token(http_base, &pair.scanner_identity).await?;
+        pair.scanner
+            .send(unknown_peer, encode_token_hex(&token)?, synth_envelope)
+            .await?;
+
+        // Drain presenter events for 2s. We expect Queued/RelayError on
+        // the SENDER side (scanner) — which our PeerHandle doesn't
+        // distinguish per-peer, so we also drain scanner events. The
+        // INVARIANT is: presenter must not see Inbound.
+        let probe_end = tokio::time::Instant::now() + Duration::from_secs(2);
+        let mut saw_scanner_signal = false;
+        loop {
+            let remaining = probe_end.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            tokio::select! {
+                evt = pair.presenter.next_evt(remaining) => {
+                    match evt {
+                        Some(PeerEvt::Inbound { .. }) => {
+                            return Err(anyhow!(
+                                "unknown-peer routing leak: presenter received a CALL_SIGNAL addressed to a random PeerId"
+                            ));
+                        }
+                        Some(PeerEvt::Disconnected) | Some(PeerEvt::RelayError(_)) => {
+                            return Err(anyhow!("presenter lost connection during unknown-peer probe"));
+                        }
+                        _ => {}
+                    }
+                }
+                evt = pair.scanner.next_evt(remaining) => {
+                    // Scanner may see Queued or RelayError — either is a
+                    // valid "relay did not route to an unknown peer"
+                    // signal. We record that we saw *something* so we
+                    // can log it, but no specific value is required.
+                    if matches!(evt, Some(PeerEvt::Queued) | Some(PeerEvt::RelayError(_))) {
+                        saw_scanner_signal = true;
+                    }
+                }
+            }
+        }
+        tracing::info!(
+            "[call-signal] unknown-peer OK (presenter never received stray frame; \
+             scanner saw queued/error: {})",
+            saw_scanner_signal
+        );
+
+        println!("\n════════════════════════════════════════════════════════════");
+        println!("  CALL-SIGNAL LOOPBACK PASS ✅");
+        println!("  offer / answer / ice / hangup / reject: round-tripped byte-exact");
+        println!("  reverse-direction hangup: round-tripped byte-exact");
+        println!("  unknown-peer CALL_SIGNAL: not mis-routed");
+        println!("════════════════════════════════════════════════════════════\n");
+
+        pair.presenter.close().await;
+        pair.scanner.close().await;
+        Ok::<(), anyhow::Error>(())
+    };
+
+    match tokio::time::timeout(Duration::from_secs(timeout_secs), fut).await {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(e)) => {
+            println!("\n  CALL-SIGNAL LOOPBACK FAIL ❌  {e}\n");
+            Err(e)
+        }
+        Err(_) => {
+            let msg = format!("CALL-SIGNAL LOOPBACK TIMED OUT after {}s", timeout_secs);
             println!("\n  {}\n", msg);
             Err(anyhow!(msg))
         }
