@@ -189,32 +189,34 @@ async function onWasmReady() {
     // the user perceives missing messages (the exact bootstrap-bug symptom:
     // "receiver is receiving nothing"). We also nudge on visibilitychange/
     // focus so returning to the tab doesn't require a full tick.
-    let _lastRelayStatusReply = Date.now();
+    // The SW now enforces PNP-001 §10.3 MUST-066 itself (20s ping / 40s
+    // dead-threshold watchdog in sw.source.js). The page's job is narrower:
+    // poll the SW's authoritative `relayIsLive()` status every 10s, and if
+    // it comes back false (or if the SW doesn't reply at all within 8s —
+    // meaning the SW was evicted and has no pingTimer running), send a
+    // relay_connect to kick it back up.
     function _nudgeRelay() {
         if (!connMgr.relayUrl) return;
-        if (connMgr.isRelayConnected()) return;
         connMgr._swPost({
             type: 'relay_connect',
             url: connMgr.relayUrl,
             peerId: window._peerId || null,
         });
     }
+    let _lastRelayStatusReply = Date.now();
     navigator.serviceWorker?.addEventListener('message', (ev) => {
         const d = ev.data;
         if (d && d.type === 'relay_status') _lastRelayStatusReply = Date.now();
     });
     setInterval(() => {
         if (!connMgr.relayUrl) return;
-        // Ask the SW for status; if it replies "connected" we're fine. If
-        // we don't hear back within ~8 s the SW is likely dead — kick it.
         if (navigator.serviceWorker && navigator.serviceWorker.controller) {
             navigator.serviceWorker.controller.postMessage({ type: 'relay_status_query' });
         }
-        if (Date.now() - _lastRelayStatusReply > 8_000) {
+        const swSilent = Date.now() - _lastRelayStatusReply > 8_000;
+        if (swSilent || !connMgr.isRelayConnected()) {
             _nudgeRelay();
-            _lastRelayStatusReply = Date.now();
-        } else if (!connMgr.isRelayConnected()) {
-            _nudgeRelay();
+            if (swSilent) _lastRelayStatusReply = Date.now();
         }
     }, 10_000);
     document.addEventListener('visibilitychange', () => {

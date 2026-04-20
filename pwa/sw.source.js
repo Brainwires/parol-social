@@ -388,7 +388,22 @@ let relayUrl = null;
 let relayPeerId = null;
 let relayReconnectTimer = null;
 let relayReconnectDelay = 1000;
-let relayConnected = false;
+// Has the relay confirmed our `register` with a `registered` response?
+// This is a *precondition* for being live, not a proof of liveness — the
+// authoritative answer is `relayIsLive()` below.
+let relayRegistered = false;
+// Last Date.now() at which ANY inbound frame arrived (pong, message, ...).
+// PNP-001 §10.3 MUST-066: if now - lastInboundAt > 40s, the socket MUST
+// be torn down. Initialized to 0 so an un-opened socket is correctly
+// reported dead.
+let lastInboundAt = 0;
+// Heartbeat timers — created when the socket opens, cleared on close.
+let pingIntervalTimer = null;
+let livenessCheckTimer = null;
+
+const PING_INTERVAL_MS = 20_000;      // PNP-001-MUST-065
+const DEAD_THRESHOLD_MS = 40_000;     // PNP-001-MUST-066
+const LIVENESS_CHECK_INTERVAL_MS = 5_000;
 
 // When true, the page has explicitly asked the SW to stand down its
 // relay socket (H3 onion mode uses a main-thread WebSocket instead).
@@ -396,9 +411,59 @@ let relayConnected = false;
 // to resume.
 let relaySuspended = false;
 
+// Authoritative "socket is usable right now" predicate. Any subsystem
+// that wants to answer "is the relay up?" MUST read this, not the
+// pre-v0.10 `relayConnected` bool which lied about dead sockets.
+function relayIsLive() {
+    if (!relayWs) return false;
+    if (relayWs.readyState !== 1) return false; // 1 = OPEN
+    if (!relayRegistered) return false;
+    if (lastInboundAt === 0) return false;
+    return (Date.now() - lastInboundAt) < DEAD_THRESHOLD_MS;
+}
+
+function swClearHeartbeatTimers() {
+    if (pingIntervalTimer !== null) {
+        clearInterval(pingIntervalTimer);
+        pingIntervalTimer = null;
+    }
+    if (livenessCheckTimer !== null) {
+        clearInterval(livenessCheckTimer);
+        livenessCheckTimer = null;
+    }
+}
+
+function swStartHeartbeat() {
+    swClearHeartbeatTimers();
+    // Outbound ping every 20s (PNP-001-MUST-065).
+    pingIntervalTimer = setInterval(() => {
+        if (!relayWs || relayWs.readyState !== 1) return;
+        try {
+            relayWs.send(JSON.stringify({ type: 'ping', ts: Date.now() }));
+        } catch {}
+    }, PING_INTERVAL_MS);
+    // Dead-threshold watchdog (PNP-001-MUST-066). Check every 5s whether
+    // the >40s silence rule has tripped. On trip: tear down, schedule
+    // reconnect. No grace period — the spec is explicit.
+    livenessCheckTimer = setInterval(() => {
+        if (!relayWs) return;
+        if (relayWs.readyState !== 1) return;
+        const silentMs = Date.now() - lastInboundAt;
+        if (lastInboundAt !== 0 && silentMs > DEAD_THRESHOLD_MS) {
+            console.warn('[SW-Relay] dead socket — ' + silentMs + 'ms silence, tearing down');
+            try { relayWs.close(4000, 'idle-timeout'); } catch {}
+            // onclose handler fires and schedules reconnect.
+        }
+    }, LIVENESS_CHECK_INTERVAL_MS);
+}
+
 function swConnectRelay() {
     if (relaySuspended) return;
-    if (relayWs && (relayWs.readyState === 0 || relayWs.readyState === 1)) return;
+    // Only skip if we already have a live connection — readyState 0 means
+    // "connecting but stuck", which in pre-v0.10 builds would block the
+    // reconnect forever. If the socket's in CONNECTING (0), we let the
+    // liveness watchdog decide; if it's past its deadline we close+reopen.
+    if (relayWs && relayWs.readyState === 1 && relayRegistered) return;
     if (!relayUrl) return;
     try {
         relayWs = new WebSocket(relayUrl);
@@ -407,30 +472,44 @@ function swConnectRelay() {
         return;
     }
 
+    relayRegistered = false;
+    lastInboundAt = 0;
+
     relayWs.onopen = () => {
         console.log('[SW-Relay] WebSocket open, awaiting registration...');
         relayReconnectDelay = 1000;
+        // The onopen itself counts as an inbound event for liveness
+        // purposes — the socket demonstrably handshook.
+        lastInboundAt = Date.now();
         if (relayPeerId) {
             relayWs.send(JSON.stringify({ type: 'register', peer_id: relayPeerId }));
         }
+        swStartHeartbeat();
     };
 
     relayWs.onmessage = (event) => {
+        // PNP-001-MUST-066: any inbound frame (not just pong) resets the
+        // liveness timer. The relay's response to other traffic is equally
+        // strong evidence the socket is alive.
+        lastInboundAt = Date.now();
         try {
             const msg = JSON.parse(event.data);
-            // Only mark as connected after relay confirms registration
-            if (msg.type === 'registered' && !relayConnected) {
+            if (msg.type === 'registered' && !relayRegistered) {
                 console.log('[SW-Relay] registered with relay');
-                relayConnected = true;
+                relayRegistered = true;
                 swBroadcastStatus(true);
             }
+            // Pongs are purely for liveness; no app handling needed.
+            if (msg.type === 'pong') return;
             swBroadcastOrBuffer(msg);
         } catch(e) {}
     };
 
     relayWs.onclose = () => {
         console.log('[SW-Relay] disconnected');
-        relayConnected = false;
+        swClearHeartbeatTimers();
+        relayRegistered = false;
+        lastInboundAt = 0;
         swBroadcastStatus(false);
         swScheduleReconnect();
     };
@@ -457,14 +536,16 @@ function swSuspendRelay() {
         clearTimeout(relayReconnectTimer);
         relayReconnectTimer = null;
     }
+    swClearHeartbeatTimers();
     if (relayWs) {
         try { relayWs.close(); } catch {}
     }
     relayWs = null;
-    if (relayConnected) {
-        relayConnected = false;
+    if (relayRegistered) {
+        relayRegistered = false;
         swBroadcastStatus(false);
     }
+    lastInboundAt = 0;
 }
 
 function swBroadcastStatus(connected) {
@@ -579,7 +660,7 @@ self.addEventListener('message', event => {
             break;
         case 'relay_status_query':
             if (event.source) {
-                event.source.postMessage({ type: 'relay_status', connected: relayConnected });
+                event.source.postMessage({ type: 'relay_status', connected: relayIsLive() });
             }
             break;
     }
