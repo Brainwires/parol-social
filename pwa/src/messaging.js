@@ -169,6 +169,13 @@ export async function sendCallSignal(peerId, action, payload = {}) {
 }
 
 // ── Relay Message Handling ────────────────────────────────
+// Returns `{ delivered: boolean, reason?: string }` so the SW-inbox drain can
+// decide whether to ack-and-delete the buffered row or leave it for a later
+// retry. `delivered === true` means the frame has been consumed to completion
+// (either dispatched to the UI, or a transient signal we've finished acting
+// on). `delivered === false` means the caller should keep the row buffered
+// and redeliver on the next drain opportunity (e.g. WASM wasn't ready, no
+// session was available yet, trial_decrypt threw).
 export function handleRelayMessage(msg) {
     switch (msg.type) {
         case 'challenge':
@@ -186,51 +193,55 @@ export function handleRelayMessage(msg) {
                         nonce: msg.nonce
                     });
                     console.log('[Auth] Challenge signed, sending authenticated register');
+                    return { delivered: true };
                 } catch(e) {
                     console.warn('[Auth] Failed to sign challenge:', e);
+                    return { delivered: false, reason: 'sign-failed' };
                 }
             } else {
                 console.warn('[Auth] Cannot sign challenge — WASM not ready or missing sign_bytes');
+                return { delivered: false, reason: 'wasm-not-ready' };
             }
-            break;
 
         case 'registered':
             console.log('Registered with relay. Online peers:', msg.online_peers);
             discoverPeers();
             startDiscoveryInterval();
-            break;
+            return { delivered: true };
 
         case 'message':
             // All wire frames are PNP-001 envelopes — onIncomingMessage tries
             // each known session until one decrypts (sealed-sender path; no
             // `from` field on the wire per PNP-001-MUST-048).
-            onIncomingMessage(msg.payload);
-            break;
+            return onIncomingMessage(msg.payload);
 
         case 'queued':
             // PNP-001-MUST-068: provisional-delivery signal, not a failure.
             // PNP-001-SHOULD-015: clients MUST NOT render this as an error.
             // A modal toast would miscommunicate the state, so we log only.
             console.log('[Relay] queued (peer offline — relay will store-and-forward)');
-            break;
+            return { delivered: true };
 
         case 'rtc_offer':
             handleRTCOffer(msg.from, msg.payload).catch(e => console.warn('[WebRTC] offer error:', e));
-            break;
+            return { delivered: true };
         case 'rtc_answer':
             handleRTCAnswer(msg.from, msg.payload).catch(e => console.warn('[WebRTC] answer error:', e));
-            break;
+            return { delivered: true };
         case 'rtc_ice':
             handleRTCIce(msg.from, msg.payload).catch(e => console.warn('[WebRTC] ICE error:', e));
-            break;
+            return { delivered: true };
 
         case 'error':
             console.warn('Relay error:', msg.message);
             if (msg.message === 'peer not connected') {
                 showToast(t('toast.peerNotOnline'));
             }
-            break;
+            return { delivered: true };
     }
+    // Unknown / unhandled frame types: treat as delivered so we don't loop
+    // forever retrying something we can't interpret.
+    return { delivered: true };
 }
 
 // ── Group Management ───────────────────────────────────────
@@ -1395,15 +1406,24 @@ function hexToBytes(hex) {
 // success commits the session and returns `bootstrapped: true`, which we
 // turn into the "new secure contact" UI.
 export function onIncomingMessage(payload) {
-    if (!payload || typeof payload !== 'string') return;
+    if (!payload || typeof payload !== 'string') {
+        return { delivered: true, reason: 'empty-payload' };
+    }
 
     const dedupKey = payload.slice(0, 128);
-    if (seenGossipMessages.has(dedupKey)) return;
-    markGossipSeen(dedupKey);
+    if (seenGossipMessages.has(dedupKey)) {
+        // Already processed — treat as delivered so the SW-inbox row is
+        // reaped and we don't loop on a duplicate.
+        return { delivered: true, reason: 'duplicate' };
+    }
 
     if (!wasm || !wasm.trial_decrypt) {
-        console.warn('[Envelope] WASM not available — dropping frame');
-        return;
+        // CRITICAL: do NOT markGossipSeen here and do NOT ack the row.
+        // The drain caller must leave the SW-inbox row in place so a later
+        // post-WASM drain can decode it. Marking seen now would cause the
+        // retry to be silently deduped out.
+        console.warn('[Envelope] WASM not available — deferring frame for retry');
+        return { delivered: false, reason: 'wasm-not-ready' };
     }
 
     let decoded;
@@ -1411,11 +1431,25 @@ export function onIncomingMessage(payload) {
         decoded = wasm.trial_decrypt(payload);
     } catch (e) {
         // No committed session decrypted AND no bootstrap fallback succeeded.
-        // Surface the reason so bootstrap-path failures are diagnosable;
-        // ordinary misrouted-traffic drops become visible rather than silent.
-        console.warn('[Envelope] trial_decrypt failed:', e && e.message ? e.message : e);
-        return;
+        // This can be a genuine misrouted frame (delivered=true, drop it) OR
+        // a transient "session not yet restored" condition during drain
+        // (delivered=false, retry later). We distinguish by checking whether
+        // session import has run yet: if `has_any_session` reports at least
+        // one session, decrypt failure is terminal (bad frame or unknown
+        // peer). If zero sessions exist, we may just not be ready — defer.
+        const msg = e && e.message ? e.message : String(e);
+        const anySession = wasm.session_count && wasm.session_count() > 0;
+        if (!anySession) {
+            console.warn('[Envelope] trial_decrypt failed with no sessions yet — deferring:', msg);
+            return { delivered: false, reason: 'no-sessions-yet' };
+        }
+        console.warn('[Envelope] trial_decrypt failed:', msg);
+        // Mark seen so we don't retry the same un-decryptable frame forever.
+        markGossipSeen(dedupKey);
+        return { delivered: true, reason: 'decrypt-failed' };
     }
+    // From here on the frame decrypted — safe to dedup.
+    markGossipSeen(dedupKey);
     console.log('[Envelope] decrypted', {
         from: decoded.source_peer_id.slice(0, 8),
         msgType: decoded.msg_type,
@@ -1448,4 +1482,5 @@ export function onIncomingMessage(payload) {
 
     const plaintext = hexToBytes(decoded.plaintext_hex);
     dispatchByMsgType(decoded.msg_type, sourcePeer, plaintext);
+    return { delivered: true };
 }

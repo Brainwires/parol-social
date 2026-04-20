@@ -371,18 +371,39 @@ function updateConnectionStatus() {
 // ── SW Inbox Drain ──────────────────────────────────────────
 //
 // Pulls store-and-forward frames the SW buffered while no page client
-// was attached (tab closed during relay drain). MUST run only after
-// `wasm` is ready — onIncomingMessage's trial_decrypt needs WASM; a
-// pre-WASM drain would delete rows from IndexedDB and silently drop
-// each frame in `messaging.js::onIncomingMessage`'s `!wasm` guard.
-// Kept idempotent so both the onWasmReady call and the
-// visibility-change call below are safe.
+// was attached (tab closed during relay drain).
+//
+// Design: ACK-AFTER-DECRYPT. Rows are read first, dispatched to
+// `handleRelayMessage`, and only DELETED for entries that actually
+// reported `delivered: true`. Undeliverable frames (WASM loaded but
+// sessions not yet imported, trial_decrypt failed with zero sessions,
+// etc.) stay in the inbox and will be retried by the next drain — which
+// is what makes the drain safe to call eagerly.
+//
+// This removes the fragility of the old WASM-ready guard: even a drain
+// that races ahead of WASM or session restore cannot LOSE messages —
+// the worst case is a no-op pass that leaves the rows in place.
+let _drainInFlight = false;
+let _drainQueued = false;
 async function drainSwInbox() {
-    if (!wasm || !wasm.trial_decrypt) {
-        // WASM not ready yet — leave the inbox alone. A subsequent
-        // drain (from onWasmReady or visibility change) will handle it.
-        return;
+    // Single-flight: coalesce overlapping calls. If another drain is
+    // running we remember to re-drain once it finishes so late triggers
+    // (visibility change, session restore, token pool refresh) don't
+    // race their own drains against each other.
+    if (_drainInFlight) { _drainQueued = true; return; }
+    _drainInFlight = true;
+    try {
+        await _drainSwInboxOnce();
+        while (_drainQueued) {
+            _drainQueued = false;
+            await _drainSwInboxOnce();
+        }
+    } finally {
+        _drainInFlight = false;
     }
+}
+
+function _drainSwInboxOnce() {
     return new Promise((resolve) => {
         const req = indexedDB.open('parolnet-sw', 1);
         req.onupgradeneeded = (e) => {
@@ -390,31 +411,72 @@ async function drainSwInbox() {
         };
         req.onsuccess = (e) => {
             const db = e.target.result;
-            const tx = db.transaction('sw-inbox', 'readwrite');
-            const store = tx.objectStore('sw-inbox');
-            const msgs = [];
-            store.openCursor().onsuccess = (ce) => {
+            // Phase 1: read all rows (readonly, no delete).
+            const rows = [];
+            const readTx = db.transaction('sw-inbox', 'readonly');
+            const readStore = readTx.objectStore('sw-inbox');
+            readStore.openCursor().onsuccess = (ce) => {
                 const cursor = ce.target.result;
                 if (cursor) {
-                    msgs.push(cursor.value.msg);
-                    cursor.delete();
+                    rows.push({ id: cursor.value.id, msg: cursor.value.msg, timestamp: cursor.value.timestamp });
                     cursor.continue();
                 }
             };
-            tx.oncomplete = () => {
-                db.close();
-                msgs.sort((a, b) => (a.timestamp || 0) - (b.timestamp || 0));
-                for (const msg of msgs) {
-                    try { handleRelayMessage(msg); } catch(e) {}
+            readTx.oncomplete = () => {
+                if (rows.length === 0) { db.close(); resolve(); return; }
+                rows.sort((a, b) => (a.timestamp || 0) - (b.timestamp || 0));
+
+                // Phase 2: dispatch. Collect IDs of rows that reported
+                // delivered: true; leave the rest in the inbox for retry.
+                const deliveredIds = [];
+                const deferredReasons = new Map();
+                for (const row of rows) {
+                    let res;
+                    try {
+                        res = handleRelayMessage(row.msg);
+                    } catch (e) {
+                        // A synchronous throw is a BUG, not a delivery
+                        // outcome — surface it but still retry later.
+                        console.warn('[SW-Inbox] handleRelayMessage threw:', e && e.message);
+                        res = { delivered: false, reason: 'exception' };
+                    }
+                    if (res && res.delivered) {
+                        deliveredIds.push(row.id);
+                    } else {
+                        const r = (res && res.reason) || 'unknown';
+                        deferredReasons.set(r, (deferredReasons.get(r) || 0) + 1);
+                    }
                 }
-                if (msgs.length > 0) console.log('[SW-Inbox] drained', msgs.length, 'buffered messages');
-                resolve();
+
+                const deferred = rows.length - deliveredIds.length;
+                if (deliveredIds.length > 0) {
+                    console.log('[SW-Inbox] delivered', deliveredIds.length, 'of', rows.length, 'buffered frames');
+                }
+                if (deferred > 0) {
+                    console.log('[SW-Inbox] deferred', deferred, 'frames for retry —', Object.fromEntries(deferredReasons));
+                }
+
+                if (deliveredIds.length === 0) { db.close(); resolve(); return; }
+
+                // Phase 3: delete only the delivered IDs.
+                const delTx = db.transaction('sw-inbox', 'readwrite');
+                const delStore = delTx.objectStore('sw-inbox');
+                for (const id of deliveredIds) {
+                    try { delStore.delete(id); } catch (_) {}
+                }
+                delTx.oncomplete = () => { db.close(); resolve(); };
+                delTx.onerror = () => { db.close(); resolve(); };
             };
-            tx.onerror = () => { resolve(); };
+            readTx.onerror = () => { db.close(); resolve(); };
         };
         req.onerror = () => resolve();
     });
 }
+
+// Expose drain for other modules (e.g. messaging.js after session restore,
+// token-pool.js after a batch refresh) so transient "not ready yet" defers
+// get a prompt retry without waiting for the next visibility change.
+export { drainSwInbox };
 
 // ── Service Worker Registration ─────────────────────────────
 function registerServiceWorker() {
