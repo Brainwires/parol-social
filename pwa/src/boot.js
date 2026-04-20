@@ -8,7 +8,7 @@ import { dbGet, dbPut, dbGetRaw } from './db.js';
 import { telemetry } from './telemetry.js';
 import { showView, calcPress, loadPanicCode } from './views.js';
 import { rtcConnections, initWebRTC, hasDirectConnection, loadCustomStunServers } from './webrtc.js';
-import { connMgr, flushMessageQueue } from './connection.js';
+import { connMgr, flushMessageQueue, hydratePendingSends } from './connection.js';
 import { requestBatch, maybeRefill } from './token-pool.js';
 import {
     handleRelayMessage, switchListTab, showCreateGroupDialog, createGroup,
@@ -155,6 +155,14 @@ async function onWasmReady() {
     // Load the H3 high-anonymity-mode preference. Actual circuit build
     // happens after connMgr.start() so connMgr.relayUrl is populated.
     await loadOnionModeSetting();
+
+    // Rehydrate any sends queued in a previous session so a tab reload
+    // during a relay outage doesn't silently lose messages. Encrypted rows
+    // are only decryptable now (post-unlock), so this runs inside
+    // onWasmReady, not earlier. Fire-and-forget — the flush on reconnect
+    // will pick them up whether hydration finished first or not.
+    hydratePendingSends().catch(e =>
+        console.warn('[Boot] hydratePendingSends failed:', e && e.message));
 
     relayClient.discover().then(relays => {
         console.log('[App] Discovered', relays.length, 'relays');

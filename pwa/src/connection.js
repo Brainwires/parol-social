@@ -4,7 +4,7 @@
 // node --test (state.js transitively imports the DOM-dependent
 // crypto-store.js). Under the browser the dynamic import resolves
 // synchronously against the registry.
-import { dbGet, dbGetAll } from './db.js';
+import { dbGet, dbGetAll, dbPut, dbDelete } from './db.js';
 import { hasDirectConnection, sendViaWebRTC, initWebRTC } from './webrtc.js';
 
 let _stateMod = null;
@@ -274,15 +274,80 @@ export function sendToRelay(toPeerId, payload, token) {
 }
 
 // ── Message Queue (offline resilience) ─────────────────────
+//
+// In-memory queue is the source of truth during a session; every mutation
+// mirrors to the `pending_sends` IndexedDB store so a tab close during a
+// relay outage doesn't lose pending sends. On the next boot, `hydrate-
+// PendingSends` reloads rows back into `messageQueue`.
 const messageQueue = [];
 const MAX_QUEUE_SIZE = 200;
 const MAX_QUEUE_AGE_MS = 3600000; // 1 hour
 const RETRY_BACKOFF_MS = 5000;    // per-message head-of-line skip window
 
+// Fire-and-forget IDB write. Attaches the autoIncrement id back onto the
+// in-memory entry so later flush attempts can target the exact row for
+// deletion. Errors are logged but never thrown — the in-memory queue stays
+// functional even if persistence fails (e.g., quota exhausted).
+function _persistQueueEntry(entry) {
+    const { toPeerId, payload, timestamp, nextTryAt, id } = entry;
+    const row = { toPeerId, payload, timestamp, nextTryAt };
+    if (id !== undefined) row.id = id;
+    dbPut('pending_sends', row).then(newId => {
+        // dbPut returns the (possibly-new) primary key. First write assigns
+        // an autoIncrement id; subsequent updates return the same id.
+        if (newId !== undefined && entry.id === undefined) entry.id = newId;
+    }).catch(e => {
+        console.warn('[Queue] failed to persist pending send:', e && e.message);
+    });
+}
+
+function _deletePersisted(entry) {
+    if (entry.id === undefined) return;
+    dbDelete('pending_sends', entry.id).catch(e => {
+        console.warn('[Queue] failed to drop pending send:', e && e.message);
+    });
+}
+
 export function queueMessage(toPeerId, payload) {
-    if (messageQueue.length >= MAX_QUEUE_SIZE) messageQueue.shift();
-    messageQueue.push({ toPeerId, payload, timestamp: Date.now(), nextTryAt: 0 });
+    if (messageQueue.length >= MAX_QUEUE_SIZE) {
+        const dropped = messageQueue.shift();
+        if (dropped) _deletePersisted(dropped);
+    }
+    const entry = { toPeerId, payload, timestamp: Date.now(), nextTryAt: 0 };
+    messageQueue.push(entry);
+    _persistQueueEntry(entry);
     console.log('[Queue] Message queued for', toPeerId.slice(0, 8), '- queue size:', messageQueue.length);
+}
+
+/// Rehydrate the in-memory queue from `pending_sends`. Called once on boot
+/// after the crypto store is unlocked (encrypted rows can't decrypt before
+/// unlock). Safe to call multiple times — it unions on row id to avoid
+/// duplicating entries already loaded.
+export async function hydratePendingSends() {
+    let rows;
+    try { rows = await dbGetAll('pending_sends'); } catch { return 0; }
+    if (!rows || rows.length === 0) return 0;
+    const now = Date.now();
+    const known = new Set(messageQueue.map(e => e.id).filter(id => id !== undefined));
+    let loaded = 0;
+    for (const row of rows) {
+        if (row.id !== undefined && known.has(row.id)) continue;
+        if (row.timestamp && now - row.timestamp > MAX_QUEUE_AGE_MS) {
+            // Age-expired during downtime — drop from storage, don't hydrate.
+            if (row.id !== undefined) dbDelete('pending_sends', row.id).catch(() => {});
+            continue;
+        }
+        messageQueue.push({
+            id: row.id,
+            toPeerId: row.toPeerId,
+            payload: row.payload,
+            timestamp: row.timestamp || now,
+            nextTryAt: row.nextTryAt || 0,
+        });
+        loaded++;
+    }
+    if (loaded > 0) console.log('[Queue] Hydrated', loaded, 'pending sends from IDB');
+    return loaded;
 }
 
 export function flushMessageQueue() {
@@ -292,15 +357,14 @@ export function flushMessageQueue() {
     // reconnect so the lazy lookup cost is negligible.
     import('./token-pool.js').then(({ spendOneToken }) => {
         const now = Date.now();
-        // Per-message nextTryAt prevents a permanently-unsendable message
-        // from starving sendable ones behind it: we iterate over a snapshot,
-        // attempt each message whose backoff has elapsed, and re-queue
-        // failures with a fresh nextTryAt so the next flush skips past them
-        // until the window reopens.
         console.log('[Queue] Flushing', messageQueue.length, 'queued messages');
         const toFlush = messageQueue.splice(0, messageQueue.length);
         for (const msg of toFlush) {
-            if (now - msg.timestamp > MAX_QUEUE_AGE_MS) continue; // expired
+            if (now - msg.timestamp > MAX_QUEUE_AGE_MS) {
+                // Aged-out: drop from storage too.
+                _deletePersisted(msg);
+                continue;
+            }
             if (msg.nextTryAt && msg.nextTryAt > now) {
                 messageQueue.push(msg); // not yet time to retry
                 continue;
@@ -314,9 +378,12 @@ export function flushMessageQueue() {
                 try { token = spendOneToken(connMgr.relayUrl); } catch { token = null; }
                 if (token) sent = sendToRelay(msg.toPeerId, msg.payload, token);
             }
-            if (!sent) {
+            if (sent) {
+                _deletePersisted(msg);
+            } else {
                 msg.nextTryAt = now + RETRY_BACKOFF_MS;
                 messageQueue.push(msg); // re-queue with backoff
+                _persistQueueEntry(msg);  // update nextTryAt on disk
             }
         }
         if (messageQueue.length > 0) {

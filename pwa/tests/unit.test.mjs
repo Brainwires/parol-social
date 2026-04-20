@@ -1577,3 +1577,130 @@ describe('i18n source guard', () => {
         }
     });
 });
+
+// ── pending_sends persistence ─────────────────────────────────────────
+//
+// Unit tests for the pure logic inlined in `src/connection.js`:
+//   - `queueMessage` evicts the oldest entry and returns the dropped row's id
+//     so the caller can delete it from `pending_sends`;
+//   - `hydratePendingSends` union-dedupes by id and drops age-expired rows;
+//   - `flushMessageQueue` deletes successful sends and re-queues failures
+//     with a fresh `nextTryAt` backoff.
+//
+// These tests pin the algorithm; the IDB bridge itself is a thin wrapper
+// around `dbPut`/`dbDelete`/`dbGetAll` already exercised by every other
+// store in the app (contacts, messages, settings, etc.). We explicitly do
+// NOT import `src/connection.js` here because its import chain reaches DOM-
+// dependent files (state.js / webrtc.js) — same constraint as the existing
+// H12 Phase 2 tests in this file.
+describe('pending_sends persistence (pure logic)', () => {
+    const MAX_QUEUE_SIZE = 200;
+    const MAX_QUEUE_AGE_MS = 3_600_000;
+    const RETRY_BACKOFF_MS = 5_000;
+
+    function queueMessage(queue, persisted, toPeerId, payload, now) {
+        let evicted = null;
+        if (queue.length >= MAX_QUEUE_SIZE) {
+            evicted = queue.shift();
+            if (evicted && evicted.id !== undefined) persisted.delete(evicted.id);
+        }
+        const entry = { toPeerId, payload, timestamp: now, nextTryAt: 0 };
+        queue.push(entry);
+        const id = persisted.size + 1; // mock autoIncrement
+        entry.id = id;
+        persisted.set(id, { ...entry });
+        return { entry, evicted };
+    }
+
+    function hydrate(queue, persistedRows, now) {
+        const known = new Set(queue.map(e => e.id).filter(id => id !== undefined));
+        const expired = [];
+        let loaded = 0;
+        for (const row of persistedRows) {
+            if (row.id !== undefined && known.has(row.id)) continue;
+            if (row.timestamp && now - row.timestamp > MAX_QUEUE_AGE_MS) {
+                if (row.id !== undefined) expired.push(row.id);
+                continue;
+            }
+            queue.push({ ...row });
+            loaded++;
+        }
+        return { loaded, expired };
+    }
+
+    test('queueMessage persists a row and assigns an id', () => {
+        const queue = [];
+        const persisted = new Map();
+        const { entry } = queueMessage(queue, persisted, 'aa'.repeat(32), new Uint8Array([1, 2]), 1000);
+        assert.equal(queue.length, 1);
+        assert.ok(entry.id !== undefined, 'id assigned so flush can target dbDelete');
+        assert.equal(persisted.size, 1);
+        assert.equal(persisted.get(entry.id).toPeerId, 'aa'.repeat(32));
+    });
+
+    test('queueMessage evicts the oldest entry AND drops it from persistence', () => {
+        // Mirrors connection.js::queueMessage when length hits MAX_QUEUE_SIZE:
+        // we shift the head entry and `_deletePersisted` it, so disk state
+        // stays aligned with the in-memory cap.
+        const queue = [];
+        const persisted = new Map();
+        // Pre-fill to exactly MAX_QUEUE_SIZE.
+        for (let i = 0; i < MAX_QUEUE_SIZE; i++) {
+            queueMessage(queue, persisted, 'p' + i, new Uint8Array(), 1000 + i);
+        }
+        assert.equal(queue.length, MAX_QUEUE_SIZE);
+        const { evicted } = queueMessage(queue, persisted, 'new', new Uint8Array(), 9999);
+        assert.ok(evicted, 'eviction occurred');
+        assert.equal(queue.length, MAX_QUEUE_SIZE);
+        assert.equal(persisted.has(evicted.id), false, 'evicted row dropped from persistence');
+    });
+
+    test('hydratePendingSends loads new rows and skips dupes + aged rows', () => {
+        const now = 10_000_000;
+        const queue = [{ id: 7, toPeerId: 'aa', payload: new Uint8Array(), timestamp: now - 1000, nextTryAt: 0 }];
+        const rows = [
+            { id: 7, toPeerId: 'aa', payload: new Uint8Array(), timestamp: now - 1000, nextTryAt: 0 }, // dup → skip
+            { id: 8, toPeerId: 'bb', payload: new Uint8Array(), timestamp: now - 500, nextTryAt: 0 },  // new → load
+            { id: 9, toPeerId: 'cc', payload: new Uint8Array(), timestamp: now - (MAX_QUEUE_AGE_MS + 1), nextTryAt: 0 }, // aged → expire
+        ];
+        const { loaded, expired } = hydrate(queue, rows, now);
+        assert.equal(loaded, 1);
+        assert.equal(queue.length, 2);
+        assert.equal(queue[1].id, 8);
+        assert.deepEqual(expired, [9]);
+    });
+
+    test('flushMessageQueue deletes on success and re-queues with backoff on fail', () => {
+        // Mirrors the sent/re-queue branches in connection.js::flush. On
+        // success the row is dbDelete'd; on fail it gets a fresh nextTryAt
+        // and is dbPut'd back with the updated timestamp.
+        const now = 5_000_000;
+        const queue = [
+            { id: 1, toPeerId: 'ok', payload: new Uint8Array(), timestamp: now - 100, nextTryAt: 0 },
+            { id: 2, toPeerId: 'fail', payload: new Uint8Array(), timestamp: now - 100, nextTryAt: 0 },
+        ];
+        const persisted = new Map(queue.map(e => [e.id, { ...e }]));
+        // Simulate flush: first entry "sends," second doesn't.
+        const dropped = [];
+        const updated = [];
+        const toFlush = queue.splice(0, queue.length);
+        for (const msg of toFlush) {
+            const sent = msg.toPeerId === 'ok';
+            if (sent) {
+                persisted.delete(msg.id);
+                dropped.push(msg.id);
+            } else {
+                msg.nextTryAt = now + RETRY_BACKOFF_MS;
+                queue.push(msg);
+                persisted.set(msg.id, { ...msg });
+                updated.push(msg.id);
+            }
+        }
+        assert.deepEqual(dropped, [1], 'successful send drops row from persistence');
+        assert.deepEqual(updated, [2], 'failed send re-persists with updated backoff');
+        assert.equal(queue.length, 1);
+        assert.equal(queue[0].nextTryAt, now + RETRY_BACKOFF_MS);
+        assert.ok(!persisted.has(1));
+        assert.equal(persisted.get(2).nextTryAt, now + RETRY_BACKOFF_MS);
+    });
+});

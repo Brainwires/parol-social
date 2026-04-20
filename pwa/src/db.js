@@ -2,7 +2,7 @@
 import { cryptoStore } from './state.js';
 
 const DB_NAME = 'parolnet';
-const DB_VERSION = 5;
+const DB_VERSION = 6;
 
 export function openDB() {
     return new Promise((resolve, reject) => {
@@ -48,6 +48,13 @@ export function openDB() {
                 if (!db.objectStoreNames.contains('contact_state')) {
                     db.createObjectStore('contact_state', { keyPath: 'peerId' });
                 }
+                // v6: pending relay sends that the caller couldn't hand off to
+                // WebRTC or the relay at the moment of send. Hydrated on tab
+                // launch so closing the page during a relay outage doesn't
+                // discard queued messages.
+                if (!db.objectStoreNames.contains('pending_sends')) {
+                    db.createObjectStore('pending_sends', { keyPath: 'id', autoIncrement: true });
+                }
             };
             req.onsuccess = () => { if (!resolved) { resolved = true; clearTimeout(timeout); resolve(req.result); } };
             req.onerror = () => { if (!resolved) { resolved = true; clearTimeout(timeout); reject(req.error); } };
@@ -91,9 +98,13 @@ export async function dbGetRaw(storeName, key) {
     });
 }
 
-// Stores that should be encrypted when crypto is active
+// Stores that should be encrypted when crypto is active.
+// `pending_sends` is included because the toPeerId + envelope bytes would
+// otherwise leak a recipient graph and PNP-001 outer-frame bytes at rest;
+// the payload itself is already E2E-encrypted but at-rest encryption adds
+// the peer-id indirection layer.
 export const ENCRYPTED_STORES = new Set([
-    'contacts', 'messages', 'settings', 'groups', 'group_messages', 'contact_state',
+    'contacts', 'messages', 'settings', 'groups', 'group_messages', 'contact_state', 'pending_sends',
 ]);
 
 function getKeyField(storeName) {
@@ -104,6 +115,7 @@ function getKeyField(storeName) {
     if (storeName === 'groups') return 'groupId';
     if (storeName === 'group_messages') return 'id';
     if (storeName === 'contact_state') return 'peerId';
+    if (storeName === 'pending_sends') return 'id';
     return 'id';
 }
 
