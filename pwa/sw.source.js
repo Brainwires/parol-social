@@ -477,7 +477,6 @@ function swConnectRelay() {
 
     relayWs.onopen = () => {
         console.log('[SW-Relay] WebSocket open, awaiting registration...');
-        relayReconnectDelay = 1000;
         // The onopen itself counts as an inbound event for liveness
         // purposes — the socket demonstrably handshook.
         lastInboundAt = Date.now();
@@ -485,6 +484,12 @@ function swConnectRelay() {
             relayWs.send(JSON.stringify({ type: 'register', peer_id: relayPeerId }));
         }
         swStartHeartbeat();
+        // NB: `relayReconnectDelay` is intentionally NOT reset here. A
+        // half-up relay can accept TCP and immediately drop; resetting on
+        // TCP-open would cause a 1-second reconnect storm. Reset happens in
+        // the `registered` branch of `onmessage` instead, so "open" alone
+        // doesn't discharge the backoff — only a completed challenge-
+        // response handshake does.
     };
 
     relayWs.onmessage = (event) => {
@@ -497,6 +502,11 @@ function swConnectRelay() {
             if (msg.type === 'registered' && !relayRegistered) {
                 console.log('[SW-Relay] registered with relay');
                 relayRegistered = true;
+                // Discharge the backoff only once the relay has acknowledged
+                // our registration. A flapping or half-up relay that closes
+                // before `registered` would otherwise reset the timer on
+                // every TCP-open cycle and we'd hammer it at 1 Hz.
+                relayReconnectDelay = 1000;
                 swBroadcastStatus(true);
             }
             // Pongs are purely for liveness; no app handling needed.
