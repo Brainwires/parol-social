@@ -6,6 +6,8 @@
 // synchronously against the registry.
 import { dbGet, dbGetAll, dbPut, dbDelete } from './db.js';
 import { hasDirectConnection, sendViaWebRTC, initWebRTC } from './webrtc.js';
+import { showErrorToast } from './utils.js';
+import { t } from './i18n.js';
 
 let _stateMod = null;
 async function _state() {
@@ -298,6 +300,7 @@ function _persistQueueEntry(entry) {
         if (newId !== undefined && entry.id === undefined) entry.id = newId;
     }).catch(e => {
         console.warn('[Queue] failed to persist pending send:', e && e.message);
+        showErrorToast(t('toast.pendingQueuePersistFailed'));
     });
 }
 
@@ -305,6 +308,7 @@ function _deletePersisted(entry) {
     if (entry.id === undefined) return;
     dbDelete('pending_sends', entry.id).catch(e => {
         console.warn('[Queue] failed to drop pending send:', e && e.message);
+        showErrorToast(t('toast.pendingQueueDropFailed'));
     });
 }
 

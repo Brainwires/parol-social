@@ -66,18 +66,60 @@ export function detectPlatform() {
 }
 
 // ── Toast Notifications ─────────────────────────────────────
-export function showToast(message, duration = 3000) {
+//
+// Three call shapes, all backwards-compatible:
+//   showToast('msg')                       → info, auto-hide 3s
+//   showToast('msg', 2000)                 → info, auto-hide 2s
+//   showToast('msg', { level, persistent, duration })
+//
+// Every toast is tap-to-dismiss; persistent toasts have no auto-hide
+// timer. Error toasts (level: 'error') default to persistent:true so
+// the user MUST acknowledge them — matches the "loud failures" rule.
+//
+// Rapid successive calls reuse a single DOM node (message overwrites).
+// That's an accepted tradeoff: we lose intermediate toast text but we
+// NEVER silently drop the caller's error — the latest failure is
+// always on screen.
+const TOAST_STYLE_BASE = 'position:fixed;bottom:80px;left:50%;transform:translateX(-50%);padding:12px 24px;border-radius:8px;font-size:14px;z-index:9999;max-width:80%;text-align:center;display:none;cursor:pointer;';
+const TOAST_STYLE_INFO = 'background:#333;color:#fff;';
+const TOAST_STYLE_ERROR = 'background:#b3261e;color:#fff;';
+
+export function showToast(message, opts) {
+    // Back-compat: legacy numeric second arg is duration.
+    let level = 'info';
+    let persistent = false;
+    let duration;
+    if (typeof opts === 'number') {
+        duration = opts;
+    } else if (opts && typeof opts === 'object') {
+        if (opts.level === 'error') level = 'error';
+        if (typeof opts.duration === 'number') duration = opts.duration;
+        if (typeof opts.persistent === 'boolean') persistent = opts.persistent;
+        else if (level === 'error') persistent = true; // errors default to persistent
+    }
+    if (duration === undefined) duration = 3000;
+
     let toast = document.getElementById('toast');
     if (!toast) {
         toast = document.createElement('div');
         toast.id = 'toast';
-        toast.style.cssText = 'position:fixed;bottom:80px;left:50%;transform:translateX(-50%);background:#333;color:#fff;padding:12px 24px;border-radius:8px;font-size:14px;z-index:9999;pointer-events:none;max-width:80%;text-align:center;display:none;';
         document.body.appendChild(toast);
+        toast.addEventListener('click', () => {
+            toast.style.display = 'none';
+            if (toast._timeout) { clearTimeout(toast._timeout); toast._timeout = null; }
+        });
     }
+    toast.style.cssText = TOAST_STYLE_BASE + (level === 'error' ? TOAST_STYLE_ERROR : TOAST_STYLE_INFO);
     toast.textContent = message;
     toast.style.display = 'block';
-    clearTimeout(toast._timeout);
-    toast._timeout = setTimeout(() => { toast.style.display = 'none'; }, duration);
+    if (toast._timeout) { clearTimeout(toast._timeout); toast._timeout = null; }
+    if (!persistent) {
+        toast._timeout = setTimeout(() => { toast.style.display = 'none'; }, duration);
+    }
+}
+
+export function showErrorToast(message) {
+    return showToast(message, { level: 'error', persistent: true });
 }
 
 // ── HTML/Attribute Escaping ─────────────────────────────────

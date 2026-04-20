@@ -3,7 +3,7 @@ import {
     wasm, setWasm, cryptoStore, relayClient,
     platform, setPlatform, setLocalStream
 } from './state.js';
-import { showToast, detectPlatform, showLocalNotification, requestNotificationPermission } from './utils.js';
+import { showToast, showErrorToast, detectPlatform, showLocalNotification, requestNotificationPermission } from './utils.js';
 import { dbGet, dbPut, dbGetRaw } from './db.js';
 import { telemetry } from './telemetry.js';
 import { showView, calcPress, loadPanicCode } from './views.js';
@@ -98,6 +98,7 @@ async function onWasmReady() {
                     console.log('Identity saved');
                 } catch(e) {
                     console.warn('Identity save failed (non-fatal):', e.message);
+                    showErrorToast(t('toast.identitySaveFailed'));
                 }
             }
         }
@@ -113,6 +114,7 @@ async function onWasmReady() {
         }
     } catch(e) {
         console.warn('Session restore skipped:', e.message);
+        showErrorToast(t('toast.sessionRestoreFailed'));
     }
 
     if (wasm.get_peer_id) {
@@ -161,8 +163,31 @@ async function onWasmReady() {
     // are only decryptable now (post-unlock), so this runs inside
     // onWasmReady, not earlier. Fire-and-forget — the flush on reconnect
     // will pick them up whether hydration finished first or not.
-    hydratePendingSends().catch(e =>
-        console.warn('[Boot] hydratePendingSends failed:', e && e.message));
+    hydratePendingSends().catch(e => {
+        console.warn('[Boot] hydratePendingSends failed:', e && e.message);
+        showErrorToast(t('toast.hydratePendingFailed'));
+    });
+
+    // Proactively ask for notification permission so drained offline
+    // messages (next step) actually surface to the OS. Previously this
+    // was only requested lazily inside sendMessage, so a user who hadn't
+    // yet sent anything would get buffered messages but no system
+    // notification — the `showLocalNotification` call silently no-ops
+    // when permission is `default`. Safe on browsers without
+    // Notification support (the helper guards internally).
+    requestNotificationPermission().catch(e =>
+        console.warn('[Boot] notification permission request failed:', e && e.message));
+
+    // Drain any SW-buffered INCOMING frames that arrived while the page
+    // was booting (store-and-forward delivery from the relay). This MUST
+    // run after WASM is ready — onIncomingMessage needs wasm.trial_decrypt
+    // to decode the envelope. Earlier drain attempts (from the SW-
+    // registration path) would otherwise delete rows from the inbox and
+    // drop them silently in the decrypt step. Fire-and-forget.
+    drainSwInbox().catch(e => {
+        console.warn('[Boot] drainSwInbox failed:', e && e.message);
+        showErrorToast(t('toast.offlineInboxDrainFailed'));
+    });
 
     relayClient.discover().then(relays => {
         console.log('[App] Discovered', relays.length, 'relays');
@@ -344,7 +369,20 @@ function updateConnectionStatus() {
 }
 
 // ── SW Inbox Drain ──────────────────────────────────────────
+//
+// Pulls store-and-forward frames the SW buffered while no page client
+// was attached (tab closed during relay drain). MUST run only after
+// `wasm` is ready — onIncomingMessage's trial_decrypt needs WASM; a
+// pre-WASM drain would delete rows from IndexedDB and silently drop
+// each frame in `messaging.js::onIncomingMessage`'s `!wasm` guard.
+// Kept idempotent so both the onWasmReady call and the
+// visibility-change call below are safe.
 async function drainSwInbox() {
+    if (!wasm || !wasm.trial_decrypt) {
+        // WASM not ready yet — leave the inbox alone. A subsequent
+        // drain (from onWasmReady or visibility change) will handle it.
+        return;
+    }
     return new Promise((resolve) => {
         const req = indexedDB.open('parolnet-sw', 1);
         req.onupgradeneeded = (e) => {
@@ -430,7 +468,11 @@ function registerServiceWorker() {
             });
         });
 
-        drainSwInbox().catch(() => {});
+        // Inbox drain intentionally NOT called here — at SW-registration
+        // time WASM is still loading, and drainSwInbox would delete
+        // rows before onIncomingMessage could decode them. The drain
+        // now fires from onWasmReady (post-WASM) and on visibility
+        // change (always post-boot), both of which are safe.
 
         navigator.serviceWorker.ready.then(() => {
             if (navigator.serviceWorker.controller) {
@@ -508,6 +550,9 @@ document.addEventListener('visibilitychange', () => {
         if (navigator.serviceWorker && navigator.serviceWorker.controller) {
             navigator.serviceWorker.controller.postMessage({ type: 'relay_status_query' });
         }
+        // Best-effort re-drain on tab focus. The onWasmReady drain is the
+        // authoritative call — if it ever errors the user already saw a
+        // toast; swallowing here avoids toasting twice per boot cycle.
         drainSwInbox().catch(() => {});
     }
 });

@@ -4,7 +4,7 @@ import {
     currentCallId, setCurrentCallId, localStream, setLocalStream
 } from './state.js';
 import {
-    showToast, escapeHtml, escapeAttr, formatTime, formatSize,
+    showToast, showErrorToast, escapeHtml, escapeAttr, formatTime, formatSize,
     generateMsgId, requestNotificationPermission, showLocalNotification
 } from './utils.js';
 import {
@@ -177,7 +177,10 @@ export function openChat(peerId) {
         dbGetAll('contacts').then(contacts => {
             const c = contacts.find(x => x.peerId === peerId);
             if (c && c.name && nameEl) nameEl.textContent = c.name;
-        }).catch(() => {});
+        }).catch(() => {
+            // Best-effort name lookup. Failure leaves the peerId prefix
+            // already rendered above — no user-visible data loss.
+        });
     }
     loadMessages(peerId);
 
@@ -223,7 +226,10 @@ export async function sendMessage() {
         timestamp: Date.now()
     };
 
-    try { await dbPut('messages', msg); } catch(e) { console.warn(e); }
+    try { await dbPut('messages', msg); } catch(e) {
+        console.warn('[Msg] dbPut failed:', e);
+        showErrorToast(t('toast.messageStoreFailed'));
+    }
 
     appendMessage(msg);
 
@@ -307,7 +313,10 @@ export async function sendMessage() {
             lastTime: formatTime(Date.now()),
             unread: 0,
         });
-    } catch(e) { console.warn(e); }
+    } catch(e) {
+        console.warn('[Contact] state update failed:', e);
+        showErrorToast(t('toast.contactStateFailed'));
+    }
 
     if ('Notification' in window && Notification.permission === 'default') {
         requestNotificationPermission();

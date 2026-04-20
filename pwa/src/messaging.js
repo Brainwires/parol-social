@@ -6,7 +6,7 @@ import {
     pendingFileReceives, groupCallPollInterval, setGroupCallPollInterval,
     currentCallId, setCurrentCallId
 } from './state.js';
-import { showToast, escapeHtml, escapeAttr, formatTime, formatSize, showLocalNotification } from './utils.js';
+import { showToast, showErrorToast, escapeHtml, escapeAttr, formatTime, formatSize, showLocalNotification } from './utils.js';
 import { dbGet, dbPut, dbGetAll, dbGetByIndex, dbDelete, updateContactState } from './db.js';
 import { showView } from './views.js';
 import { hasDirectConnection, sendViaWebRTC, seenGossipMessages, markGossipSeen,
@@ -1099,7 +1099,10 @@ function handleChatPlaintext(fromPeerId, plaintext) {
         content: messageText,
         timestamp: Date.now()
     };
-    dbPut('messages', msg).catch(e => console.warn('Failed to store message:', e));
+    dbPut('messages', msg).catch(e => {
+        console.warn('Failed to store message:', e);
+        showErrorToast(t('toast.messageStoreFailed'));
+    });
     // Upsert the stable identity row (name + future pubkey anchor if any) and
     // the volatile state row separately. lastMessage/lastTime/unread live on
     // contact_state (v5) so panic-wipe can zero them without losing trust
@@ -1107,12 +1110,18 @@ function handleChatPlaintext(fromPeerId, plaintext) {
     dbPut('contacts', {
         peerId: fromPeerId,
         name: fromPeerId.slice(0, 8) + '...',
-    }).catch(() => {});
+    }).catch(e => {
+        console.warn('[Contact] upsert failed:', e);
+        showErrorToast(t('toast.contactStateFailed'));
+    });
     updateContactState(fromPeerId, {
         lastMessage: messageText.slice(0, 50),
         lastTime: formatTime(Date.now()),
         unread: 1,
-    }).catch(() => {});
+    }).catch(e => {
+        console.warn('[Contact] state update failed:', e);
+        showErrorToast(t('toast.contactStateFailed'));
+    });
 
     if (currentView === 'chat' && currentPeerId === fromPeerId) {
         appendMessage(msg);
