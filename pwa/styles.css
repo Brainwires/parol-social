@@ -985,7 +985,14 @@ button.success {
     right: 0;
     background: var(--bg2);
     border-bottom: 2px solid var(--accent);
+    /* Respect the display safe area (notch, status bar, rounded corners)
+       so the Accept/Decline buttons never sit under device chrome and
+       become impossible to tap. The fallback padding still applies when
+       env() isn't supported. */
     padding: 16px;
+    padding-top: calc(16px + env(safe-area-inset-top, 0px));
+    padding-left: calc(16px + env(safe-area-inset-left, 0px));
+    padding-right: calc(16px + env(safe-area-inset-right, 0px));
     display: flex;
     align-items: center;
     justify-content: space-between;

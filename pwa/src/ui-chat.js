@@ -414,10 +414,52 @@ export async function initiateCall(peerId, withVideo) {
     startCallTimer();
 }
 
-export function answerIncomingCall(callId) {
-    if (wasm && wasm.answer_call) {
-        wasm.answer_call(callId);
+export async function answerIncomingCall(callId, opts) {
+    const withVideo = !!(opts && opts.withVideo);
+    const peerId = currentPeerId;
+    // Acquire local media on the callee side. Without this step the call
+    // appeared "connected" in the UI but no microphone was ever opened,
+    // the caller saw "Calling..." forever, and nothing flowed across the
+    // wire — because no media tracks, no answer signal, no peer nego.
+    try {
+        const constraints = { audio: true };
+        if (withVideo) constraints.video = { width: 320, height: 240 };
+        setLocalStream(await navigator.mediaDevices.getUserMedia(constraints));
+        if (withVideo) {
+            const localVideo = document.getElementById('local-video');
+            if (localVideo) {
+                localVideo.srcObject = localStream;
+                localVideo.classList.remove('hidden');
+            }
+        }
+    } catch (e) {
+        showToast(t('toast.avAccessError', { error: e.message }));
+        if (wasm && wasm.hangup_call) { try { wasm.hangup_call(callId); } catch {} }
+        return;
     }
+
+    if (wasm && wasm.answer_call) {
+        try { wasm.answer_call(callId); } catch (e) { console.warn('[Call] answer_call:', e); }
+    }
+
+    // Tell the caller we accepted so their UI can transition from
+    // "Calling..." to "Connected" and start the call timer. Without this
+    // the caller never knows the callee picked up.
+    if (peerId && wasm && wasm.envelope_encode && wasm.has_session && wasm.has_session(peerId)) {
+        try {
+            const inner = new TextEncoder().encode(JSON.stringify({
+                action: 'answer',
+                callId,
+                withVideo,
+            }));
+            const nowSecs = BigInt(Math.floor(Date.now() / 1000));
+            const envelope = wasm.envelope_encode(peerId, MSG_TYPE_CALL_SIGNAL, inner, nowSecs);
+            await sendRawEnvelope(peerId, envelope);
+        } catch (e) {
+            console.warn('[Call] answer-signal encode failed:', e);
+        }
+    }
+
     const statusEl = document.getElementById('call-status');
     if (statusEl) statusEl.textContent = 'Connected';
     startCallTimer();

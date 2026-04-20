@@ -744,7 +744,7 @@ async function sendFileChunked(fileId, toPeerId) {
 // ── Incoming Call Notification ──────────────────────────────
 
 function handleIncomingCall(msg) {
-    setIncomingCallInfo({ from: msg.from, callId: msg.callId });
+    setIncomingCallInfo({ from: msg.from, callId: msg.callId, withVideo: !!msg.withVideo });
     showIncomingCallNotification(msg.from, msg.callId);
 }
 
@@ -767,7 +767,7 @@ export function acceptIncomingCall() {
     if (notif) notif.classList.add('hidden');
     setCurrentPeerId(incomingCallInfo.from);
     setCurrentCallId(incomingCallInfo.callId);
-    answerIncomingCall(incomingCallInfo.callId);
+    answerIncomingCall(incomingCallInfo.callId, { withVideo: !!incomingCallInfo.withVideo });
     showView('call');
     const nameEl = document.getElementById('call-peer-name');
     if (nameEl) nameEl.textContent = incomingCallInfo.from.slice(0, 16) + '...';
@@ -1158,6 +1158,12 @@ function handleCallSignalPlaintext(fromPeerId, plaintext) {
     if (!obj) return;
     if (obj.action === 'offer') {
         handleIncomingCall({ ...obj, from: fromPeerId });
+    } else if (obj.action === 'answer') {
+        // Caller side: callee accepted. Flip the "Calling..." status so the
+        // UI reflects that the other side picked up. The call timer was
+        // already started by initiateCall.
+        const statusEl = document.getElementById('call-status');
+        if (statusEl) statusEl.textContent = 'Connected';
     } else if (obj.action === 'reject') {
         showToast(t('toast.callDeclined'));
     } else {
