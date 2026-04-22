@@ -285,23 +285,41 @@ async function onWasmReady() {
 }
 
 // Fetch the first batch of Privacy Pass relay tokens. Without tokens the
-// outer `message` frames cannot be sent — the user can still receive
-// messages, but `sendEnvelope` will toast + drop new sends until a batch
-// lands. Fire-and-forget: boot must not block on network.
+// outer `message` frames cannot be sent — `sendEnvelope` now waits on the
+// pool's readyPromise (see token-pool.js::acquireToken) so outbound sends
+// fired before the first batch lands will patiently await it rather than
+// dropping. The 3-tier retry ladder below rides the transient-failure
+// window silently and only surfaces a toast once the outage exceeds ~7 s.
+let _initialTokenFetchInFlight = false;
 async function kickOffInitialTokenFetch() {
     if (!connMgr.relayUrl) return;
-    try {
-        const res = await requestBatch(connMgr.relayUrl);
-        if (!res || !res.ok) {
-            console.warn('[TokenPool] initial fetch failed:', res && res.reason);
-            showToast(t('toast.relayTokenFetchFailed'));
-        } else {
-            console.log('[TokenPool] initial batch ok:', res.count, 'tokens, epoch', res.epochId);
+    if (_initialTokenFetchInFlight) return;
+    _initialTokenFetchInFlight = true;
+
+    const attempt = async (label) => {
+        try {
+            const res = await requestBatch(connMgr.relayUrl);
+            if (res && res.ok) {
+                console.log(`[TokenPool] ${label} ok:`, res.count, 'tokens, epoch', res.epochId);
+                return true;
+            }
+            console.warn(`[TokenPool] ${label} failed:`, res && res.reason);
+            return false;
+        } catch (e) {
+            console.warn(`[TokenPool] ${label} threw:`, e && e.message);
+            return false;
         }
-    } catch (e) {
-        console.warn('[TokenPool] initial fetch threw:', e && e.message);
-        showToast(t('toast.relayTokenFetchFailed'));
-    }
+    };
+
+    if (await attempt('initial fetch')) { _initialTokenFetchInFlight = false; return; }
+    await new Promise(r => setTimeout(r, 2000));
+    if (await attempt('retry 1')) { _initialTokenFetchInFlight = false; return; }
+    await new Promise(r => setTimeout(r, 5000));
+    if (await attempt('retry 2')) { _initialTokenFetchInFlight = false; return; }
+
+    // 3 failures across ~7 s. This is a real outage, surface to user.
+    showToast(t('toast.relayTokenFetchFailed'));
+    _initialTokenFetchInFlight = false;
 }
 
 export function attemptUnlock() {

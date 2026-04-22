@@ -12,7 +12,7 @@ import { showView } from './views.js';
 import { hasDirectConnection, sendViaWebRTC, seenGossipMessages, markGossipSeen,
          handleRTCOffer, handleRTCAnswer, handleRTCIce } from './webrtc.js';
 import { sendToRelay, discoverPeers, startDiscoveryInterval, connMgr } from './connection.js';
-import { spendOneToken, maybeRefill, requestBatch, queueSize } from './token-pool.js';
+import { maybeRefill, acquireToken } from './token-pool.js';
 import { lookupHomeRelay } from './peer-relay-cache.js';
 import { isOnionActive, sendViaOnion } from './onion.js';
 import { loadContacts, appendMessage, answerIncomingCall, loadAddressBook,
@@ -106,11 +106,15 @@ export async function sendRawEnvelope(toPeerId, env) {
     if (!homeRelay || homeRelay === connMgr.relayUrl) {
         let token;
         try {
-            token = spendOneToken(connMgr.relayUrl);
+            // Waits up to 10 s for the pool to be primed by the initial
+            // VOPRF batch before surfacing a failure toast. This replaces
+            // the pre-fix behavior that dropped the send immediately on
+            // cold boot whenever hydrate/drain fired before the first
+            // batch landed.
+            token = await acquireToken(connMgr.relayUrl, { timeoutMs: 10_000 });
         } catch (e) {
-            console.warn('[Relay] home token pool empty — dropping send; refill in progress');
+            console.warn('[Relay] acquireToken failed:', e && e.reason);
             showToast(t('toast.relayTokenEmpty'));
-            maybeRefill(connMgr.relayUrl);
             return false;
         }
         const ok = sendToRelay(toPeerId, env, token);
@@ -129,17 +133,13 @@ export async function sendRawEnvelope(toPeerId, env) {
         showToast(t('toast.peerLookupFailed'));
         return false;
     }
-    if (queueSize(homeRelay) === 0) {
-        const res = await requestBatch(homeRelay);
-        if (!res || !res.ok) {
-            showToast(t('toast.relayTokenEmpty'));
-            return false;
-        }
-    }
     let token;
     try {
-        token = spendOneToken(homeRelay);
-    } catch (_) {
+        // Cross-relay outbound: acquireToken spends from *this relay's*
+        // per-relay pool, kicking off a refill if the pool is cold.
+        token = await acquireToken(homeRelay, { timeoutMs: 10_000 });
+    } catch (e) {
+        console.warn('[Relay] cross-relay acquireToken failed:', e && e.reason);
         showToast(t('toast.relayTokenEmpty'));
         return false;
     }

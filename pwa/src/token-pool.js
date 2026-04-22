@@ -63,7 +63,7 @@ const pools = new Map();
 const HOME_RELAY_SENTINEL = Symbol.for('parolnet.token-pool.home');
 
 function newPoolState() {
-    return {
+    const p = {
         currentEpochId: null,   // hex string (8 chars = 4 bytes)
         currentExpiresAt: 0,    // unix seconds (end of epoch incl. grace)
         queue: [],              // array of hex-encoded Token CBOR
@@ -71,7 +71,32 @@ function newPoolState() {
         // Injection seam for tests: replaced to observe / stub `requestBatch`
         // without touching the module's real fetch path.
         _requestBatchImpl: null,
+        // Pool-readiness signal. `readyPromise` resolves on the next
+        // successful `requestBatch` and rejects on a failed one; each
+        // outcome replaces the trio with a fresh pending cycle so the
+        // next wave of waiters has something new to await. See
+        // `acquireToken` below.
+        readyPromise: null,
+        readyResolve: null,
+        readyReject: null,
     };
+    _installFreshReadyPromise(p);
+    return p;
+}
+
+// Replace the ready-signal trio with a fresh pending promise. Called on
+// pool creation AND after each batch attempt resolves/rejects so the next
+// `acquireToken` caller awaits the *next* cycle, not the one that just
+// finished.
+function _installFreshReadyPromise(pool) {
+    pool.readyPromise = new Promise((resolve, reject) => {
+        pool.readyResolve = resolve;
+        pool.readyReject = reject;
+    });
+    // Swallow unhandled-rejection noise when no one is currently awaiting —
+    // the promise's semantic is "the next batch may or may not have an
+    // interested listener". Callers opt in via acquireToken.
+    pool.readyPromise.catch(() => {});
 }
 
 /**
@@ -327,16 +352,65 @@ function randomNonceHex(bytes = 32) {
 export async function requestBatch(relayUrl, batchSize = DEFAULT_BATCH_SIZE) {
     const pool = tokenPoolFor(relayUrl);
     if (pool._requestBatchImpl) {
-        return pool._requestBatchImpl(relayUrl, batchSize);
+        // Wrap the test-injected impl so it still participates in the
+        // ready-promise signal. Without this the acquireToken unit tests
+        // would hang — their mocked requestBatch wouldn't trigger
+        // readyResolve / readyReject.
+        let res;
+        try {
+            res = await pool._requestBatchImpl(relayUrl, batchSize);
+        } catch (err) {
+            _notifyBatchOutcome(pool, { ok: false, reason: 'exception:' + (err && err.message || err) });
+            throw err;
+        }
+        _notifyBatchOutcome(pool, res);
+        return res;
     }
     if (pool.refilling) {
-        return { ok: false, reason: 'already-refilling' };
+        const res = { ok: false, reason: 'already-refilling' };
+        // Don't reject readyPromise here — another call is in flight and
+        // will resolve/reject it. This keeps "already-refilling" invisible
+        // to acquireToken waiters, who still get the eventual outcome.
+        return res;
     }
     const wasm = await getWasm();
     if (!wasm || !wasm.token_prepare_blind || !wasm.token_unblind || !wasm.sign_bytes || !wasm.get_public_key) {
-        return { ok: false, reason: 'wasm-not-ready' };
+        const res = { ok: false, reason: 'wasm-not-ready' };
+        _notifyBatchOutcome(pool, res);
+        return res;
     }
     pool.refilling = true;
+    let _result;
+    try {
+        _result = await _runBatchFetch(pool, relayUrl, batchSize, wasm);
+    } finally {
+        pool.refilling = false;
+    }
+    _notifyBatchOutcome(pool, _result);
+    return _result;
+}
+
+// Notify any `acquireToken` waiters of the outcome of a `requestBatch`
+// attempt. Always installs a fresh pending `readyPromise` afterwards so
+// the next wave of waiters has a new one to await.
+function _notifyBatchOutcome(pool, res) {
+    if (res && res.ok) {
+        try { pool.readyResolve({ count: res.count, epochId: res.epochId }); } catch (_) {}
+    } else {
+        try {
+            pool.readyReject(Object.assign(
+                new Error('token-refill-failed'),
+                { reason: (res && res.reason) || 'unknown' }
+            ));
+        } catch (_) {}
+    }
+    _installFreshReadyPromise(pool);
+}
+
+// Inner body of the real `requestBatch` — kept as a private helper so the
+// outer function's try/finally can cleanly flip `pool.refilling` without
+// entangling it with the ready-promise plumbing.
+async function _runBatchFetch(pool, relayUrl, batchSize, wasm) {
     try {
         const prepared = wasm.token_prepare_blind(batchSize);
         const handleHex = prepared.handle_hex;
@@ -420,8 +494,57 @@ export async function requestBatch(relayUrl, batchSize = DEFAULT_BATCH_SIZE) {
         return { ok: true, count: tokenHexes.length, epochId: epochIdHex };
     } catch (e) {
         return { ok: false, reason: 'exception:' + (e && e.message || e) };
+    }
+}
+
+// ── acquireToken — outbound-send readiness ─────────────────────
+/**
+ * Await a spendable token for `relayUrl`. Resolves with a token hex on
+ * success; rejects with a tagged error on timeout or refill failure.
+ * Triggers `maybeRefill` internally if the pool is empty on entry so
+ * callers don't have to coordinate with the refill cycle themselves.
+ *
+ * Rejection shapes:
+ *   - `{ reason: 'refill-timeout' }`  — no batch resolved within timeoutMs
+ *   - `{ reason: 'refill-failed', cause? }` — requestBatch rejected, or the
+ *                                            batch landed but the pool is
+ *                                            still empty (stale-epoch purge)
+ *
+ * @param {string} relayUrl
+ * @param {{ timeoutMs?: number }} [opts]
+ * @returns {Promise<string>}
+ */
+export async function acquireToken(relayUrl, opts = {}) {
+    const timeoutMs = opts.timeoutMs ?? 10_000;
+    try { return spendOneToken(relayUrl); } catch { /* empty pool — wait below */ }
+
+    const pool = tokenPoolFor(relayUrl);
+    // Fire-and-forget; idempotent when a refill is already in flight
+    // (maybeRefill short-circuits on pool.refilling).
+    maybeRefill(relayUrl);
+
+    let timeoutHandle;
+    const timeout = new Promise((_, rej) => {
+        timeoutHandle = setTimeout(
+            () => rej(Object.assign(new Error('token-refill-timeout'), { reason: 'refill-timeout' })),
+            timeoutMs,
+        );
+    });
+    try {
+        await Promise.race([pool.readyPromise, timeout]);
+    } catch (err) {
+        if (err && err.reason === 'refill-timeout') throw err;
+        throw Object.assign(new Error('token-refill-failed'), { reason: 'refill-failed', cause: err });
     } finally {
-        pool.refilling = false;
+        clearTimeout(timeoutHandle);
+    }
+
+    try { return spendOneToken(relayUrl); }
+    catch (e) {
+        // Pool reported ready but is still empty — e.g. every token got
+        // purged by a mid-flight epoch rotation. Treat as refill-failed so
+        // the caller surfaces a real error.
+        throw Object.assign(new Error('token-refill-empty'), { reason: 'refill-failed' });
     }
 }
 

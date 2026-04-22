@@ -1354,6 +1354,78 @@ describe('relay token pool', () => {
         // so a single reload does not drain the hourly cap.
         assert.ok(mod.TOKEN_POOL_DEFAULT_BATCH <= 8192);
     });
+
+    test('acquireToken resolves after a pending batch lands', async () => {
+        const mod = await freshPool();
+        const { tokenPoolFor, acquireToken, resetTokenPool } = mod;
+        resetTokenPool();
+        const url = 'ws://relay.example/ws';
+        const pool = tokenPoolFor(url);
+        // Ensure maybeRefill (called inside acquireToken) will trigger the
+        // stub: empty queue + unexpired epoch satisfies the low-water path.
+        pool.currentEpochId = 'deadbeef';
+        pool.currentExpiresAt = Math.floor(Date.now() / 1000) + 3600;
+
+        // Stub the batch: resolves after 50 ms, populating the pool with
+        // one fresh token.
+        pool._requestBatchImpl = async () => {
+            await new Promise(r => setTimeout(r, 50));
+            pool.queue.push({ epoch_id: 'deadbeef', hex: 'aa' });
+            return { ok: true, count: 1, epochId: 'deadbeef' };
+        };
+
+        const token = await acquireToken(url, { timeoutMs: 500 });
+        assert.equal(token, 'aa', 'acquireToken returns the freshly-issued hex');
+    });
+
+    test('acquireToken rejects with refill-failed when the batch errors', async () => {
+        const mod = await freshPool();
+        const { tokenPoolFor, acquireToken, resetTokenPool } = mod;
+        resetTokenPool();
+        const url = 'ws://relay.example/ws';
+        const pool = tokenPoolFor(url);
+        pool.currentEpochId = 'deadbeef';
+        pool.currentExpiresAt = Math.floor(Date.now() / 1000) + 3600;
+
+        pool._requestBatchImpl = async () => {
+            await new Promise(r => setTimeout(r, 20));
+            return { ok: false, reason: 'http-503' };
+        };
+
+        let caught;
+        try { await acquireToken(url, { timeoutMs: 500 }); }
+        catch (e) { caught = e; }
+        assert.ok(caught, 'acquireToken threw');
+        assert.equal(caught.reason, 'refill-failed');
+    });
+
+    test('acquireToken rejects with refill-timeout when no batch arrives', async () => {
+        const mod = await freshPool();
+        const { tokenPoolFor, acquireToken, resetTokenPool } = mod;
+        resetTokenPool();
+        const url = 'ws://relay.example/ws';
+        const pool = tokenPoolFor(url);
+        // currentExpiresAt = 0 means maybeRefill's epoch checks are false;
+        // we also stub _requestBatchImpl to hang forever so nothing
+        // resolves readyPromise. With an unexpired-epoch guard maybeRefill
+        // would short-circuit to a no-op — we want the acquireToken timeout
+        // path to fire, so we arrange both conditions: empty queue + no
+        // batch-in-flight + never-resolving stub when eventually called.
+        pool._requestBatchImpl = () => new Promise(() => {}); // never settles
+        // Force maybeRefill to actually call through: empty queue + room.
+        pool.currentEpochId = 'deadbeef';
+        pool.currentExpiresAt = Math.floor(Date.now() / 1000) + 3600;
+
+        let caught;
+        const t0 = Date.now();
+        try { await acquireToken(url, { timeoutMs: 150 }); }
+        catch (e) { caught = e; }
+        const elapsed = Date.now() - t0;
+        assert.ok(caught, 'acquireToken threw');
+        assert.equal(caught.reason, 'refill-timeout');
+        // Should have waited at least ~150 ms before rejecting.
+        assert.ok(elapsed >= 140, 'waited for timeout (elapsed=' + elapsed + ')');
+    });
 });
 
 // ── H12 Phase 2 cross-relay ────────────────────────────────────
