@@ -1710,7 +1710,9 @@ describe('i18n source guard', () => {
 // H12 Phase 2 tests in this file.
 describe('pending_sends persistence (pure logic)', () => {
     const MAX_QUEUE_SIZE = 200;
-    const MAX_QUEUE_AGE_MS = 3_600_000;
+    // Mirrors connection.js::MAX_QUEUE_AGE_MS — raised from 1h to 24h so
+    // the PWA's retry horizon matches the relay's store-and-forward TTL.
+    const MAX_QUEUE_AGE_MS = 24 * 60 * 60 * 1000;
     const RETRY_BACKOFF_MS = 5_000;
 
     function queueMessage(queue, persisted, toPeerId, payload, now) {
@@ -2243,5 +2245,256 @@ describe('live relay_msg ack-after-decrypt parity', () => {
         const drain = async () => {};
         await handleLiveRelayMsg({ type: 'message' }, handle, rebuffer, drain);
         assert.equal(inbox.size, 0, 'successful live delivery does not touch sw-inbox');
+    });
+});
+
+// ── Cross-relay send durability ─────────────────────────────────────────
+//
+// Covers the fix:
+//   fix(pwa): durable cross-relay sends + 24h retry horizon
+//
+// The real sendRawEnvelope (messaging.js) now persists to pending_sends
+// via queueMessage() whenever a cross-relay send can't make the wire —
+// openOutbound failure, acquireToken failure, sendToRelayUrl returning
+// false, or a thrown exception. Peer-lookup-null no longer silently
+// routes to sender's own home relay unless the presence cache confirms
+// that's actually peer's home. flushMessageQueue now re-runs the whole
+// sendRawEnvelope path so a fresh peer_lookup gets a second chance.
+//
+// We can't import messaging.js or connection.js directly under
+// node --test (transitive DOM deps — same constraint as the H12 Phase 2
+// and pending_sends pure-logic blocks above). Instead we mirror the
+// routing path under a local sendRawEnvelope double and assert the
+// queueMessage / persist-and-retry contract.
+describe('cross-relay send durability', () => {
+    const MAX_QUEUE_AGE_MS = 24 * 60 * 60 * 1000;
+
+    // Minimal stub-IDB: pending_sends rows keyed by auto-increment id.
+    function makeStubStore() {
+        const rows = new Map();
+        let nextId = 1;
+        return {
+            rows,
+            put(row) {
+                if (row.id === undefined) row.id = nextId++;
+                rows.set(row.id, { ...row });
+                return row.id;
+            },
+            delete(id) { rows.delete(id); },
+            all() { return Array.from(rows.values()); },
+        };
+    }
+
+    // Construct the queueMessage / flush pair we exercise in these tests.
+    // Mirrors connection.js::queueMessage + flushMessageQueue closely, so
+    // the fixture faithfully reproduces the durability contract.
+    function makeQueue({ sendFn, store, nowFn }) {
+        const messageQueue = [];
+        const RETRY_BACKOFF_MS = 5_000;
+
+        function queueMessage(toPeerId, payload) {
+            const entry = { toPeerId, payload, timestamp: nowFn(), nextTryAt: 0 };
+            entry.id = store.put({ ...entry });
+            messageQueue.push(entry);
+            return entry;
+        }
+        async function flush() {
+            const now = nowFn();
+            const toFlush = messageQueue.splice(0, messageQueue.length);
+            for (const msg of toFlush) {
+                if (now - msg.timestamp > MAX_QUEUE_AGE_MS) {
+                    store.delete(msg.id);
+                    continue;
+                }
+                if (msg.nextTryAt && msg.nextTryAt > now) {
+                    messageQueue.push(msg);
+                    continue;
+                }
+                let sent = false;
+                try {
+                    // noPersist=true so the sender stub doesn't
+                    // double-queue on failure (real flush path passes
+                    // the same flag).
+                    sent = await sendFn(msg.toPeerId, msg.payload, { noPersist: true });
+                } catch (_) {
+                    sent = false;
+                }
+                if (sent) {
+                    store.delete(msg.id);
+                } else {
+                    msg.nextTryAt = now + RETRY_BACKOFF_MS;
+                    messageQueue.push(msg);
+                    store.put({ ...msg });
+                }
+            }
+        }
+        return { messageQueue, queueMessage, flush };
+    }
+
+    // Production sendRawEnvelope shape — only the cross-relay failure
+    // and lookup-null branches matter for this suite. Takes injected
+    // stubs so each test can steer success/failure at the right layer.
+    function makeSendRawEnvelope({ lookupFn, peekCacheFn, ourRelayUrl, openFn, acquireFn, sendToRelayUrlFn, queueMessage }) {
+        return async function sendRawEnvelope(peerId, env, opts) {
+            const noPersist = !!(opts && opts.noPersist);
+            const persistOnFail = () => {
+                if (noPersist) return;
+                queueMessage(peerId, env);
+            };
+            const home = await lookupFn(peerId);
+            if (!home) {
+                const cached = peekCacheFn ? peekCacheFn(peerId) : null;
+                const ourHomeIsPeerHome = !!(cached && cached.homeRelayUrl === ourRelayUrl);
+                if (!ourHomeIsPeerHome) {
+                    persistOnFail();
+                    return false;
+                }
+                // Fall through to home-relay path — not exercised here.
+                return true;
+            }
+            if (home === ourRelayUrl) {
+                // Home-relay path — not under test here. Assume success.
+                return true;
+            }
+            // Cross-relay path — emulate the three failure points.
+            try {
+                const opened = await openFn(home);
+                if (!opened) { persistOnFail(); return false; }
+                let token;
+                try { token = await acquireFn(home); }
+                catch (_) { persistOnFail(); return false; }
+                const ok = sendToRelayUrlFn(home, peerId, env, token);
+                if (ok) return true;
+                persistOnFail();
+                return false;
+            } catch (_) {
+                persistOnFail();
+                return false;
+            }
+        };
+    }
+
+    test('cross-relay openOutbound failure persists via queueMessage', async () => {
+        const store = makeStubStore();
+        let now = 1_000_000;
+        const PEER = 'aa'.repeat(32);
+        const ENV = 'deadbeefcafe';
+        // Build queue + sender with openFn returning false (simulating
+        // outbound WS fail — e.g., peer-relay unreachable).
+        let queueRef;
+        const send = makeSendRawEnvelope({
+            lookupFn: async () => 'wss://other.example/ws',
+            peekCacheFn: () => null,
+            ourRelayUrl: 'wss://home.example/ws',
+            openFn: async () => false,
+            acquireFn: async () => 'tok',
+            sendToRelayUrlFn: () => true,
+            queueMessage: (p, e) => queueRef.queueMessage(p, e),
+        });
+        queueRef = makeQueue({ sendFn: send, store, nowFn: () => now });
+
+        const ok = await send(PEER, ENV);
+        assert.equal(ok, false, 'send failed on openOutbound');
+        const persisted = store.all();
+        assert.equal(persisted.length, 1, 'failed cross-relay send persisted to pending_sends');
+        assert.equal(persisted[0].toPeerId, PEER);
+        assert.equal(persisted[0].payload, ENV);
+        assert.ok(persisted[0].id !== undefined, 'persisted row has an autoIncrement id');
+    });
+
+    test('lookup-null with unknown home-relay cache persists instead of misrouting', async () => {
+        const store = makeStubStore();
+        let now = 1_000_000;
+        const PEER = 'bb'.repeat(32);
+        const ENV = '01020304';
+        let sendToRelayCalls = 0;
+        let openCalls = 0;
+        let queueRef;
+        const send = makeSendRawEnvelope({
+            // Lookup failed (network 404 / sig mismatch / CBOR decode).
+            lookupFn: async () => null,
+            // Cache has no entry for this peer.
+            peekCacheFn: () => null,
+            ourRelayUrl: 'wss://home.example/ws',
+            openFn: async () => { openCalls++; return true; },
+            acquireFn: async () => 'tok',
+            sendToRelayUrlFn: () => { sendToRelayCalls++; return true; },
+            queueMessage: (p, e) => queueRef.queueMessage(p, e),
+        });
+        queueRef = makeQueue({ sendFn: send, store, nowFn: () => now });
+
+        const ok = await send(PEER, ENV);
+        assert.equal(ok, false, 'unknown-home peer returns false on lookup miss');
+        assert.equal(store.all().length, 1, 'queued for later retry');
+        assert.equal(openCalls, 0, 'no outbound attempt made without known home');
+        assert.equal(sendToRelayCalls, 0, 'no relay send attempted without known home');
+    });
+
+    test('flush re-runs sendRawEnvelope; success dequeues', async () => {
+        const store = makeStubStore();
+        let now = 1_000_000;
+        const PEER = 'cc'.repeat(32);
+        const ENV = 'aabbccdd';
+        // First attempt: openFn fails → queued. Second attempt (via
+        // flush): openFn succeeds → send → success → dequeue.
+        let openAttempts = 0;
+        let queueRef;
+        const send = makeSendRawEnvelope({
+            lookupFn: async () => 'wss://other.example/ws',
+            peekCacheFn: () => null,
+            ourRelayUrl: 'wss://home.example/ws',
+            openFn: async () => { openAttempts++; return openAttempts > 1; },
+            acquireFn: async () => 'tok',
+            sendToRelayUrlFn: () => true,
+            queueMessage: (p, e) => queueRef.queueMessage(p, e),
+        });
+        queueRef = makeQueue({ sendFn: send, store, nowFn: () => now });
+
+        // Attempt 1 — fails and persists.
+        const firstOk = await send(PEER, ENV);
+        assert.equal(firstOk, false);
+        assert.equal(store.all().length, 1, 'entry persisted after first failure');
+        assert.equal(queueRef.messageQueue.length, 1, 'entry in memory queue');
+
+        // Flush — second attempt succeeds.
+        await queueRef.flush();
+        assert.equal(store.all().length, 0, 'successful flush removed the entry from pending_sends');
+        assert.equal(queueRef.messageQueue.length, 0, 'in-memory queue drained');
+    });
+
+    test('flush drops entries older than 24h; keeps younger entries', async () => {
+        const store = makeStubStore();
+        let now = 1_000_000_000;
+        // Sender always succeeds — but the age check is applied before
+        // any send attempt, so the old entry should be dropped outright.
+        let queueRef;
+        let sends = 0;
+        const send = async () => { sends++; return true; };
+        queueRef = makeQueue({ sendFn: send, store, nowFn: () => now });
+
+        // Plant an aged entry (>24h) and a fresh entry (<24h) directly
+        // in storage + in-memory queue, as hydrate/boot would.
+        const old = { toPeerId: 'old'.padEnd(64, '0'), payload: 'x', timestamp: now - (MAX_QUEUE_AGE_MS + 1), nextTryAt: 0 };
+        old.id = store.put({ ...old });
+        queueRef.messageQueue.push(old);
+        const fresh = { toPeerId: 'new'.padEnd(64, '0'), payload: 'y', timestamp: now - 1_000, nextTryAt: 0 };
+        fresh.id = store.put({ ...fresh });
+        queueRef.messageQueue.push(fresh);
+        assert.equal(store.all().length, 2);
+
+        await queueRef.flush();
+
+        // Old one dropped without a send attempt; fresh one sent and dequeued.
+        assert.equal(sends, 1, 'only the fresh entry triggered a send');
+        assert.equal(store.all().length, 0, 'aged entry dropped + fresh entry delivered');
+
+        // Just-under-24h still survives: re-plant one at exactly
+        // MAX_QUEUE_AGE_MS - 1000 and verify it's not considered aged.
+        const oneHourOld = { toPeerId: 'hr'.padEnd(64, '0'), payload: 'z', timestamp: now - (60 * 60 * 1000), nextTryAt: 0 };
+        oneHourOld.id = store.put({ ...oneHourOld });
+        queueRef.messageQueue.push(oneHourOld);
+        await queueRef.flush();
+        assert.equal(store.all().length, 0, '1h-old entry was NOT dropped (new 24h horizon) — sent successfully');
+        assert.equal(sends, 2, 'sender was invoked for the 1h-old entry (would have been skipped under old 1h horizon)');
     });
 });

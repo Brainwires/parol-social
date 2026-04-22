@@ -11,9 +11,9 @@ import { dbGet, dbPut, dbGetAll, dbGetByIndex, dbDelete, updateContactState } fr
 import { showView } from './views.js';
 import { hasDirectConnection, sendViaWebRTC, seenGossipMessages, markGossipSeen,
          handleRTCOffer, handleRTCAnswer, handleRTCIce } from './webrtc.js';
-import { sendToRelay, discoverPeers, startDiscoveryInterval, connMgr } from './connection.js';
+import { sendToRelay, discoverPeers, startDiscoveryInterval, connMgr, queueMessage } from './connection.js';
 import { maybeRefill, acquireToken } from './token-pool.js';
-import { lookupHomeRelay } from './peer-relay-cache.js';
+import { lookupHomeRelay, _peekCache } from './peer-relay-cache.js';
 import { isOnionActive, sendViaOnion } from './onion.js';
 import { loadContacts, appendMessage, answerIncomingCall, loadAddressBook,
          stopLocalMedia, stopCallTimer, clearNoAnswerTimer } from './ui-chat.js';
@@ -90,8 +90,18 @@ async function sendEnvelope(toPeerId, msgType, obj) {
 ///
 /// The WebRTC-first / onion / home-relay / cross-relay cascade is identical
 /// to `sendEnvelope`; only the encoding step is pulled out.
-export async function sendRawEnvelope(toPeerId, env) {
+export async function sendRawEnvelope(toPeerId, env, opts) {
     if (!env) return false;
+    // `noPersist` is set by flushMessageQueue: the caller already owns a
+    // pending_sends row for this payload, so a fresh queueMessage() on
+    // failure would duplicate it. The outer flush loop handles re-queue +
+    // backoff for no-persist callers.
+    const noPersist = !!(opts && opts.noPersist);
+    const persistOnFail = () => {
+        if (noPersist) return;
+        try { queueMessage(toPeerId, env); } catch (_) {}
+    };
+
     markRealSend();
     if (hasDirectConnection(toPeerId)) {
         return sendViaWebRTC(toPeerId, env);
@@ -103,7 +113,27 @@ export async function sendRawEnvelope(toPeerId, env) {
     let homeRelay = null;
     try { homeRelay = await lookupHomeRelay(toPeerId); } catch (_) { homeRelay = null; }
 
-    if (!homeRelay || homeRelay === connMgr.relayUrl) {
+    // Peer-lookup miss: only route via sender's own home relay when we have
+    // positive evidence (presence cache hit) that the home relay IS the
+    // peer's home. Otherwise persist to pending_sends — a silent fall-back
+    // would stash the frame on the wrong relay and the sender would never
+    // know (IMG_0608 / IMG_0609 scenario).
+    if (!homeRelay) {
+        let cached = null;
+        try { cached = _peekCache(toPeerId); } catch (_) { cached = null; }
+        const ourHomeIsPeerHome = !!(cached && cached.homeRelayUrl === connMgr.relayUrl);
+        if (!ourHomeIsPeerHome) {
+            // No cached evidence — persist and return false so flush will
+            // retry with a refreshed lookup.
+            persistOnFail();
+            return false;
+        }
+        // Cache says our home IS peer's home — fall through to home-relay
+        // path below (which is the correct route).
+        homeRelay = connMgr.relayUrl;
+    }
+
+    if (homeRelay === connMgr.relayUrl) {
         let token;
         try {
             // Waits up to 10 s for the pool to be primed by the initial
@@ -119,33 +149,47 @@ export async function sendRawEnvelope(toPeerId, env) {
         }
         const ok = sendToRelay(toPeerId, env, token);
         if (ok) maybeRefill(connMgr.relayUrl);
-        // A null homeRelay is the common case — brand-new contacts, peers on
-        // our own relay, or single-relay deployments. The home-relay send
-        // path above handles all three. Emitting a toast here surfaced a
-        // false error on every send to an uncached peer; the relay-server
-        // will bounce with "peer not connected" if the fallback genuinely
-        // can't deliver.
+        // Home-relay path: either the peer is on our relay (direct deliver)
+        // or offline (store-and-forward). The relay-server will bounce with
+        // "peer not connected" if it genuinely can't deliver.
         return ok;
     }
 
-    const opened = await connMgr.openOutbound(homeRelay);
-    if (!opened) {
-        showToast(t('toast.peerLookupFailed'));
-        return false;
-    }
-    let token;
+    // Cross-relay send: any failure along the way (open, token, send) is
+    // persisted into pending_sends so flushMessageQueue can retry later
+    // with a fresh peer_lookup. We still return false on the immediate
+    // attempt so the caller knows this send didn't make the wire.
     try {
-        // Cross-relay outbound: acquireToken spends from *this relay's*
-        // per-relay pool, kicking off a refill if the pool is cold.
-        token = await acquireToken(homeRelay, { timeoutMs: 10_000 });
+        const opened = await connMgr.openOutbound(homeRelay);
+        if (!opened) {
+            persistOnFail();
+            showToast(t('toast.peerLookupFailed'));
+            return false;
+        }
+        let token;
+        try {
+            // Cross-relay outbound: acquireToken spends from *this relay's*
+            // per-relay pool, kicking off a refill if the pool is cold.
+            token = await acquireToken(homeRelay, { timeoutMs: 10_000 });
+        } catch (e) {
+            console.warn('[Relay] cross-relay acquireToken failed:', e && e.reason);
+            persistOnFail();
+            showToast(t('toast.relayTokenEmpty'));
+            return false;
+        }
+        const ok = connMgr.sendToRelayUrl(homeRelay, toPeerId, env, token);
+        if (ok) {
+            maybeRefill(homeRelay);
+            return true;
+        }
+        // Send rejected by the outbound WS (not open, serialize error, etc.)
+        persistOnFail();
+        return false;
     } catch (e) {
-        console.warn('[Relay] cross-relay acquireToken failed:', e && e.reason);
-        showToast(t('toast.relayTokenEmpty'));
+        console.warn('[Relay] cross-relay send failed:', e && e.message);
+        persistOnFail();
         return false;
     }
-    const ok = connMgr.sendToRelayUrl(homeRelay, toPeerId, env, token);
-    if (ok) maybeRefill(homeRelay);
-    return ok;
 }
 
 // Call-signaling helper. Wraps a `{action, callId, ...payload}` body in a

@@ -283,7 +283,12 @@ export function sendToRelay(toPeerId, payload, token) {
 // PendingSends` reloads rows back into `messageQueue`.
 const messageQueue = [];
 const MAX_QUEUE_SIZE = 200;
-const MAX_QUEUE_AGE_MS = 3600000; // 1 hour
+// 24 hours — matches the relay's store-and-forward TTL so the PWA doesn't
+// drop a pending retry the relay would have honored. Prior 1h horizon lost
+// cross-relay sends that failed at the outbound-WS layer (home-relay
+// unreachable, token starvation, etc.) — flushMessageQueue would expire
+// them before the outbound relay was back in reach.
+const MAX_QUEUE_AGE_MS = 24 * 60 * 60 * 1000;
 const RETRY_BACKOFF_MS = 5000;    // per-message head-of-line skip window
 
 // Fire-and-forget IDB write. Attaches the autoIncrement id back onto the
@@ -356,16 +361,17 @@ export async function hydratePendingSends() {
 
 export function flushMessageQueue() {
     if (messageQueue.length === 0) return;
-    // Late-bound import to avoid a circular dependency: messaging.js →
-    // token-pool.js → connection.js. The flush path only runs on
-    // reconnect so the lazy lookup cost is negligible.
-    import('./token-pool.js').then(({ spendOneToken }) => {
+    // Dynamic import to break the connection.js ↔ messaging.js cycle:
+    // messaging.js imports queueMessage from here, so we can't import
+    // sendRawEnvelope at module-top. Flush only runs on reconnect /
+    // WebRTC open so the lazy lookup cost is negligible.
+    import('./messaging.js').then(async ({ sendRawEnvelope }) => {
         const now = Date.now();
         console.log('[Queue] Flushing', messageQueue.length, 'queued messages');
         const toFlush = messageQueue.splice(0, messageQueue.length);
         for (const msg of toFlush) {
             if (now - msg.timestamp > MAX_QUEUE_AGE_MS) {
-                // Aged-out: drop from storage too.
+                // Aged-out (> 24h): drop from storage too.
                 _deletePersisted(msg);
                 continue;
             }
@@ -374,13 +380,17 @@ export function flushMessageQueue() {
                 continue;
             }
             let sent = false;
-            if (hasDirectConnection(msg.toPeerId)) {
-                sent = sendViaWebRTC(msg.toPeerId, msg.payload);
-            }
-            if (!sent) {
-                let token;
-                try { token = spendOneToken(connMgr.relayUrl); } catch { token = null; }
-                if (token) sent = sendToRelay(msg.toPeerId, msg.payload, token);
+            try {
+                // Full routing path: WebRTC → onion → home-relay (with
+                // fresh peer_lookup) → cross-relay. A peer that was
+                // unreachable at queue time may now have a valid
+                // peer_lookup cache entry, or WebRTC may now be up.
+                // noPersist: flush already owns this row; sendRawEnvelope
+                // must NOT re-queue on failure or we'd duplicate the entry.
+                sent = await sendRawEnvelope(msg.toPeerId, msg.payload, { noPersist: true });
+            } catch (e) {
+                console.warn('[Queue] sendRawEnvelope threw on flush:', e && e.message);
+                sent = false;
             }
             if (sent) {
                 _deletePersisted(msg);
