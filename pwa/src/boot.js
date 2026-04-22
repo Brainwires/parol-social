@@ -35,6 +35,7 @@ import {
 } from './settings.js';
 import { initI18n, t, changeLanguage, applyToDOM, getCurrentLang } from './i18n.js';
 import { showSafetyNumberModal } from './safety-number.js';
+import { handleLiveRelayMsg } from './live-relay-handler.js';
 
 // ── WASM Loading ────────────────────────────────────────────
 async function loadWasm() {
@@ -497,8 +498,11 @@ function _drainSwInboxOnce() {
 export { drainSwInbox };
 
 // TODO: factor this out alongside the messaging.js `delivered/reason` shape
-// into a shared module once we add more transient reasons. For now duplicated
-// inline (only two cases) — keep in sync with messaging.js.
+// into a shared module once we add more transient reasons. Retained here
+// for any future live-path or diagnostic use; the live relay_msg handler
+// no longer gates on it (see handleLiveRelayMsg and the commit
+// "fix(pwa): live relay_msg path ack-after-decrypt parity").
+// eslint-disable-next-line no-unused-vars
 function isTransientReason(reason) {
     return reason === 'wasm-not-ready' || reason === 'no-sessions-yet';
 }
@@ -540,28 +544,18 @@ function registerServiceWorker() {
         if (!d || typeof d !== 'object') return;
         if (d.type === 'relay_msg') {
             // Live frame from SW (SW saw a page client so it posted directly
-            // instead of buffering). If our handler defers for a transient
-            // reason (WASM still loading, no sessions imported yet), the
-            // frame would otherwise be silently dropped — nothing in
-            // sw-inbox to retry from. Re-buffer it so the next drain pass
-            // (onWasmReady, visibilitychange, post-session-restore) picks
-            // it up. Terminal failures and delivered=true need no action;
+            // instead of buffering). ANY non-delivered outcome (or a
+            // synchronous throw) re-buffers into sw-inbox and hands off
+            // classification to drainSwInbox — that path owns readiness
+            // state, terminal-marking, and dedup, so classifying twice
+            // (once here, once in the drain) is what lost frames. The
+            // most important new case is `decrypt-failed` during session
+            // restore races on a fresh-SW reconnect; previously that was
+            // silently dropped because it didn't match the transient set.
+            // Terminal failures and delivered=true need no action;
             // drain-layer dedup (seenGossipMessages) catches any stray
             // re-buffer of an already-delivered frame.
-            let res;
-            try {
-                res = handleRelayMessage(d.msg);
-            } catch (e) {
-                console.warn('[SW-Live] handleRelayMessage threw:', e && e.message);
-                res = { delivered: false, reason: 'exception' };
-            }
-            if (res && res.delivered === false && isTransientReason(res.reason)) {
-                swInboxRebuffer(d.msg).then(() => {
-                    // Opportunistic retry — drainSwInbox is single-flight
-                    // coalesced so this is cheap if another drain is active.
-                    drainSwInbox().catch(() => {});
-                });
-            }
+            handleLiveRelayMsg(d.msg, handleRelayMessage, swInboxRebuffer, drainSwInbox);
         } else if (d.type === 'relay_status') {
             const wasConnected = connMgr._swRelayConnected;
             connMgr._swRelayConnected = d.connected;

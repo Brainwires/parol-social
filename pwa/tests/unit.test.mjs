@@ -2173,3 +2173,75 @@ describe('toast carousel auto-dismiss', () => {
         }
     });
 });
+
+// ── Live relay_msg ack-after-decrypt parity ─────────────────────────
+//
+// Covers the offline-delivery gap closed by:
+//   fix(pwa): live relay_msg path ack-after-decrypt parity
+//
+// When a fresh-SW PWA reconnects, the relay drains store-and-forward
+// to the live WS, so those frames arrive at the page as live relay_msg
+// (not via sw-inbox). Previously the live handler only re-buffered on
+// the two transient reasons wasm-not-ready / no-sessions-yet; any
+// other delivered:false outcome — most importantly decrypt-failed
+// during a session-restore race — was silently dropped.
+//
+// The helper now re-buffers on ANY non-delivered outcome (and on a
+// synchronous throw) and lets drainSwInbox own classification.
+const { handleLiveRelayMsg } = await import('../src/live-relay-handler.js');
+
+describe('live relay_msg ack-after-decrypt parity', () => {
+    test('decrypt-failed outcome re-buffers then is delivered by drain', async () => {
+        // Fake sw-inbox: a Map keyed by auto-increment id.
+        const inbox = new Map();
+        let nextId = 1;
+        const rebuffer = async (msg) => { inbox.set(nextId++, msg); };
+
+        // First decrypt attempt fails (simulates a session-restore race:
+        // session_count > 0 but not for this peer yet). Second attempt
+        // succeeds. We switch behavior by mutating `ready`.
+        let ready = false;
+        const handle = (msg) => ready
+            ? { delivered: true }
+            : { delivered: false, reason: 'decrypt-failed' };
+
+        // drainSwInbox mirrors boot.js::_drainSwInboxOnce: try each row,
+        // delete on delivered:true, leave otherwise.
+        const drain = async () => {
+            for (const [id, msg] of Array.from(inbox.entries())) {
+                const res = handle(msg);
+                if (res && res.delivered) inbox.delete(id);
+            }
+        };
+
+        // Live frame arrives with decrypt still failing.
+        const frame = { type: 'message', payload: { n: 42 } };
+        await handleLiveRelayMsg(frame, handle, rebuffer, drain);
+        assert.equal(inbox.size, 1, 'non-delivered live frame re-buffered (old code would have dropped it)');
+
+        // Session catches up — drain now delivers.
+        ready = true;
+        await drain();
+        assert.equal(inbox.size, 0, 'frame delivered on retry and removed from inbox');
+    });
+
+    test('synchronous throw from handler still re-buffers', async () => {
+        const inbox = new Map();
+        let nextId = 1;
+        const rebuffer = async (msg) => { inbox.set(nextId++, msg); };
+        const handle = () => { throw new Error('boom'); };
+        const drain = async () => {};
+        await handleLiveRelayMsg({ type: 'message' }, handle, rebuffer, drain);
+        assert.equal(inbox.size, 1, 'exception path re-buffers instead of losing the frame');
+    });
+
+    test('delivered:true is a no-op (no re-buffer)', async () => {
+        const inbox = new Map();
+        let nextId = 1;
+        const rebuffer = async (msg) => { inbox.set(nextId++, msg); };
+        const handle = () => ({ delivered: true });
+        const drain = async () => {};
+        await handleLiveRelayMsg({ type: 'message' }, handle, rebuffer, drain);
+        assert.equal(inbox.size, 0, 'successful live delivery does not touch sw-inbox');
+    });
+});
