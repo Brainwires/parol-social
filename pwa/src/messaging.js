@@ -13,7 +13,7 @@ import { hasDirectConnection, sendViaWebRTC, seenGossipMessages, markGossipSeen,
          handleRTCOffer, handleRTCAnswer, handleRTCIce } from './webrtc.js';
 import { sendToRelay, discoverPeers, startDiscoveryInterval, connMgr, queueMessage } from './connection.js';
 import { maybeRefill, acquireToken } from './token-pool.js';
-import { lookupHomeRelay, _peekCache } from './peer-relay-cache.js';
+import { lookupHomeRelay } from './peer-relay-cache.js';
 import { isOnionActive, sendViaOnion } from './onion.js';
 import { loadContacts, appendMessage, answerIncomingCall, loadAddressBook,
          stopLocalMedia, stopCallTimer, clearNoAnswerTimer } from './ui-chat.js';
@@ -113,27 +113,15 @@ export async function sendRawEnvelope(toPeerId, env, opts) {
     let homeRelay = null;
     try { homeRelay = await lookupHomeRelay(toPeerId); } catch (_) { homeRelay = null; }
 
-    // Peer-lookup miss: only route via sender's own home relay when we have
-    // positive evidence (presence cache hit) that the home relay IS the
-    // peer's home. Otherwise persist to pending_sends — a silent fall-back
-    // would stash the frame on the wrong relay and the sender would never
-    // know (IMG_0608 / IMG_0609 scenario).
-    if (!homeRelay) {
-        let cached = null;
-        try { cached = _peekCache(toPeerId); } catch (_) { cached = null; }
-        const ourHomeIsPeerHome = !!(cached && cached.homeRelayUrl === connMgr.relayUrl);
-        if (!ourHomeIsPeerHome) {
-            // No cached evidence — persist and return false so flush will
-            // retry with a refreshed lookup.
-            persistOnFail();
-            return false;
-        }
-        // Cache says our home IS peer's home — fall through to home-relay
-        // path below (which is the correct route).
-        homeRelay = connMgr.relayUrl;
-    }
-
-    if (homeRelay === connMgr.relayUrl) {
+    // Peer-lookup miss (null) is legitimately the common case for first-
+    // contact sends — QR-pairing bootstrap envelopes in particular have
+    // no cache entry and will often see a null lookup if the provider's
+    // presence hasn't propagated yet. Fall through to the home-relay
+    // send path: if the provider is on this same relay the relay routes
+    // directly; if not, the relay bounces with "peer not connected" and
+    // the caller can retry. Cross-relay failures further down still
+    // persist to pending_sends for retry with a refreshed lookup.
+    if (!homeRelay || homeRelay === connMgr.relayUrl) {
         let token;
         try {
             // Waits up to 10 s for the pool to be primed by the initial

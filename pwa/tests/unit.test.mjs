@@ -2334,7 +2334,13 @@ describe('cross-relay send durability', () => {
     // Production sendRawEnvelope shape — only the cross-relay failure
     // and lookup-null branches matter for this suite. Takes injected
     // stubs so each test can steer success/failure at the right layer.
-    function makeSendRawEnvelope({ lookupFn, peekCacheFn, ourRelayUrl, openFn, acquireFn, sendToRelayUrlFn, queueMessage }) {
+    //
+    // Post-regression-fix: lookup-null falls through to the home-relay
+    // path (matches first-contact sends such as QR-pairing bootstraps
+    // where presence hasn't propagated yet). Cross-relay failures still
+    // persist to pending_sends; home-relay failures also persist so the
+    // home-relay path has its own durability net.
+    function makeSendRawEnvelope({ lookupFn, ourRelayUrl, homeSendFn, openFn, acquireFn, sendToRelayUrlFn, queueMessage }) {
         return async function sendRawEnvelope(peerId, env, opts) {
             const noPersist = !!(opts && opts.noPersist);
             const persistOnFail = () => {
@@ -2342,19 +2348,15 @@ describe('cross-relay send durability', () => {
                 queueMessage(peerId, env);
             };
             const home = await lookupFn(peerId);
-            if (!home) {
-                const cached = peekCacheFn ? peekCacheFn(peerId) : null;
-                const ourHomeIsPeerHome = !!(cached && cached.homeRelayUrl === ourRelayUrl);
-                if (!ourHomeIsPeerHome) {
-                    persistOnFail();
-                    return false;
-                }
-                // Fall through to home-relay path — not exercised here.
-                return true;
-            }
-            if (home === ourRelayUrl) {
-                // Home-relay path — not under test here. Assume success.
-                return true;
+            if (!home || home === ourRelayUrl) {
+                // Home-relay path (or lookup-miss fallback). A null
+                // lookup is the legitimate first-contact case — just
+                // route through our own home relay and let it deliver
+                // directly or store-and-forward.
+                const okHome = homeSendFn ? homeSendFn(peerId, env) : true;
+                if (okHome) return true;
+                persistOnFail();
+                return false;
             }
             // Cross-relay path — emulate the three failure points.
             try {
@@ -2402,32 +2404,54 @@ describe('cross-relay send durability', () => {
         assert.ok(persisted[0].id !== undefined, 'persisted row has an autoIncrement id');
     });
 
-    test('lookup-null with unknown home-relay cache persists instead of misrouting', async () => {
+    test('lookup-null falls through to home-relay send (QR-pairing first-contact path)', async () => {
+        // Regression guard for the QR-pairing fix: first-contact sends
+        // legitimately have no cache entry and will often see a null
+        // peer_lookup if the provider's presence hasn't propagated yet.
+        // The pre-regression behaviour was to attempt the home-relay
+        // send; 446937a briefly persisted instead, which broke QR
+        // bootstraps because they never reached the provider. This test
+        // locks in that a null lookup now invokes the home-relay send,
+        // and that home-relay failures still persist to pending_sends.
         const store = makeStubStore();
         let now = 1_000_000;
         const PEER = 'bb'.repeat(32);
         const ENV = '01020304';
-        let sendToRelayCalls = 0;
+
+        // Case 1: lookup null, home-relay send succeeds → delivered,
+        // nothing queued.
+        let homeSendCalls = [];
         let openCalls = 0;
         let queueRef;
+        let homeOk = true;
         const send = makeSendRawEnvelope({
-            // Lookup failed (network 404 / sig mismatch / CBOR decode).
             lookupFn: async () => null,
-            // Cache has no entry for this peer.
-            peekCacheFn: () => null,
             ourRelayUrl: 'wss://home.example/ws',
+            homeSendFn: (p, e) => { homeSendCalls.push({ p, e }); return homeOk; },
             openFn: async () => { openCalls++; return true; },
             acquireFn: async () => 'tok',
-            sendToRelayUrlFn: () => { sendToRelayCalls++; return true; },
+            sendToRelayUrlFn: () => true,
             queueMessage: (p, e) => queueRef.queueMessage(p, e),
         });
         queueRef = makeQueue({ sendFn: send, store, nowFn: () => now });
 
-        const ok = await send(PEER, ENV);
-        assert.equal(ok, false, 'unknown-home peer returns false on lookup miss');
-        assert.equal(store.all().length, 1, 'queued for later retry');
-        assert.equal(openCalls, 0, 'no outbound attempt made without known home');
-        assert.equal(sendToRelayCalls, 0, 'no relay send attempted without known home');
+        const ok1 = await send(PEER, ENV);
+        assert.equal(ok1, true, 'lookup-null routes through home-relay send');
+        assert.equal(homeSendCalls.length, 1, 'home-relay send was invoked');
+        assert.equal(homeSendCalls[0].p, PEER, 'home-relay send got correct peerId');
+        assert.equal(homeSendCalls[0].e, ENV, 'home-relay send got correct envelope');
+        assert.equal(openCalls, 0, 'no cross-relay openOutbound on lookup-null path');
+        assert.equal(store.all().length, 0, 'successful home-relay send does not queue');
+
+        // Case 2: lookup null, home-relay send fails → persisted for
+        // retry. This keeps the durability net intact for genuine
+        // home-relay failures (WS dead, token exhausted, etc.).
+        homeOk = false;
+        const ok2 = await send(PEER, ENV);
+        assert.equal(ok2, false, 'home-relay failure returns false');
+        assert.equal(store.all().length, 1, 'home-relay failure persisted to pending_sends');
+        assert.equal(store.all()[0].toPeerId, PEER);
+        assert.equal(store.all()[0].payload, ENV);
     });
 
     test('flush re-runs sendRawEnvelope; success dequeues', async () => {
