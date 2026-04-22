@@ -44,18 +44,82 @@ async function _getConn() {
 }
 
 const TTL_MS = 60 * 60 * 1000; // PNP-008-MUST-067: 1 hr
+const STORE_NAME = 'peer_relay_cache';
 
 /** @type {Map<string, {homeRelayUrl: string, lastSeen: number, signature: string, cachedAt: number, relayPeerId: string}>} */
 const cache = new Map();
 
+// Persistence state. `_restored` is set the first time we hydrate from
+// IDB so subsequent lookups don't re-open the DB on every call. Tests
+// can reset via `_resetRestore()` between module reloads.
+let _restored = false;
+let _restorePromise = null;
+
 /** Test / debug hook. */
 export function _clearCache() {
     cache.clear();
+    _restored = false;
+    _restorePromise = null;
 }
 
 /** Test / debug hook — inspect a single entry without going through lookup. */
 export function _peekCache(peerIdHex) {
     return cache.get(peerIdHex) || null;
+}
+
+// ── IDB persistence ────────────────────────────────────────────
+// The cache's 1 h TTL is meaningless if every page reload wipes it,
+// which is what happened when this lived only in a bare `Map`. We now
+// mirror writes to the `peer_relay_cache` store (db.js schema v7) and
+// rehydrate on first lookup. Directory data is public and signed, so
+// we store it unencrypted via dbPutRaw/dbGetAllRaw — no dependency on
+// the crypto store being unlocked.
+async function _loadStorage() {
+    if (_inj.storageLoad) return await _inj.storageLoad();
+    try {
+        const dbMod = await import('./db.js');
+        return await dbMod.dbGetAllRaw(STORE_NAME);
+    } catch (_) {
+        return [];
+    }
+}
+async function _saveStorage(entry) {
+    if (_inj.storageSave) { try { await _inj.storageSave(entry); } catch (_) {} return; }
+    try {
+        const dbMod = await import('./db.js');
+        await dbMod.dbPutRaw(STORE_NAME, entry);
+    } catch (_) { /* best-effort persistence */ }
+}
+
+async function _restoreOnce() {
+    if (_restored) return;
+    if (_restorePromise) { await _restorePromise; return; }
+    _restorePromise = (async () => {
+        const rows = await _loadStorage();
+        const nowMs = Date.now();
+        for (const row of (rows || [])) {
+            if (!row || !row.peerId) continue;
+            if (!Number.isFinite(row.cachedAt)) continue;
+            // Drop expired entries on restore — matches PNP-008-MUST-067.
+            if ((nowMs - row.cachedAt) >= TTL_MS) continue;
+            cache.set(row.peerId, {
+                homeRelayUrl: row.homeRelayUrl,
+                lastSeen: row.lastSeen,
+                signature: row.signature,
+                cachedAt: row.cachedAt,
+                relayPeerId: row.relayPeerId,
+            });
+        }
+        _restored = true;
+    })();
+    try { await _restorePromise; }
+    finally { _restorePromise = null; }
+}
+
+function _persistEntry(peerId, entry) {
+    // Fire-and-forget; a persistence failure must not break the live
+    // in-memory cache path. The caller already has the correct value.
+    _saveStorage({ peerId, ...entry }).catch(() => {});
 }
 
 function isFresh(entry, nowMs) {
@@ -243,6 +307,11 @@ function _sha256Sync(data) {
  */
 export async function lookupHomeRelay(peerIdHex) {
     if (!peerIdHex || typeof peerIdHex !== 'string') return null;
+    // Rehydrate from IDB on first call of the session. Subsequent calls
+    // hit the in-memory map directly — restore runs at most once.
+    if (!_restored) {
+        try { await _restoreOnce(); } catch (_) { /* fall through */ }
+    }
     const key = peerIdHex.toLowerCase();
     const nowMs = Date.now();
     const hit = cache.get(key);
@@ -323,13 +392,17 @@ export async function lookupHomeRelay(peerIdHex) {
     if (!okSig) return null;
 
     const verifiedUrl = await _preferReachable(homeRelayUrl, relayPeerId, vDir);
-    cache.set(key, {
+    const entry = {
         homeRelayUrl: verifiedUrl,
         lastSeen,
         signature: sigHex,
         cachedAt: nowMs,
         relayPeerId,
-    });
+    };
+    cache.set(key, entry);
+    // Mirror into IDB so a reload doesn't wipe the directory data and
+    // force the null-lookup fallback. TTL is re-checked on restore.
+    _persistEntry(key, entry);
     return verifiedUrl;
 }
 
@@ -403,6 +476,8 @@ const _inj = {
     verifyFn: null,
     homeRelayUrl: null,
     verifiedDirectory: null,
+    storageLoad: null,
+    storageSave: null,
 };
 export function _inject(overrides) {
     Object.assign(_inj, overrides || {});
@@ -412,4 +487,6 @@ export function _resetInject() {
     _inj.verifyFn = null;
     _inj.homeRelayUrl = null;
     _inj.verifiedDirectory = null;
+    _inj.storageLoad = null;
+    _inj.storageSave = null;
 }

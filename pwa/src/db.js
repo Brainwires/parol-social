@@ -2,7 +2,7 @@
 import { cryptoStore } from './state.js';
 
 const DB_NAME = 'parolnet';
-const DB_VERSION = 6;
+const DB_VERSION = 7;
 
 export function openDB() {
     return new Promise((resolve, reject) => {
@@ -54,6 +54,14 @@ export function openDB() {
                 // discard queued messages.
                 if (!db.objectStoreNames.contains('pending_sends')) {
                     db.createObjectStore('pending_sends', { keyPath: 'id', autoIncrement: true });
+                }
+                // v7: peer → home-relay lookup cache persisted across reloads
+                // (PNP-008-MUST-067, 1 h TTL). Signed directory data — public,
+                // so we keep it in the plaintext lane outside ENCRYPTED_STORES.
+                // Eliminates the post-reload null-lookup window that forced
+                // established-session sends onto the wrong relay.
+                if (!db.objectStoreNames.contains('peer_relay_cache')) {
+                    db.createObjectStore('peer_relay_cache', { keyPath: 'peerId' });
                 }
             };
             req.onsuccess = () => { if (!resolved) { resolved = true; clearTimeout(timeout); resolve(req.result); } };

@@ -2340,7 +2340,7 @@ describe('cross-relay send durability', () => {
     // where presence hasn't propagated yet). Cross-relay failures still
     // persist to pending_sends; home-relay failures also persist so the
     // home-relay path has its own durability net.
-    function makeSendRawEnvelope({ lookupFn, ourRelayUrl, homeSendFn, openFn, acquireFn, sendToRelayUrlFn, queueMessage }) {
+    function makeSendRawEnvelope({ lookupFn, ourRelayUrl, homeSendFn, openFn, acquireFn, sendToRelayUrlFn, queueMessage, hasSessionFn }) {
         return async function sendRawEnvelope(peerId, env, opts) {
             const noPersist = !!(opts && opts.noPersist);
             const persistOnFail = () => {
@@ -2348,11 +2348,17 @@ describe('cross-relay send durability', () => {
                 queueMessage(peerId, env);
             };
             const home = await lookupFn(peerId);
+            // Session-aware null-lookup gate. If a session exists,
+            // null is transient → queue. Otherwise fall through to
+            // home-relay (first-contact / QR-pairing). The `hasSessionFn`
+            // stub defaults to false so legacy tests that don't pass it
+            // keep exercising the first-contact fallback.
+            if (!home) {
+                const hasSession = hasSessionFn ? !!hasSessionFn(peerId) : false;
+                if (hasSession) { persistOnFail(); return false; }
+            }
             if (!home || home === ourRelayUrl) {
-                // Home-relay path (or lookup-miss fallback). A null
-                // lookup is the legitimate first-contact case — just
-                // route through our own home relay and let it deliver
-                // directly or store-and-forward.
+                // Home-relay path (Case A + Case C first-contact).
                 const okHome = homeSendFn ? homeSendFn(peerId, env) : true;
                 if (okHome) return true;
                 persistOnFail();
@@ -2520,5 +2526,224 @@ describe('cross-relay send durability', () => {
         await queueRef.flush();
         assert.equal(store.all().length, 0, '1h-old entry was NOT dropped (new 24h horizon) — sent successfully');
         assert.equal(sends, 2, 'sender was invoked for the 1h-old entry (would have been skipped under old 1h horizon)');
+    });
+
+    // Post-reconnect regression guard. When the peer-relay directory
+    // query returns null and we have an established session with the
+    // peer (e.g. provider replying to scanner after a page reload),
+    // the send MUST queue for a later flush, not misroute to our own
+    // home relay. Scanner's home relay ≠ provider's home relay, so a
+    // home-relay send silently drops the frame.
+    test('established-session + lookup-null queues instead of home-relay send', async () => {
+        const store = makeStubStore();
+        let now = 1_000_000;
+        const PEER = 'dd'.repeat(32);
+        const ENV = 'feedface';
+
+        let homeSendCalls = 0;
+        let queueRef;
+        const send = makeSendRawEnvelope({
+            lookupFn: async () => null,
+            ourRelayUrl: 'wss://home.example/ws',
+            homeSendFn: () => { homeSendCalls++; return true; },
+            openFn: async () => true,
+            acquireFn: async () => 'tok',
+            sendToRelayUrlFn: () => true,
+            queueMessage: (p, e) => queueRef.queueMessage(p, e),
+            hasSessionFn: () => true, // established session with PEER
+        });
+        queueRef = makeQueue({ sendFn: send, store, nowFn: () => now });
+
+        const ok = await send(PEER, ENV);
+        assert.equal(ok, false, 'established-session + null lookup returns false (queued)');
+        assert.equal(homeSendCalls, 0, 'home-relay send NOT attempted — would misroute');
+        const persisted = store.all();
+        assert.equal(persisted.length, 1, 'frame persisted to pending_sends for retry');
+        assert.equal(persisted[0].toPeerId, PEER);
+        assert.equal(persisted[0].payload, ENV);
+    });
+
+    // First-contact (no session yet) preserves the QR-pairing fallback.
+    // Without this path, the first frame of a pairing handshake would
+    // never reach the provider and QR bootstraps would break.
+    test('first-contact + lookup-null still falls through to home-relay send', async () => {
+        const store = makeStubStore();
+        let now = 1_000_000;
+        const PEER = 'ee'.repeat(32);
+        const ENV = 'cafe01';
+
+        let homeSendCalls = 0;
+        let queueRef;
+        const send = makeSendRawEnvelope({
+            lookupFn: async () => null,
+            ourRelayUrl: 'wss://home.example/ws',
+            homeSendFn: () => { homeSendCalls++; return true; },
+            openFn: async () => true,
+            acquireFn: async () => 'tok',
+            sendToRelayUrlFn: () => true,
+            queueMessage: (p, e) => queueRef.queueMessage(p, e),
+            hasSessionFn: () => false, // no session yet (QR bootstrap)
+        });
+        queueRef = makeQueue({ sendFn: send, store, nowFn: () => now });
+
+        const ok = await send(PEER, ENV);
+        assert.equal(ok, true, 'first-contact null lookup routes via home relay');
+        assert.equal(homeSendCalls, 1, 'home-relay send invoked exactly once');
+        assert.equal(store.all().length, 0, 'successful home-relay send does not queue');
+    });
+});
+
+// ── peer-relay-cache IDB persistence ──────────────────────────
+// The cache used to be a bare in-memory Map that evaporated on every
+// page reload — the primary upstream trigger for the post-reconnect
+// lookup-null cascade. Mirror entries into IndexedDB (db.js schema v7)
+// and restore on the first lookup of a new session. 1 h TTL per
+// PNP-008-MUST-067 is enforced on restore so stale entries don't
+// outlive their signed freshness window.
+describe('peer-relay-cache IDB persistence', () => {
+    async function freshCache() {
+        return await import('../src/peer-relay-cache.js?t=' + Math.random());
+    }
+
+    const PEER_HEX = '22'.repeat(32);
+    const RELAY_PUB_HEX = 'a'.repeat(64);
+    const RELAY_PID_HEX = 'bb'.repeat(32);
+
+    // Re-use the CBOR encoder from the H12 Phase 2 block via local
+    // inlining — the helper lives inside that describe's scope.
+    function u64beBytes(n) {
+        const out = new Uint8Array(8);
+        const hi = Math.floor(n / 0x100000000); const lo = n >>> 0;
+        out[0]=(hi>>>24)&0xff; out[1]=(hi>>>16)&0xff; out[2]=(hi>>>8)&0xff; out[3]=hi&0xff;
+        out[4]=(lo>>>24)&0xff; out[5]=(lo>>>16)&0xff; out[6]=(lo>>>8)&0xff; out[7]=lo&0xff;
+        return out;
+    }
+    void u64beBytes; // not needed here but kept for symmetry
+    function cborHdr(out, major, len) {
+        const mt = major << 5;
+        if (len < 24) { out.push(mt | len); return; }
+        if (len < 0x100) { out.push(mt | 24, len); return; }
+        if (len < 0x10000) { out.push(mt | 25, (len>>8)&0xff, len&0xff); return; }
+        out.push(mt | 26, (len>>>24)&0xff, (len>>>16)&0xff, (len>>>8)&0xff, len&0xff);
+    }
+    function cborText(out, s) { const b = new TextEncoder().encode(s); cborHdr(out, 3, b.length); for (const x of b) out.push(x); }
+    function cborBytes(out, bytes) { cborHdr(out, 2, bytes.length); for (const x of bytes) out.push(x); }
+    function cborUint(out, n) { cborHdr(out, 0, n); }
+    function encodeLookup(homeRelayUrl, lastSeen, signature64) {
+        const out = [];
+        cborHdr(out, 5, 3);
+        cborText(out, 'home_relay_url'); cborText(out, homeRelayUrl);
+        cborText(out, 'last_seen');      cborUint(out, lastSeen);
+        cborText(out, 'signature');      cborBytes(out, signature64);
+        return new Uint8Array(out);
+    }
+    function fakeResp(bodyBytes, status = 200) {
+        return {
+            ok: status === 200,
+            status,
+            async arrayBuffer() { return bodyBytes.buffer.slice(bodyBytes.byteOffset, bodyBytes.byteOffset + bodyBytes.byteLength); },
+        };
+    }
+
+    test('successful lookup persists entry to storage', async () => {
+        const mod = await freshCache();
+        const { lookupHomeRelay, _clearCache, _inject, _resetInject } = mod;
+        _clearCache();
+        const saved = [];
+        const body = encodeLookup('https://home.example', 1_700_000_000, new Uint8Array(64));
+        _inject({
+            fetchFn: async () => fakeResp(body),
+            verifyFn: () => true,
+            homeRelayUrl: () => 'wss://home.example/ws',
+            verifiedDirectory: () => [
+                { url: 'https://home.example', identityKey: RELAY_PUB_HEX, peerIdHex: RELAY_PID_HEX, verified: true },
+            ],
+            storageLoad: async () => [],
+            storageSave: async (row) => { saved.push(row); },
+        });
+        const r = await lookupHomeRelay(PEER_HEX);
+        // Give the fire-and-forget persist a microtask to land.
+        await new Promise(r => setImmediate(r));
+        _resetInject();
+        assert.equal(r, 'https://home.example');
+        assert.equal(saved.length, 1, 'entry mirrored to storage');
+        assert.equal(saved[0].peerId, PEER_HEX);
+        assert.equal(saved[0].homeRelayUrl, 'https://home.example');
+        assert.equal(saved[0].relayPeerId, RELAY_PID_HEX);
+        assert.ok(Number.isFinite(saved[0].cachedAt));
+    });
+
+    test('restored entry survives module reload and skips the fetch', async () => {
+        // Simulate: user A looks up peer B, entry lands in storage.
+        // Page reloads. Module is re-imported. Next lookup should hit
+        // the restored entry without touching the network.
+        const mod = await freshCache();
+        const { lookupHomeRelay, _clearCache, _inject, _resetInject, _peekCache } = mod;
+        _clearCache();
+        let fetchCalls = 0;
+        const prePersisted = [{
+            peerId: PEER_HEX,
+            homeRelayUrl: 'https://home.example',
+            lastSeen: 1_700_000_000,
+            signature: 'ab'.repeat(32),
+            cachedAt: Date.now() - (5 * 60 * 1000), // 5 min ago — fresh
+            relayPeerId: RELAY_PID_HEX,
+        }];
+        _inject({
+            fetchFn: async () => { fetchCalls++; return fakeResp(new Uint8Array(0)); },
+            verifyFn: () => true,
+            homeRelayUrl: () => 'wss://home.example/ws',
+            verifiedDirectory: () => [
+                { url: 'https://home.example', identityKey: RELAY_PUB_HEX, peerIdHex: RELAY_PID_HEX, verified: true },
+            ],
+            storageLoad: async () => prePersisted,
+            storageSave: async () => {},
+        });
+
+        const r = await lookupHomeRelay(PEER_HEX);
+        _resetInject();
+        assert.equal(r, 'https://home.example', 'restored entry returned without fetch');
+        assert.equal(fetchCalls, 0, 'no network fetch — entry served from restore');
+        // Restored into the in-memory map too.
+        const peek = _peekCache(PEER_HEX);
+        assert.ok(peek, 'entry present in in-memory cache after restore');
+        assert.equal(peek.homeRelayUrl, 'https://home.example');
+    });
+
+    test('restore respects 1 h TTL — stale entries dropped', async () => {
+        const mod = await freshCache();
+        const { lookupHomeRelay, _clearCache, _inject, _resetInject, _peekCache } = mod;
+        _clearCache();
+        let fetchCalls = 0;
+        // Entry cached 2 h ago → exceeds the PNP-008-MUST-067 1 h TTL.
+        const stale = [{
+            peerId: PEER_HEX,
+            homeRelayUrl: 'https://stale.example',
+            lastSeen: 1_700_000_000,
+            signature: 'cd'.repeat(32),
+            cachedAt: Date.now() - (2 * 60 * 60 * 1000),
+            relayPeerId: RELAY_PID_HEX,
+        }];
+        // When the stale entry is dropped we'll fall through to a fresh
+        // fetch — return a legitimate signed blob so the test doesn't
+        // wander into the fetch-null branch.
+        const body = encodeLookup('https://home.example', 1_700_000_000, new Uint8Array(64));
+        _inject({
+            fetchFn: async () => { fetchCalls++; return fakeResp(body); },
+            verifyFn: () => true,
+            homeRelayUrl: () => 'wss://home.example/ws',
+            verifiedDirectory: () => [
+                { url: 'https://home.example', identityKey: RELAY_PUB_HEX, peerIdHex: RELAY_PID_HEX, verified: true },
+            ],
+            storageLoad: async () => stale,
+            storageSave: async () => {},
+        });
+
+        const r = await lookupHomeRelay(PEER_HEX);
+        _resetInject();
+        assert.equal(r, 'https://home.example', 'fresh fetch returned after stale drop');
+        assert.equal(fetchCalls, 1, 'stale restore dropped, fetch fell through');
+        const peek = _peekCache(PEER_HEX);
+        assert.equal(peek && peek.homeRelayUrl, 'https://home.example', 'in-memory cache now holds the fresh entry, not the stale one');
     });
 });

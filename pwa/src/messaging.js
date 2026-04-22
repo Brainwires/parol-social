@@ -38,6 +38,35 @@ function persistSessions() {
     } catch(e) { console.warn('Session persist failed:', e.message); }
 }
 
+// ── Session-existence check for routing decisions ────────────
+// Distinguishes "first-contact" from "established-session" when the
+// peer-lookup directory returns null. First-contact (QR pairing) must
+// fall through to the home-relay send so the responder can discover
+// us. Established sessions must queue instead — a null lookup there
+// is almost always transient (presence propagation delay, cache miss,
+// directory query failure), and misrouting the frame to our own home
+// relay silently loses it because the peer lives on a different relay.
+//
+// Preferred source of truth: `wasm.has_session(peerId)`. It's O(1) in
+// the WASM session table and exactly mirrors the server-side Double
+// Ratchet commit status.
+//
+// If WASM isn't ready yet (e.g. during the narrow boot window before
+// sessions are restored), we default to "has session" = true. That's
+// the SAFE direction: it queues rather than misroutes, so the caller
+// gets a retry instead of silent loss. If the peer really is a fresh
+// first-contact, the next flush (once WASM is ready) will also see
+// "has session = false" (we have no row) and route correctly then.
+// The brief queue bounce is cheap compared to a silently-lost message.
+export function checkSessionExists(peerId) {
+    if (!wasm || typeof wasm.has_session !== 'function') {
+        // WASM not ready — err on the side of "yes, queue for retry".
+        return true;
+    }
+    try { return !!wasm.has_session(peerId); }
+    catch (_) { return true; }
+}
+
 // ── Envelope wrapping helper ─────────────────────────────
 // Wraps a structured (JSON-serializable) payload in a PNP-001 envelope for a
 // given peer. Returns the bucket-padded hex string, or null if no secure
@@ -113,15 +142,29 @@ export async function sendRawEnvelope(toPeerId, env, opts) {
     let homeRelay = null;
     try { homeRelay = await lookupHomeRelay(toPeerId); } catch (_) { homeRelay = null; }
 
-    // Peer-lookup miss (null) is legitimately the common case for first-
-    // contact sends — QR-pairing bootstrap envelopes in particular have
-    // no cache entry and will often see a null lookup if the provider's
-    // presence hasn't propagated yet. Fall through to the home-relay
-    // send path: if the provider is on this same relay the relay routes
-    // directly; if not, the relay bounces with "peer not connected" and
-    // the caller can retry. Cross-relay failures further down still
-    // persist to pending_sends for retry with a refreshed lookup.
-    if (!homeRelay || homeRelay === connMgr.relayUrl) {
+    // Three-way routing decision:
+    //   Case A: lookup returned our own relay URL → home-relay path.
+    //   Case B: lookup returned a different URL → cross-relay path.
+    //   Case C: lookup returned null → ambiguous:
+    //     - If a session already exists with this peer, lookup failure
+    //       is transient (presence propagation delay, cache miss, directory
+    //       query failure). Queue for the next flush so a refreshed
+    //       lookup can route correctly — do NOT misroute to our own
+    //       home relay (post-reconnect regression: peer lives on a
+    //       different relay, so home-send silently loses the frame).
+    //     - If no session exists (QR-pairing first-contact), fall
+    //       through to the home-relay send: the relay will either
+    //       deliver directly (peer on same relay) or store-and-forward.
+    //       This keeps the QR bootstrap path working end-to-end.
+    if (!homeRelay) {
+        if (checkSessionExists(toPeerId)) {
+            // Case C — established session + transient lookup failure.
+            persistOnFail();
+            return false;
+        }
+        // Case C — first-contact; fall through to home-relay branch below.
+    }
+    if (homeRelay === connMgr.relayUrl || !homeRelay) {
         let token;
         try {
             // Waits up to 10 s for the pool to be primed by the initial
