@@ -1955,7 +1955,10 @@ describe('toast carousel auto-dismiss', () => {
             assert.equal(bodyEl().textContent, 'A', 'A still visible at 2999ms total');
             clock.advance(2); // cross A's 3000ms deadline
             assert.equal(bodyEl().textContent, 'B', 'B slid into view when A auto-dismissed');
-            assert.ok(!container().classList.contains('toast-carousel-active'), 'no longer in carousel after A dismissed');
+            // Carousel latch: once the queue reached ≥2 the panel stays
+            // visually engaged until the queue empties, even though only
+            // B remains now. Prev/Next will be disabled below when drained.
+            assert.ok(container().classList.contains('toast-carousel-active'), 'carousel latched; stays until queue empties');
             clock.advance(3001); // cross B's 3000ms
             assert.equal(container().style.display, 'none', 'B dismissed, viewer hidden');
             assert.equal(clock.pendingCount(), 0);
@@ -2068,15 +2071,64 @@ describe('toast carousel auto-dismiss', () => {
             // Advance past B's 8s → C is now the only toast left.
             clock.advance(8001);
             assert.equal(bodyEl().textContent, 'C', 'C visible after B auto-dismissed');
-            assert.ok(!container().classList.contains('toast-carousel-active'), 'carousel exited with only C left');
-            // C is persistent and alone — its carousel timer was cancelled,
-            // so it reverts to stay-until-tapped.
+            // Latch keeps the carousel class on even with 1 remaining.
+            assert.ok(container().classList.contains('toast-carousel-active'), 'latch holds with only C left');
+            // C is persistent and alone — its carousel timer was cancelled
+            // (timer logic uses the real queue length via toastVisibleInCarousel,
+            // not the visual latch), so it reverts to stay-until-tapped.
             assert.equal(clock.pendingCount(), 0, 'lone persistent C has no timer');
             assert.equal(container().style.display, 'block', 'C still visible, waiting for tap');
 
             clock.advance(60_000);
             assert.equal(bodyEl().textContent, 'C', 'C still waiting after a long delay');
             assert.equal(container().style.display, 'block');
+        } finally {
+            restore();
+        }
+    });
+
+    test('scenario 9: carousel latches until queue empties', async () => {
+        const { clock, mod, container, bodyEl, restore } = await setup();
+        try {
+            // Controls: children[1] is controls div; its children are
+            // [prevBtn, counter, nextBtn, clearBtn] per ensureToastDom().
+            const controls = () => container().children[1];
+            const prevBtn = () => controls().children[0];
+            const counter = () => controls().children[1];
+            const nextBtn = () => controls().children[2];
+
+            mod.showToast('A', 3000);
+            mod.showToast('B', 3000);
+            assert.ok(container().classList.contains('toast-carousel-active'), 'latch engages at 2');
+            assert.equal(prevBtn().disabled, false);
+            assert.equal(nextBtn().disabled, false);
+
+            // Drain A → queue = 1 (B), but latch must stay.
+            clock.advance(3001);
+            assert.equal(bodyEl().textContent, 'B');
+            assert.ok(container().classList.contains('toast-carousel-active'), 'latch holds with 1 left');
+            assert.equal(prevBtn().disabled, true, 'prev disabled with only 1 toast');
+            assert.equal(nextBtn().disabled, true, 'next disabled with only 1 toast');
+            // Counter still rendered (latch keeps controls visible). In the
+            // test harness i18n strings aren't loaded so t() returns the key
+            // verbatim; assert presence rather than exact count text.
+            assert.ok(counter().textContent.length > 0, 'counter rendered under latch');
+
+            // New toast arrives mid-latch → arrows re-enable.
+            mod.showToast('C', 3000);
+            assert.ok(container().classList.contains('toast-carousel-active'), 'latch still held');
+            assert.equal(prevBtn().disabled, false, 'prev re-enabled');
+            assert.equal(nextBtn().disabled, false, 'next re-enabled');
+
+            // Drain fully → viewer hides and latch clears.
+            clock.advance(10_000);
+            assert.equal(container().style.display, 'none', 'viewer hidden');
+            assert.ok(!container().classList.contains('toast-carousel-active'), 'latch cleared');
+
+            // Fresh toast → single-bar mode (latch was not remembered).
+            mod.showToast('D', 3000);
+            assert.ok(!container().classList.contains('toast-carousel-active'), 'no stale latch');
+            assert.equal(controls().style.display, 'none');
         } finally {
             restore();
         }
@@ -2108,7 +2160,8 @@ describe('toast carousel auto-dismiss', () => {
             // Cross 8s → A auto-dismisses, B slides in as the lone toast.
             clock.advance(2);
             assert.equal(bodyEl().textContent, 'B', 'B visible after A dismissed');
-            assert.ok(!container().classList.contains('toast-carousel-active'), 'carousel exited with only B left');
+            // Latch keeps the carousel visual mode until the queue empties.
+            assert.ok(container().classList.contains('toast-carousel-active'), 'latch holds with only B left');
             assert.equal(clock.pendingCount(), 1, 'B has its own 3s timer');
 
             // B drains normally.

@@ -127,6 +127,13 @@ let toastVisibleInCarousel = false; // whether the visible entry was
                                     // If this flips for the same visible
                                     // id, persistent toasts need their
                                     // carousel-timer started or cancelled.
+let toastLatchedCarousel = false;   // once the queue reached ≥2, the
+                                    // viewer stays VISUALLY in carousel
+                                    // mode until the queue empties (or
+                                    // the user taps Clear All). This is a
+                                    // pure visual latch — timer rules
+                                    // still use the true queue length via
+                                    // toastVisibleInCarousel.
 
 function ensureToastDom() {
     if (toastDom) return toastDom;
@@ -291,17 +298,24 @@ function renderToast() {
         if (dom.container.classList) dom.container.classList.remove('toast-carousel-active');
         toastVisibleId = null;
         toastVisibleInCarousel = false;
+        toastLatchedCarousel = false;
         return;
     }
     if (toastCurrentIndex >= toastQueue.length) toastCurrentIndex = toastQueue.length - 1;
     if (toastCurrentIndex < 0) toastCurrentIndex = 0;
+
+    // Engage the visual latch once the queue reaches ≥2. The latch is
+    // cleared only when the queue empties (above) or via clearAllToasts —
+    // never on a mid-drain dip back to 1, so the carousel panel does not
+    // flicker back into a single-toast bar between auto-dismissals.
+    if (toastQueue.length >= 2) toastLatchedCarousel = true;
 
     const entry = toastQueue[toastCurrentIndex];
     dom.body.style.cssText = TOAST_BODY_STYLE_BASE + (entry.level === 'error' ? TOAST_BODY_STYLE_ERROR : TOAST_BODY_STYLE_INFO);
     dom.body.textContent = entry.message;
     dom.container.style.display = 'block';
 
-    if (toastQueue.length >= 2) {
+    if (toastLatchedCarousel) {
         // Flag the viewer as a carousel so styles.css can enlarge it to
         // fill ≥1/3 of the viewport and lay out the prev/next/counter/
         // clear-all controls with room to breathe.
@@ -321,6 +335,13 @@ function renderToast() {
         if (dom.container.classList) dom.container.classList.remove('toast-carousel-active');
         dom.controls.style.display = 'none';
     }
+
+    // Prev/Next enablement tracks the TRUE queue length, not the latch.
+    // When the carousel is latched but only one toast remains, arrows
+    // visibly deactivate while Clear All stays usable.
+    const canCycle = toastQueue.length >= 2;
+    dom.prevBtn.disabled = !canCycle;
+    dom.nextBtn.disabled = !canCycle;
 
     // Reconcile the visible entry's auto-dismiss timer against current
     // state. Handles all of:
@@ -360,6 +381,7 @@ function clearAllToasts() {
     toastCurrentIndex = 0;
     toastVisibleId = null;
     toastVisibleInCarousel = false;
+    toastLatchedCarousel = false;
     renderToast();
 }
 

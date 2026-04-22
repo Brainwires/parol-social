@@ -1423,6 +1423,16 @@ button.success {
     outline: none;
 }
 
+/* Latched carousel with only 1 toast left → arrows disabled but still
+ * visible; grey them out and kill hover/click so the user sees they
+ * are inert without the panel collapsing. Clear All stays usable. */
+#toast.toast-carousel-active .toast-prev[disabled],
+#toast.toast-carousel-active .toast-next[disabled] {
+    opacity: 0.35;
+    cursor: default;
+    pointer-events: none;
+}
+
 #toast.toast-carousel-active .toast-counter {
     flex: 1 1 auto;
     text-align: center;
