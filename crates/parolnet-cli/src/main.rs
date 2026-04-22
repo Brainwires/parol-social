@@ -141,6 +141,29 @@ enum Cmd {
         #[arg(long, default_value = "30")]
         timeout_secs: u64,
     },
+    /// Bootstrap two peers, disconnect the recipient, send N messages while
+    /// recipient is offline (these land in relay store-and-forward), then
+    /// reconnect the recipient and send additional messages DURING the
+    /// register handshake window. All messages must arrive. Regression-
+    /// guards the relay's second-pass drain that closes the auth-window
+    /// race (where frames enqueued mid-challenge-response previously sat
+    /// until the next reconnect).
+    OfflineStoreForward {
+        #[arg(long)]
+        relay: String,
+        #[arg(long)]
+        http: String,
+        /// How many messages to send while recipient is offline (default 3).
+        #[arg(long, default_value = "3")]
+        offline_count: usize,
+        /// How many additional messages to send during / right after
+        /// reconnect, to exercise the auth-window race (default 3).
+        #[arg(long, default_value = "3")]
+        race_count: usize,
+        /// Overall test timeout.
+        #[arg(long, default_value = "30")]
+        timeout_secs: u64,
+    },
 }
 
 #[tokio::main]
@@ -185,6 +208,15 @@ async fn main() -> Result<()> {
             http,
             timeout_secs,
         } => run_call_signal_loopback(&relay, &http, timeout_secs).await,
+        Cmd::OfflineStoreForward {
+            relay,
+            http,
+            offline_count,
+            race_count,
+            timeout_secs,
+        } => {
+            run_offline_store_forward(&relay, &http, offline_count, race_count, timeout_secs).await
+        }
     }
 }
 
@@ -1591,6 +1623,247 @@ async fn run_call_signal_loopback(
             let msg = format!("CALL-SIGNAL LOOPBACK TIMED OUT after {}s", timeout_secs);
             println!("\n  {}\n", msg);
             Err(anyhow!(msg))
+        }
+    }
+}
+
+// ───────────────── offline-store-forward orchestrator ─────────────────────
+//
+// Regression-guards the relay's second-pass drain, which closes the
+// auth-window race where messages enqueued during a peer's register
+// challenge-response could previously sit until the peer's next reconnect.
+//
+// Flow:
+//   1. Bootstrap A (scanner) ↔ B (presenter) with sessions in both
+//      directions.
+//   2. Close B's WebSocket. B is now offline but its session keys are
+//      preserved in memory.
+//   3. A sends `offline_count` envelopes to B. The relay stores them in
+//      the in-memory store-and-forward buffer (MSG_TYPE_CHAT, addressed
+//      to B's PeerId).
+//   4. Reconnect B. Immediately after kicking off the reconnect — BEFORE
+//      we've drained B's `Registered` event — A sends `race_count` more
+//      envelopes. Some of these will arrive at the relay during the
+//      challenge-response window, exercising the second-pass drain path.
+//   5. Wait for B to drain all `offline_count + race_count` inbound
+//      frames. Assert each body is byte-exact and none were dropped.
+//
+// Caveats on the race test:
+//   The CLI's WS to localhost has sub-millisecond challenge/response
+//   latency, so the auth-window is much smaller than in the mobile
+//   repro. We can't precisely time a send to land in that window from
+//   the CLI. We do the best we can — fire race sends concurrently with
+//   the reconnect — but this test also (and more robustly) regression-
+//   guards the happy path of store-and-forward through a real relay.
+//   Precisely-timed race coverage would require a controllable relay
+//   harness that pauses between `challenge` and `registered`, which
+//   we do not have; per the f400b45 precedent, we do not invent one.
+
+async fn run_offline_store_forward(
+    relay_url: &str,
+    http_base: &str,
+    offline_count: usize,
+    race_count: usize,
+    timeout_secs: u64,
+) -> Result<()> {
+    if offline_count == 0 && race_count == 0 {
+        return Err(anyhow!(
+            "offline_count and race_count are both 0 — nothing to test"
+        ));
+    }
+
+    let fut = async {
+        let pair = bootstrap_pair(relay_url, http_base).await?;
+
+        // Move out the pieces we need; `pair.presenter` is consumed when
+        // we close it below and is later replaced by a fresh handle.
+        let presenter_id = pair.presenter_id;
+        let scanner_id = pair.scanner_id;
+        let presenter_client = pair.presenter_client;
+        let scanner_client = pair.scanner_client;
+        let scanner_identity = pair.scanner_identity;
+        let presenter_identity = pair.presenter_identity;
+        let mut scanner = pair.scanner;
+
+        // Close B (presenter) cleanly — its WS goes away and the relay
+        // will route subsequent A→B frames into store-and-forward.
+        pair.presenter.close().await;
+        tracing::info!("[offline-sf] presenter closed; it is now offline");
+
+        // Give the relay a moment to observe the close. Without this
+        // the very first A→B send could race with the relay still
+        // holding a live tx reference, which would short-circuit the
+        // store-and-forward path we want to exercise.
+        tokio::time::sleep(Duration::from_millis(250)).await;
+
+        // ── Phase 1: `offline_count` sends while B is offline. ──────────
+        let mut expected: Vec<String> = Vec::new();
+        for i in 0..offline_count {
+            let body = format!("offline #{i}");
+            send_chat(
+                http_base,
+                &scanner,
+                &scanner_client,
+                &scanner_identity,
+                presenter_id,
+                body.as_bytes(),
+            )
+            .await
+            .with_context(|| format!("offline send #{i}"))?;
+            expected.push(body);
+        }
+        // Drain any sender-side `Queued` events so they don't clutter
+        // later polling.
+        drain_scanner_noise(&mut scanner, Duration::from_millis(200)).await;
+        tracing::info!("[offline-sf] sent {offline_count} offline frames");
+
+        // ── Phase 2: reconnect B, race-send during its auth window. ────
+        let mut presenter =
+            PeerHandle::connect(relay_url, clone_identity(&presenter_identity)).await?;
+        tracing::info!("[offline-sf] presenter reconnecting");
+
+        // Fire race-count sends concurrently with B's register cycle.
+        // We do NOT await B's Registered event first — the whole point
+        // is to land some frames during the challenge-response window.
+        for i in 0..race_count {
+            let body = format!("race #{i}");
+            send_chat(
+                http_base,
+                &scanner,
+                &scanner_client,
+                &scanner_identity,
+                presenter_id,
+                body.as_bytes(),
+            )
+            .await
+            .with_context(|| format!("race send #{i}"))?;
+            expected.push(body);
+            // Small gap so sends are spread across B's register window.
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        tracing::info!("[offline-sf] sent {race_count} race frames");
+
+        // ── Phase 3: drain all expected frames from B. ─────────────────
+        let total_expected = expected.len();
+        let mut received: Vec<String> = Vec::with_capacity(total_expected);
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(4000);
+        while received.len() < total_expected {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            match presenter.next_evt(remaining).await {
+                Some(PeerEvt::Inbound { envelope }) => {
+                    let decoded =
+                        decrypt_for_peer(presenter_client.sessions(), &scanner_id, &envelope)
+                            .context("decrypt inbound")?;
+                    let body =
+                        String::from_utf8(decoded.plaintext).context("non-utf8 plaintext")?;
+                    received.push(body);
+                }
+                Some(PeerEvt::Disconnected) => {
+                    return Err(anyhow!("presenter disconnected mid-drain"));
+                }
+                Some(PeerEvt::RelayError(m)) => {
+                    return Err(anyhow!("presenter relay error: {m}"));
+                }
+                Some(_) | None => continue,
+            }
+        }
+
+        // Some frames in phase 2 may re-order (offline-stored first,
+        // race frames after) — compare as multisets, not sequences.
+        let mut want_sorted = expected.clone();
+        want_sorted.sort();
+        let mut got_sorted = received.clone();
+        got_sorted.sort();
+        if want_sorted != got_sorted {
+            let missing: Vec<&String> = want_sorted
+                .iter()
+                .filter(|b| !got_sorted.contains(b))
+                .collect();
+            let extra: Vec<&String> = got_sorted
+                .iter()
+                .filter(|b| !want_sorted.contains(b))
+                .collect();
+            return Err(anyhow!(
+                "offline-store-forward mismatch: expected {} frames, got {}; missing={:?} extra={:?}",
+                want_sorted.len(),
+                got_sorted.len(),
+                missing,
+                extra,
+            ));
+        }
+
+        println!("\n════════════════════════════════════════════════════════════");
+        println!("  OFFLINE-STORE-FORWARD PASS ✅");
+        println!("  offline phase    : {offline_count} frames via first-pass drain");
+        println!("  race phase       : {race_count} frames (exercises second-pass drain)");
+        println!("  total delivered  : {total_expected}");
+        println!("════════════════════════════════════════════════════════════\n");
+
+        presenter.close().await;
+        scanner.close().await;
+        // Silence unused-warning for identities we cloned for symmetry
+        // with bootstrap_pair's output.
+        let _ = &presenter_identity;
+        let _ = &scanner_identity;
+        Ok::<(), anyhow::Error>(())
+    };
+
+    match tokio::time::timeout(Duration::from_secs(timeout_secs), fut).await {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(e)) => {
+            println!("\n  OFFLINE-STORE-FORWARD FAIL ❌  {e}\n");
+            Err(e)
+        }
+        Err(_) => {
+            let msg = format!("OFFLINE-STORE-FORWARD TIMED OUT after {}s", timeout_secs);
+            println!("\n  {}\n", msg);
+            Err(anyhow!(msg))
+        }
+    }
+}
+
+/// Encrypt + send one CHAT envelope (msg_type 0x01) from `sender` to
+/// `recipient_peer_id` via the real relay. Returns once the WS write
+/// completes — does NOT wait for any inbound.
+async fn send_chat(
+    http_base: &str,
+    sender: &PeerHandle,
+    sender_client: &ParolNet,
+    sender_identity: &IdentityKeyPair,
+    recipient_peer_id: PeerId,
+    body: &[u8],
+) -> Result<()> {
+    let now_secs = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
+    let envelope = encrypt_for_peer(
+        sender_client.sessions(),
+        &recipient_peer_id,
+        0x01, // MSG_TYPE_CHAT
+        body,
+        now_secs,
+        None,
+    )?;
+    let token = issue_one_token(http_base, sender_identity).await?;
+    sender
+        .send(recipient_peer_id, encode_token_hex(&token)?, envelope)
+        .await
+}
+
+/// Drain non-inbound sender-side events (Queued, Pong) for `duration`
+/// so they don't clutter later polling. Bails early on Disconnected /
+/// RelayError since those are real failures.
+async fn drain_scanner_noise(sender: &mut PeerHandle, duration: Duration) {
+    let deadline = tokio::time::Instant::now() + duration;
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return;
+        }
+        match sender.next_evt(remaining).await {
+            Some(PeerEvt::Queued) | Some(PeerEvt::Pong { .. }) => continue,
+            Some(_) | None => return,
         }
     }
 }

@@ -2110,6 +2110,41 @@ async fn handle_socket(
                                     for msg in pending {
                                         let _ = tx.send(Message::Text(msg.into()));
                                     }
+
+                                    // Second-pass drain: a message addressed to this peer
+                                    // can land in `store` during the ~50–500 ms register
+                                    // challenge-response window AFTER the synchronous
+                                    // drain above has already run. Without this pass it
+                                    // would sit until the peer reconnects again (which
+                                    // might be never). Schedule a short delayed drain on
+                                    // the same connection — but only if the peer is still
+                                    // registered, so a fast disconnect is a no-op.
+                                    let store_cloned = store.clone();
+                                    let peers_cloned = peers.clone();
+                                    let peer_id_cloned = peer_id.clone();
+                                    tokio::spawn(async move {
+                                        tokio::time::sleep(Duration::from_secs(1)).await;
+                                        let tx_opt = {
+                                            let peers_guard = peers_cloned.lock().await;
+                                            peers_guard.get(&peer_id_cloned).cloned()
+                                        };
+                                        let Some(tx) = tx_opt else {
+                                            return;
+                                        };
+                                        let pending = store_cloned.lock().await.retrieve(&mesh_pid);
+                                        if pending.is_empty() {
+                                            return;
+                                        }
+                                        let delivered = pending.len();
+                                        for msg in pending {
+                                            let _ = tx.send(Message::Text(msg.into()));
+                                        }
+                                        tracing::info!(
+                                            peer = %peer_id_cloned,
+                                            delivered,
+                                            "second-pass drain delivered frames stored during register handshake"
+                                        );
+                                    });
                                 }
                             }
                             Ok(false) | Err(_) => {
