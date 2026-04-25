@@ -92,7 +92,7 @@ opus-rs = "0.1"
 codec2 = "0.3"
 
 # HMAC-SHA1 for TURN REST API credentials
-sha1 = "0.10"
+sha1 = "0.11"
 base64 = "0.22"
 
 # HTTP Client
