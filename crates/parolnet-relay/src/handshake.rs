@@ -6,7 +6,7 @@
 use crate::error::RelayError;
 use crate::onion::HopKeys;
 use crate::{CELL_PAYLOAD_SIZE, CellType, RelayCell};
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use parolnet_protocol::address::PeerId;
 use sha2::Sha256;
 use x25519_dalek::{PublicKey, StaticSecret};

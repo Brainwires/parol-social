@@ -21,8 +21,8 @@ ciborium = { workspace = true }
 hex = { workspace = true }
 sha2 = { workspace = true }
 subtle = "2"
-hmac = "0.12"
-hkdf = "0.12"
+hmac = "0.13"
+hkdf = "0.13"
 
 [dev-dependencies]
 parolnet-clause = { path = "../parolnet-clause" }

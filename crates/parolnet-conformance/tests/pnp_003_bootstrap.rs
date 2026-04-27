@@ -195,7 +195,7 @@ fn proof_is_hmac_sha256_over_ik_ek_nonce() {
     // MUST-021: proof = HMAC-SHA-256(BS, ik || ek || nonce).
     // MUST-022: receiver MUST verify by recomputing HMAC.
     // Pinned with reference vectors produced by the RustCrypto hmac crate.
-    use hmac::{Hmac, Mac};
+    use hmac::{Hmac, KeyInit, Mac};
     use sha2::Sha256;
     type HmacSha256 = Hmac<Sha256>;
 
@@ -267,7 +267,7 @@ fn bs_hint_is_first_4_bytes_of_sha256_of_bs() {
 fn sas_confirm_mac_is_hmac_sha256() {
     // MUST-028/029: SASVerify carries sas_mac = HMAC-SHA-256(session_key,
     // sas_string || "confirm").
-    use hmac::{Hmac, Mac};
+    use hmac::{Hmac, KeyInit, Mac};
     use sha2::Sha256;
     type HmacSha256 = Hmac<Sha256>;
 
