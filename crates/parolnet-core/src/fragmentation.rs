@@ -198,12 +198,7 @@ impl Reassembler {
 
     /// Feed a fragment. Returns the reassembled body if this completes a
     /// message.
-    pub fn push(
-        &mut self,
-        sender: PeerId,
-        frag: FragmentPiece,
-        now: u64,
-    ) -> ReassemblyResult {
+    pub fn push(&mut self, sender: PeerId, frag: FragmentPiece, now: u64) -> ReassemblyResult {
         if (frag.fragment_seq as usize) >= self.max_fragments_per_message {
             return ReassemblyResult::Rejected(FragmentError::FragmentSeqOutOfRange {
                 seq: frag.fragment_seq,
@@ -267,8 +262,8 @@ impl Reassembler {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rand::rngs::StdRng;
     use rand::SeedableRng;
+    use rand::rngs::StdRng;
 
     fn peer(b: u8) -> PeerId {
         PeerId([b; 32])
@@ -600,7 +595,10 @@ mod tests {
             "../../../specs/vectors/PNP-001/fragment_constants.json"
         ))
         .unwrap();
-        assert_eq!(REASSEMBLY_TIMEOUT_SECS, v["reassembly_timeout_secs"].as_u64().unwrap());
+        assert_eq!(
+            REASSEMBLY_TIMEOUT_SECS,
+            v["reassembly_timeout_secs"].as_u64().unwrap()
+        );
         assert_eq!(
             MAX_INFLIGHT_PER_SENDER as u64,
             v["max_inflight_messages_per_sender"].as_u64().unwrap()
@@ -609,7 +607,10 @@ mod tests {
             MAX_FRAGMENTS_PER_MESSAGE as u64,
             v["max_fragments_per_message"].as_u64().unwrap()
         );
-        assert_eq!(FRAGMENT_ID_BYTES as u64, v["fragment_id_bytes"].as_u64().unwrap());
+        assert_eq!(
+            FRAGMENT_ID_BYTES as u64,
+            v["fragment_id_bytes"].as_u64().unwrap()
+        );
     }
 
     // -- Round trip --------------------------------------------------------

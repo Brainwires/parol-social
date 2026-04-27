@@ -104,9 +104,7 @@ impl TokenBucket {
             return;
         }
         // tokens_to_add = floor(elapsed * capacity / period_secs).
-        let add = elapsed
-            .saturating_mul(self.capacity as u64)
-            / self.period_secs;
+        let add = elapsed.saturating_mul(self.capacity as u64) / self.period_secs;
         if add == 0 {
             return;
         }
@@ -404,9 +402,7 @@ impl FederationManager {
         self.peers
             .entry(peer_id)
             .or_insert_with(|| FederationPeer::new(peer_id, now));
-        self.replay_caches
-            .entry(peer_id)
-            .or_insert_with(SyncIdReplayCache::new);
+        self.replay_caches.entry(peer_id).or_default();
     }
 
     /// Forget a peer entirely. Used when a descriptor is pruned or an
@@ -486,10 +482,7 @@ impl FederationManager {
         if !self.peers.contains_key(peer_id) {
             return Err(ManagerError::UnknownPeer);
         }
-        let cache = self
-            .replay_caches
-            .entry(*peer_id)
-            .or_insert_with(SyncIdReplayCache::new);
+        let cache = self.replay_caches.entry(*peer_id).or_default();
         if cache.observe(sync_id, now).is_err() {
             return Ok(vec![ObservationEvent::ReplayedWithinWindow]);
         }
@@ -927,7 +920,10 @@ mod tests {
         assert_eq!(m.known_peer_count(), 0);
         // Re-adding starts fresh — the old sync_id is no longer tracked.
         m.add_peer(pid(1), 100);
-        assert!(m.observe_sync_id(&pid(1), &[0x11; 16], 101).unwrap().is_empty());
+        assert!(
+            m.observe_sync_id(&pid(1), &[0x11; 16], 101)
+                .unwrap()
+                .is_empty()
+        );
     }
-
 }

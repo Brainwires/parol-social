@@ -55,15 +55,15 @@ pub fn key_file_path() -> PathBuf {
 ///
 /// Errors are fatal for the relay process: invalid env hex, unreadable file,
 /// wrong file size, or filesystem I/O failure.
-pub fn load_or_generate_relay_identity(
-    key_file: &Path,
-) -> io::Result<([u8; 32], IdentitySource)> {
+pub fn load_or_generate_relay_identity(key_file: &Path) -> io::Result<([u8; 32], IdentitySource)> {
     // 1. Environment override — never touches disk.
     if let Ok(hex_key) = std::env::var(RELAY_SECRET_KEY_ENV) {
-        let bytes = hex::decode(hex_key.trim())
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!(
-                "{RELAY_SECRET_KEY_ENV} must be valid hex: {e}"
-            )))?;
+        let bytes = hex::decode(hex_key.trim()).map_err(|e| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("{RELAY_SECRET_KEY_ENV} must be valid hex: {e}"),
+            )
+        })?;
         if bytes.len() != 32 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,

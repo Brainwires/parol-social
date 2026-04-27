@@ -23,9 +23,7 @@ fn fresh_key_file(tag: &str) -> PathBuf {
         .unwrap_or(0);
     let pid = std::process::id();
     let mut p = std::env::temp_dir();
-    p.push(format!(
-        "parolnet-relay-identity-test-{pid}-{nanos}-{tag}"
-    ));
+    p.push(format!("parolnet-relay-identity-test-{pid}-{nanos}-{tag}"));
     p.push("relay.key");
     p
 }
@@ -94,12 +92,10 @@ fn identity_stable_across_restarts() {
     let _g = EnvGuard::acquire();
     let path = fresh_key_file("stable");
 
-    let (first, src1) =
-        load_or_generate_relay_identity(&path).expect("first boot");
+    let (first, src1) = load_or_generate_relay_identity(&path).expect("first boot");
     assert_eq!(src1, IdentitySource::GeneratedAndPersisted);
 
-    let (second, src2) =
-        load_or_generate_relay_identity(&path).expect("second boot");
+    let (second, src2) = load_or_generate_relay_identity(&path).expect("second boot");
     assert_eq!(src2, IdentitySource::ExistingFile);
 
     assert_eq!(
@@ -127,8 +123,7 @@ fn env_var_overrides_file() {
         std::env::set_var(RELAY_SECRET_KEY_ENV, &env_hex);
     }
 
-    let (bytes, source) =
-        load_or_generate_relay_identity(&path).expect("should load from env");
+    let (bytes, source) = load_or_generate_relay_identity(&path).expect("should load from env");
     assert_eq!(source, IdentitySource::EnvVar);
     assert_eq!(
         bytes, env_key,

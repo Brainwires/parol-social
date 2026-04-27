@@ -38,8 +38,7 @@ impl SeedChannel {
         if EMBEDDED_SEED_CBOR.is_empty() {
             return Err(ChannelError::NotFound);
         }
-        let bundle = BootstrapBundle::from_cbor(EMBEDDED_SEED_CBOR)
-            .map_err(ChannelError::from)?;
+        let bundle = BootstrapBundle::from_cbor(EMBEDDED_SEED_CBOR).map_err(ChannelError::from)?;
         bundle
             .verify_and_validate(authority_pubkeys, now_secs)
             .map_err(ChannelError::from)?;

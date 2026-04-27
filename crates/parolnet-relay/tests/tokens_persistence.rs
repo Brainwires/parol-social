@@ -52,7 +52,9 @@ fn serialize_deserialize_roundtrips_issue_accept() {
         "same epoch after restart"
     );
 
-    after.verify_and_spend(&tok, 1_000_001).expect("token still redeems post-restart");
+    after
+        .verify_and_spend(&tok, 1_000_001)
+        .expect("token still redeems post-restart");
 
     // Double-spend within the rebuilt authority still blocked.
     assert!(matches!(
@@ -92,7 +94,9 @@ fn from_persisted_triggers_rotation_on_stale_epoch() {
     // The original token minted under the old epoch must still verify —
     // the rotate-on-load path put that key into `prior`, which is still
     // within grace at t=110 (epoch ends at 100, grace until 150).
-    after.verify_and_spend(&tok, 120).expect("prior-within-grace accepts old token");
+    after
+        .verify_and_spend(&tok, 120)
+        .expect("prior-within-grace accepts old token");
 }
 
 #[test]

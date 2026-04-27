@@ -319,8 +319,8 @@ pub fn try_bootstrap_and_decrypt(
 
     // Candidate session — held on the stack, not yet in the session manager.
     let ratchet_sk = StaticSecret::from(*our_ratchet_secret);
-    let mut candidate = DoubleRatchetSession::initialize_responder(bs, ratchet_sk)
-        .map_err(CoreError::Crypto)?;
+    let mut candidate =
+        DoubleRatchetSession::initialize_responder(bs, ratchet_sk).map_err(CoreError::Crypto)?;
 
     let header_bytes = encode_header(&envelope.cleartext_header)?;
     let plaintext = candidate
@@ -361,9 +361,8 @@ mod tests {
     fn round_trip_small_plaintext() {
         let (mut alice, mut bob) = session_pair();
         let dest = PeerId([0x11u8; 32]);
-        let env =
-            encrypt_into_envelope(&mut alice, &dest, 0x01, b"hello bob", 1_700_000_000, None)
-                .unwrap();
+        let env = encrypt_into_envelope(&mut alice, &dest, 0x01, b"hello bob", 1_700_000_000, None)
+            .unwrap();
         assert!(BUCKET_SIZES.contains(&env.len()));
         let decoded = decrypt_from_envelope(&mut bob, &env).unwrap();
         assert_eq!(decoded.plaintext, b"hello bob");

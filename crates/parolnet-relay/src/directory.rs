@@ -177,12 +177,7 @@ impl RelayDirectory {
 
     /// Feed a PNP-008 §7 reputation event for `peer_id`. Lazily creates a
     /// reputation record starting from `REPUTATION_INITIAL_SCORE`.
-    pub fn record_reputation_event(
-        &mut self,
-        peer_id: &PeerId,
-        event: ObservationEvent,
-        now: u64,
-    ) {
+    pub fn record_reputation_event(&mut self, peer_id: &PeerId, event: ObservationEvent, now: u64) {
         let rep = self
             .reputation
             .entry(*peer_id)

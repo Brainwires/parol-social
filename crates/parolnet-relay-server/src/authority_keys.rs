@@ -54,11 +54,12 @@ pub fn load_or_empty(path: &Path) -> io::Result<(Vec<PersistedEpochKey>, Authori
         return Ok((Vec::new(), AuthorityKeySource::FreshGenerated));
     }
     let bytes = fs::read(path)?;
-    let keys: Vec<PersistedEpochKey> = ciborium::from_reader(bytes.as_slice())
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!(
-            "malformed authority key file {}: {e}",
-            path.display(),
-        )))?;
+    let keys: Vec<PersistedEpochKey> = ciborium::from_reader(bytes.as_slice()).map_err(|e| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("malformed authority key file {}: {e}", path.display(),),
+        )
+    })?;
     Ok((keys, AuthorityKeySource::ExistingFile))
 }
 
@@ -87,7 +88,12 @@ pub fn persist(path: &Path, keys: &[PersistedEpochKey]) -> io::Result<()> {
             tmp_name.push(".tmp");
             path.with_file_name(tmp_name)
         }
-        None => return Err(io::Error::new(io::ErrorKind::InvalidInput, "key file has no name")),
+        None => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "key file has no name",
+            ));
+        }
     };
 
     // Clear any stale tmp file from a previous crashed write.

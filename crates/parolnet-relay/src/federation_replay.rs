@@ -17,12 +17,18 @@ use std::collections::HashMap;
 use parolnet_protocol::federation::SYNC_ID_REPLAY_WINDOW_SECS;
 
 /// Bounded replay-protection cache keyed by 128-bit `sync_id`.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct SyncIdReplayCache {
     seen: HashMap<[u8; 16], u64>,
     /// Hard cap on entries — defends against flooding a peer who then replays
     /// old IDs after the window slides. `0` disables the cap.
     max_entries: usize,
+}
+
+impl Default for SyncIdReplayCache {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl SyncIdReplayCache {
@@ -47,13 +53,13 @@ impl SyncIdReplayCache {
     /// the next call and the insert succeeds.
     pub fn observe(&mut self, sync_id: &[u8; 16], now: u64) -> Result<(), RelayError> {
         self.prune(now);
-        if let Some(&prev) = self.seen.get(sync_id) {
-            if now.saturating_sub(prev) < SYNC_ID_REPLAY_WINDOW_SECS {
-                return Err(RelayError::FederationSync(format!(
-                    "PNP-008-MUST-006: sync_id replayed within {} s",
-                    SYNC_ID_REPLAY_WINDOW_SECS
-                )));
-            }
+        if let Some(&prev) = self.seen.get(sync_id)
+            && now.saturating_sub(prev) < SYNC_ID_REPLAY_WINDOW_SECS
+        {
+            return Err(RelayError::FederationSync(format!(
+                "PNP-008-MUST-006: sync_id replayed within {} s",
+                SYNC_ID_REPLAY_WINDOW_SECS
+            )));
         }
         // Enforce the entry cap before insert.
         if self.max_entries > 0 && self.seen.len() >= self.max_entries {
@@ -99,9 +105,10 @@ mod tests {
         let mut c = SyncIdReplayCache::new();
         c.observe(&[1u8; 16], 1000).unwrap();
         assert!(c.observe(&[1u8; 16], 1000 + 100).is_err());
-        assert!(c
-            .observe(&[1u8; 16], 1000 + SYNC_ID_REPLAY_WINDOW_SECS - 1)
-            .is_err());
+        assert!(
+            c.observe(&[1u8; 16], 1000 + SYNC_ID_REPLAY_WINDOW_SECS - 1)
+                .is_err()
+        );
     }
 
     #[test]
@@ -109,9 +116,10 @@ mod tests {
         let mut c = SyncIdReplayCache::new();
         c.observe(&[1u8; 16], 1000).unwrap();
         // Exactly at the window boundary: window is exclusive.
-        assert!(c
-            .observe(&[1u8; 16], 1000 + SYNC_ID_REPLAY_WINDOW_SECS)
-            .is_ok());
+        assert!(
+            c.observe(&[1u8; 16], 1000 + SYNC_ID_REPLAY_WINDOW_SECS)
+                .is_ok()
+        );
     }
 
     #[test]

@@ -239,8 +239,8 @@ fn federation_manager_refuses_ninth_active_peer() {
     // End-to-end pin: once 8 peers are ACTIVE, on_sync_complete MUST fail
     // for the 9th. Caller must shed a peer (reputation-ban, timeout, or
     // operator eviction) before another can be admitted.
-    use parolnet_relay::federation::{FederationManager, ManagerError};
     use parolnet_protocol::PeerId;
+    use parolnet_relay::federation::{FederationManager, ManagerError};
     let mut m = FederationManager::new();
     let mut t = 0u64;
     for i in 1u8..=8 {
@@ -284,8 +284,8 @@ fn handshake_failure_transitions_to_idle_and_counts() {
     // MUST-019: the transport must close on unverifiable descriptor. Our
     // state machine routes this through handshake_failed → Idle, bumping
     // failures for the MUST-020 backoff to take effect.
-    use parolnet_relay::federation::{FederationPeer, PeerState};
     use parolnet_protocol::PeerId;
+    use parolnet_relay::federation::{FederationPeer, PeerState};
     let mut p = FederationPeer::new(PeerId([7; 32]), 0);
     p.connect(1).unwrap();
     p.handshake_failed(2);
@@ -308,8 +308,8 @@ fn reconnect_backoff_formula_is_30_times_two_to_failures_capped_at_3600() {
 #[clause("PNP-008-MUST-022")]
 #[test]
 fn federation_rate_limits_are_100_per_min_descriptors_10_per_hour_syncs() {
-    use parolnet_relay::federation::FederationPeer;
     use parolnet_protocol::PeerId;
+    use parolnet_relay::federation::FederationPeer;
     let mut p = FederationPeer::new(PeerId([1; 32]), 0);
     // Descriptor deliveries: 100 tokens at t=0, 101st rejected.
     for _ in 0..100 {
@@ -380,8 +380,8 @@ fn federation_sync_timestamp_window_is_300_seconds() {
 #[clause("PNP-008-MUST-006")]
 #[test]
 fn federation_sync_id_replay_window_is_five_minutes() {
-    use parolnet_relay::federation_replay::SyncIdReplayCache;
     use parolnet_protocol::federation::SYNC_ID_REPLAY_WINDOW_SECS;
+    use parolnet_relay::federation_replay::SyncIdReplayCache;
     assert_eq!(SYNC_ID_REPLAY_WINDOW_SECS, 300);
 
     let mut cache = SyncIdReplayCache::new();
@@ -389,9 +389,11 @@ fn federation_sync_id_replay_window_is_five_minutes() {
     // Within window → replay rejected.
     assert!(cache.observe(&[7u8; 16], 1_299).is_err());
     // Past window → accepted again.
-    assert!(cache
-        .observe(&[7u8; 16], 1_000 + SYNC_ID_REPLAY_WINDOW_SECS)
-        .is_ok());
+    assert!(
+        cache
+            .observe(&[7u8; 16], 1_000 + SYNC_ID_REPLAY_WINDOW_SECS)
+            .is_ok()
+    );
 }
 
 #[clause("PNP-008-MUST-007")]
@@ -460,7 +462,10 @@ fn requested_digests_response_is_subset_not_fabrication() {
     };
     // 3 requested, 2 returned — the receiver pairs responses to requested by
     // re-hashing. Pin by shape: response count may be less than request count.
-    assert!(fs.requested_digests.as_ref().unwrap().len() >= fs.response_descriptors.as_ref().unwrap().len());
+    assert!(
+        fs.requested_digests.as_ref().unwrap().len()
+            >= fs.response_descriptors.as_ref().unwrap().len()
+    );
     // Removing a digest after signing would require re-signing; pin the
     // ordering invariant used by the verifier.
     fs.requested_digests.as_mut().unwrap().pop();
@@ -474,9 +479,7 @@ fn heartbeat_counter_must_strictly_increase_verified_via_sig() {
     // Pair this with the signature check to ensure a replay of the same
     // counter (even with a valid old signature) fails the monotonicity gate.
     use ed25519_dalek::SigningKey;
-    use parolnet_protocol::federation::{
-        FederationHeartbeat, HeartbeatFlags, LoadHint,
-    };
+    use parolnet_protocol::federation::{FederationHeartbeat, HeartbeatFlags, LoadHint};
     let mut s = [0u8; 32];
     s[0] = 77;
     let signer = SigningKey::from_bytes(&s);
@@ -507,9 +510,7 @@ fn heartbeat_counter_must_strictly_increase_verified_via_sig() {
 #[clause("PNP-008-MUST-011")]
 #[test]
 fn heartbeat_cadence_constants_match_spec() {
-    use parolnet_protocol::federation::{
-        HEARTBEAT_MIN_INTERVAL_SECS, HEARTBEAT_UNREACHABLE_SECS,
-    };
+    use parolnet_protocol::federation::{HEARTBEAT_MIN_INTERVAL_SECS, HEARTBEAT_UNREACHABLE_SECS};
     assert_eq!(HEARTBEAT_MIN_INTERVAL_SECS, 60);
     assert_eq!(HEARTBEAT_UNREACHABLE_SECS, 180);
     assert!(HEARTBEAT_UNREACHABLE_SECS >= 3 * HEARTBEAT_MIN_INTERVAL_SECS);
@@ -588,8 +589,7 @@ fn reputation_event_table_matches_spec() {
 #[test]
 fn suspect_threshold_score_below_0_2_for_15_minutes() {
     use parolnet_relay::health::{
-        ObservationEvent, RelayFlags, RelayReputation, SUSPECT_DWELL_SECS,
-        SUSPECT_SCORE_THRESHOLD,
+        ObservationEvent, RelayFlags, RelayReputation, SUSPECT_DWELL_SECS, SUSPECT_SCORE_THRESHOLD,
     };
     assert!((SUSPECT_SCORE_THRESHOLD - 0.2).abs() < 1e-9);
     assert_eq!(SUSPECT_DWELL_SECS, 900);
@@ -700,7 +700,7 @@ fn bootstrap_channels_do_not_grant_trust_only_descriptors() {
 #[clause("PNP-008-MUST-042")]
 #[test]
 fn bootstrap_bundle_version_is_one() {
-    use parolnet_relay::bootstrap::{BootstrapBundle, BUNDLE_VERSION};
+    use parolnet_relay::bootstrap::{BUNDLE_VERSION, BootstrapBundle};
     assert_eq!(BUNDLE_VERSION, 0x01);
     // Fresh bundle carries the version constant.
     let signer = sk(1);
@@ -724,7 +724,7 @@ fn bootstrap_bundle_signature_verified_before_descriptor_parsing() {
 #[clause("PNP-008-MUST-041")]
 #[test]
 fn bootstrap_dns_txt_record_name_is_parolnet_relay_tcp() {
-    use parolnet_relay::bootstrap::dns::{fqdn, DNS_RECORD_PREFIX};
+    use parolnet_relay::bootstrap::dns::{DNS_RECORD_PREFIX, fqdn};
     assert_eq!(DNS_RECORD_PREFIX, "_parolnet-relay._tcp.");
     assert_eq!(
         fqdn("relay.parol.social"),
@@ -772,13 +772,16 @@ fn bootstrap_bundle_version_byte_checked_before_signature() {
     ))
     .unwrap();
     assert_eq!(v["input"]["valid_version"], 1);
-    assert_eq!(v["expected"]["version_field_precedes_signature_check"], true);
+    assert_eq!(
+        v["expected"]["version_field_precedes_signature_check"],
+        true
+    );
 }
 
 #[clause("PNP-008-MUST-072")]
 #[test]
 fn bootstrap_bundle_freshness_is_seven_days() {
-    use parolnet_relay::bootstrap::{BootstrapBundle, BundleError, BUNDLE_MAX_AGE_SECS};
+    use parolnet_relay::bootstrap::{BUNDLE_MAX_AGE_SECS, BootstrapBundle, BundleError};
     assert_eq!(BUNDLE_MAX_AGE_SECS, 604_800);
 
     let signer = sk(9);
@@ -845,7 +848,10 @@ fn bootstrap_seed_list_loads_without_network() {
     // highest priority (so it runs first at startup before any network
     // dependency is attempted).
     let channels = ["seed", "dns_txt", "https", "dht", "lan"];
-    assert_eq!(channels[0], "seed", "seed MUST be the first attempted channel");
+    assert_eq!(
+        channels[0], "seed",
+        "seed MUST be the first attempted channel"
+    );
 }
 
 // -- §5.5 Federation link on-wire framing (v0.5) ---------------------------
@@ -869,7 +875,7 @@ fn federation_link_path_is_version_one() {
 #[test]
 fn federation_frame_length_prefix_is_big_endian_u32() {
     use parolnet_protocol::federation::{FederationHeartbeat, HeartbeatFlags, LoadHint};
-    use parolnet_relay::federation_codec::{encode_frame, FederationFrame, FRAME_LEN_PREFIX_BYTES};
+    use parolnet_relay::federation_codec::{FRAME_LEN_PREFIX_BYTES, FederationFrame, encode_frame};
 
     let v: serde_json::Value = serde_json::from_slice(include_bytes!(
         "../../../specs/vectors/PNP-008/federation_link_framing.json"
@@ -889,8 +895,7 @@ fn federation_frame_length_prefix_is_big_endian_u32() {
     };
     let bytes = encode_frame(&FederationFrame::Heartbeat(hb)).unwrap();
     assert!(bytes.len() > FRAME_LEN_PREFIX_BYTES);
-    let declared =
-        u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as usize;
+    let declared = u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as usize;
     assert_eq!(declared, bytes.len() - FRAME_LEN_PREFIX_BYTES);
 }
 
@@ -898,7 +903,7 @@ fn federation_frame_length_prefix_is_big_endian_u32() {
 #[test]
 fn federation_frame_max_bytes_is_2mib() {
     use parolnet_relay::federation_codec::{
-        decode_frame, CodecError, CLOSE_OVERSIZE, FRAME_LEN_PREFIX_BYTES, MAX_FRAME_BYTES,
+        CLOSE_OVERSIZE, CodecError, FRAME_LEN_PREFIX_BYTES, MAX_FRAME_BYTES, decode_frame,
     };
 
     let v: serde_json::Value = serde_json::from_slice(include_bytes!(
@@ -925,7 +930,7 @@ fn federation_frame_max_bytes_is_2mib() {
 #[test]
 fn federation_unknown_type_closes_transport() {
     use parolnet_protocol::federation::FederationPayloadType;
-    use parolnet_relay::federation_codec::{CodecError, CLOSE_UNKNOWN_TYPE};
+    use parolnet_relay::federation_codec::{CLOSE_UNKNOWN_TYPE, CodecError};
     for code in [0x00u8, 0x01, 0x05, 0x09, 0xFF] {
         assert!(
             FederationPayloadType::from_u8(code).is_none(),
@@ -950,8 +955,8 @@ fn federation_sync_must_precede_heartbeat_post_handshake() {
 #[clause("PNP-008-MUST-082")]
 #[test]
 fn heartbeat_permitted_during_sync_does_not_advance_state() {
-    use parolnet_relay::federation::{FederationPeer, PeerState};
     use parolnet_protocol::PeerId;
+    use parolnet_relay::federation::{FederationPeer, PeerState};
     let mut p = FederationPeer::new(PeerId([1; 32]), 0);
     p.connect(1).unwrap();
     p.handshake_ok(2).unwrap();
@@ -965,9 +970,11 @@ fn heartbeat_permitted_during_sync_does_not_advance_state() {
 #[test]
 fn federation_dedup_close_code_is_4000() {
     use parolnet_protocol::PeerId;
-    use parolnet_relay::federation_codec::CLOSE_DUP_PEER;
-    use parolnet_relay::federation_link::{FederationLink, FederationLinkError, FederationLinkRole};
     use parolnet_relay::FederationManager;
+    use parolnet_relay::federation_codec::CLOSE_DUP_PEER;
+    use parolnet_relay::federation_link::{
+        FederationLink, FederationLinkError, FederationLinkRole,
+    };
 
     let v: serde_json::Value = serde_json::from_slice(include_bytes!(
         "../../../specs/vectors/PNP-008/federation_close_codes.json"
@@ -1027,10 +1034,7 @@ fn bridge_cover_page_is_200_html_min_256_bytes() {
     ))
     .unwrap();
     assert_eq!(v["http_status"].as_u64(), Some(200));
-    assert_eq!(
-        v["content_type"].as_str(),
-        Some("text/html; charset=utf-8")
-    );
+    assert_eq!(v["content_type"].as_str(), Some("text/html; charset=utf-8"));
     assert_eq!(v["min_body_bytes"].as_u64(), Some(256));
     // Relay implementation must serve the compiled-in cover page that meets
     // the spec bounds.
@@ -1118,9 +1122,7 @@ fn bridge_disclosure_counter_ephemeral_in_memory() {
 #[clause("PNP-008-MUST-090")]
 #[test]
 fn bridge_ip_log_scrubber_purges_at_24h() {
-    use parolnet_relay::bridge::{
-        IpAuditLog, IP_LOG_MAX_AGE_SECS, IP_LOG_SCRUBBER_INTERVAL_SECS,
-    };
+    use parolnet_relay::bridge::{IP_LOG_MAX_AGE_SECS, IP_LOG_SCRUBBER_INTERVAL_SECS, IpAuditLog};
     let v: serde_json::Value = serde_json::from_slice(include_bytes!(
         "../../../specs/vectors/PNP-008/bridge_disclosure_limits.json"
     ))
@@ -1395,8 +1397,8 @@ fn unverifiable_peer_descriptor_closes_transport() {
 #[clause("PNP-008-MUST-021")]
 #[test]
 fn failure_counter_resets_after_300s_active_session() {
-    use parolnet_relay::federation::{FederationPeer, STABILIZATION_ACTIVE_SECS};
     use parolnet_protocol::PeerId;
+    use parolnet_relay::federation::{FederationPeer, STABILIZATION_ACTIVE_SECS};
     assert_eq!(STABILIZATION_ACTIVE_SECS, 300);
 
     let mut p = FederationPeer::new(PeerId([1; 32]), 0);
@@ -1569,7 +1571,7 @@ fn bundle_signature_verified_independently_of_tls() {
 #[clause("PNP-008-MUST-047")]
 #[test]
 fn dht_bootstrap_uses_bep44_mutable_items() {
-    use parolnet_relay::bootstrap::dht::{DhtBootstrapKey, BEP_44_SALT, BEP_44_TARGET_BYTES};
+    use parolnet_relay::bootstrap::dht::{BEP_44_SALT, BEP_44_TARGET_BYTES, DhtBootstrapKey};
     use sha1::{Digest, Sha1};
     // MUST-047: BEP-44 target hash = SHA-1(pubkey || salt), 20 bytes, keyed
     // by an authority Ed25519 pubkey (32 B).
@@ -1588,7 +1590,7 @@ fn dht_bootstrap_uses_bep44_mutable_items() {
 fn dht_bundle_is_deterministic_cbor_with_issued_at_seq() {
     use ed25519_dalek::SigningKey;
     use parolnet_relay::bootstrap::bundle::BootstrapBundle;
-    use parolnet_relay::bootstrap::dht::{verify_and_extract_bundle, DhtBep44Value, DhtError};
+    use parolnet_relay::bootstrap::dht::{DhtBep44Value, DhtError, verify_and_extract_bundle};
     // MUST-048: the BEP-44 seq MUST equal the bundle's `issued_at` (seconds).
     let issued_at: u64 = 1_700_000_000;
     let mut seed = [0u8; 32];
@@ -1619,7 +1621,7 @@ fn dht_bundle_is_deterministic_cbor_with_issued_at_seq() {
 fn dht_values_signature_verified_before_use() {
     use ed25519_dalek::SigningKey;
     use parolnet_relay::bootstrap::bundle::{BootstrapBundle, BundleError};
-    use parolnet_relay::bootstrap::dht::{verify_and_extract_bundle, DhtBep44Value, DhtError};
+    use parolnet_relay::bootstrap::dht::{DhtBep44Value, DhtError, verify_and_extract_bundle};
     // MUST-049: values MUST be signature-verified before descriptors are used.
     // Tampered CBOR body → signature invalid → bundle rejected (no descriptors
     // returned).
@@ -1677,7 +1679,7 @@ fn pluggable_transport_listen_and_connect_roles() {
 #[test]
 fn pluggable_transport_registry_matches_spec() {
     use parolnet_transport::pluggable::{
-        is_valid_transport_id, TransportRegistry, V1_REGISTRY_IDS,
+        TransportRegistry, V1_REGISTRY_IDS, is_valid_transport_id,
     };
     let v: serde_json::Value = serde_json::from_slice(include_bytes!(
         "../../../specs/vectors/PNP-008/pluggable_transport_registry.json"
@@ -1690,7 +1692,10 @@ fn pluggable_transport_registry_matches_spec() {
         .map(|t| t["id"].as_str().unwrap())
         .collect();
     for id in ["domain_front", "obfs", "direct_tls"] {
-        assert!(transports.contains(&id), "transport registry MUST include {id}");
+        assert!(
+            transports.contains(&id),
+            "transport registry MUST include {id}"
+        );
         assert!(is_valid_transport_id(id));
         assert!(V1_REGISTRY_IDS.contains(&id));
     }
@@ -1708,8 +1713,7 @@ fn pluggable_transport_domain_fronting_sni_matches_front() {
     // Distinct SNI + inner host → accepted.
     DomainFrontConfig::new("cdn.example.net", "bridge.secret.invalid").unwrap();
     // SNI == inner host → rejected as unfronted (case-insensitive).
-    let err =
-        DomainFrontConfig::new("bridge.secret.invalid", "bridge.secret.invalid").unwrap_err();
+    let err = DomainFrontConfig::new("bridge.secret.invalid", "bridge.secret.invalid").unwrap_err();
     assert!(matches!(err, DomainFrontError::UnfrontedConnection { .. }));
     let err2 = DomainFrontConfig::validate_inbound("Bridge.X", "bridge.x").unwrap_err();
     assert!(matches!(err2, DomainFrontError::UnfrontedConnection { .. }));
@@ -1718,7 +1722,7 @@ fn pluggable_transport_domain_fronting_sni_matches_front() {
 #[clause("PNP-008-MUST-095")]
 #[test]
 fn pluggable_transport_obfuscation_min_32_random_prefix() {
-    use parolnet_transport::obfs::{RandomPrefix, MIN_RANDOM_PREFIX_BYTES};
+    use parolnet_transport::obfs::{MIN_RANDOM_PREFIX_BYTES, RandomPrefix};
     let v: serde_json::Value = serde_json::from_slice(include_bytes!(
         "../../../specs/vectors/PNP-008/pluggable_transport_obfuscation.json"
     ))
@@ -1746,7 +1750,7 @@ fn pluggable_transport_obfuscation_min_32_random_prefix() {
 #[clause("PNP-008-MUST-096")]
 #[test]
 fn pluggable_transport_frame_length_distribution_matches_cover() {
-    use parolnet_transport::obfs::{pad_to_cover, CoverProfile};
+    use parolnet_transport::obfs::{CoverProfile, pad_to_cover};
     use rand::SeedableRng;
     let v: serde_json::Value = serde_json::from_slice(include_bytes!(
         "../../../specs/vectors/PNP-008/pluggable_transport_obfuscation.json"
@@ -1769,7 +1773,7 @@ fn pluggable_transport_frame_length_distribution_matches_cover() {
 #[clause("PNP-008-MUST-097")]
 #[test]
 fn pluggable_transport_direct_tls_is_mandatory_baseline() {
-    use parolnet_transport::pluggable::{RegistryError, TransportRegistry, MANDATORY_BASELINE_ID};
+    use parolnet_transport::pluggable::{MANDATORY_BASELINE_ID, RegistryError, TransportRegistry};
     let v: serde_json::Value = serde_json::from_slice(include_bytes!(
         "../../../specs/vectors/PNP-008/pluggable_transport_registry.json"
     ))

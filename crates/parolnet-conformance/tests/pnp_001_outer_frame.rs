@@ -265,8 +265,8 @@ fn bootstrap_state() -> (
     let parsed = parolnet_core::bootstrap::parse_qr_payload(&qr.payload_bytes).unwrap();
     let mut ratchet_key = [0u8; 32];
     ratchet_key.copy_from_slice(&parsed.rk);
-    let bs = derive_bootstrap_secret(&qr.seed, &scanner.public_key(), &presenter.public_key())
-        .unwrap();
+    let bs =
+        derive_bootstrap_secret(&qr.seed, &scanner.public_key(), &presenter.public_key()).unwrap();
     let presenter_peer = presenter.peer_id();
     scanner
         .establish_session(presenter_peer, SharedSecret(bs), &ratchet_key, true)
@@ -274,7 +274,14 @@ fn bootstrap_state() -> (
 
     let scanner_peer = scanner.peer_id();
     let scanner_ik = scanner.public_key();
-    (presenter, scanner, qr.seed, qr.ratchet_secret, scanner_peer, scanner_ik)
+    (
+        presenter,
+        scanner,
+        qr.seed,
+        qr.ratchet_secret,
+        scanner_peer,
+        scanner_ik,
+    )
 }
 
 #[clause("PNP-001-MUST-063", "PNP-001-MUST-064")]
@@ -405,12 +412,9 @@ fn second_envelope_uses_null_source_hint_on_established_session() {
     .unwrap();
 
     // Presenter decrypts via the normal path — no materialization needed now.
-    let decoded = parolnet_core::envelope::decrypt_for_peer(
-        presenter.sessions(),
-        &scanner_peer,
-        &wire2,
-    )
-    .unwrap();
+    let decoded =
+        parolnet_core::envelope::decrypt_for_peer(presenter.sessions(), &scanner_peer, &wire2)
+            .unwrap();
 
     assert_eq!(decoded.plaintext, b"second");
     assert_eq!(
