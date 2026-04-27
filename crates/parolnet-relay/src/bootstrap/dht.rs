@@ -114,8 +114,8 @@ pub enum DhtError {
 ///    (version → signature → freshness). This is the same pipeline every
 ///    other §8 channel funnels through so the DHT does not get a validation
 ///    bypass.
-pub fn verify_and_extract_bundle<'a>(
-    value: &'a DhtBep44Value,
+pub fn verify_and_extract_bundle(
+    value: &DhtBep44Value,
     authority_pubkeys: &[[u8; 32]],
     now_secs: u64,
 ) -> Result<BootstrapBundle, DhtError> {

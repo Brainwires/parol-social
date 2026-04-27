@@ -54,11 +54,12 @@ pub fn load_or_empty(path: &Path) -> io::Result<(Vec<PersistedEpochKey>, Authori
         return Ok((Vec::new(), AuthorityKeySource::FreshGenerated));
     }
     let bytes = fs::read(path)?;
-    let keys: Vec<PersistedEpochKey> = ciborium::from_reader(bytes.as_slice())
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!(
-            "malformed authority key file {}: {e}",
-            path.display(),
-        )))?;
+    let keys: Vec<PersistedEpochKey> = ciborium::from_reader(bytes.as_slice()).map_err(|e| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("malformed authority key file {}: {e}", path.display(),),
+        )
+    })?;
     Ok((keys, AuthorityKeySource::ExistingFile))
 }
 
@@ -70,11 +71,12 @@ pub fn load_or_empty(path: &Path) -> io::Result<(Vec<PersistedEpochKey>, Authori
 /// readable — the worst case is that we start up with a one-epoch-stale
 /// key set, which `from_persisted` handles via its rotate-on-load path.
 pub fn persist(path: &Path, keys: &[PersistedEpochKey]) -> io::Result<()> {
-    if let Some(parent) = path.parent() {
-        if !parent.as_os_str().is_empty() && !parent.exists() {
-            fs::create_dir_all(parent)?;
-            set_dir_mode_0700(parent)?;
-        }
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+        && !parent.exists()
+    {
+        fs::create_dir_all(parent)?;
+        set_dir_mode_0700(parent)?;
     }
 
     let mut buf = Vec::with_capacity(128);
@@ -87,7 +89,12 @@ pub fn persist(path: &Path, keys: &[PersistedEpochKey]) -> io::Result<()> {
             tmp_name.push(".tmp");
             path.with_file_name(tmp_name)
         }
-        None => return Err(io::Error::new(io::ErrorKind::InvalidInput, "key file has no name")),
+        None => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "key file has no name",
+            ));
+        }
     };
 
     // Clear any stale tmp file from a previous crashed write.

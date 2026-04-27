@@ -311,12 +311,11 @@ impl RelayReputation {
         if self.active_since.is_none() {
             self.active_since = Some(now);
         }
-        if let Some(since) = self.active_since {
-            if now.saturating_sub(since) >= STABLE_ACTIVE_DWELL_SECS
-                && self.score >= STABLE_SCORE_THRESHOLD
-            {
-                self.flags.insert(RelayFlags::STABLE);
-            }
+        if let Some(since) = self.active_since
+            && now.saturating_sub(since) >= STABLE_ACTIVE_DWELL_SECS
+            && self.score >= STABLE_SCORE_THRESHOLD
+        {
+            self.flags.insert(RelayFlags::STABLE);
         }
     }
 

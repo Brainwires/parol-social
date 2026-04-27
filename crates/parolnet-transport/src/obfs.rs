@@ -175,6 +175,9 @@ mod tests {
 
     #[test]
     fn obfs_transport_id_matches_registry() {
-        assert_eq!(ObfsTransport::new(CoverProfile::Http1).id(), TRANSPORT_ID_OBFS);
+        assert_eq!(
+            ObfsTransport::new(CoverProfile::Http1).id(),
+            TRANSPORT_ID_OBFS
+        );
     }
 }

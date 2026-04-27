@@ -27,6 +27,12 @@ pub struct RelayMessageStore {
     buffers: HashMap<PeerId, Vec<BufferedRelayMessage>>,
 }
 
+impl Default for RelayMessageStore {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl RelayMessageStore {
     pub fn new() -> Self {
         Self {

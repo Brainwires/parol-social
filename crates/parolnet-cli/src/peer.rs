@@ -67,10 +67,7 @@ pub struct PeerHandle {
 impl PeerHandle {
     /// Open the WS, sign the challenge, wait for `registered`, and return a
     /// handle the orchestrator can use to send messages and drain events.
-    pub async fn connect(
-        relay_url: &str,
-        identity: IdentityKeyPair,
-    ) -> Result<Self> {
+    pub async fn connect(relay_url: &str, identity: IdentityKeyPair) -> Result<Self> {
         let peer_id = PeerId::from_public_key(&identity.public_key_bytes());
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel::<PeerCmd>();
         let (evt_tx, evt_rx) = mpsc::unbounded_channel::<PeerEvt>();
@@ -156,8 +153,7 @@ async fn run_peer_task(
         ))
         .await?;
 
-    let mut ping_timer =
-        tokio::time::interval(std::time::Duration::from_secs(PING_INTERVAL_SECS));
+    let mut ping_timer = tokio::time::interval(std::time::Duration::from_secs(PING_INTERVAL_SECS));
     ping_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     // Burn the first (immediate) tick — we don't want to ping before we're registered.
     ping_timer.tick().await;

@@ -36,6 +36,12 @@ pub struct ClientStats {
     pub total_batches: AtomicU64,
 }
 
+impl Default for ClientStats {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ClientStats {
     pub fn new() -> Self {
         Self {

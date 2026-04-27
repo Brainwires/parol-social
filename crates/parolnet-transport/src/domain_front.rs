@@ -116,7 +116,8 @@ mod tests {
 
     #[test]
     fn validate_inbound_rejects_identity_case_insensitive() {
-        let err = DomainFrontConfig::validate_inbound("Bridge.Example", "bridge.example").unwrap_err();
+        let err =
+            DomainFrontConfig::validate_inbound("Bridge.Example", "bridge.example").unwrap_err();
         assert!(matches!(err, DomainFrontError::UnfrontedConnection { .. }));
     }
 
@@ -139,9 +140,7 @@ mod tests {
 
     #[test]
     fn id_matches_registry() {
-        let t = DomainFrontTransport::new(
-            DomainFrontConfig::new("cdn.x", "bridge.y").unwrap(),
-        );
+        let t = DomainFrontTransport::new(DomainFrontConfig::new("cdn.x", "bridge.y").unwrap());
         assert_eq!(t.id(), TRANSPORT_ID_DOMAIN_FRONT);
     }
 }

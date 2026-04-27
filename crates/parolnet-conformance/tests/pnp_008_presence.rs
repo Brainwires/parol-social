@@ -34,8 +34,7 @@ fn local_presence_returns_signed_entries_for_connected_peers() {
     // MUST-064: each entry carries an Ed25519 signature over the canonical hash.
     let home_sk = sk(1);
     let home_rid = relay_identity(&home_sk);
-    let mut auth =
-        PresenceAuthority::new(home_rid, home_sk.clone(), PresenceConfig::default());
+    let mut auth = PresenceAuthority::new(home_rid, home_sk.clone(), PresenceConfig::default());
 
     let peer_a = PeerId([0x11; 32]);
     let peer_b = PeerId([0x22; 32]);
@@ -125,8 +124,7 @@ fn lookup_signature_verifies_under_home_relay_key() {
     // verify it with an independently constructed VerifyingKey.
     let home_sk = sk(4);
     let home_rid = relay_identity(&home_sk);
-    let mut auth =
-        PresenceAuthority::new(home_rid, home_sk.clone(), PresenceConfig::default());
+    let mut auth = PresenceAuthority::new(home_rid, home_sk.clone(), PresenceConfig::default());
     auth.set_own_public_url("http://verify.example".into());
 
     let peer = PeerId([0x44; 32]);

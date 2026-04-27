@@ -6,7 +6,7 @@
 //! (MUST-046) — a compromised CA cannot inject descriptors.
 
 use super::bundle::BootstrapBundle;
-use super::{ChannelError, ChannelKind, CHANNEL_ATTEMPT_TIMEOUT_SECS};
+use super::{CHANNEL_ATTEMPT_TIMEOUT_SECS, ChannelError, ChannelKind};
 use std::time::Duration;
 
 /// Accepted content-type for the body, per MUST-076. The parameterised form
@@ -17,8 +17,7 @@ pub const REQUIRED_CONTENT_TYPE: &str = "application/cbor";
 pub fn content_type_accepted(content_type: &str) -> bool {
     let lower = content_type.to_ascii_lowercase();
     let trimmed = lower.trim();
-    trimmed == REQUIRED_CONTENT_TYPE
-        || trimmed.starts_with(&format!("{REQUIRED_CONTENT_TYPE};"))
+    trimmed == REQUIRED_CONTENT_TYPE || trimmed.starts_with(&format!("{REQUIRED_CONTENT_TYPE};"))
 }
 
 /// HTTPS channel.
@@ -117,7 +116,9 @@ mod tests {
 
     #[tokio::test]
     async fn non_https_url_rejected_without_io() {
-        let err = HttpsChannel::fetch("http://example.com/bundle").await.unwrap_err();
+        let err = HttpsChannel::fetch("http://example.com/bundle")
+            .await
+            .unwrap_err();
         match err {
             ChannelError::Transport(msg) => assert!(msg.contains("https://")),
             other => panic!("expected Transport error, got {other:?}"),

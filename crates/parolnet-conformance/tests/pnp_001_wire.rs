@@ -943,8 +943,8 @@ fn bucket_padding_supports_traffic_analysis_resistance() {
 // -- §3.9 Fragmentation (v0.6) — real type: parolnet_core::fragmentation ----
 
 use parolnet_core::fragmentation::{
-    FragmentPiece, Fragmenter, ReassemblyResult, Reassembler, FRAGMENT_ID_BYTES,
-    MAX_FRAGMENTS_PER_MESSAGE, MAX_INFLIGHT_PER_SENDER, REASSEMBLY_TIMEOUT_SECS,
+    FRAGMENT_ID_BYTES, FragmentPiece, Fragmenter, MAX_FRAGMENTS_PER_MESSAGE,
+    MAX_INFLIGHT_PER_SENDER, REASSEMBLY_TIMEOUT_SECS, Reassembler, ReassemblyResult,
 };
 
 fn frag_arrivals_from_vector(v: &serde_json::Value) -> (PeerId, [u8; 16], Vec<FragmentPiece>) {
@@ -966,7 +966,12 @@ fn frag_arrivals_from_vector(v: &serde_json::Value) -> (PeerId, [u8; 16], Vec<Fr
     (PeerId([0xC0; 32]), fid, arrivals)
 }
 
-#[clause("PNP-001-MUST-053", "PNP-001-MUST-054", "PNP-001-MUST-055", "PNP-001-MUST-058")]
+#[clause(
+    "PNP-001-MUST-053",
+    "PNP-001-MUST-054",
+    "PNP-001-MUST-055",
+    "PNP-001-MUST-058"
+)]
 #[test]
 fn fragment_reassembly_happy_path() {
     let v: serde_json::Value = serde_json::from_slice(include_bytes!(
@@ -1083,7 +1088,12 @@ fn fragment_missing_seq_prevents_reassembly() {
     assert_eq!(
         r.push(
             sender,
-            FragmentPiece { fragment_id: fid, fragment_seq: 0, is_final: false, body: vec![1] },
+            FragmentPiece {
+                fragment_id: fid,
+                fragment_seq: 0,
+                is_final: false,
+                body: vec![1]
+            },
             0,
         ),
         ReassemblyResult::Buffered
@@ -1091,7 +1101,12 @@ fn fragment_missing_seq_prevents_reassembly() {
     assert_eq!(
         r.push(
             sender,
-            FragmentPiece { fragment_id: fid, fragment_seq: 2, is_final: true, body: vec![3] },
+            FragmentPiece {
+                fragment_id: fid,
+                fragment_seq: 2,
+                is_final: true,
+                body: vec![3]
+            },
             0,
         ),
         ReassemblyResult::Buffered
@@ -1101,8 +1116,8 @@ fn fragment_missing_seq_prevents_reassembly() {
 #[clause("PNP-001-MUST-053", "PNP-001-MUST-054", "PNP-001-MUST-055")]
 #[test]
 fn fragmenter_split_produces_spec_compliant_fragments() {
-    use rand::rngs::StdRng;
     use rand::SeedableRng;
+    use rand::rngs::StdRng;
     let body: Vec<u8> = (0..1000u32).map(|i| (i & 0xff) as u8).collect();
     let mut rng = StdRng::seed_from_u64(7);
     let frags = Fragmenter::split(&body, 100, &mut rng).unwrap();

@@ -176,7 +176,10 @@ mod tests {
         assert_eq!(declared, bytes.len() - FRAME_LEN_PREFIX_BYTES);
         // Decode returns same type discriminator.
         let back = decode_frame(&bytes).unwrap();
-        assert_eq!(back.payload_type(), FederationPayloadType::FederationHeartbeat);
+        assert_eq!(
+            back.payload_type(),
+            FederationPayloadType::FederationHeartbeat
+        );
     }
 
     #[test]

@@ -517,7 +517,10 @@ pub fn trial_decrypt(envelope_hex: &str) -> Result<JsValue, JsError> {
             .ok_or_else(|| JsError::new("not initialized — call initialize() first"))?;
 
         let mut last_err: Option<String> = None;
-        let mut success: Option<(parolnet_protocol::address::PeerId, parolnet_core::envelope::DecryptedEnvelope)> = None;
+        let mut success: Option<(
+            parolnet_protocol::address::PeerId,
+            parolnet_core::envelope::DecryptedEnvelope,
+        )> = None;
 
         for (pid_bytes, _) in client.sessions().export_all() {
             let pid = parolnet_protocol::address::PeerId(pid_bytes);
@@ -2153,6 +2156,7 @@ pub fn token_prepare_blind(count: u32) -> Result<JsValue, JsError> {
 /// The caller MUST NOT reuse the handle after this call; the secret blinds
 /// are consumed and zeroized on our side.
 #[wasm_bindgen]
+#[allow(clippy::boxed_local)]
 pub fn token_unblind(
     handle_hex: &str,
     evaluated_bytes_hex_list: Box<[JsValue]>,
@@ -2179,9 +2183,9 @@ pub fn token_unblind(
 
     let mut out: Vec<String> = Vec::with_capacity(handle.blinds.len());
     for (i, eval_js) in evaluated_bytes_hex_list.iter().enumerate() {
-        let eval_hex = eval_js.as_string().ok_or_else(|| {
-            JsError::new(&format!("evaluated[{i}] is not a string"))
-        })?;
+        let eval_hex = eval_js
+            .as_string()
+            .ok_or_else(|| JsError::new(&format!("evaluated[{i}] is not a string")))?;
         let eval_bytes = hex::decode(&eval_hex)
             .map_err(|e| JsError::new(&format!("evaluated[{i}] invalid hex: {e}")))?;
 

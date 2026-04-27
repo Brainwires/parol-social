@@ -1,8 +1,8 @@
 use parolnet_relay_server::frames::{IncomingMessage, OutgoingMessage};
 use parolnet_relay_server::rate_limit::{
-    ConnRateLimiter, LookupRateLimiter, LOOKUP_RATE_LIMIT, LOOKUP_RATE_WINDOW_SECS,
-    MSG_RATE_LIMIT, MSG_RATE_WINDOW_SECS, MsgRateLimiter, PUSH_RATE_LIMIT, PUSH_RATE_WINDOW_SECS,
-    PushRateLimiter, RateLimiter, WS_CONN_RATE_LIMIT, WS_CONN_RATE_WINDOW_SECS,
+    ConnRateLimiter, LOOKUP_RATE_LIMIT, LOOKUP_RATE_WINDOW_SECS, LookupRateLimiter, MSG_RATE_LIMIT,
+    MSG_RATE_WINDOW_SECS, MsgRateLimiter, PUSH_RATE_LIMIT, PUSH_RATE_WINDOW_SECS, PushRateLimiter,
+    RateLimiter, WS_CONN_RATE_LIMIT, WS_CONN_RATE_WINDOW_SECS,
 };
 use parolnet_relay_server::storage::RelayMessageStore;
 use parolnet_relay_server::telemetry::{ClientStats, TelemetryBatch, handle_telemetry};
@@ -22,14 +22,12 @@ use futures_util::{SinkExt, StreamExt};
 use parolnet_mesh::peer_manager::PeerManager;
 use parolnet_protocol::address::PeerId;
 use parolnet_relay::authority::EndorsedDescriptor;
-use parolnet_relay::directory::{RelayDescriptor, RelayDirectory};
 use parolnet_relay::bridge::{
-    DisclosureLimiter, DisclosureScope, IpAuditLog, COVER_CONTENT_TYPE, COVER_PAGE_HTML,
-    IP_LOG_SCRUBBER_INTERVAL_SECS,
+    COVER_CONTENT_TYPE, COVER_PAGE_HTML, DisclosureLimiter, DisclosureScope,
+    IP_LOG_SCRUBBER_INTERVAL_SECS, IpAuditLog,
 };
-use parolnet_relay::federation_codec::{
-    CLOSE_OVERSIZE, CLOSE_UNKNOWN_TYPE, FEDERATION_LINK_PATH,
-};
+use parolnet_relay::directory::{RelayDescriptor, RelayDirectory};
+use parolnet_relay::federation_codec::{CLOSE_OVERSIZE, CLOSE_UNKNOWN_TYPE, FEDERATION_LINK_PATH};
 use parolnet_relay::presence::{PresenceAuthority, PresenceConfig, PresenceEntry};
 use parolnet_relay::tokens::{Suite, Token, TokenAuthority, TokenConfig};
 use rand::seq::SliceRandom;
@@ -179,7 +177,10 @@ async fn handle_bridge_info(
         _ => {
             return (
                 StatusCode::BAD_REQUEST,
-                [(axum::http::header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+                [(
+                    axum::http::header::CONTENT_TYPE,
+                    "text/plain; charset=utf-8",
+                )],
                 "scope and id required\n".to_string(),
             );
         }
@@ -441,7 +442,10 @@ async fn federation_presence_fetch(
 
         // Snapshot the directory so we can resolve each peer relay's pubkey
         // without holding the lock across HTTP I/O.
-        let directory_snapshot: HashMap<std::net::SocketAddr, ([u8; 32], parolnet_protocol::address::PeerId)> = {
+        let directory_snapshot: HashMap<
+            std::net::SocketAddr,
+            ([u8; 32], parolnet_protocol::address::PeerId),
+        > = {
             let dir = directory.lock().await;
             dir.descriptors()
                 .values()
@@ -473,18 +477,18 @@ async fn federation_presence_fetch(
             match client.get(&presence_url).send().await {
                 Ok(resp) if resp.status().is_success() => match resp.bytes().await {
                     Ok(body) => {
-                        let entries: Vec<PresenceEntry> =
-                            match ciborium::from_reader(body.as_ref()) {
-                                Ok(v) => v,
-                                Err(e) => {
-                                    tracing::warn!(
-                                        url = %presence_url,
-                                        error = %e,
-                                        "invalid CBOR in /peers/presence response"
-                                    );
-                                    continue;
-                                }
-                            };
+                        let entries: Vec<PresenceEntry> = match ciborium::from_reader(body.as_ref())
+                        {
+                            Ok(v) => v,
+                            Err(e) => {
+                                tracing::warn!(
+                                    url = %presence_url,
+                                    error = %e,
+                                    "invalid CBOR in /peers/presence response"
+                                );
+                                continue;
+                            }
+                        };
                         let stats = presence.lock().await.merge_federation_presence(
                             url,
                             home_peer_id,
@@ -527,7 +531,10 @@ async fn federation_presence_fetch(
 /// wait rather than accept unverified presence entries).
 fn resolve_peer_relay_identity(
     url: &str,
-    directory_snapshot: &HashMap<std::net::SocketAddr, ([u8; 32], parolnet_protocol::address::PeerId)>,
+    directory_snapshot: &HashMap<
+        std::net::SocketAddr,
+        ([u8; 32], parolnet_protocol::address::PeerId),
+    >,
 ) -> Option<([u8; 32], parolnet_protocol::address::PeerId)> {
     // Strip scheme, then expect host:port.
     let without_scheme = url
@@ -1190,12 +1197,9 @@ async fn main() {
             );
         }
     }
-    let mut authority = TokenAuthority::from_persisted(
-        TokenConfig::default(),
-        startup_secs,
-        persisted_keys,
-    )
-    .expect("failed to reconstruct TokenAuthority from persisted keys");
+    let mut authority =
+        TokenAuthority::from_persisted(TokenConfig::default(), startup_secs, persisted_keys)
+            .expect("failed to reconstruct TokenAuthority from persisted keys");
     // Install the persist hook. Fires once immediately with the loaded/fresh
     // state so the on-disk file exists before we accept traffic, and then on
     // every subsequent rotation.
@@ -1270,7 +1274,6 @@ async fn main() {
             }
         });
     }
-
 
     // Initialize mesh PeerManager as a gossip supernode.
     //
@@ -1390,10 +1393,8 @@ async fn main() {
 
     // Rate limiter for presence + lookup endpoints (10 req/s per IP,
     // PNP-008-MUST-066). A 1-second window of 10 events is the policy.
-    let lookup_rate_limiter: LookupRateLimiter = Arc::new(RateLimiter::new(
-        LOOKUP_RATE_LIMIT,
-        LOOKUP_RATE_WINDOW_SECS,
-    ));
+    let lookup_rate_limiter: LookupRateLimiter =
+        Arc::new(RateLimiter::new(LOOKUP_RATE_LIMIT, LOOKUP_RATE_WINDOW_SECS));
     {
         let rl = lookup_rate_limiter.clone();
         tokio::spawn(async move {
@@ -1891,6 +1892,7 @@ fn handle_relay_cell(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_socket(
     socket: WebSocket,
     peers: PeerMap,
@@ -2098,10 +2100,7 @@ async fn handle_socket(
                                         .duration_since(std::time::UNIX_EPOCH)
                                         .unwrap_or_default()
                                         .as_secs();
-                                    presence_authority
-                                        .lock()
-                                        .await
-                                        .upsert_local(mesh_pid, now);
+                                    presence_authority.lock().await.upsert_local(mesh_pid, now);
                                 }
 
                                 // Deliver stored messages
@@ -2226,10 +2225,7 @@ async fn handle_socket(
                 if let Some(ref pid_hex) = my_peer_id
                     && let Some(mesh_pid) = parse_peer_id(pid_hex)
                 {
-                    presence_authority
-                        .lock()
-                        .await
-                        .upsert_local(mesh_pid, now);
+                    presence_authority.lock().await.upsert_local(mesh_pid, now);
                 }
 
                 // Token passed — route the payload to `to`. The outbound frame

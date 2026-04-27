@@ -342,8 +342,7 @@ pub async fn reconcile(
     let remote_iblt = Iblt::from_bytes(remote_iblt_bytes)?;
 
     // Build our local IBLT at the remote's dimensions
-    let mut local_iblt =
-        Iblt::with_capacity(remote_iblt.num_cells(), remote_iblt.num_hashes());
+    let mut local_iblt = Iblt::with_capacity(remote_iblt.num_cells(), remote_iblt.num_hashes());
     for id in local_message_ids {
         local_iblt.insert(id);
     }

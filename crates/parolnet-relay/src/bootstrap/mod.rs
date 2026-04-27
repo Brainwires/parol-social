@@ -22,10 +22,10 @@ pub mod dns;
 pub mod https;
 pub mod seed;
 
-pub use bundle::{BootstrapBundle, BundleError, BUNDLE_VERSION, BUNDLE_MAX_AGE_SECS};
+pub use bundle::{BUNDLE_MAX_AGE_SECS, BUNDLE_VERSION, BootstrapBundle, BundleError};
 pub use dht::{
-    verify_and_extract_bundle as dht_verify_and_extract_bundle, DhtBep44Value, DhtBootstrapKey,
-    DhtError, DhtFetcher, InMemoryDht, BEP_44_SALT, BEP_44_TARGET_BYTES,
+    BEP_44_SALT, BEP_44_TARGET_BYTES, DhtBep44Value, DhtBootstrapKey, DhtError, DhtFetcher,
+    InMemoryDht, verify_and_extract_bundle as dht_verify_and_extract_bundle,
 };
 
 /// Per-attempt timeout on any bootstrap channel (PNP-008-MUST-074).

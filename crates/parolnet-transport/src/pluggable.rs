@@ -95,7 +95,9 @@ impl TransportRegistry {
     /// CSPRNG (e.g. `rand::thread_rng()`); deterministic picks are a spec
     /// violation.
     pub fn choose<R: rand::Rng + ?Sized>(&self, rng: &mut R) -> &str {
-        self.ids.choose(rng).expect("registry non-empty by construction")
+        self.ids
+            .choose(rng)
+            .expect("registry non-empty by construction")
     }
 }
 

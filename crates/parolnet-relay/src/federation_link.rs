@@ -16,10 +16,10 @@
 //! callbacks so relay-server can use `axum::extract::ws::WebSocket` and tests
 //! can use an in-memory channel pair.
 
-use crate::federation_codec::{
-    decode_frame, encode_frame, CodecError, FederationFrame, CLOSE_NORMAL, CLOSE_RATE_LIMIT,
-};
 use crate::FederationManager;
+use crate::federation_codec::{
+    CLOSE_NORMAL, CLOSE_RATE_LIMIT, CodecError, FederationFrame, decode_frame, encode_frame,
+};
 use parolnet_protocol::address::PeerId;
 
 /// Link role. The initiator MUST send the first `FederationSync`
@@ -123,10 +123,10 @@ impl FederationLink {
         now: u64,
     ) -> Result<(), FederationLinkError> {
         // Already-admitted peer in an ACTIVE/SYNC state → dedup reject.
-        if let Some(existing) = manager.peer(&self.peer_id) {
-            if existing.state.can_send_federation_payload() {
-                return Err(FederationLinkError::DuplicatePeer(self.peer_id));
-            }
+        if let Some(existing) = manager.peer(&self.peer_id)
+            && existing.state.can_send_federation_payload()
+        {
+            return Err(FederationLinkError::DuplicatePeer(self.peer_id));
         }
         manager.add_peer(self.peer_id, now);
         manager
@@ -214,7 +214,12 @@ mod tests {
         mgr.connect_peer(&pid(9), 1000).unwrap();
         mgr.on_handshake_ok(&pid(9), 1010).unwrap();
         // Now peer is in SYNC which is federation-payload-ok.
-        assert!(mgr.peer(&pid(9)).unwrap().state.can_send_federation_payload());
+        assert!(
+            mgr.peer(&pid(9))
+                .unwrap()
+                .state
+                .can_send_federation_payload()
+        );
 
         let link = FederationLink::new(pid(9), FederationLinkRole::Responder);
         let err = link.admit_inbound(&mut mgr, 1020).unwrap_err();

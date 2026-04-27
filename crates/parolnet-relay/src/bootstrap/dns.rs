@@ -9,9 +9,7 @@
 //! DoH/DoT endpoint.
 
 use super::bundle::BootstrapBundle;
-use super::{
-    ChannelError, ChannelKind, CHANNEL_ATTEMPT_TIMEOUT_SECS,
-};
+use super::{CHANNEL_ATTEMPT_TIMEOUT_SECS, ChannelError, ChannelKind};
 use base64::Engine;
 use std::time::Duration;
 
@@ -97,15 +95,9 @@ mod tests {
 
     #[test]
     fn fqdn_matches_spec_prefix() {
-        assert_eq!(
-            fqdn("parol.example"),
-            "_parolnet-relay._tcp.parol.example"
-        );
+        assert_eq!(fqdn("parol.example"), "_parolnet-relay._tcp.parol.example");
         // Trailing dots trimmed so the prefix format is stable.
-        assert_eq!(
-            fqdn("parol.example."),
-            "_parolnet-relay._tcp.parol.example"
-        );
+        assert_eq!(fqdn("parol.example."), "_parolnet-relay._tcp.parol.example");
     }
 
     #[test]
