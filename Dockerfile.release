@@ -7,11 +7,6 @@ FROM rust:1.92-bookworm AS builder
 # Pin wasm-pack version for deterministic WASM output
 ENV WASM_PACK_VERSION=0.13.1
 
-# Install build dependencies
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    binaryen \
-    && rm -rf /var/lib/apt/lists/*
-
 # Install pinned wasm-pack
 RUN cargo install wasm-pack --version ${WASM_PACK_VERSION} --locked
 
@@ -28,11 +23,6 @@ RUN cargo build --release --locked --bin parolnet-authority
 
 # Build WASM bindings
 RUN wasm-pack build crates/parolnet-wasm --target web --release
-
-# Optimize WASM with pinned wasm-opt (from binaryen package)
-RUN wasm-opt -O3 --enable-all \
-    crates/parolnet-wasm/pkg/parolnet_wasm_bg.wasm \
-    -o crates/parolnet-wasm/pkg/parolnet_wasm_bg.wasm
 
 # Generate checksums
 RUN mkdir -p /artifacts && \
