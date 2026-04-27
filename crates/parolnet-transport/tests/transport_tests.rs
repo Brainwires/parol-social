@@ -317,13 +317,13 @@ fn test_bandwidth_modes_are_distinct() {
 /// Generate a self-signed cert for the default SNI hostname and return a
 /// TlsTransport configured to trust it.
 fn build_test_tls_transport() -> TlsTransport {
-    let rcgen::CertifiedKey { cert, key_pair } = rcgen::generate_simple_self_signed(vec![
+    let rcgen::CertifiedKey { cert, signing_key } = rcgen::generate_simple_self_signed(vec![
         parolnet_transport::tls_stream::DEFAULT_SNI.to_string(),
     ])
     .expect("generate self-signed cert");
 
     let cert_der = cert.der().clone();
-    let key_der = key_pair.serialize_der();
+    let key_der = signing_key.serialize_der();
 
     // Server config
     let server_config = rustls::ServerConfig::builder()
