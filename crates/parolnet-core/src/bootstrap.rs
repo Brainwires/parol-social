@@ -171,7 +171,7 @@ pub fn compute_bootstrap_proof(
     ephemeral_key: &[u8; 32],
     nonce: &[u8; 16],
 ) -> Result<[u8; 32], CoreError> {
-    use hmac::{Hmac, Mac};
+    use hmac::{Hmac, KeyInit, Mac};
     use sha2::Sha256;
 
     let mut mac = Hmac::<Sha256>::new_from_slice(bootstrap_secret)

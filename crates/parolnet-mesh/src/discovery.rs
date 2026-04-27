@@ -8,7 +8,7 @@
 
 use crate::{DiscoveredPeer, MeshError, PeerDiscovery};
 use async_trait::async_trait;
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use parolnet_protocol::address::PeerId;
 use sha2::Sha256;
 use std::net::SocketAddr;

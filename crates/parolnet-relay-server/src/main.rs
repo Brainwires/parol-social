@@ -756,7 +756,7 @@ async fn handle_turn_credentials() -> impl IntoResponse {
     let username = format!("{expiry}:{random_id:016x}");
 
     // HMAC-SHA1(secret, username) — standard TURN REST API pattern
-    use hmac::{Hmac, Mac};
+    use hmac::{Hmac, KeyInit, Mac};
     use sha1::Sha1;
     type HmacSha1 = Hmac<Sha1>;
 
