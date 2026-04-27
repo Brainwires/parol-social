@@ -297,11 +297,11 @@ fn rewrite_spec_index(root: &Path, rows: &[Coverage]) -> Result<()> {
     let text = std::fs::read_to_string(&p)?;
     let mut out_lines: Vec<String> = Vec::new();
     for line in text.lines() {
-        if let Some(spec) = line_spec(line) {
-            if let Some(r) = rows.iter().find(|r| r.spec == spec) {
-                out_lines.push(update_row_line(line, r));
-                continue;
-            }
+        if let Some(spec) = line_spec(line)
+            && let Some(r) = rows.iter().find(|r| r.spec == spec)
+        {
+            out_lines.push(update_row_line(line, r));
+            continue;
         }
         out_lines.push(line.to_string());
     }
@@ -342,12 +342,7 @@ fn run_vectors(_validate: bool) -> Result<()> {
     }
     let clause_ids: BTreeSet<String> = collect_spec_clauses(&root)?
         .into_values()
-        .flat_map(|cs| {
-            cs.must
-                .into_iter()
-                .chain(cs.should.into_iter())
-                .chain(cs.may.into_iter())
-        })
+        .flat_map(|cs| cs.must.into_iter().chain(cs.should).chain(cs.may))
         .collect();
 
     let mut count = 0usize;
@@ -370,17 +365,42 @@ fn run_vectors(_validate: bool) -> Result<()> {
                 continue;
             }
         };
-        let clause = v.get("clause").and_then(|c| c.as_str()).unwrap_or("");
-        if !clause_regex().is_match(clause) {
-            eprintln!("{}: invalid `clause` field {clause:?}", e.path().display());
+        // Accept either a single `clause` string field or a `clauses` array.
+        let mut clauses: Vec<String> = Vec::new();
+        if let Some(s) = v.get("clause").and_then(|c| c.as_str()) {
+            clauses.push(s.to_string());
+        }
+        if let Some(arr) = v.get("clauses").and_then(|c| c.as_array()) {
+            for item in arr {
+                if let Some(s) = item.as_str() {
+                    clauses.push(s.to_string());
+                }
+            }
+        }
+        if clauses.is_empty() {
+            eprintln!(
+                "{}: missing `clause` or `clauses` field",
+                e.path().display()
+            );
             bad += 1;
             continue;
         }
-        if !clause_ids.contains(clause) {
-            eprintln!(
-                "{}: `clause` {clause} does not match any published spec clause",
-                e.path().display()
-            );
+        let mut file_bad = false;
+        for clause in &clauses {
+            if !clause_regex().is_match(clause) {
+                eprintln!("{}: invalid clause id {clause:?}", e.path().display());
+                file_bad = true;
+                continue;
+            }
+            if !clause_ids.contains(clause) {
+                eprintln!(
+                    "{}: clause {clause} does not match any published spec clause",
+                    e.path().display()
+                );
+                file_bad = true;
+            }
+        }
+        if file_bad {
             bad += 1;
         }
     }

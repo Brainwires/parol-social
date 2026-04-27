@@ -1892,6 +1892,7 @@ fn handle_relay_cell(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_socket(
     socket: WebSocket,
     peers: PeerMap,

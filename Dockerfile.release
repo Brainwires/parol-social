@@ -21,10 +21,10 @@ COPY . .
 
 # Ensure lockfile is used (no network dependency resolution)
 # Build relay server
-RUN cargo build --release --locked --bin parolnet-relay-server
+RUN cargo build --release --locked --bin parolnet-relay
 
 # Build authority CLI
-RUN cargo build --release --locked --bin parolnet-authority-cli
+RUN cargo build --release --locked --bin parolnet-authority
 
 # Build WASM bindings
 RUN wasm-pack build crates/parolnet-wasm --target web --release
@@ -36,13 +36,13 @@ RUN wasm-opt -O3 \
 
 # Generate checksums
 RUN mkdir -p /artifacts && \
-    cp target/release/parolnet-relay-server /artifacts/ && \
-    cp target/release/parolnet-authority-cli /artifacts/ && \
+    cp target/release/parolnet-relay /artifacts/ && \
+    cp target/release/parolnet-authority /artifacts/ && \
     cp -r crates/parolnet-wasm/pkg /artifacts/wasm-pkg && \
     cp -r pwa /artifacts/pwa && \
     cd /artifacts && \
-    sha256sum parolnet-relay-server > SHA256SUMS && \
-    sha256sum parolnet-authority-cli >> SHA256SUMS && \
+    sha256sum parolnet-relay > SHA256SUMS && \
+    sha256sum parolnet-authority >> SHA256SUMS && \
     find wasm-pkg -type f -name '*.wasm' -o -name '*.js' | sort | xargs sha256sum >> SHA256SUMS && \
     find pwa -type f | sort | xargs sha256sum >> SHA256SUMS
 

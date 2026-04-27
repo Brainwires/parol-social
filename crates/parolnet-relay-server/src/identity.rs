@@ -101,11 +101,12 @@ pub fn load_or_generate_relay_identity(key_file: &Path) -> io::Result<([u8; 32],
     let mut arr = [0u8; 32];
     rand::rngs::OsRng.fill_bytes(&mut arr);
 
-    if let Some(parent) = key_file.parent() {
-        if !parent.as_os_str().is_empty() && !parent.exists() {
-            fs::create_dir_all(parent)?;
-            set_dir_mode_0700(parent)?;
-        }
+    if let Some(parent) = key_file.parent()
+        && !parent.as_os_str().is_empty()
+        && !parent.exists()
+    {
+        fs::create_dir_all(parent)?;
+        set_dir_mode_0700(parent)?;
     }
 
     write_key_file_0600(key_file, &arr)?;

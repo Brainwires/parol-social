@@ -2156,6 +2156,7 @@ pub fn token_prepare_blind(count: u32) -> Result<JsValue, JsError> {
 /// The caller MUST NOT reuse the handle after this call; the secret blinds
 /// are consumed and zeroized on our side.
 #[wasm_bindgen]
+#[allow(clippy::boxed_local)]
 pub fn token_unblind(
     handle_hex: &str,
     evaluated_bytes_hex_list: Box<[JsValue]>,

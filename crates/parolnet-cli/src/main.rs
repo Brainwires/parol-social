@@ -998,6 +998,7 @@ async fn wait_registered(h: &mut PeerHandle) -> Result<()> {
 
 /// Send `count` chats from `sender` to `recipient`, awaiting each envelope
 /// on `recipient`. Returns per-message latency in milliseconds.
+#[allow(clippy::too_many_arguments)]
 async fn exchange_one_direction(
     label: &str,
     count: usize,
