@@ -30,7 +30,7 @@ RUN cargo build --release --locked --bin parolnet-authority
 RUN wasm-pack build crates/parolnet-wasm --target web --release
 
 # Optimize WASM with pinned wasm-opt (from binaryen package)
-RUN wasm-opt -O3 --enable-bulk-memory \
+RUN wasm-opt -O3 --enable-all \
     crates/parolnet-wasm/pkg/parolnet_wasm_bg.wasm \
     -o crates/parolnet-wasm/pkg/parolnet_wasm_bg.wasm
 
