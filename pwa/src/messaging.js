@@ -18,7 +18,7 @@ import { isOnionActive, sendViaOnion } from './onion.js';
 import { loadContacts, appendMessage, answerIncomingCall, loadAddressBook,
          stopLocalMedia, stopCallTimer, clearNoAnswerTimer } from './ui-chat.js';
 import { completeCallConnection, addRemoteIce, teardownCallConnection,
-         setCallStatus } from './call.js';
+         setCallStatus, startMediaWatchdog } from './call.js';
 import { t } from './i18n.js';
 import {
     MSG_TYPE_CHAT, MSG_TYPE_SYSTEM, MSG_TYPE_FILE_CHUNK, MSG_TYPE_FILE_CONTROL,
@@ -130,12 +130,14 @@ export async function sendRawEnvelope(toPeerId, env, opts) {
     markRealSend();
     if (hasDirectConnection(toPeerId)) {
         const ok = sendViaWebRTC(toPeerId, env);
-        if (ok) return { ok: true };
+        if (ok) { console.log('[Send] direct-webrtc to', toPeerId.slice(0, 8)); return { ok: true }; }
+        console.warn('[Send] webrtc-send-failed to', toPeerId.slice(0, 8));
         return { ok: false, reason: 'webrtc-send-failed' };
     }
     if (isOnionActive()) {
         const ok = sendViaOnion(toPeerId, env);
-        if (ok) return { ok: true };
+        if (ok) { console.log('[Send] onion to', toPeerId.slice(0, 8)); return { ok: true }; }
+        console.warn('[Send] onion-send-failed to', toPeerId.slice(0, 8));
         return { ok: false, reason: 'onion-send-failed' };
     }
 
@@ -159,6 +161,7 @@ export async function sendRawEnvelope(toPeerId, env, opts) {
     if (!homeRelay) {
         if (checkSessionExists(toPeerId)) {
             // Case C — established session + transient lookup failure.
+            console.warn('[Send] transient-lookup-failure (queued) for', toPeerId.slice(0, 8));
             persistOnFail();
             return { ok: false, reason: 'transient-lookup-failure' };
         }
@@ -180,12 +183,14 @@ export async function sendRawEnvelope(toPeerId, env, opts) {
         }
         const ok = sendToRelay(toPeerId, env, token);
         if (ok) {
+            console.log('[Send] home-relay to', toPeerId.slice(0, 8));
             maybeRefill(connMgr.relayUrl);
             return { ok: true };
         }
         // Home-relay path: either the peer is on our relay (direct deliver)
         // or offline (store-and-forward). The relay-server will bounce with
         // "peer not connected" if it genuinely can't deliver.
+        console.warn('[Send] home-relay-send-failed to', toPeerId.slice(0, 8));
         return { ok: false, reason: 'home-relay-send-failed' };
     }
 
@@ -198,7 +203,7 @@ export async function sendRawEnvelope(toPeerId, env, opts) {
         if (!opened) {
             persistOnFail();
             showToast(t('toast.peerLookupFailed'));
-            return { ok: false, reason: 'peer-lookup-failed', alreadyToasted: true };
+            return { ok: false, reason: 'cross-relay-open-failed', alreadyToasted: true };
         }
         let token;
         try {
@@ -213,14 +218,16 @@ export async function sendRawEnvelope(toPeerId, env, opts) {
         }
         const ok = connMgr.sendToRelayUrl(homeRelay, toPeerId, env, token);
         if (ok) {
+            console.log('[Send] cross-relay to', toPeerId.slice(0, 8), 'via', homeRelay);
             maybeRefill(homeRelay);
             return { ok: true };
         }
         // Send rejected by the outbound WS (not open, serialize error, etc.)
+        console.warn('[Send] cross-relay-send-failed to', toPeerId.slice(0, 8), 'via', homeRelay);
         persistOnFail();
         return { ok: false, reason: 'cross-relay-send-failed' };
     } catch (e) {
-        console.warn('[Relay] cross-relay send failed:', e && e.message);
+        console.warn('[Send] cross-relay-exception:', e && e.message);
         persistOnFail();
         return { ok: false, reason: 'cross-relay-exception' };
     }
@@ -233,13 +240,17 @@ export async function sendRawEnvelope(toPeerId, env, opts) {
 // signals without re-implementing the envelope + transport plumbing.
 export async function sendCallSignal(peerId, action, payload = {}) {
     if (!wasm || !wasm.envelope_encode || !wasm.has_session || !wasm.has_session(peerId)) {
+        console.warn('[CallSignal]', action, 'no session with', peerId.slice(0, 8));
         return { ok: false, reason: 'no-session' };
     }
     try {
         const inner = new TextEncoder().encode(JSON.stringify({ action, ...payload }));
         const nowSecs = BigInt(Math.floor(Date.now() / 1000));
         const envelope = wasm.envelope_encode(peerId, MSG_TYPE_CALL_SIGNAL, inner, nowSecs);
-        return await sendRawEnvelope(peerId, envelope);
+        const result = await sendRawEnvelope(peerId, envelope);
+        console.log('[CallSignal]', action, '→', peerId.slice(0, 8), 'ok:', result.ok,
+                    result.reason ? '(' + result.reason + ')' : '');
+        return result;
     } catch (e) {
         console.warn('[CallSignal] encode failed:', e && e.message);
         return { ok: false, reason: 'encode-failed' };
@@ -255,6 +266,7 @@ export async function sendCallSignal(peerId, action, payload = {}) {
 // and redeliver on the next drain opportunity (e.g. WASM wasn't ready, no
 // session was available yet, trial_decrypt threw).
 export function handleRelayMessage(msg) {
+    console.log('[Relay] ←', msg && msg.type);
     switch (msg.type) {
         case 'challenge':
             // Relay requires challenge-response auth: sign the nonce with our Ed25519 key
@@ -856,6 +868,9 @@ async function sendFileChunked(fileId, toPeerId) {
 // ── Incoming Call Notification ──────────────────────────────
 
 function handleIncomingCall(msg) {
+    console.log('[Call] incoming offer from', msg.from && msg.from.slice(0, 8),
+                'callId:', msg.callId, 'video:', !!msg.withVideo,
+                'sdpLen:', msg.sdp ? msg.sdp.length : 0);
     setIncomingCallInfo({
         from: msg.from,
         callId: msg.callId,
@@ -1288,6 +1303,7 @@ function handleFileControlPlaintext(fromPeerId, plaintext) {
 function handleCallSignalPlaintext(fromPeerId, plaintext) {
     const obj = parseJsonPlaintext(plaintext);
     if (!obj) return;
+    console.log('[CallSignal] ←', obj.action, 'from', fromPeerId.slice(0, 8));
     switch (obj.action) {
         case 'offer':
             handleIncomingCall({ ...obj, from: fromPeerId });
@@ -1302,10 +1318,12 @@ function handleCallSignalPlaintext(fromPeerId, plaintext) {
                 console.warn('[CallSignal] completeCallConnection failed:', e && e.message);
                 showErrorToast(t('toast.callConnectionFailed'));
             });
-            // Provisional label flip. The PC will also drive this via
-            // onconnectionstatechange → 'connected'; setCallStatus is
-            // idempotent so whichever path wins the race is fine.
-            setCallStatus('Connected');
+            // Provisional label for the gap between answer arrival and
+            // pc.connectionState === 'connected'. The PC handler flips to
+            // 'Connected' once ICE/DTLS/RTP actually come up; the media
+            // watchdog catches the case where they never do.
+            setCallStatus('Establishing media…');
+            startMediaWatchdog(fromPeerId);
             break;
         }
         case 'ice':

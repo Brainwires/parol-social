@@ -13,10 +13,11 @@ import {
 } from './db.js';
 import { showView } from './views.js';
 import { initWebRTC, hasDirectConnection, sendViaWebRTC, rtcConnections,
-         seenGossipMessages, markGossipSeen } from './webrtc.js';
+         seenGossipMessages, markGossipSeen,
+         waitForTurnReady, hasTurnConfigured, isWebrtcPrivacyMode } from './webrtc.js';
 import { sendToRelay, connMgr, queueMessage } from './connection.js';
 import { sendRawEnvelope, sendCallSignal } from './messaging.js';
-import { startCallConnection, acceptCallConnection, teardownCallConnection, setCallStatus } from './call.js';
+import { startCallConnection, acceptCallConnection, teardownCallConnection, setCallStatus, startMediaWatchdog } from './call.js';
 import { spendOneToken, maybeRefill } from './token-pool.js';
 import { t } from './i18n.js';
 import { MSG_TYPE_CHAT, MSG_TYPE_SYSTEM, MSG_TYPE_CALL_SIGNAL } from './protocol-constants.js';
@@ -383,6 +384,16 @@ export async function initiateCall(peerId, withVideo) {
     if (!peerId) return;
     setCurrentCallId(null);
 
+    // TURN readiness gate. In privacy mode the RTCPeerConnection runs with
+    // iceTransportPolicy: 'relay', so with no TURN entries ICE has nowhere
+    // to go and the call would sit at "Calling…" until the watchdog fires.
+    // Wait up to 5 s for credentials to land; fail-fast otherwise.
+    await waitForTurnReady(5000);
+    if (isWebrtcPrivacyMode() && !hasTurnConfigured()) {
+        showErrorToast(t('toast.callNoTurn'));
+        return;
+    }
+
     try {
         const constraints = { audio: true };
         if (withVideo) constraints.video = { width: 320, height: 240 };
@@ -473,6 +484,16 @@ export async function initiateCall(peerId, withVideo) {
 export async function answerIncomingCall(callId, opts) {
     const withVideo = !!(opts && opts.withVideo);
     const peerId = currentPeerId;
+
+    // TURN readiness gate (mirror of initiateCall). The callee can't answer
+    // either if no relay candidate is available — privacy mode demands TURN.
+    await waitForTurnReady(5000);
+    if (isWebrtcPrivacyMode() && !hasTurnConfigured()) {
+        showErrorToast(t('toast.callNoTurn'));
+        if (wasm && wasm.hangup_call) { try { wasm.hangup_call(callId); } catch {} }
+        return;
+    }
+
     // Acquire local media on the callee side. Without this step the call
     // appeared "connected" in the UI but no microphone was ever opened,
     // the caller saw "Calling..." forever, and nothing flowed across the
@@ -521,10 +542,13 @@ export async function answerIncomingCall(callId, opts) {
         console.warn('[Call] answerIncomingCall: missing peerId or offerSdp');
     }
 
-    // Status will also be driven by pc.onconnectionstatechange once the
-    // PC reaches 'connected'; setting it here is the callee's provisional
-    // label for the gap between answer-SDP emit and first ICE pair success.
-    setCallStatus('Connected');
+    // Provisional label for the gap between answer-SDP emit and the PC
+    // reaching 'connected'. pc.onconnectionstatechange flips this to
+    // 'Connected' once ICE/DTLS/RTP actually come up. Without an explicit
+    // intermediate state, a stuck PC (TURN unreachable, ICE blocked) would
+    // leave the user staring at "Connected" with no audio.
+    setCallStatus('Establishing media…');
+    if (peerId) startMediaWatchdog(peerId);
     startCallTimer();
 }
 
@@ -535,9 +559,12 @@ export async function hangupCall() {
     // and with all media going over TURN that can take several seconds.
     if (currentCallId && currentPeerId) {
         try {
-            await sendCallSignal(currentPeerId, 'hangup', { callId: currentCallId });
+            const result = await sendCallSignal(currentPeerId, 'hangup', { callId: currentCallId });
+            if (!result.ok) {
+                console.warn('[Call] hangup signal not delivered:', result.reason);
+            }
         } catch (e) {
-            console.warn('[Call] hangup signal failed:', e && e.message);
+            console.warn('[Call] hangup signal threw:', e && e.message);
         }
         teardownCallConnection(currentPeerId);
     }

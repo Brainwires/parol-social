@@ -118,7 +118,7 @@ export const connMgr = {
             return new Promise((resolve) => entry.openWaiters.push(resolve));
         }
 
-        entry = { ws: null, authState: 'pending', lastActivityMs: Date.now(), openWaiters: [] };
+        entry = { ws: null, authState: 'pending', lastActivityMs: Date.now(), openWaiters: [], authTimer: null };
         this.outbound.set(relayUrl, entry);
 
         const wsUrl = _toWsUrl(relayUrl);
@@ -130,7 +130,23 @@ export const connMgr = {
             return false;
         }
 
-        const settle = (ok) => this._notifyWaiters(entry, ok);
+        const settle = (ok) => {
+            if (entry.authTimer) { clearTimeout(entry.authTimer); entry.authTimer = null; }
+            this._notifyWaiters(entry, ok);
+        };
+
+        // 10s authentication watchdog. If the relay accepts the WS but never
+        // sends 'challenge' (or 'registered' after our register), every
+        // subsequent send to this relay would block on openWaiters forever.
+        entry.authTimer = setTimeout(() => {
+            if (entry.authState !== 'open') {
+                console.warn('[Relay] openOutbound auth timeout for', relayUrl);
+                entry.authState = 'failed';
+                try { entry.ws && entry.ws.close(); } catch (_) {}
+                this.outbound.delete(relayUrl);
+                this._notifyWaiters(entry, false);
+            }
+        }, 10000);
 
         entry.ws.onmessage = async (ev) => {
             entry.lastActivityMs = Date.now();
@@ -367,16 +383,20 @@ export function flushMessageQueue() {
     // WebRTC open so the lazy lookup cost is negligible.
     import('./messaging.js').then(async ({ sendRawEnvelope }) => {
         const now = Date.now();
-        console.log('[Queue] Flushing', messageQueue.length, 'queued messages');
+        const initialSize = messageQueue.length;
+        console.log('[Queue] Flushing', initialSize, 'queued messages');
         const toFlush = messageQueue.splice(0, messageQueue.length);
+        let sentCount = 0, droppedAged = 0, deferredBackoff = 0, reQueued = 0;
         for (const msg of toFlush) {
             if (now - msg.timestamp > MAX_QUEUE_AGE_MS) {
                 // Aged-out (> 24h): drop from storage too.
                 _deletePersisted(msg);
+                droppedAged++;
                 continue;
             }
             if (msg.nextTryAt && msg.nextTryAt > now) {
                 messageQueue.push(msg); // not yet time to retry
+                deferredBackoff++;
                 continue;
             }
             let sent = false;
@@ -395,15 +415,17 @@ export function flushMessageQueue() {
             }
             if (sent) {
                 _deletePersisted(msg);
+                sentCount++;
             } else {
                 msg.nextTryAt = now + RETRY_BACKOFF_MS;
                 messageQueue.push(msg); // re-queue with backoff
                 _persistQueueEntry(msg);  // update nextTryAt on disk
+                reQueued++;
             }
         }
-        if (messageQueue.length > 0) {
-            console.log('[Queue]', messageQueue.length, 'messages still queued');
-        }
+        console.log('[Queue] flush done — sent:', sentCount, 'droppedAged:', droppedAged,
+                    'deferredBackoff:', deferredBackoff, 'reQueued:', reQueued,
+                    'remaining:', messageQueue.length);
     }).catch(() => {});
 }
 

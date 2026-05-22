@@ -17,6 +17,14 @@ const DEFAULT_STUN_SERVERS = [];
 
 let customIceServers = null;
 
+// Tracks the in-flight fetchTurnCredentials() promise so call-setup code can
+// await it before creating an RTCPeerConnection. Without this, initiateCall
+// can fire while customIceServers is still null, resulting in a PC built with
+// an empty iceServers list — which in privacy mode (iceTransportPolicy:
+// 'relay') guarantees ICE failure with no signal beyond a delayed 'failed'
+// connection state.
+let turnReadyPromise = null;
+
 // Privacy mode: when enabled, only relay (TURN) candidates are used, so no
 // direct peer connection can expose the client's public IP to the remote peer.
 // Default ON — opt-out only. ParolNet's threat model requires that the IP
@@ -57,7 +65,34 @@ export async function loadCustomStunServers() {
         console.warn('[WebRTC] Failed to load privacy mode setting:', e);
     }
     // Auto-fetch TURN credentials from relay
-    fetchTurnCredentials().catch(() => {});
+    turnReadyPromise = fetchTurnCredentials().catch(() => {});
+}
+
+// Resolves true once TURN credentials have been loaded (or determined absent).
+// Resolves false on timeout. Callers should treat false as a hard fail in
+// privacy mode, since the resulting PC will have no usable candidate type.
+export async function waitForTurnReady(timeoutMs = 5000) {
+    if (customIceServers && customIceServers.length > 0) return true;
+    if (!turnReadyPromise) {
+        // No fetch ever kicked off (loadCustomStunServers never ran). Try
+        // one now and await it under the same timeout.
+        turnReadyPromise = fetchTurnCredentials().catch(() => {});
+    }
+    const timeout = new Promise(resolve => setTimeout(() => resolve('timeout'), timeoutMs));
+    const result = await Promise.race([turnReadyPromise.then(() => 'ok'), timeout]);
+    return result === 'ok' && Array.isArray(customIceServers) && customIceServers.length > 0;
+}
+
+// True if the resolved iceServers list contains at least one TURN entry.
+// Used by call setup to decide whether privacy mode can safely allow the
+// call to proceed — `iceTransportPolicy: 'relay'` with no TURN = no media.
+export function hasTurnConfigured() {
+    if (!customIceServers || customIceServers.length === 0) return false;
+    return customIceServers.some(s => {
+        const u = s.urls || s.url || '';
+        if (Array.isArray(u)) return u.some(x => typeof x === 'string' && (x.startsWith('turn:') || x.startsWith('turns:')));
+        return typeof u === 'string' && (u.startsWith('turn:') || u.startsWith('turns:'));
+    });
 }
 
 export async function setCustomStunServers(serversJson) {

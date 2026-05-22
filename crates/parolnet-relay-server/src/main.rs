@@ -2106,6 +2106,14 @@ async fn handle_socket(
                                 // Deliver stored messages
                                 if let Some(mesh_pid) = parse_peer_id(&peer_id) {
                                     let pending = store.lock().await.retrieve(&mesh_pid);
+                                    let drained = pending.len();
+                                    if drained > 0 {
+                                        tracing::info!(
+                                            peer = %&peer_id[..peer_id.len().min(16)],
+                                            drained,
+                                            "drained stored messages on reconnect"
+                                        );
+                                    }
                                     for msg in pending {
                                         let _ = tx.send(Message::Text(msg.into()));
                                     }
@@ -2242,11 +2250,20 @@ async fn handle_socket(
                 if let Some(recipient_tx) = peers_lock.get(&to) {
                     let _ = recipient_tx.send(Message::Text(outgoing.into()));
                     stats.record_message_routed();
+                    tracing::debug!(to = %&to[..to.len().min(16)], "delivered to online peer");
                 } else {
                     drop(peers_lock);
                     if let Some(dest_pid) = parse_peer_id(&to) {
+                        let size = outgoing.len();
                         store.lock().await.store(dest_pid, outgoing);
                         stats.record_message_queued();
+                        tracing::debug!(
+                            to = %&to[..to.len().min(16)],
+                            size,
+                            "queued for offline peer (store-and-forward)"
+                        );
+                    } else {
+                        tracing::warn!(to = %to, "recipient peer_id failed to parse — frame dropped");
                     }
                     let _ = tx.send(Message::Text(
                         serde_json::to_string(&OutgoingMessage {

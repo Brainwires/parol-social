@@ -46,13 +46,31 @@ impl RelayMessageStore {
         let size = msg.len();
         let buffer = self.buffers.entry(peer).or_default();
 
+        let mut evicted_count = 0usize;
         while buffer.len() >= MAX_STORED_MESSAGES_PER_PEER {
             buffer.remove(0);
+            evicted_count += 1;
+        }
+        if evicted_count > 0 {
+            tracing::debug!(
+                peer = ?peer,
+                evicted = evicted_count,
+                "evicted oldest messages — per-peer count cap"
+            );
         }
 
         let mut total_size: usize = buffer.iter().map(|m| m.size).sum();
+        let mut evicted_size = 0usize;
         while total_size + size > MAX_STORED_BUFFER_SIZE && !buffer.is_empty() {
             total_size -= buffer.remove(0).size;
+            evicted_size += 1;
+        }
+        if evicted_size > 0 {
+            tracing::debug!(
+                peer = ?peer,
+                evicted = evicted_size,
+                "evicted oldest messages — per-peer size cap"
+            );
         }
 
         buffer.push(BufferedRelayMessage {

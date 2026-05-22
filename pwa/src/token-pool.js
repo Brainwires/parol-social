@@ -516,9 +516,13 @@ async function _runBatchFetch(pool, relayUrl, batchSize, wasm) {
  */
 export async function acquireToken(relayUrl, opts = {}) {
     const timeoutMs = opts.timeoutMs ?? 10_000;
-    try { return spendOneToken(relayUrl); } catch { /* empty pool — wait below */ }
+    try {
+        const tok = spendOneToken(relayUrl);
+        return tok;
+    } catch { /* empty pool — wait below */ }
 
     const pool = tokenPoolFor(relayUrl);
+    console.warn('[Token] pool empty for', relayUrl, '— awaiting refill (timeout:', timeoutMs, 'ms, queue:', pool.queue.length, ')');
     // Fire-and-forget; idempotent when a refill is already in flight
     // (maybeRefill short-circuits on pool.refilling).
     maybeRefill(relayUrl);

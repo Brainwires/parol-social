@@ -28,6 +28,37 @@ import { t } from './i18n.js';
 // trickle races with the callee's setRemoteDescription(offer).
 const callPeerConnections = new Map();
 
+// peerId -> timeoutId. Started when SDP exchange completes; cleared when
+// pc.connectionState reaches 'connected' or the call is torn down. If it
+// fires, ICE / DTLS / RTP never came up (typically TURN unreachable from
+// one side) and we treat it the same as pc.connectionState === 'failed'.
+const mediaWatchdogs = new Map();
+const MEDIA_WATCHDOG_MS = 15000;
+
+function clearMediaWatchdog(peerId) {
+    const id = mediaWatchdogs.get(peerId);
+    if (id) {
+        clearTimeout(id);
+        mediaWatchdogs.delete(peerId);
+    }
+}
+
+export function startMediaWatchdog(peerId) {
+    clearMediaWatchdog(peerId);
+    const id = setTimeout(() => {
+        mediaWatchdogs.delete(peerId);
+        const record = callPeerConnections.get(peerId);
+        if (!record) return;
+        if (record.pc.connectionState === 'connected') return;
+        console.warn('[Call] media watchdog fired — pc state:', record.pc.connectionState);
+        showErrorToast(t('toast.callMediaTimeout'));
+        window.dispatchEvent(new CustomEvent('parolnet:call-failed', {
+            detail: { peerId, reason: 'media-timeout' },
+        }));
+    }, MEDIA_WATCHDOG_MS);
+    mediaWatchdogs.set(peerId, id);
+}
+
 function filterIceCandidateInPrivacyMode(candidateStr) {
     // Same predicate as initWebRTC's onicecandidate handler. Privacy mode
     // must never allow host or server-reflexive candidates on the wire —
@@ -50,47 +81,110 @@ export function setCallStatus(text) {
 
 function attachRemoteTrack(event) {
     const stream = event.streams && event.streams[0];
-    if (!stream) return;
-    setRemoteStream(stream);
     const track = event.track;
+    console.log('[Call] ontrack fired — kind:', track && track.kind, 'hasStream:', !!stream);
+    if (!stream) {
+        console.warn('[Call] ontrack: no event.streams[0] — remote media will not play');
+        return;
+    }
+    setRemoteStream(stream);
     if (!track) return;
     if (track.kind === 'audio') {
         const el = document.getElementById('remote-audio');
         if (el) el.srcObject = stream;
+        else console.warn('[Call] ontrack: <audio id="remote-audio"> not in DOM');
     } else if (track.kind === 'video') {
         const el = document.getElementById('remote-video');
         if (el) {
             el.srcObject = stream;
             el.classList.remove('hidden');
+        } else {
+            console.warn('[Call] ontrack: <video id="remote-video"> not in DOM');
         }
+    }
+}
+
+// Walk getStats() and summarise candidate-pair outcomes. Called when the PC
+// state goes to 'failed' so the console captures *why* ICE never came up
+// instead of just the terminal state. Best-effort: stats API varies across
+// browsers, so we fail soft.
+async function logIceStats(peerId, pc) {
+    try {
+        const stats = await pc.getStats();
+        let nominated = 0, succeeded = 0, failed = 0, total = 0;
+        const transports = [];
+        for (const r of stats.values()) {
+            if (r.type === 'candidate-pair') {
+                total++;
+                if (r.nominated) nominated++;
+                if (r.state === 'succeeded') succeeded++;
+                if (r.state === 'failed') failed++;
+            } else if (r.type === 'transport') {
+                transports.push({ dtls: r.dtlsState, ice: r.iceState, selected: r.selectedCandidatePairId });
+            }
+        }
+        console.warn('[Call]', peerId.slice(0, 8), 'getStats — pairs total:', total,
+                     'nominated:', nominated, 'succeeded:', succeeded, 'failed:', failed,
+                     'transports:', transports);
+    } catch (e) {
+        console.warn('[Call] getStats failed:', e && e.message);
     }
 }
 
 function createCallPc(peerId, callId) {
     const cfg = getRtcConfig();
+    console.log('[Call]', peerId.slice(0, 8), 'createCallPc — iceServers:', (cfg.iceServers || []).length,
+                'policy:', cfg.iceTransportPolicy || 'all', 'privacy:', isWebrtcPrivacyMode());
     if (isWebrtcPrivacyMode() && (!cfg.iceServers || cfg.iceServers.length === 0)) {
         console.warn('[Call] privacy mode ON but iceServers is empty — TURN credentials may not have loaded yet');
     }
     const pc = new RTCPeerConnection(cfg);
 
+    // Per-PC ICE candidate counters. Useful when the connection never comes
+    // up — a zero-sent count points at TURN/STUN missing, a zero-received
+    // count points at signaling not flowing.
+    const iceStats = { sent: 0, filtered: 0, sendFailed: 0, received: 0, applied: 0, queued: 0 };
+
     pc.onicecandidate = (event) => {
-        if (!event.candidate) return;
+        if (!event.candidate) {
+            console.log('[ICE]', peerId.slice(0, 8), 'end-of-candidates — sent:', iceStats.sent,
+                        'filtered:', iceStats.filtered, 'sendFailed:', iceStats.sendFailed);
+            return;
+        }
         const candidateStr = event.candidate.candidate || '';
         if (filterIceCandidateInPrivacyMode(candidateStr)) {
+            iceStats.filtered++;
             console.debug('[Call] privacy mode: filtered non-relay candidate:', candidateStr);
             return;
         }
+        iceStats.sent++;
         // Fire-and-forget: ICE trickles are idempotent on the receive side
         // and the remote PC tolerates out-of-order arrival.
         sendCallSignal(peerId, 'ice', { callId, candidate: event.candidate.toJSON() })
-            .catch(e => console.warn('[Call] ICE send failed:', e && e.message));
+            .then(result => {
+                if (!result || !result.ok) {
+                    iceStats.sendFailed++;
+                    console.warn('[ICE]', peerId.slice(0, 8), 'send failed:', result && result.reason);
+                }
+            })
+            .catch(e => {
+                iceStats.sendFailed++;
+                console.warn('[Call] ICE send threw:', e && e.message);
+            });
+        if (iceStats.sent % 5 === 0) {
+            console.log('[ICE]', peerId.slice(0, 8), 'progress — sent:', iceStats.sent,
+                        'filtered:', iceStats.filtered, 'sendFailed:', iceStats.sendFailed);
+        }
     };
 
     pc.ontrack = attachRemoteTrack;
 
     pc.onconnectionstatechange = () => {
         const state = pc.connectionState;
-        console.log('[Call]', peerId.slice(0, 8), 'pc state:', state);
+        console.log('[Call]', peerId.slice(0, 8), 'pc state:', state,
+                    '| ice:', pc.iceConnectionState,
+                    '| gather:', pc.iceGatheringState,
+                    '| signal:', pc.signalingState);
         // Drive the status label from the PC lifecycle. Idempotent — the
         // answer-signal path in messaging.js may flip to 'Connected' first,
         // which is fine: setCallStatus just mirrors into #call-status.
@@ -105,12 +199,18 @@ function createCallPc(peerId, callId) {
                 setCallStatus('Ringing...');
             }
         } else if (state === 'connected') {
+            clearMediaWatchdog(peerId);
             setCallStatus('Connected');
         } else if (state === 'failed') {
             // Only react if we still own this PC — teardown races with the
             // state-change event and we don't want to fire a toast after
             // the user already hung up.
             if (callPeerConnections.get(peerId) && callPeerConnections.get(peerId).pc === pc) {
+                console.warn('[Call]', peerId.slice(0, 8), 'pc failed — ICE stats:',
+                             'sent:', iceStats.sent, 'filtered:', iceStats.filtered,
+                             'received:', iceStats.received, 'applied:', iceStats.applied,
+                             'queued:', iceStats.queued);
+                logIceStats(peerId, pc);
                 showErrorToast(t('toast.callConnectionLost'));
                 // ui-chat.js owns hangup semantics (remote signal + teardown
                 // + timer + view nav). Cross-module import from call.js back
@@ -132,7 +232,7 @@ function createCallPc(peerId, callId) {
         }
     }
 
-    const record = { pc, callId, pendingIceIn: [] };
+    const record = { pc, callId, pendingIceIn: [], iceStats };
     callPeerConnections.set(peerId, record);
     return record;
 }
@@ -146,6 +246,8 @@ export async function startCallConnection(peerId, callId, _withVideo) {
     try {
         const offer = await pc.createOffer();
         await pc.setLocalDescription(offer);
+        console.log('[Call]', peerId.slice(0, 8), 'offer SDP created — length:',
+                    pc.localDescription.sdp.length);
         return pc.localDescription.sdp;
     } catch (e) {
         console.warn('[Call] startCallConnection failed:', e && e.message);
@@ -162,14 +264,21 @@ export async function acceptCallConnection(peerId, callId, offerSdp, _withVideo)
     const { pc } = record;
     try {
         await pc.setRemoteDescription({ type: 'offer', sdp: offerSdp });
+        console.log('[Call]', peerId.slice(0, 8), 'remote description applied: offer');
         // Flush any remote ICE that arrived before we had a remote description.
+        const flushedCount = record.pendingIceIn.length;
         for (const cand of record.pendingIceIn) {
-            try { await pc.addIceCandidate(cand); }
+            try { await pc.addIceCandidate(cand); record.iceStats.applied++; }
             catch (e) { console.warn('[Call] flushed ICE add failed:', e && e.message); }
+        }
+        if (flushedCount > 0) {
+            console.log('[Call]', peerId.slice(0, 8), 'flushed', flushedCount, 'queued ICE candidates');
         }
         record.pendingIceIn = [];
         const answer = await pc.createAnswer();
         await pc.setLocalDescription(answer);
+        console.log('[Call]', peerId.slice(0, 8), 'answer SDP created — length:',
+                    pc.localDescription.sdp.length);
         return pc.localDescription.sdp;
     } catch (e) {
         console.warn('[Call] acceptCallConnection failed:', e && e.message);
@@ -187,11 +296,16 @@ export async function completeCallConnection(peerId, answerSdp) {
     }
     try {
         await record.pc.setRemoteDescription({ type: 'answer', sdp: answerSdp });
+        console.log('[Call]', peerId.slice(0, 8), 'remote description applied: answer');
         // Flush early remote ICE (caller side typically doesn't have any,
         // but the callee may start trickling before their answer reaches us).
+        const flushedCount = record.pendingIceIn.length;
         for (const cand of record.pendingIceIn) {
-            try { await record.pc.addIceCandidate(cand); }
+            try { await record.pc.addIceCandidate(cand); record.iceStats.applied++; }
             catch (e) { console.warn('[Call] flushed ICE add failed:', e && e.message); }
+        }
+        if (flushedCount > 0) {
+            console.log('[Call]', peerId.slice(0, 8), 'flushed', flushedCount, 'queued ICE candidates');
         }
         record.pendingIceIn = [];
     } catch (e) {
@@ -207,22 +321,27 @@ export async function addRemoteIce(peerId, candidate) {
         // No PC yet — incoming call hasn't been accepted. Drop silently; when
         // the callee accepts, the caller's trickle continues after answer is
         // exchanged, so losing pre-accept ICE is harmless.
+        console.log('[ICE]', peerId.slice(0, 8), 'received but no PC yet — dropped');
         return;
     }
+    record.iceStats.received++;
     const pc = record.pc;
     // If remote description isn't set yet, queue the candidate for flush.
     if (!pc.remoteDescription || !pc.remoteDescription.type) {
         record.pendingIceIn.push(candidate);
+        record.iceStats.queued++;
         return;
     }
     try {
         await pc.addIceCandidate(candidate);
+        record.iceStats.applied++;
     } catch (e) {
         console.warn('[Call] addIceCandidate failed:', e && e.message);
     }
 }
 
 export function teardownCallConnection(peerId) {
+    clearMediaWatchdog(peerId);
     const record = callPeerConnections.get(peerId);
     if (record) {
         record.pendingIceIn = [];

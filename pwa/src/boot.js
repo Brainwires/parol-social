@@ -444,6 +444,7 @@ function _drainSwInboxOnce() {
             readTx.oncomplete = () => {
                 if (rows.length === 0) { db.close(); resolve(); return; }
                 rows.sort((a, b) => (a.timestamp || 0) - (b.timestamp || 0));
+                console.log('[SW-Inbox] draining', rows.length, 'buffered frames');
 
                 // Phase 2: dispatch. Collect IDs of rows that reported
                 // delivered: true; leave the rest in the inbox for retry.

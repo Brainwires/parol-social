@@ -267,6 +267,8 @@
   "toast.callConnectionFailed": "Couldn't establish the call connection.",
   "toast.callNoAnswer": "No answer",
   "toast.callConnectionLost": "Call connection lost",
+  "toast.callNoTurn": "Call unavailable — TURN servers not reachable. Check your connection or disable WebRTC privacy mode.",
+  "toast.callMediaTimeout": "Media never connected — ICE/TURN may be blocked.",
   "toast.qrUnrecognized": "Unrecognized QR code",
   "toast.qrSelf": "That's your own QR code!",
 
