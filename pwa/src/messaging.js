@@ -106,21 +106,17 @@ function encodeEnvelope(toPeerId, msgType, obj) {
 async function sendEnvelope(toPeerId, msgType, obj) {
     const env = encodeEnvelope(toPeerId, msgType, obj);
     if (!env) return false;
-    return sendRawEnvelope(toPeerId, env);
+    const result = await sendRawEnvelope(toPeerId, env);
+    return result.ok;
 }
 
-/// Transport dispatch for a pre-encoded PNP-001 envelope. Shared by every
-/// call site that already has envelope bytes in hand — call-signal offers
-/// (bootstrap source_hint envelopes, file chunks, identity-rotation
-/// notifications, cover-traffic decoys, etc.). All of those MUST spend a
-/// Privacy Pass token before the outer frame leaves the client per
-/// PNP-001-MUST-048; this helper centralizes that discipline so none of
-/// them can forget it again.
+/// Transport dispatch for a pre-encoded PNP-001 envelope.
 ///
-/// The WebRTC-first / onion / home-relay / cross-relay cascade is identical
-/// to `sendEnvelope`; only the encoding step is pulled out.
+/// Returns `{ ok: boolean, reason?: string, alreadyToasted?: boolean }` so
+/// callers can avoid surfacing a second generic toast when a specific one
+/// (e.g. relayTokenEmpty, peerLookupFailed) was already shown.
 export async function sendRawEnvelope(toPeerId, env, opts) {
-    if (!env) return false;
+    if (!env) return { ok: false, reason: 'missing-envelope' };
     // `noPersist` is set by flushMessageQueue: the caller already owns a
     // pending_sends row for this payload, so a fresh queueMessage() on
     // failure would duplicate it. The outer flush loop handles re-queue +
@@ -133,10 +129,14 @@ export async function sendRawEnvelope(toPeerId, env, opts) {
 
     markRealSend();
     if (hasDirectConnection(toPeerId)) {
-        return sendViaWebRTC(toPeerId, env);
+        const ok = sendViaWebRTC(toPeerId, env);
+        if (ok) return { ok: true };
+        return { ok: false, reason: 'webrtc-send-failed' };
     }
     if (isOnionActive()) {
-        return sendViaOnion(toPeerId, env);
+        const ok = sendViaOnion(toPeerId, env);
+        if (ok) return { ok: true };
+        return { ok: false, reason: 'onion-send-failed' };
     }
 
     let homeRelay = null;
@@ -160,7 +160,7 @@ export async function sendRawEnvelope(toPeerId, env, opts) {
         if (checkSessionExists(toPeerId)) {
             // Case C — established session + transient lookup failure.
             persistOnFail();
-            return false;
+            return { ok: false, reason: 'transient-lookup-failure' };
         }
         // Case C — first-contact; fall through to home-relay branch below.
     }
@@ -176,14 +176,17 @@ export async function sendRawEnvelope(toPeerId, env, opts) {
         } catch (e) {
             console.warn('[Relay] acquireToken failed:', e && e.reason);
             showToast(t('toast.relayTokenEmpty'));
-            return false;
+            return { ok: false, reason: 'token-empty', alreadyToasted: true };
         }
         const ok = sendToRelay(toPeerId, env, token);
-        if (ok) maybeRefill(connMgr.relayUrl);
+        if (ok) {
+            maybeRefill(connMgr.relayUrl);
+            return { ok: true };
+        }
         // Home-relay path: either the peer is on our relay (direct deliver)
         // or offline (store-and-forward). The relay-server will bounce with
         // "peer not connected" if it genuinely can't deliver.
-        return ok;
+        return { ok: false, reason: 'home-relay-send-failed' };
     }
 
     // Cross-relay send: any failure along the way (open, token, send) is
@@ -195,7 +198,7 @@ export async function sendRawEnvelope(toPeerId, env, opts) {
         if (!opened) {
             persistOnFail();
             showToast(t('toast.peerLookupFailed'));
-            return false;
+            return { ok: false, reason: 'peer-lookup-failed', alreadyToasted: true };
         }
         let token;
         try {
@@ -206,20 +209,20 @@ export async function sendRawEnvelope(toPeerId, env, opts) {
             console.warn('[Relay] cross-relay acquireToken failed:', e && e.reason);
             persistOnFail();
             showToast(t('toast.relayTokenEmpty'));
-            return false;
+            return { ok: false, reason: 'token-empty', alreadyToasted: true };
         }
         const ok = connMgr.sendToRelayUrl(homeRelay, toPeerId, env, token);
         if (ok) {
             maybeRefill(homeRelay);
-            return true;
+            return { ok: true };
         }
         // Send rejected by the outbound WS (not open, serialize error, etc.)
         persistOnFail();
-        return false;
+        return { ok: false, reason: 'cross-relay-send-failed' };
     } catch (e) {
         console.warn('[Relay] cross-relay send failed:', e && e.message);
         persistOnFail();
-        return false;
+        return { ok: false, reason: 'cross-relay-exception' };
     }
 }
 
@@ -230,7 +233,7 @@ export async function sendRawEnvelope(toPeerId, env, opts) {
 // signals without re-implementing the envelope + transport plumbing.
 export async function sendCallSignal(peerId, action, payload = {}) {
     if (!wasm || !wasm.envelope_encode || !wasm.has_session || !wasm.has_session(peerId)) {
-        return false;
+        return { ok: false, reason: 'no-session' };
     }
     try {
         const inner = new TextEncoder().encode(JSON.stringify({ action, ...payload }));
@@ -239,7 +242,7 @@ export async function sendCallSignal(peerId, action, payload = {}) {
         return await sendRawEnvelope(peerId, envelope);
     } catch (e) {
         console.warn('[CallSignal] encode failed:', e && e.message);
-        return false;
+        return { ok: false, reason: 'encode-failed' };
     }
 }
 

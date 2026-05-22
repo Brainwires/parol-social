@@ -67,7 +67,11 @@ function attachRemoteTrack(event) {
 }
 
 function createCallPc(peerId, callId) {
-    const pc = new RTCPeerConnection(getRtcConfig());
+    const cfg = getRtcConfig();
+    if (isWebrtcPrivacyMode() && (!cfg.iceServers || cfg.iceServers.length === 0)) {
+        console.warn('[Call] privacy mode ON but iceServers is empty — TURN credentials may not have loaded yet');
+    }
+    const pc = new RTCPeerConnection(cfg);
 
     pc.onicecandidate = (event) => {
         if (!event.candidate) return;

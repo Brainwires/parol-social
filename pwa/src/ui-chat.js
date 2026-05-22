@@ -424,20 +424,24 @@ export async function initiateCall(peerId, withVideo) {
     try {
         offerSdp = await startCallConnection(peerId, currentCallId, !!withVideo);
     } catch (e) {
-        showToast(t('toast.callSignalFailed'));
+        // startCallConnection already showed toast.callConnectionFailed
+        console.warn('[Call] WebRTC offer creation failed:', e && e.message);
         stopLocalMedia();
         return;
     }
 
     // CALL_SIGNAL `offer` now carries the SDP. sendCallSignal wraps the
     // payload in a token-authenticated PNP-001 envelope via sendRawEnvelope.
-    const ok = await sendCallSignal(peerId, 'offer', {
+    const result = await sendCallSignal(peerId, 'offer', {
         callId: currentCallId,
         withVideo: !!withVideo,
         sdp: offerSdp,
     });
-    if (!ok) {
-        showToast(t('toast.callSignalFailed'));
+    if (!result.ok) {
+        console.warn('[Call] offer signal failed:', result.reason);
+        if (!result.alreadyToasted) {
+            showToast(t('toast.callSignalFailed'));
+        }
         stopLocalMedia();
         teardownCallConnection(peerId);
         return;
@@ -860,9 +864,9 @@ function handleScannedQR(data) {
                 // sendRawEnvelope handles markRealSend internally and spends
                 // a Privacy Pass token; without it the relay silently drops
                 // the frame and the presenter never materializes our session.
-                const sent = await sendRawEnvelope(peerId, envelope);
-                if (!sent) {
-                    console.log('[Bootstrap] relay offline / no token — queued for later send');
+                const result = await sendRawEnvelope(peerId, envelope);
+                if (!result.ok) {
+                    console.log('[Bootstrap] relay offline / no token — queued for later send:', result.reason);
                     queueMessage(peerId, envelope);
                 } else {
                     console.log('[Bootstrap] envelope handed to relay');

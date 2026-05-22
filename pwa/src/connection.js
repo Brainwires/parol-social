@@ -387,7 +387,8 @@ export function flushMessageQueue() {
                 // peer_lookup cache entry, or WebRTC may now be up.
                 // noPersist: flush already owns this row; sendRawEnvelope
                 // must NOT re-queue on failure or we'd duplicate the entry.
-                sent = await sendRawEnvelope(msg.toPeerId, msg.payload, { noPersist: true });
+                const result = await sendRawEnvelope(msg.toPeerId, msg.payload, { noPersist: true });
+                sent = result.ok;
             } catch (e) {
                 console.warn('[Queue] sendRawEnvelope threw on flush:', e && e.message);
                 sent = false;

@@ -119,7 +119,7 @@ async function tick(deps) {
  * @param {object} opts
  * @param {'NORMAL'} [opts.mode='NORMAL'] - Only NORMAL is supported for now.
  * @param {object} opts.wasm - The loaded WASM module (must expose envelope_encode + has_session).
- * @param {function} opts.sendRawEnvelope - async (toPeerId, envelopeHex) => boolean
+ * @param {function} opts.sendRawEnvelope - async (toPeerId, envelopeHex) => { ok: boolean }
  * @param {function} opts.listContacts - async () => Array<{ peerId }>
  */
 export function startCoverTraffic(opts) {
