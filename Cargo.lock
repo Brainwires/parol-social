@@ -1542,15 +1542,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "num-complex"
-version = "0.4.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "73f88a1307638156682bada9d7604135552957b7818057dcef22705b4d509495"
-dependencies = [
- "num-traits",
-]
-
-[[package]]
 name = "num-conv"
 version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1647,13 +1638,9 @@ dependencies = [
 
 [[package]]
 name = "opus-rs"
-version = "0.1.12"
+version = "0.1.19"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "66421ba23fd82491daf81c195f65acf326ed276e68d76c28f61c44ef7b4abed2"
-dependencies = [
- "num-complex",
- "once_cell",
-]
+checksum = "6511297abde7ca183099fb30e50b8f81c3bde45ab85812f68bb4db3d97f20a0c"
 
 [[package]]
 name = "parking_lot"
