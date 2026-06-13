@@ -1638,9 +1638,9 @@ dependencies = [
 
 [[package]]
 name = "opus-rs"
-version = "0.1.19"
+version = "0.1.22"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6511297abde7ca183099fb30e50b8f81c3bde45ab85812f68bb4db3d97f20a0c"
+checksum = "28911d75055df30f4e6203424619fd81d6435c5d63a9d9942968848db545f3b9"
 
 [[package]]
 name = "parking_lot"
