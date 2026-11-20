@@ -1,5 +1,17 @@
 # TURN / coturn operations runbook
 
+> **Status (2026-11-20): the relay image no longer bundles coturn.** The
+> default relay profile is signaling-only (PNP-001 §10.5): it carries no user
+> traffic and `/turn-credentials` returns STUN URIs only (`STUN_URIS`). This
+> runbook now applies only to an operator who deliberately runs the **relay
+> profile** (`SIGNALING_ONLY=0`) with a TURN server of their own, deployed
+> beside the relay container rather than inside it: set `TURN_SECRET` (the
+> TURN server's REST shared secret) and `TURN_URIS` on the relay, and use
+> `ops/turn/coturn.conf.example` for the TURN server. Users of a
+> signaling-only relay who need TURN configure their own TURN server in the
+> app's settings. References below to `server/turnserver.conf`, the bundled
+> sidecar and the compose port mappings describe the earlier image.
+
 The ParolNet relay spawns one-off TURN credentials per session but does not
 run the TURN server itself — a sidecar `coturn` process running inside the
 main relay container handles RFC 5766 allocations, STUN binding, and ICE

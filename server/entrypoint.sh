@@ -6,15 +6,20 @@ echo "window.BUILD_INFO={date:'v${PAROLNET_BUILD_VERSION} ${PAROLNET_BUILD_COMMI
     > /usr/share/nginx/html/pwa/build-info.js
 echo "Build: v${PAROLNET_BUILD_VERSION} ${PAROLNET_BUILD_COMMIT} | dev=${_dev}"
 
-# Start TURN/STUN server if configured
-if [ -n "$TURN_SECRET" ] && [ -n "$TURN_EXTERNAL_IP" ]; then
-    envsubst '${TURN_SECRET} ${TURN_EXTERNAL_IP} ${TURN_REALM}' \
-        < /etc/turnserver.conf.template > /etc/turnserver.conf
-    turnserver -c /etc/turnserver.conf &
-    echo "TURN/STUN server started on :3478 (external: $TURN_EXTERNAL_IP)"
-else
-    echo "TURN/STUN server not configured (set TURN_SECRET + TURN_EXTERNAL_IP to enable)"
-fi
+# The image runs no TURN server. The relay defaults to the signaling-only
+# profile (SIGNALING_ONLY unset or 1): it serves STUN URIs from STUN_URIS and
+# never relays or stores user content. SIGNALING_ONLY=0 selects the relay
+# profile (mailbox, tokens, TURN credentials for an external TURN server).
+_profile=$(printf '%s' "${SIGNALING_ONLY:-1}" | tr '[:upper:]' '[:lower:]' | tr -d ' ')
+case "$_profile" in
+    0|false|off|no)
+        echo "Relay profile: relay (SIGNALING_ONLY=${SIGNALING_ONLY})"
+        # Proxy the relay-profile endpoints too, unless the operator mounted
+        # their own nginx config (read-only mount: the copy fails, theirs stays).
+        cp /etc/nginx/parolnet-relay.conf /etc/nginx/conf.d/default.conf 2>/dev/null || true
+        ;;
+    *) echo "Relay profile: signaling-only" ;;
+esac
 
 # Start relay server in background
 echo "Starting ParolNet relay on port 9000..."
