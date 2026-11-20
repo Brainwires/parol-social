@@ -24,7 +24,7 @@ The Cargo workspace currently has 9 members:
 | `parolnet-relay` | Relay cells, circuit primitives, onion encryption helpers, relay directory |
 | `parolnet-core` | Client/session/bootstrap APIs, media/file/group helpers, panic wipe helpers |
 | `parolnet-wasm` | Browser bindings for crypto/session/bootstrap/core functions |
-| `parolnet-relay-server` | Axum WebSocket relay, store-forward, directory and endorsement endpoints |
+| `parolnet-relay-server` | Axum WebSocket relay. Default signaling-only profile (registration, SDP/ICE between online peers, presence push, directory read, STUN URIs; resource bounds per PNP-001 §10.6); opt-in relay profile adds store-forward, tokens, onion cells, gossip, TURN credentials, federation |
 | `parolnet-authority-cli` | Authority key and relay endorsement CLI |
 
 ## Current User-Facing Path
@@ -58,7 +58,7 @@ This path provides end-to-end content encryption when a Double Ratchet session e
 - Relay health/reputation scoring: `RelayHealth` tracks latency EMA, success/failure counts, and computes weighted scores. `select_random()` and `select_guards()` use health-weighted selection.
 - Relay federation: gossip-based directory propagation via `POST /directory/push`, bidirectional pull+push sync, dynamic peer discovery from directory entries (capped at 50), push rate limiting, `merge_descriptors()` API.
 - 3-hop onion circuit support: WASM circuit builder constructs 3-hop circuits over WebSocket with X25519 handshake, layered ChaCha20-Poly1305 encryption, and HMAC key confirmation. Relay server processes binary relay cells (CREATE/EXTEND/DATA/DESTROY) with single-relay MVP mode. JS exports (`build_circuit`, `circuit_send`, `circuit_recv`, `circuit_destroy`) allow PWA to send messages through onion circuits.
-- WebRTC privacy mode: relay-only by default (`iceTransportPolicy: "relay"`), ICE candidate filtering strips host/srflx candidates, `GET /turn-credentials` endpoint generates time-limited HMAC-SHA1 TURN credentials, auto-fetch credentials from relay on startup, settings toggle with privacy warning, WASM `get_webrtc_privacy_config()` export.
+- WebRTC: direct (host + srflx) with STUN by default, since the default relay profile is signaling-only and carries no user traffic; contacts on a direct connection see each other's IP address (the app shows a notice). Relay-only ICE is an opt-in setting that uses only a TURN server the user configures. `GET /turn-credentials` returns STUN URIs only on a signaling-only relay and time-limited HMAC-SHA1 TURN credentials on a relay-profile relay with `TURN_SECRET`. WASM `get_webrtc_privacy_config()` export.
 - Domain fronting & bridge relays: `BridgeAddress` type with QR encoding, relay server bridge mode (unlisted, X-Forwarded-For proxy support), PWA bridge relay discovery and priority connection, WASM bridge address parsing exports. CDN-side domain fronting is an operational deployment concern (configure CDN to proxy to bridge relay).
 - PWA group management UI: create/join/leave groups, group chat with per-group IndexedDB message history, member management modal, Chats/Groups tab switcher.
 - PWA file receive flow: incoming file offer accept/decline, chunked receive with progress, download link on completion.
@@ -76,7 +76,7 @@ This path provides end-to-end content encryption when a Double Ratchet session e
 - Traffic shaping exists as constants/helpers and some jitter, but constant-rate padding and dummy traffic are not applied end-to-end to the current PWA relay path.
 - Mesh discovery is implemented as obfuscated UDP broadcast, not mDNS/BLE as written in older spec text.
 - File, call, group call, and group file APIs: core/WASM primitives exist and PWA UI is wired for basic flows; messages are not yet routed through the full onion circuit protocol stack.
-- WebRTC data channels use privacy mode by default (relay-only, ICE candidate filtering); TURN credential auto-fetch is implemented but multi-relay TURN infrastructure deployment is left to operators.
+- WebRTC data channels connect directly over STUN by default; pairs behind NATs that block a direct path need a user-supplied TURN server (no TURN on the signaling-only public relay). Offline delivery is the sender-side queue; there is no relay mailbox in the default profile.
 
 ## Not Yet Implemented
 

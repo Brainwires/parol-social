@@ -29,6 +29,8 @@ ParolNet is built from the ground up to solve these problems together:
 
 **Metadata protection is partial today.** Message content is end-to-end encrypted after a secure session is established. The current app still exposes relay/WebRTC connection metadata and does not yet provide the full padding, decoy, and constant-rate protections described by PNP-004 and PNP-006.
 
+**The public relay is signaling-only.** By default the relay server only helps peers set up direct connections (registration, WebRTC offer/answer/ICE exchange between two online contacts, presence, STUN); no message, file, group, call or decoy traffic transits or is stored on it ([PNP-001 §10.5](specs/PNP-001-wire-protocol.md)). Chats and files travel peer to peer, so **a contact you connect to sees your IP address** (strangers never do); you can avoid that by adding your own TURN server in Settings. Messages to a contact who is offline wait on your device until you are both online. Operators who want store-and-forward, Privacy Pass tokens, TURN credentials or federation run the relay profile (`SIGNALING_ONLY=0`).
+
 **Your device is safe if seized.** A single panic button securely erases all keys, messages, and contacts from your device. A decoy mode makes the app appear as a calculator or notepad. Deniable encryption means you cannot be forced to prove what you sent — even to a court.
 
 **Offline and local mesh support is partial today.** The codebase has store-forward and UDP broadcast discovery primitives. BLE bootstrap and a fully integrated offline browser mesh are not complete.
@@ -178,7 +180,7 @@ Nine protocol specifications define the design target. Implementation coverage v
 - **Serialization**: CBOR (RFC 8949) via ciborium
 - **Async**: tokio
 - **WASM**: wasm-bindgen for browser PWA delivery
-- **Relay**: Axum WebSocket relay server with store-forward, directory, and endorsement endpoints
+- **Relay**: Axum WebSocket relay server; signaling-only by default (register, SDP/ICE exchange, presence push, directory read, STUN URIs), with an opt-in relay profile adding store-forward, tokens, TURN credentials and federation
 - **Storage**: AES-256-GCM encrypted IndexedDB with PBKDF2 key derivation
 - **License**: MIT OR Apache-2.0
 
