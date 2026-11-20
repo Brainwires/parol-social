@@ -68,6 +68,7 @@ const keep = process.env.INTEROP_KEEP === "1";
 
 const cleanups = [];
 const openPwas = new Set();
+const openBots = new Set();
 const work = mkdtempSync(join(tmpdir(), "parolnet-interop-"));
 cleanups.push(() => keep || rmSync(work, { recursive: true, force: true }));
 
@@ -224,6 +225,7 @@ class Bot {
     this.name = name;
     this.events = [];
     this.stderr = [];
+    openBots.add(this);
     const dir = join(work, `bot-${name}`);
     this.child = spawn(
       botBin,
@@ -685,7 +687,12 @@ try {
   for (const p of openPwas) {
     try {
       console.error(`pwa ${p.name} connections: ${JSON.stringify(await p.diag(), null, 1)}`);
+      console.error(`pwa ${p.name} console (last 40):\n  ${p.console.slice(-40).join("\n  ")}`);
     } catch {}
+  }
+  for (const b of openBots) {
+    console.error(`bot ${b.name} events (last 20):\n  ${b.events.slice(-20).map((e) => JSON.stringify(e)).join("\n  ")}`);
+    console.error(`bot ${b.name} stderr (last 30):\n  ${b.stderr.slice(-30).join("\n  ")}`);
   }
 }
 for (const c of cleanups.reverse()) {

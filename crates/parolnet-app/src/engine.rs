@@ -1202,7 +1202,7 @@ impl Engine {
             verified: false,
         });
         st.fallback_armed = false;
-        if st.path != PathState::NoDirectPath {
+        if !matches!(st.path, PathState::NoDirectPath | PathState::BindingFailed) {
             self.set_path(peer, PathState::Connecting);
         }
         let config = RtcConfig {
