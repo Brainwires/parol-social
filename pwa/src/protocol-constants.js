@@ -49,6 +49,10 @@ export const MSG_TYPE_GROUP_ADMIN = 0x12;
 // 0x13 IDENTITY_ROTATE — signed identity rotation notification.
 export const MSG_TYPE_IDENTITY_ROTATE = 0x13;
 
+// ── PNP-001 §10.5.1 direct data-channel binding ──────────────
+// 0x14 CHANNEL_BINDING — the data channel's DTLS fingerprints, inside the session.
+export const MSG_TYPE_CHANNEL_BINDING = 0x14;
+
 // All message-type codes in PNP-001 §3.4 (registry mirror — tests enumerate this).
 export const ALL_MSG_TYPES = Object.freeze({
     TEXT:                    MSG_TYPE_CHAT,
@@ -70,4 +74,5 @@ export const ALL_MSG_TYPES = Object.freeze({
     SENDER_KEY_DISTRIBUTION: MSG_TYPE_SENDER_KEY_DISTRIBUTION,
     GROUP_ADMIN:             MSG_TYPE_GROUP_ADMIN,
     IDENTITY_ROTATE:         MSG_TYPE_IDENTITY_ROTATE,
+    CHANNEL_BINDING:         MSG_TYPE_CHANNEL_BINDING,
 });

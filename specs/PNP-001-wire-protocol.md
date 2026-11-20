@@ -1,12 +1,17 @@
 # PNP-001: ParolNet Wire Protocol
 
 ### Status: CANDIDATE
-### Version: 0.11
+### Version: 0.12
 ### Date: 2026-11-20
 
 ---
 
 ## Changelog
+
+**v0.12 (2026-11-20) — Direct data-channel binding**
+
+- Added §10.5.1 "Direct Data-Channel Binding". On a signaling-only relay the data channel's SDP crosses the relay in plaintext, so a hostile relay could replace both DTLS fingerprints and terminate DTLS on each side. Each peer now sends a CHANNEL_BINDING message (new code 0x14) inside the end-to-end encrypted session, on the channel itself, naming its own DTLS fingerprints and the ones it received; the receiver compares them with its own view and drops the connection on a mismatch or when no binding arrives.
+- New clauses: **PNP-001-MUST-079** … **PNP-001-MUST-081**, **PNP-001-SHOULD-018**. MUST count: 81.
 
 **v0.11 (2026-11-20) — Signaling-only relay profile; resource bounds for every relay**
 
@@ -212,7 +217,7 @@ This construction makes the AEAD tag tamper-evident with respect to (a) every re
 
 ### 3.4 Message Types
 
-Codes 0x01–0x06 are allocated by this specification. Codes 0x07–0x0B are allocated by PNP-007 (Media & File Transfer). Codes 0x0C–0x12 are allocated by PNP-009 (Group Communication). Code 0x13 is allocated by PNP-002 (Handshake Protocol) for identity rotation. PNP-001 is the canonical registry — new message types MUST be assigned here in future revisions.
+Codes 0x01–0x06 and 0x14 are allocated by this specification. Codes 0x07–0x0B are allocated by PNP-007 (Media & File Transfer). Codes 0x0C–0x12 are allocated by PNP-009 (Group Communication). Code 0x13 is allocated by PNP-002 (Handshake Protocol) for identity rotation. PNP-001 is the canonical registry — new message types MUST be assigned here in future revisions.
 
 | Code | Name | Allocated By | Description |
 |------|------|-------------|-------------|
@@ -235,8 +240,9 @@ Codes 0x01–0x06 are allocated by this specification. Codes 0x07–0x0B are all
 | 0x11 | SENDER_KEY_DISTRIBUTION | PNP-009 | Sender key distribution |
 | 0x12 | GROUP_ADMIN | PNP-009 | Group admin operation (invite, member add/remove; see PNP-009 §6.2) |
 | 0x13 | IDENTITY_ROTATE | PNP-002 | Signed identity rotation notification (see PNP-002 §7) |
+| 0x14 | CHANNEL_BINDING | PNP-001 | DTLS fingerprints of a direct data channel (§10.5.1) |
 
-Codes 0x14–0xFF are reserved for future assignment.
+Codes 0x15–0xFF are reserved for future assignment.
 
 Implementations MUST treat unrecognized message type codes as DECOY and silently discard them after decryption. **PNP-001-MUST-008**
 
@@ -652,6 +658,20 @@ A relay operates in exactly one of two profiles:
 **Client behaviour (non-normative rationale, normative SHOULD).** Because a signaling-only relay forwards at most a few dozen signaling frames per minute per sender, clients SHOULD send connection SDP non-trickle (wait for ICE gathering to complete, bounded at a few seconds, and send the candidates inside the offer / answer), SHOULD stagger new connection attempts, and SHOULD back off on `rate_limited` instead of retrying at once. **PNP-001-SHOULD-016** With no relay message path, all content (chat, group fan-out, files, call signalling) rides the direct peer-to-peer data channel; messages for a contact who is offline queue on the sender until both are online. Direct connections reveal each side's network address to the contact (never to strangers, since connections are only attempted to contacts); clients SHOULD say so plainly and SHOULD let the user configure their own TURN server, which then relays only for that user.
 
 **Logging.** A relay SHOULD NOT write PeerIds at its default log level, SHOULD NOT write access logs that pair client addresses with PeerIds, and SHOULD NOT accept PeerIds in request URLs; the reference signaling-only relay answers `GET /bootstrap` with an empty list and ignores its `exclude` parameter. **PNP-001-SHOULD-017**
+
+#### 10.5.1 Direct Data-Channel Binding
+
+The data channel's SDP (offer and answer, with each side's DTLS certificate fingerprint) crosses the relay in plaintext. A relay that replaced both fingerprints with its own could terminate DTLS towards each peer and relay between them: it could not read end-to-end encrypted envelopes, but it would sit on the "direct" path, learn its timing and sizes, and drop envelopes the sender believes delivered. The binding below detects that.
+
+**The binding message.** A CHANNEL_BINDING envelope (`msg_type = 0x14`) carries a CBOR map `{ "v": 1, "local": [fp, …], "remote": [fp, …] }`. Each `fp` is a text string `"<hash function> <fingerprint>"` taken from an `a=fingerprint:` line (RFC 8122), the hash function in lower case and the fingerprint in upper-case hex with colons; each list is sorted, has no duplicates and holds 1 to 8 entries. `local` lists the fingerprints of the sender's own local description for the connection the channel runs on; `remote` lists those of the remote description the sender applied. The envelope is an ordinary Double Ratchet envelope (§3), padded like any other.
+
+**Sending.** Once the data channel of a direct connection is open and the sender holds a session with the peer, it MUST send exactly one CHANNEL_BINDING envelope on that channel. The QR scanner (PNP-003) sends its bootstrap-completing envelope (§5.3.1) first and its binding right after it; the presenter sends its binding once that envelope has materialized its session. **PNP-001-MUST-079**
+
+**Verifying.** The receiver MUST compare the binding with its own view of the same connection: the peer's `local` list MUST equal the fingerprints of the remote description the receiver applied, and the peer's `remote` list MUST equal the fingerprints of the receiver's own local description. On any difference, or a binding that does not decode, the receiver MUST close the connection without sending further envelopes on it and MUST tell the user that the direct connection failed its end-to-end check. **PNP-001-MUST-080**
+
+**Before verification.** Until the peer's binding has verified, a client MUST NOT send call signals (PNP-007 `CALL_SIGNAL`) on the channel and MUST NOT present the path to the user as a direct connection. A client that has not received a valid binding within 20 seconds of the channel opening MUST close the connection (it MAY retry with a new connection). **PNP-001-MUST-081** A client SHOULD hold every content envelope other than the bootstrap-completing envelope and its own binding until the peer's binding has verified, so that envelopes reported as sent did not go to an interposed relay. **PNP-001-SHOULD-018**
+
+Call connections need no separate binding: their offer and answer travel as `CALL_SIGNAL` envelopes inside the session, so their fingerprints are end-to-end authenticated already. A user who also compares safety numbers (PNP-002 §10) knows the session itself is with the right person.
 
 ### 10.6 Resource Bounds
 

@@ -24,6 +24,8 @@ pub enum MessageType {
     GroupFileControl = 0x10,
     SenderKeyDistribution = 0x11,
     IdentityRotate = 0x13,
+    /// Direct data-channel binding (PNP-001 §10.5.1).
+    ChannelBinding = 0x14,
 }
 
 impl MessageType {
@@ -41,7 +43,8 @@ impl MessageType {
     /// assert_eq!(MessageType::from_u8(0x13), Some(MessageType::IdentityRotate));
     /// assert_eq!(MessageType::from_u8(0x00), None);
     /// assert_eq!(MessageType::from_u8(0x12), None);
-    /// assert_eq!(MessageType::from_u8(0x14), None);
+    /// assert_eq!(MessageType::from_u8(0x14), Some(MessageType::ChannelBinding));
+    /// assert_eq!(MessageType::from_u8(0x15), None);
     /// ```
     pub fn from_u8(v: u8) -> Option<Self> {
         match v {
@@ -63,6 +66,7 @@ impl MessageType {
             0x10 => Some(Self::GroupFileControl),
             0x11 => Some(Self::SenderKeyDistribution),
             0x13 => Some(Self::IdentityRotate),
+            0x14 => Some(Self::ChannelBinding),
             _ => None,
         }
     }

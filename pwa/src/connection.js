@@ -339,8 +339,9 @@ export function queuedCountFor(peerId) {
 // deletion. Errors are logged but never thrown — the in-memory queue stays
 // functional even if persistence fails (e.g., quota exhausted).
 function _persistQueueEntry(entry) {
-    const { toPeerId, payload, timestamp, nextTryAt, id } = entry;
+    const { toPeerId, payload, timestamp, nextTryAt, id, bootstrap } = entry;
     const row = { toPeerId, payload, timestamp, nextTryAt };
+    if (bootstrap) row.bootstrap = true;
     if (id !== undefined) row.id = id;
     dbPut('pending_sends', row).then(newId => {
         // dbPut returns the (possibly-new) primary key. First write assigns
@@ -360,8 +361,12 @@ function _deletePersisted(entry) {
     });
 }
 
-export function queueMessage(toPeerId, payload) {
+/// `opts.bootstrap`: the QR scanner's bootstrap-completing envelope. It is the one envelope
+/// sent on a new data channel before the peer's channel binding verifies (PNP-001 §10.5.1):
+/// the presenter needs it to have a session at all.
+export function queueMessage(toPeerId, payload, opts) {
     const entry = { toPeerId, payload, timestamp: Date.now(), nextTryAt: 0 };
+    if (opts && opts.bootstrap) entry.bootstrap = true;
     const changed = [toPeerId];
     for (const dropped of planQueueEviction(messageQueue, entry)) {
         const i = messageQueue.indexOf(dropped);
@@ -399,6 +404,7 @@ export async function hydratePendingSends() {
             payload: row.payload,
             timestamp: row.timestamp || now,
             nextTryAt: row.nextTryAt || 0,
+            bootstrap: !!row.bootstrap,
         });
         loaded++;
     }
@@ -408,6 +414,28 @@ export async function hydratePendingSends() {
         emitQueueChanged(messageQueue.map(e => e.toPeerId));
     }
     return loaded;
+}
+
+/// Send the queued bootstrap envelopes for `peerId` through `send(payload) -> bool` (the
+/// just-opened, not yet verified data channel), synchronously and in order, so they precede
+/// our channel binding. Returns how many went out.
+export function flushBootstrapQueue(peerId, send) {
+    let sent = 0;
+    for (let i = 0; i < messageQueue.length; ) {
+        const e = messageQueue[i];
+        if (e.toPeerId === peerId && e.bootstrap && send(e.payload)) {
+            messageQueue.splice(i, 1);
+            _deletePersisted(e);
+            sent++;
+        } else {
+            i++;
+        }
+    }
+    if (sent > 0) {
+        console.log('[Queue] sent', sent, 'bootstrap envelope(s) to', peerId.slice(0, 8));
+        emitQueueChanged([peerId]);
+    }
+    return sent;
 }
 
 // Flush the sender queue. `opts.peerId` limits the flush to one contact

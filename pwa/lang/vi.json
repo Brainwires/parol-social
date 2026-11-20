@@ -310,5 +310,6 @@
   "notice.ipAvoid": "To hide your IP address, add your own TURN server in Settings and turn on \"Relay through my own TURN server\".",
   "notice.ipOpenSettings": "Open Settings",
   "notice.ipOk": "I understand",
-  "toast.callMediaTimeout": "Media never connected — ICE/TURN may be blocked."
+  "toast.callMediaTimeout": "Media never connected — ICE/TURN may be blocked.",
+  "toast.channelBindingFailed": "Kết nối trực tiếp với {name} không vượt qua kiểm tra đầu cuối và đã bị đóng. Có thể ai đó ở giữa, chẳng hạn máy chủ chuyển tiếp, đang can thiệp."
 }

@@ -27,6 +27,9 @@
 //      pairs like a camera scan, messages both ways.
 //   3. Sender queue: with case 2's pair, the PWA tab closes; the bot's message waits in its
 //      queue and is delivered when the PWA comes back (same browser profile).
+//   4. Channel binding (PNP-001 §10.5.1): every case above requires both sides to verify the
+//      other's binding before the path is direct; here the PWA binds a fingerprint it did not
+//      see (as if a relay had swapped the desktop's), and the desktop must refuse the channel.
 //
 // Environment: PAROLNET_RELAY_BIN, PAROLNET_BOT_BIN (default: $CARGO_TARGET_DIR or target/,
 // debug profile), CHROME_PATH, INTEROP_ICE, INTEROP_KEEP=1 (keep temp dirs), INTEROP_VERBOSE=1
@@ -274,8 +277,24 @@ async function launchBrowser(profileDir) {
 }
 
 class Pwa {
-  static async open(browser, port, name) {
+  static async open(browser, port, name, { tamperBinding = false } = {}) {
     const page = await browser.newPage();
+    if (tamperBinding) {
+      // Once connected, the local description the PWA binds names a fingerprint that is not
+      // its certificate's: the binding then disagrees with what the desktop saw.
+      await page.evaluateOnNewDocument(() => {
+        const desc = Object.getOwnPropertyDescriptor(RTCPeerConnection.prototype, "localDescription");
+        Object.defineProperty(RTCPeerConnection.prototype, "localDescription", {
+          configurable: true,
+          get() {
+            const d = desc.get.call(this);
+            if (!d || this.connectionState !== "connected") return d;
+            const fake = Array(32).fill("AA").join(":");
+            return { type: d.type, sdp: d.sdp.replace(/a=fingerprint:(\S+) [0-9A-Fa-f:]+/g, `a=fingerprint:$1 ${fake}`) };
+          },
+        });
+      });
+    }
     const p = new Pwa(page, name);
     page.on("console", (msg) => {
       const text = msg.text();
@@ -358,9 +377,16 @@ class Pwa {
     );
   }
 
-  async hasDirect(peerId) {
-    return this.console.some((t) => t.includes("Data channel open with") && t.includes(peerId.slice(0, 8)));
+  async verified(peerId) {
+    return this.console.some((t) => t.includes("direct channel verified with") && t.includes(peerId.slice(0, 8)));
   }
+}
+
+async function bothVerified(bot, pwa, tag) {
+  await until(`${tag}: the PWA verifies the desktop's channel binding`, 20_000, () => pwa.verified(bot.peerId));
+  await until(`${tag}: the desktop verifies the PWA's channel binding`, 20_000, () =>
+    bot.stderr.some((l) => l.includes("direct channel verified")),
+  );
 }
 
 // ── Cases ────────────────────────────────────────────────────
@@ -393,7 +419,8 @@ async function caseDesktopEntersPwaCode(ctx) {
   await bot.wait("paired", (e) => e.event === "paired" && e.peer_id === pwa.peerId);
   await bot.wait("direct path", (e) => e.event === "path" && e.peer_id === pwa.peerId && e.state === "Direct", 45_000);
   await until(`${tag}: the PWA adds the desktop as a secure contact`, 30_000, () => pwa.hasContact(bot.peerId));
-  log(`${tag}: paired, direct data channel`);
+  await bothVerified(bot, pwa, tag);
+  log(`${tag}: paired, direct data channel, bindings verified`);
   await chatBothWays(bot, pwa, tag);
   await bot.quit();
   await browser.close();
@@ -418,7 +445,8 @@ async function casePwaPastesDesktopCode(ctx) {
   await until(`${tag}: the PWA stores the desktop as a contact`, 10_000, () => pwa.hasContact(bot.peerId));
   await bot.wait("contact (presenter side)", (e) => e.event === "contact" && e.peer_id === pwa.peerId, 45_000);
   await bot.wait("direct path", (e) => e.event === "path" && e.peer_id === pwa.peerId && e.state === "Direct", 45_000);
-  log(`${tag}: paired, direct data channel`);
+  await bothVerified(bot, pwa, tag);
+  log(`${tag}: paired, direct data channel, bindings verified`);
   await chatBothWays(bot, pwa, tag);
 
   // Case 3: the PWA goes away; the bot's message waits in its sender queue.
@@ -440,6 +468,40 @@ async function casePwaPastesDesktopCode(ctx) {
   return bot;
 }
 
+async function caseTamperedBindingIsRefused(ctx) {
+  const tag = "case 4 (tampered channel binding)";
+  const profile = mkdtempSync(join(work, "chrome-4-"));
+  const browser = await launchBrowser(profile);
+  cleanups.push(() => browser.close().catch(() => {}));
+  const bot = new Bot("four", ctx.relayPort, ctx.bindIp);
+  const ready = await bot.wait("ready", (e) => e.event === "ready");
+  bot.peerId = ready.peer_id;
+  await bot.wait("registered", (e) => e.event === "relay" && e.state.includes("Registered"));
+  const pwa = await Pwa.open(browser, ctx.pwaPort, "four", { tamperBinding: true });
+
+  const code = await pwa.showCode();
+  bot.send(`pair ${code}`);
+  await bot.wait("paired", (e) => e.event === "paired" && e.peer_id === pwa.peerId);
+  const notice = await bot.wait(
+    "the end-to-end check to fail",
+    (e) => e.event === "notice" && e.text.includes("failed its end-to-end check"),
+    45_000,
+  );
+  await bot.wait("BindingFailed path", (e) => e.event === "path" && e.peer_id === pwa.peerId && e.state === "BindingFailed", 10_000);
+  if (bot.events.some((e) => e.event === "path" && e.peer_id === pwa.peerId && e.state === "Direct")) {
+    throw new Error(`${tag}: the desktop reported a direct path despite the bad binding`);
+  }
+  // Nothing the desktop queued went out on the refused channel.
+  const mark = bot.events.length;
+  bot.send(`send ${pwa.peerId} must not be delivered on a refused channel`);
+  const sent = await bot.wait("queued", (e) => e.event === "sent", 10_000, mark);
+  if (sent.state !== "Queued") throw new Error(`${tag}: expected the message to queue, got ${sent.state}`);
+  log(`${tag}: refused (${notice.text.slice(0, 60)}...)`);
+  await bot.quit();
+  await browser.close();
+  return bot;
+}
+
 // ── Main ─────────────────────────────────────────────────────
 
 async function main() {
@@ -453,13 +515,14 @@ async function main() {
   const bots = [];
   bots.push(await caseDesktopEntersPwaCode(ctx));
   bots.push(await casePwaPastesDesktopCode(ctx));
+  bots.push(await caseTamperedBindingIsRefused(ctx));
 
   if (mode === "mdns") {
     const resolved = bots.some((b) => b.stderr.some((l) => l.includes("mDNS traffic received")));
     if (!resolved) throw new Error("mDNS mode: the desktop never received an mDNS answer for Chromium's .local candidates");
     log("mDNS: the desktop resolved Chromium's .local candidates");
   }
-  log("PASS: desktop <-> PWA chat interop (3 cases)");
+  log("PASS: desktop <-> PWA chat interop (4 cases)");
 }
 
 let status = 0;

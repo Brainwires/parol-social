@@ -606,6 +606,35 @@ fn serialize_trial_result(
     serde_wasm_bindgen::to_value(&out).map_err(|e| JsError::new(&format!("serialize: {e}")))
 }
 
+/// PNP-001 §10.5.1: the CHANNEL_BINDING (`msg_type` 0x14) body this side sends once its
+/// data channel is open: the DTLS fingerprints of `local_sdp` (our local description) and
+/// `remote_sdp` (the remote description we applied), CBOR-encoded. Throws when either
+/// description has no fingerprint.
+#[wasm_bindgen]
+pub fn channel_binding_body(local_sdp: &str, remote_sdp: &str) -> Result<Vec<u8>, JsError> {
+    parolnet_protocol::channel_binding::ChannelBinding::from_sdps(local_sdp, remote_sdp)
+        .map(|b| b.encode())
+        .map_err(|e| JsError::new(&e.to_string()))
+}
+
+/// PNP-001 §10.5.1: check the peer's CHANNEL_BINDING body against our view of the same
+/// connection. `true` when it matches; `false` on a mismatch or a body that does not decode
+/// (both mean: close the connection).
+#[wasm_bindgen]
+pub fn channel_binding_verify(body: &[u8], local_sdp: &str, remote_sdp: &str) -> bool {
+    parolnet_protocol::channel_binding::ChannelBinding::decode(body)
+        .and_then(|b| b.verify(local_sdp, remote_sdp))
+        .is_ok()
+}
+
+/// PNP-002 §10: the 60-digit safety number of two PeerIds (hex), symmetric.
+#[wasm_bindgen]
+pub fn safety_number(peer_a_hex: &str, peer_b_hex: &str) -> Result<String, JsError> {
+    let a = decode_32(peer_a_hex)?;
+    let b = decode_32(peer_b_hex)?;
+    Ok(parolnet_protocol::channel_binding::safety_number(&a, &b))
+}
+
 /// Check if a session exists for a peer.
 #[wasm_bindgen]
 pub fn has_session(peer_id_hex: &str) -> bool {

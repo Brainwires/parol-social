@@ -11,6 +11,7 @@ use parolnet_core::envelope::{decrypt_for_peer, encrypt_for_peer, try_bootstrap_
 use parolnet_core::{ParolNet, ParolNetConfig};
 use parolnet_protocol::PeerId;
 use parolnet_protocol::ProtocolCodec as _;
+use parolnet_protocol::channel_binding::{BindingError, ChannelBinding};
 use parolnet_protocol::codec::CborCodec;
 use parolnet_rtc::rtc::peer_connection::sdp::RTCSessionDescription;
 use parolnet_rtc::rtc::peer_connection::state::RTCPeerConnectionState;
@@ -52,6 +53,9 @@ const PROBE_EVERY: Duration = Duration::from_secs(5 * 60);
 const TICK: Duration = Duration::from_secs(15);
 const WATCH_MAX: usize = 256;
 const PENDING_ICE_MAX: usize = 32;
+/// PNP-001-MUST-081: the peer's channel binding must verify this long after the data channel
+/// opens, or the connection is closed.
+const BINDING_TIMEOUT: Duration = Duration::from_secs(20);
 
 pub(crate) enum Input {
     Command(Command),
@@ -76,6 +80,7 @@ pub(crate) enum Timer {
     AnswerTimeout { peer: String, epoch: u64 },
     ConnectTimeout { peer: String, epoch: u64 },
     DisconnectGrace { peer: String, epoch: u64 },
+    BindingTimeout { peer: String, epoch: u64 },
     OfferFallback { peer: String },
     OfferSlot { peer: String },
     Retry { peer: String },
@@ -104,11 +109,22 @@ struct Conn {
     pending_ice: Vec<RTCIceCandidateInit>,
     dc: Option<usize>,
     last_state: Option<RTCPeerConnectionState>,
+    /// Our local description and the remote one we applied (for the channel binding).
+    local_sdp: Option<String>,
+    remote_sdp: Option<String>,
+    /// Our CHANNEL_BINDING went out on this connection.
+    binding_sent: bool,
+    /// The peer's CHANNEL_BINDING verified (PNP-001 §10.5.1): only now is the path direct.
+    verified: bool,
 }
 
 impl Conn {
     fn is_open(&self) -> bool {
         self.dc.is_some()
+    }
+
+    fn is_verified(&self) -> bool {
+        self.dc.is_some() && self.verified
     }
 }
 
@@ -118,6 +134,8 @@ enum FailReason {
     IceFailed,
     Closed,
     Error,
+    /// The peer's channel binding did not match (PNP-001-MUST-080).
+    Binding,
 }
 
 struct PeerState {
@@ -664,8 +682,23 @@ impl Engine {
         }
     }
 
-    /// Send a frame on the contact's open data channel. False when there is none.
+    /// Send a content envelope on the contact's data channel once its binding has verified
+    /// (PNP-001-SHOULD-018). False when there is no verified channel.
     fn send_on_channel(&mut self, peer: &str, envelope_hex: &str) -> bool {
+        if !self
+            .peers
+            .get(peer)
+            .and_then(|p| p.conn.as_ref())
+            .is_some_and(Conn::is_verified)
+        {
+            return false;
+        }
+        self.send_raw(peer, envelope_hex)
+    }
+
+    /// Send an envelope on the open data channel, verified or not (the bootstrap envelope
+    /// and our own binding).
+    fn send_raw(&mut self, peer: &str, envelope_hex: &str) -> bool {
         let Some(conn) = self.peers.get(peer).and_then(|p| p.conn.as_ref()) else {
             return false;
         };
@@ -673,6 +706,119 @@ impl Engine {
             return false;
         };
         handle.send_text(dc, DcFrame::chat(envelope_hex)).is_ok()
+    }
+
+    /// Send the queued bootstrap-completing envelopes (no chat message; they lead the
+    /// queue) before the binding: the presenter needs one to have a session at all.
+    fn flush_bootstrap(&mut self, peer: &str) {
+        let entries = self.state.take_queue_for(peer);
+        let mut rest = Vec::new();
+        let mut sent = false;
+        for e in entries {
+            if rest.is_empty() && e.message_id.is_none() && self.send_raw(peer, &e.envelope) {
+                sent = true;
+                continue;
+            }
+            rest.push(e);
+        }
+        for e in rest.into_iter().rev() {
+            self.state.enqueue_front(e);
+        }
+        if sent {
+            self.save();
+        }
+    }
+
+    /// PNP-001-MUST-079: our CHANNEL_BINDING, once the channel is open and we hold a session.
+    fn send_binding(&mut self, peer: &str) {
+        let Some(pid) = peer_id_of(peer) else {
+            return;
+        };
+        if !self.client.has_session(&pid) {
+            return; // the presenter, before the scanner's bootstrap envelope
+        }
+        let Some(conn) = self.peers.get(peer).and_then(|p| p.conn.as_ref()) else {
+            return;
+        };
+        if !conn.is_open() || conn.binding_sent {
+            return;
+        }
+        let (Some(local), Some(remote)) = (conn.local_sdp.as_deref(), conn.remote_sdp.as_deref())
+        else {
+            tracing::warn!(peer = %crate::short_id(peer), "no descriptions to bind");
+            return;
+        };
+        let body = match ChannelBinding::from_sdps(local, remote) {
+            Ok(b) => b.encode(),
+            Err(e) => {
+                tracing::warn!(peer = %crate::short_id(peer), %e, "cannot bind the channel");
+                return;
+            }
+        };
+        let envelope = match encrypt_for_peer(
+            self.client.sessions(),
+            &pid,
+            msg_type::CHANNEL_BINDING,
+            &body,
+            now_secs(),
+            None,
+        ) {
+            Ok(e) => hex::encode(e),
+            Err(e) => {
+                tracing::warn!(peer = %crate::short_id(peer), %e, "binding encrypt failed");
+                return;
+            }
+        };
+        if self.send_raw(peer, &envelope) {
+            if let Some(c) = self.peers.get_mut(peer).and_then(|p| p.conn.as_mut()) {
+                c.binding_sent = true;
+            }
+            self.persist_sessions();
+        }
+    }
+
+    /// PNP-001-MUST-080: check the peer's binding against our view of the connection.
+    fn on_binding(&mut self, peer: &str, body: &[u8]) {
+        let Some(conn) = self.peers.get(peer).and_then(|p| p.conn.as_ref()) else {
+            return;
+        };
+        if !conn.is_open() || conn.verified {
+            return;
+        }
+        let result = match (conn.local_sdp.as_deref(), conn.remote_sdp.as_deref()) {
+            (Some(local), Some(remote)) => {
+                ChannelBinding::decode(body).and_then(|b| b.verify(local, remote))
+            }
+            _ => Err(BindingError::NoFingerprint),
+        };
+        match result {
+            Ok(()) => {
+                if let Some(c) = self.peers.get_mut(peer).and_then(|p| p.conn.as_mut()) {
+                    c.verified = true;
+                }
+                let st = self.peer_mut(peer);
+                st.attempt = 0;
+                st.failures = 0;
+                tracing::info!(peer = %crate::short_id(peer), "direct channel verified");
+                // A presenter whose session appeared with this very envelope binds now.
+                self.send_binding(peer);
+                self.set_path(peer, PathState::Direct);
+                self.flush_queue(peer);
+            }
+            Err(e) => {
+                tracing::warn!(peer = %crate::short_id(peer), %e, "channel binding refused");
+                let name = self
+                    .state
+                    .contact(peer)
+                    .map(|c| c.name.clone())
+                    .unwrap_or_else(|| crate::short_id(peer));
+                self.emit(AppEvent::Notice(format!(
+                    "The direct connection to {name} failed its end-to-end check ({e}). \
+                     Someone between you, such as the relay, may be interfering; it was closed."
+                )));
+                self.conn_failed(peer, FailReason::Binding);
+            }
+        }
     }
 
     fn flush_queue(&mut self, peer: &str) {
@@ -869,10 +1015,12 @@ impl Engine {
                     tracing::debug!("malformed answer");
                     return;
                 };
+                let answer_sdp = answer.sdp.clone();
                 if let Some(h) = conn.handle.as_ref()
                     && h.set_remote_description(answer).is_ok()
                 {
                     conn.remote_set = true;
+                    conn.remote_sdp = Some(answer_sdp);
                     for c in conn.pending_ice.drain(..) {
                         let _ = h.add_remote_candidate(c);
                     }
@@ -988,6 +1136,10 @@ impl Engine {
             pending_ice: Vec::new(),
             dc: None,
             last_state: None,
+            local_sdp: None,
+            remote_sdp: None,
+            binding_sent: false,
+            verified: false,
         });
         st.fallback_armed = false;
         if st.path != PathState::NoDirectPath {
@@ -1077,8 +1229,12 @@ impl Engine {
         let ok = if conn.initiator {
             handle.create_offer().is_ok()
         } else if let Some(offer) = conn.remote_offer.take() {
+            let offer_sdp = offer.sdp.clone();
             let ok = handle.set_remote_description(offer).is_ok();
             conn.remote_set = ok;
+            if ok {
+                conn.remote_sdp = Some(offer_sdp);
+            }
             for c in conn.pending_ice.drain(..) {
                 let _ = handle.add_remote_candidate(c);
             }
@@ -1099,6 +1255,7 @@ impl Engine {
         };
         match event {
             RtcEvent::LocalDescription(desc) => {
+                conn.local_sdp = Some(desc.sdp.clone());
                 let initiator = conn.initiator;
                 let payload = serde_json::to_string(&SdpJson {
                     sdp_type: if initiator { "offer" } else { "answer" }.to_owned(),
@@ -1152,11 +1309,18 @@ impl Engine {
                 let st = self.peer_mut(peer);
                 st.online = Some(true);
                 st.offline_by_error = false;
-                st.attempt = 0;
-                st.failures = 0;
-                tracing::info!(peer = %crate::short_id(peer), "data channel open");
-                self.set_path(peer, PathState::Direct);
-                self.flush_queue(peer);
+                tracing::info!(peer = %crate::short_id(peer), "data channel open; binding");
+                // PNP-001 §10.5.1: the bootstrap-completing envelope first (we scanned the
+                // peer's code), then our binding. Everything else waits for the peer's binding.
+                self.flush_bootstrap(peer);
+                self.send_binding(peer);
+                self.after(
+                    BINDING_TIMEOUT,
+                    Timer::BindingTimeout {
+                        peer: peer.to_owned(),
+                        epoch,
+                    },
+                );
             }
             RtcEvent::DataChannelMessage { id, payload } => {
                 if conn.dc == Some(id) {
@@ -1203,7 +1367,9 @@ impl Engine {
             st.failures += 1;
         }
         let failures = st.failures;
-        let path = if was_open {
+        let path = if reason == FailReason::Binding {
+            PathState::BindingFailed
+        } else if was_open {
             PathState::Unknown
         } else if (reason == FailReason::IceFailed && failures >= 1)
             || (reason == FailReason::Timeout && failures >= 2)
@@ -1271,6 +1437,12 @@ impl Engine {
                         Some(RTCPeerConnectionState::Disconnected | RTCPeerConnectionState::Failed)
                     )
                 }) {
+                    self.conn_failed(&peer, FailReason::Timeout);
+                }
+            }
+            Timer::BindingTimeout { peer, epoch } => {
+                if self.conn_mut(&peer, epoch).is_some_and(|c| !c.verified) {
+                    tracing::info!(peer = %crate::short_id(&peer), "no channel binding; closing");
                     self.conn_failed(&peer, FailReason::Timeout);
                 }
             }
@@ -1390,6 +1562,11 @@ impl Engine {
         let Some(d) = decoded else {
             return;
         };
+        // We may hold a session only now (the presenter, on the scanner's bootstrap
+        // envelope): our binding can go out.
+        if d.msg_type != msg_type::CHANNEL_BINDING {
+            self.send_binding(peer);
+        }
         if let Some(ik) = bootstrapped_ik {
             let (contact, new) = self.upsert_contact(peer, Some(hex::encode(ik)));
             tracing::info!(peer = %crate::short_id(peer), "paired (presenter side)");
@@ -1421,6 +1598,7 @@ impl Engine {
                 self.emit(AppEvent::Message(msg));
             }
             msg_type::SYSTEM => {}
+            msg_type::CHANNEL_BINDING => self.on_binding(peer, &d.plaintext),
             msg_type::CALL_SIGNAL => {
                 tracing::info!(peer = %crate::short_id(peer), "call signal (calls are not in this build yet)");
             }

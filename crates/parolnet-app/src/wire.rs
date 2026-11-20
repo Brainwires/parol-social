@@ -22,8 +22,10 @@ pub mod msg_type {
     pub const CHAT: u8 = 0x01;
     /// 0x03 CONTROL: the scanner's bootstrap envelope carries an empty CONTROL body.
     pub const SYSTEM: u8 = 0x03;
-    /// 0x0B CALL_SIGNAL (not handled yet in the desktop).
+    /// 0x0B CALL_SIGNAL: call offer / answer / ice / hangup as JSON (the PWA's shapes).
     pub const CALL_SIGNAL: u8 = 0x0B;
+    /// 0x14 CHANNEL_BINDING: the data channel's DTLS fingerprints (PNP-001 §10.5.1).
+    pub const CHANNEL_BINDING: u8 = 0x14;
 }
 
 /// A frame the client sends to the relay.

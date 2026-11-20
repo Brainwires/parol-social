@@ -265,6 +265,7 @@
   "toast.callNoAnswer": "No answer",
   "toast.callConnectionLost": "Call connection lost",
   "toast.callMediaTimeout": "Media never connected — ICE/TURN may be blocked.",
+  "toast.channelBindingFailed": "The direct connection to {name} failed its end-to-end check and was closed. Someone between you, such as the relay, may be interfering.",
   "toast.qrUnrecognized": "Unrecognized QR code",
   "toast.qrSelf": "That's your own QR code!",
 

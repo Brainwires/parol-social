@@ -310,5 +310,6 @@
   "notice.ipAvoid": "Um deine IP-Adresse zu verbergen, füge in den Einstellungen deinen eigenen TURN-Server hinzu und aktiviere \"Über meinen eigenen TURN-Server leiten\".",
   "notice.ipOpenSettings": "Einstellungen öffnen",
   "notice.ipOk": "Verstanden",
-  "toast.callMediaTimeout": "Media never connected — ICE/TURN may be blocked."
+  "toast.callMediaTimeout": "Media never connected — ICE/TURN may be blocked.",
+  "toast.channelBindingFailed": "Die direkte Verbindung zu {name} hat die Ende-zu-Ende-Prüfung nicht bestanden und wurde geschlossen. Jemand zwischen euch, etwa das Relay, greift möglicherweise ein."
 }

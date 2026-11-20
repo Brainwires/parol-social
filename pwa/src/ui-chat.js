@@ -955,10 +955,10 @@ function handleScannedQR(data) {
                 // envelope is queued and rides the data channel once it
                 // opens (connectToPeer below; the presenter accepts our
                 // offer while its add-contact screen is open).
-                const result = await sendRawEnvelope(peerId, envelope);
+                const result = await sendRawEnvelope(peerId, envelope, { bootstrap: true });
                 if (!result.ok) {
                     console.log('[Bootstrap] not sent yet — queued for later send:', result.reason);
-                    if (!result.queued) queueMessage(peerId, envelope);
+                    if (!result.queued) queueMessage(peerId, envelope, { bootstrap: true });
                 } else {
                     console.log('[Bootstrap] envelope handed to relay');
                 }

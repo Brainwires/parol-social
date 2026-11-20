@@ -88,14 +88,25 @@ pub fn path_text(path: PathState, name: &str, queued: usize) -> String {
         n => format!(" ({n} messages waiting)"),
     };
     match path {
-        PathState::Direct => "Direct connection, end-to-end encrypted".to_owned(),
+        PathState::Direct => "Direct connection, end-to-end encrypted and verified".to_owned(),
         PathState::Connecting => format!("Connecting to {name}…{waiting}"),
         PathState::Offline => format!("Waiting for {name} to come online{waiting}"),
         PathState::Unknown => format!("Not connected{waiting}"),
         PathState::NoDirectPath => format!(
             "No direct path to {name}. Either side can add a TURN server in Settings.{waiting}"
         ),
+        PathState::BindingFailed => format!(
+            "The direct connection to {name} failed its end-to-end check; something between \
+             you (such as the relay) may be interfering. Retrying.{waiting}"
+        ),
     }
+}
+
+/// The safety number in two lines of three groups, as it is read aloud.
+pub fn safety_lines(number: &str) -> (String, String) {
+    let groups: Vec<&str> = number.split(' ').collect();
+    let mid = groups.len().div_ceil(2);
+    (groups[..mid].join(" "), groups[mid..].join(" "))
 }
 
 /// A short badge for the contact list.
@@ -106,6 +117,7 @@ pub fn path_badge(path: PathState) -> (&'static str, u32) {
         PathState::Offline => ("offline", 0x8b949e),
         PathState::Unknown => ("", 0x8b949e),
         PathState::NoDirectPath => ("no path", 0xf85149),
+        PathState::BindingFailed => ("check failed", 0xf85149),
     }
 }
 
@@ -180,6 +192,8 @@ pub struct ChatView {
     code_input: Entity<InputState>,
     composer: Entity<InputState>,
     name_input: Entity<InputState>,
+    /// The chat header shows the safety number (PNP-002 §10).
+    show_safety: bool,
 }
 
 impl ChatView {
@@ -268,6 +282,7 @@ impl ChatView {
             pairing_code: None,
             qr: None,
             notice: None,
+            show_safety: false,
             code_input,
             composer,
             name_input,
@@ -637,10 +652,25 @@ impl ChatView {
                 Button::new("rename")
                     .label("Rename")
                     .on_click(cx.listener(|this, _, window, cx| this.rename(window, cx))),
+            )
+            .child(
+                Button::new("verify")
+                    .label(if self.show_safety {
+                        "Hide number"
+                    } else {
+                        "Verify"
+                    })
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.show_safety = !this.show_safety;
+                        cx.notify();
+                    })),
             );
         if matches!(
             path,
-            PathState::NoDirectPath | PathState::Unknown | PathState::Offline
+            PathState::NoDirectPath
+                | PathState::Unknown
+                | PathState::Offline
+                | PathState::BindingFailed
         ) {
             header = header.child(
                 Button::new("retry")
@@ -648,6 +678,39 @@ impl ChatView {
                     .on_click(cx.listener(move |this, _, _, _| this.app.connect(&peer_owned))),
             );
         }
+
+        let safety = self
+            .show_safety
+            .then(|| self.app.safety_number(peer))
+            .flatten()
+            .map(|number| {
+                let (first, second) = safety_lines(&number);
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .p_3()
+                    .border_b_1()
+                    .border_color(rgb(0x30363d))
+                    .bg(rgb(0x161b22))
+                    .child(div().text_xs().text_color(rgb(0x8b949e)).child(format!(
+                        "Safety number with {name}. Compare it with their screen through a \
+                         channel you trust (in person, a call); in the web app it is under the \
+                         shield. The same digits mean no one swapped keys when you paired."
+                    )))
+                    .child(
+                        div()
+                            .font_family("monospace")
+                            .text_color(rgb(0xe6edf3))
+                            .child(first),
+                    )
+                    .child(
+                        div()
+                            .font_family("monospace")
+                            .text_color(rgb(0xe6edf3))
+                            .child(second),
+                    )
+            });
 
         let empty = Vec::new();
         let msgs = self.messages.get(peer).unwrap_or(&empty);
@@ -681,6 +744,7 @@ impl ChatView {
             .flex()
             .flex_col()
             .child(header)
+            .children(safety)
             .child(
                 div()
                     .id("messages")
@@ -849,6 +913,23 @@ mod tests {
         );
         assert!(path_text(PathState::Direct, "Pat", 0).starts_with("Direct"));
         assert_eq!(path_badge(PathState::NoDirectPath).0, "no path");
+        assert!(path_text(PathState::BindingFailed, "Pat", 0).contains("end-to-end check"));
+        assert_eq!(path_badge(PathState::BindingFailed).0, "check failed");
+    }
+
+    #[test]
+    fn safety_number_reads_in_two_lines() {
+        let me = "11".repeat(32);
+        let them = "22".repeat(32);
+        let number = parolnet_app::safety_number(&me, &them).unwrap();
+        // PNP-002 §10 vector (specs/vectors/PNP-002/safety_number.json), as the PWA shows it.
+        assert_eq!(
+            number,
+            "0203903273 2487506436 7022175877 9751782849 2461095953 2148788959"
+        );
+        let (a, b) = safety_lines(&number);
+        assert_eq!(a, "0203903273 2487506436 7022175877");
+        assert_eq!(b, "9751782849 2461095953 2148788959");
     }
 
     #[test]

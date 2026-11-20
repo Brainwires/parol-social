@@ -11,7 +11,8 @@ import { dbGet, dbPut, dbGetAll, dbGetByIndex, dbDelete, updateContactState } fr
 import { showView } from './views.js';
 import { hasDirectConnection, sendViaWebRTC, seenGossipMessages, markGossipSeen,
          handleRTCOffer, handleRTCAnswer, handleRTCIce, waitForSendBuffer,
-         setPeerOnline, noteSignalingRateLimited, refreshIceServersFromRelay } from './webrtc.js';
+         setPeerOnline, noteSignalingRateLimited, refreshIceServersFromRelay,
+         handleChannelBinding, maybeSendChannelBinding } from './webrtc.js';
 import { sendToRelay, connMgr, queueMessage, onRelayRegistered, requestDirectPath } from './connection.js';
 import { setServerProfile, getServerProfile, chooseSendRoute, relayPathsAllowed,
          PROFILE_SIGNALING_ONLY } from './relay-profile.js';
@@ -28,12 +29,12 @@ import {
     MSG_TYPE_CALL_SIGNAL, MSG_TYPE_GROUP_TEXT, MSG_TYPE_GROUP_CALL_SIGNAL,
     MSG_TYPE_GROUP_FILE_OFFER, MSG_TYPE_GROUP_FILE_CHUNK,
     MSG_TYPE_SENDER_KEY_DISTRIBUTION, MSG_TYPE_GROUP_ADMIN, MSG_TYPE_DECOY,
-    MSG_TYPE_IDENTITY_ROTATE
+    MSG_TYPE_IDENTITY_ROTATE, MSG_TYPE_CHANNEL_BINDING
 } from './protocol-constants.js';
 import { markRealSend } from './cover-traffic.js';
 
 // ── Session Persistence ──────────────────────────────────
-function persistSessions() {
+export function persistSessions() {
     if (!wasm || !wasm.export_sessions) return;
     try {
         const blob = wasm.export_sessions();
@@ -134,9 +135,10 @@ export async function sendRawEnvelope(toPeerId, env, opts) {
     // backoff for no-persist callers.
     const noPersist = !!(opts && opts.noPersist);
     const noQueue = !!(opts && opts.noQueue);
+    const bootstrap = !!(opts && opts.bootstrap);
     const persistOnFail = () => {
         if (noPersist || noQueue) return;
-        try { queueMessage(toPeerId, env); } catch (_) {}
+        try { queueMessage(toPeerId, env, { bootstrap }); } catch (_) {}
     };
 
     markRealSend();
@@ -1296,6 +1298,8 @@ export function dispatchByMsgType(msgType, fromPeerId, plaintext, handlers) {
             return h.groupAdmin(fromPeerId, plaintext);
         case MSG_TYPE_IDENTITY_ROTATE:
             return h.identityRotate(fromPeerId, plaintext);
+        case MSG_TYPE_CHANNEL_BINDING:
+            return h.channelBinding ? h.channelBinding(fromPeerId, plaintext) : undefined;
         default:
             // PNP-001 MUST-008: unknown types are silently discarded.
             console.warn('[Dispatch] unknown msg_type', msgType, 'from', fromPeerId.slice(0, 8));
@@ -1566,6 +1570,7 @@ const DEFAULT_DISPATCH_HANDLERS = {
     senderKey: handleSenderKeyPlaintext,
     groupAdmin: handleGroupAdminPlaintext,
     identityRotate: handleIdentityRotatePlaintext,
+    channelBinding: handleChannelBinding,
 };
 
 function hexToBytes(hex) {
@@ -1659,6 +1664,9 @@ export function onIncomingMessage(payload) {
     }
 
     const plaintext = hexToBytes(decoded.plaintext_hex);
+    // PNP-001-MUST-079: a presenter holds a session only from the scanner's bootstrap
+    // envelope on; its channel binding can go out now.
+    if (decoded.msg_type !== MSG_TYPE_CHANNEL_BINDING) maybeSendChannelBinding(sourcePeer);
     dispatchByMsgType(decoded.msg_type, sourcePeer, plaintext);
     return { delivered: true };
 }

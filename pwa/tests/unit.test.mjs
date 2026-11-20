@@ -729,6 +729,7 @@ describe('PWA envelope wire path', () => {
             [0x11, 'MSG_TYPE_SENDER_KEY_DISTRIBUTION', 'SENDER_KEY_DISTRIBUTION'],
             [0x12, 'MSG_TYPE_GROUP_ADMIN',             'GROUP_ADMIN'],
             [0x13, 'MSG_TYPE_IDENTITY_ROTATE',         'IDENTITY_ROTATE'],
+            [0x14, 'MSG_TYPE_CHANNEL_BINDING',         'CHANNEL_BINDING'],
         ];
         for (const [code, exportName, registryName] of expected) {
             assert.equal(mod[exportName], code,
@@ -2963,5 +2964,43 @@ describe('signaling-only PWA source guards', () => {
         }
         assert.match(en['chat.noDirectPath'], /\{name\}/);
         assert.match(en['chat.waitingForPeer'], /\{name\}/);
+    });
+});
+
+// ── PNP-002 §10 safety numbers / PNP-001 §10.5.1 channel binding ────────────
+
+describe('safety number and channel binding', () => {
+    const vector = JSON.parse(readFileSync(
+        join(__dirname, '..', '..', 'specs', 'vectors', 'PNP-002', 'safety_number.json'), 'utf8'));
+
+    test('safety-number.js matches the PNP-002 vector in either order', async () => {
+        const { computeSafetyNumber } = await import('../src/safety-number.js');
+        const { peer_id_a: a, peer_id_b: b } = vector.input;
+        assert.equal(await computeSafetyNumber(a, b), vector.expected.safety_number);
+        assert.equal(await computeSafetyNumber(b, a), vector.expected.safety_number);
+    });
+
+    test('wasm safety_number equals safety-number.js', async (t) => {
+        const mod = await loadWasm();
+        if (!mod || !mod.safety_number) { t.skip('pkg/ not built'); return; }
+        const { peer_id_a: a, peer_id_b: b } = vector.input;
+        assert.equal(mod.safety_number(a, b), vector.expected.safety_number);
+    });
+
+    test('wasm channel binding verifies the peer view and refuses a swapped fingerprint', async (t) => {
+        const mod = await loadWasm();
+        if (!mod || !mod.channel_binding_body) { t.skip('pkg/ not built'); return; }
+        const sdp = (fp) => `v=0\r\nm=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\na=fingerprint:sha-256 ${fp}\r\n`;
+        const alice = sdp('AB:CD:EF:01');
+        const bob = sdp('12:34:56:78');
+        const mitm = sdp('66:66:66:66');
+        // Alice offered `alice` and applied Bob's answer; Bob sees the same pair reversed.
+        const body = mod.channel_binding_body(alice, bob);
+        assert.ok(body instanceof Uint8Array && body.length > 0);
+        assert.equal(mod.channel_binding_verify(body, bob, alice), true);
+        // A relay handed Bob its own fingerprint in place of Alice's.
+        assert.equal(mod.channel_binding_verify(body, bob, mitm), false);
+        assert.equal(mod.channel_binding_verify(new Uint8Array([1, 2, 3]), bob, alice), false);
+        assert.throws(() => mod.channel_binding_body('v=0', bob));
     });
 });

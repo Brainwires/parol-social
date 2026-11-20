@@ -1,12 +1,16 @@
 # PNP-002: ParolNet Handshake Protocol
 
 ### Status: CANDIDATE
-### Version: 0.3
-### Date: 2026-04-17
+### Version: 0.4
+### Date: 2026-11-20
 
 ---
 
 ## Changelog
+
+**v0.4 (2026-11-20) — Safety numbers**
+
+- Added §10 "Safety Numbers": the 60-digit number two contacts compare out of band, derived from both PeerIds so both screens show the same digits. Allocated **PNP-002-MUST-040**. MUST count: 40.
 
 **v0.3 (2026-04-17) — Identity rotation (H5)**
 
@@ -410,3 +414,13 @@ The X3DH handshake is NOT re-run. The session's forward/future secrecy guarantee
 | PNP-004 (Relay Circuit) | Onion-layer AEAD is independent of the session-layer AEAD negotiated here (ChaCha20-Poly1305 only, no negotiation). |
 | PNP-005 (Gossip Mesh) | Pre-key bundles MAY be distributed via gossip. |
 | PNP-009 (Group Communication) | Group sender-key setup reuses the pairwise session established here. |
+
+## 10. Safety Numbers
+
+Two contacts verify that their session was set up with each other's real identity keys by comparing a safety number through a channel they trust (in person, a call). The number depends only on the two PeerIds (each the SHA-256 of an Ed25519 identity key, §3), so it is the same on both screens and changes when either identity key is substituted.
+
+Derivation: concatenate the two 32-byte PeerIds in ascending byte order (the smaller first), take SHA-256 of the 64 bytes, split the first 30 bytes of the digest into six 5-byte groups, read each group as a big-endian unsigned integer, reduce it modulo 10^10 and write it as exactly 10 decimal digits (with leading zeros). The safety number is the six groups separated by single spaces (60 digits). Every client MUST derive and display it exactly this way. **PNP-002-MUST-040**
+
+Test vector: PeerIds `11…11` (32 bytes of 0x11) and `22…22` (32 bytes of 0x22), in either order, give `vectors/PNP-002/safety_number.json`.
+
+A client SHOULD show the safety number on the contact's screen and SHOULD prompt to compare it again after the contact's identity rotates (§8.5, **PNP-002-SHOULD-012**).

@@ -150,6 +150,10 @@ pub enum PathState {
     /// The contact is online but no direct path could be built: either side can add a TURN
     /// server of their own.
     NoDirectPath,
+    /// The last direct connection failed its end-to-end check (the DTLS fingerprints the
+    /// contact saw differ from ours, PNP-001 §10.5.1): something on the signaling path may
+    /// be interfering. Retried with backoff.
+    BindingFailed,
 }
 
 /// The home relay connection.
@@ -236,6 +240,11 @@ impl AppHandle {
         &self.public_key
     }
 
+    /// The safety number to compare with `peer_id` out of band (PNP-002 §10).
+    pub fn safety_number(&self, peer_id: &str) -> Option<String> {
+        safety_number(&self.peer_id, peer_id)
+    }
+
     async fn ask<T>(
         &self,
         make: impl FnOnce(oneshot::Sender<T>) -> Command,
@@ -310,6 +319,14 @@ pub(crate) fn now_ms() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64
+}
+
+/// The 60-digit safety number of two peer ids (hex), as the PWA shows it (PNP-002 §10).
+/// `None` when either is not a 64-character hex id.
+pub fn safety_number(a: &str, b: &str) -> Option<String> {
+    let a: [u8; 32] = hex::decode(a).ok()?.try_into().ok()?;
+    let b: [u8; 32] = hex::decode(b).ok()?.try_into().ok()?;
+    Some(parolnet_protocol::channel_binding::safety_number(&a, &b))
 }
 
 /// Short display form of a peer id.
