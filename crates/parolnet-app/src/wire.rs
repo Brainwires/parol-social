@@ -1,0 +1,387 @@
+//! Wire formats the app shares with the PWA and the relay.
+//!
+//! - **Relay frames** (JSON over the relay's `/ws`, signaling-only profile, PNP-001 §10.5):
+//!   `register` (challenge-response), `watch`, `rtc_offer` / `rtc_answer` / `rtc_ice`,
+//!   `ping`; the relay answers `challenge`, `registered`, `presence`, `rtc_*`, `error`,
+//!   `pong`.
+//! - **SDP payloads**: the JSON of a browser `RTCSessionDescription` (`{"type","sdp"}`),
+//!   non-trickle (candidates inside the SDP); late candidates as `RTCIceCandidateInit` JSON.
+//! - **Data-channel frames** on the `parolnet` channel: JSON text, `{"type":"identity",
+//!   "peerId"}` once on open and `{"type":"chat","payload":<envelope hex>}` for every PNP-001
+//!   envelope (chat, bootstrap, and later file and call signals). This is what
+//!   `pwa/src/webrtc.js` sends and accepts.
+
+use serde::{Deserialize, Serialize};
+
+/// The data channel every contact connection opens (`pwa/src/webrtc.js`).
+pub const DATA_CHANNEL_LABEL: &str = "parolnet";
+
+/// PNP-001 §3.4 message types used by this slice.
+pub mod msg_type {
+    /// 0x01 TEXT: the plaintext is the UTF-8 chat text.
+    pub const CHAT: u8 = 0x01;
+    /// 0x03 CONTROL: the scanner's bootstrap envelope carries an empty CONTROL body.
+    pub const SYSTEM: u8 = 0x03;
+    /// 0x0B CALL_SIGNAL (not handled yet in the desktop).
+    pub const CALL_SIGNAL: u8 = 0x0B;
+}
+
+/// A frame the client sends to the relay.
+#[derive(Debug, Clone, Serialize, PartialEq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ClientFrame {
+    Register {
+        peer_id: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pubkey: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        signature: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        nonce: Option<String>,
+    },
+    Watch {
+        peer_ids: Vec<String>,
+    },
+    RtcOffer {
+        to: String,
+        payload: String,
+    },
+    RtcAnswer {
+        to: String,
+        payload: String,
+    },
+    RtcIce {
+        to: String,
+        payload: String,
+    },
+    Ping {
+        ts: u64,
+    },
+}
+
+impl ClientFrame {
+    pub fn to_json(&self) -> String {
+        serde_json::to_string(self).unwrap_or_default()
+    }
+}
+
+/// The signaling kinds a client exchanges through the relay.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SignalKind {
+    Offer,
+    Answer,
+    Ice,
+}
+
+impl SignalKind {
+    pub fn frame(self, to: String, payload: String) -> ClientFrame {
+        match self {
+            SignalKind::Offer => ClientFrame::RtcOffer { to, payload },
+            SignalKind::Answer => ClientFrame::RtcAnswer { to, payload },
+            SignalKind::Ice => ClientFrame::RtcIce { to, payload },
+        }
+    }
+}
+
+/// A frame the relay sends. Unknown types and fields are tolerated.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ServerFrame {
+    Challenge {
+        nonce: String,
+    },
+    Registered {
+        peer_id: String,
+        profile: Option<String>,
+    },
+    Presence {
+        peer_id: String,
+        online: bool,
+    },
+    Signal {
+        kind: SignalKind,
+        from: String,
+        payload: String,
+    },
+    Error {
+        code: String,
+        message: String,
+        peer_id: Option<String>,
+    },
+    Pong,
+    Other(String),
+}
+
+#[derive(Deserialize)]
+struct RawServerFrame {
+    #[serde(rename = "type")]
+    msg_type: String,
+    #[serde(default)]
+    nonce: Option<String>,
+    #[serde(default)]
+    peer_id: Option<String>,
+    #[serde(default)]
+    profile: Option<String>,
+    #[serde(default)]
+    online: Option<bool>,
+    #[serde(default)]
+    from: Option<String>,
+    #[serde(default)]
+    payload: Option<String>,
+    #[serde(default)]
+    code: Option<String>,
+    #[serde(default)]
+    message: Option<String>,
+}
+
+impl ServerFrame {
+    /// Parse a relay text frame. `None` for malformed JSON or a frame missing a required
+    /// field.
+    pub fn parse(text: &str) -> Option<ServerFrame> {
+        let raw: RawServerFrame = serde_json::from_str(text).ok()?;
+        let signal = |kind| {
+            Some(ServerFrame::Signal {
+                kind,
+                from: raw.from.clone()?,
+                payload: raw.payload.clone()?,
+            })
+        };
+        match raw.msg_type.as_str() {
+            "challenge" => Some(ServerFrame::Challenge { nonce: raw.nonce? }),
+            "registered" => Some(ServerFrame::Registered {
+                peer_id: raw.peer_id.unwrap_or_default(),
+                profile: raw.profile,
+            }),
+            "presence" => Some(ServerFrame::Presence {
+                peer_id: raw.peer_id?,
+                online: raw.online.unwrap_or(false),
+            }),
+            "rtc_offer" => signal(SignalKind::Offer),
+            "rtc_answer" => signal(SignalKind::Answer),
+            "rtc_ice" => signal(SignalKind::Ice),
+            "error" => Some(ServerFrame::Error {
+                code: raw.code.unwrap_or_default(),
+                message: raw.message.unwrap_or_default(),
+                peer_id: raw.peer_id,
+            }),
+            "pong" => Some(ServerFrame::Pong),
+            other => Some(ServerFrame::Other(other.to_owned())),
+        }
+    }
+}
+
+/// A session description as browsers serialize it (`RTCSessionDescription.toJSON()`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SdpJson {
+    #[serde(rename = "type")]
+    pub sdp_type: String,
+    pub sdp: String,
+}
+
+/// A frame on the `parolnet` data channel.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DcFrame {
+    /// Sent once by each side when the channel opens.
+    Identity { peer_id: String },
+    /// A hex-encoded PNP-001 envelope.
+    Envelope { hex: String },
+    /// Anything else (the PWA's mesh `gossip` frames, future types).
+    Other,
+}
+
+#[derive(Deserialize)]
+struct RawDcFrame {
+    #[serde(rename = "type")]
+    msg_type: String,
+    #[serde(default, rename = "peerId")]
+    peer_id: Option<String>,
+    #[serde(default)]
+    payload: Option<serde_json::Value>,
+}
+
+impl DcFrame {
+    pub fn identity(peer_id: &str) -> String {
+        serde_json::json!({ "type": "identity", "peerId": peer_id }).to_string()
+    }
+
+    pub fn chat(envelope_hex: &str) -> String {
+        serde_json::json!({ "type": "chat", "payload": envelope_hex }).to_string()
+    }
+
+    /// Parse a data-channel message. Like the PWA, a message that is not JSON but is hex is
+    /// taken as a bare envelope.
+    pub fn parse(data: &[u8]) -> DcFrame {
+        let Ok(text) = std::str::from_utf8(data) else {
+            return DcFrame::Other;
+        };
+        match serde_json::from_str::<RawDcFrame>(text) {
+            Ok(raw) => match raw.msg_type.as_str() {
+                "identity" => match raw.peer_id {
+                    Some(peer_id) => DcFrame::Identity { peer_id },
+                    None => DcFrame::Other,
+                },
+                "chat" => match raw.payload {
+                    Some(serde_json::Value::String(hex)) => DcFrame::Envelope { hex },
+                    _ => DcFrame::Other,
+                },
+                _ => DcFrame::Other,
+            },
+            Err(_) => {
+                let t = text.trim();
+                if !t.is_empty() && t.len() % 2 == 0 && t.bytes().all(|b| b.is_ascii_hexdigit()) {
+                    DcFrame::Envelope { hex: t.to_owned() }
+                } else {
+                    DcFrame::Other
+                }
+            }
+        }
+    }
+}
+
+/// The PWA's initiator tie-break (`shouldInitiate` in `pwa/src/relay-profile.js`): the
+/// lexicographically smaller peer id offers.
+pub fn should_initiate(me: &str, them: &str) -> bool {
+    let (a, b) = (me.to_ascii_lowercase(), them.to_ascii_lowercase());
+    a != b && a < b
+}
+
+/// True for a 64-character hex peer id.
+pub fn is_peer_id(s: &str) -> bool {
+    s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn client_frames_match_the_relay_protocol() {
+        let f = ClientFrame::Register {
+            peer_id: "ab".into(),
+            pubkey: None,
+            signature: None,
+            nonce: None,
+        };
+        assert_eq!(f.to_json(), r#"{"type":"register","peer_id":"ab"}"#);
+        let f = ClientFrame::Watch {
+            peer_ids: vec!["a".into()],
+        };
+        assert_eq!(f.to_json(), r#"{"type":"watch","peer_ids":["a"]}"#);
+        let f = SignalKind::Offer.frame("t".into(), "p".into());
+        assert_eq!(
+            f.to_json(),
+            r#"{"type":"rtc_offer","to":"t","payload":"p"}"#
+        );
+        let f = SignalKind::Ice.frame("t".into(), "p".into());
+        assert_eq!(f.to_json(), r#"{"type":"rtc_ice","to":"t","payload":"p"}"#);
+        assert_eq!(
+            ClientFrame::Ping { ts: 5 }.to_json(),
+            r#"{"type":"ping","ts":5}"#
+        );
+    }
+
+    #[test]
+    fn server_frames_parse() {
+        assert_eq!(
+            ServerFrame::parse(r#"{"type":"challenge","nonce":"00","peer_id":"x"}"#),
+            Some(ServerFrame::Challenge { nonce: "00".into() })
+        );
+        assert_eq!(
+            ServerFrame::parse(
+                r#"{"type":"registered","peer_id":"x","online_peers":2,"profile":"signaling-only"}"#
+            ),
+            Some(ServerFrame::Registered {
+                peer_id: "x".into(),
+                profile: Some("signaling-only".into())
+            })
+        );
+        assert_eq!(
+            ServerFrame::parse(r#"{"type":"rtc_answer","from":"f","payload":"{}"}"#),
+            Some(ServerFrame::Signal {
+                kind: SignalKind::Answer,
+                from: "f".into(),
+                payload: "{}".into()
+            })
+        );
+        assert_eq!(
+            ServerFrame::parse(
+                r#"{"type":"error","code":"peer_offline","message":"peer offline","peer_id":"p"}"#
+            ),
+            Some(ServerFrame::Error {
+                code: "peer_offline".into(),
+                message: "peer offline".into(),
+                peer_id: Some("p".into())
+            })
+        );
+        assert_eq!(
+            ServerFrame::parse(r#"{"type":"presence","peer_id":"p","online":true}"#),
+            Some(ServerFrame::Presence {
+                peer_id: "p".into(),
+                online: true
+            })
+        );
+        assert_eq!(
+            ServerFrame::parse(r#"{"type":"rtc_offer","from":"f"}"#),
+            None
+        );
+        assert_eq!(ServerFrame::parse("not json"), None);
+        assert_eq!(
+            ServerFrame::parse(r#"{"type":"stats"}"#),
+            Some(ServerFrame::Other("stats".into()))
+        );
+    }
+
+    #[test]
+    fn data_channel_frames_match_the_pwa() {
+        assert_eq!(
+            DcFrame::parse(DcFrame::identity("abc").as_bytes()),
+            DcFrame::Identity {
+                peer_id: "abc".into()
+            }
+        );
+        assert_eq!(
+            DcFrame::parse(DcFrame::chat("00ff").as_bytes()),
+            DcFrame::Envelope { hex: "00ff".into() }
+        );
+        // The PWA sends exactly these shapes (webrtc.js).
+        assert_eq!(
+            DcFrame::parse(br#"{"type":"identity","peerId":"p"}"#),
+            DcFrame::Identity {
+                peer_id: "p".into()
+            }
+        );
+        assert_eq!(
+            DcFrame::parse(br#"{"type":"chat","payload":"abcd"}"#),
+            DcFrame::Envelope { hex: "abcd".into() }
+        );
+        assert_eq!(
+            DcFrame::parse(b"abcd"),
+            DcFrame::Envelope { hex: "abcd".into() }
+        );
+        assert_eq!(
+            DcFrame::parse(br#"{"type":"gossip","msgId":"1","payload":"ab","ttl":2}"#),
+            DcFrame::Other
+        );
+        assert_eq!(DcFrame::parse(b"\xff\xfe"), DcFrame::Other);
+        assert_eq!(DcFrame::parse(b"xyz"), DcFrame::Other);
+    }
+
+    #[test]
+    fn initiator_tie_break_matches_the_pwa() {
+        assert!(should_initiate("aa", "bb"));
+        assert!(!should_initiate("bb", "aa"));
+        assert!(!should_initiate("aa", "AA"));
+        assert!(should_initiate("AA", "bb"));
+    }
+
+    #[test]
+    fn sdp_json_is_the_browser_shape() {
+        let s = SdpJson {
+            sdp_type: "offer".into(),
+            sdp: "v=0".into(),
+        };
+        assert_eq!(
+            serde_json::to_string(&s).unwrap(),
+            r#"{"type":"offer","sdp":"v=0"}"#
+        );
+    }
+}

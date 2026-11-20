@@ -6,14 +6,16 @@
 //! talks to it through a command channel ([`RtcHandle`]) and an event channel
 //! ([`RtcEvent`]).
 //!
-//! M0 status: skeleton. It gathers host candidates on the socket it binds, answers or makes
-//! an offer, delivers RTP packets and data-channel messages, requests keyframes and reports
-//! stats. Still to come in M1 (see `docs/m0-spike.md`): server-reflexive and TURN
-//! candidates (`rtc-turn`), several sockets per connection, interface-change restarts, and
-//! the virtual-time mode that runs the same loop over `parolnet-simnet`.
+//! Status (M1, first slice): it gathers the host candidate of the socket it binds and, when
+//! STUN servers are given, one server-reflexive candidate per server (a binding request on the
+//! same socket before the loop starts); it answers or makes a non-trickle offer, delivers RTP
+//! packets and data-channel messages (binary and text), requests keyframes and reports stats.
+//! Still to come in M1 (see `docs/m0-spike.md`): TURN candidates for a user-supplied TURN
+//! server (`rtc-turn`), IPv6 and several sockets per connection, interface-change restarts,
+//! and the virtual-time mode that runs the same loop over `parolnet-simnet`.
 
 use std::collections::HashMap;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::time::{Duration, Instant};
 
 use bytes::BytesMut;
@@ -30,8 +32,8 @@ use rtc::peer_connection::message::{RTCMessage, TaggedRTCMessage};
 use rtc::peer_connection::sdp::RTCSessionDescription;
 use rtc::peer_connection::state::{RTCIceConnectionState, RTCPeerConnectionState};
 use rtc::peer_connection::transport::{
-    CandidateConfig, CandidateHostConfig, RTCDtlsRole, RTCIceCandidate, RTCIceCandidateInit,
-    RTCIceServer,
+    CandidateConfig, CandidateHostConfig, CandidateServerReflexiveConfig, RTCDtlsRole,
+    RTCIceCandidate, RTCIceCandidateInit, RTCIceServer,
 };
 use rtc::peer_connection::{RTCPeerConnection, RTCPeerConnectionBuilder};
 use rtc::rtcp::payload_feedbacks::picture_loss_indication::PictureLossIndication;
@@ -77,8 +79,15 @@ pub struct RtcConfig {
     /// The UDP socket to bind. Its address is the host candidate, so it must name an
     /// interface (`127.0.0.1:0` for loopback tests).
     pub bind: SocketAddr,
-    /// STUN / TURN servers (unused until srflx / relay gathering lands in M1).
+    /// STUN / TURN servers handed to the engine's configuration (TURN gathering is not
+    /// implemented yet; see [`RtcConfig::stun_servers`] for server-reflexive candidates).
     pub ice_servers: Vec<RTCIceServer>,
+    /// STUN servers (`host:port`, or `stun:host:port` URIs) to learn a server-reflexive
+    /// candidate from before the connection starts. Unreachable servers are skipped after
+    /// [`RtcConfig::stun_timeout`].
+    pub stun_servers: Vec<String>,
+    /// How long STUN gathering may take in total.
+    pub stun_timeout: Duration,
     /// Receive transceivers.
     pub media: MediaConfig,
     /// When making an offer, open a data channel with this label first.
@@ -95,6 +104,8 @@ impl Default for RtcConfig {
         Self {
             bind: SocketAddr::from(([127, 0, 0, 1], 0)),
             ice_servers: Vec::new(),
+            stun_servers: Vec::new(),
+            stun_timeout: Duration::from_millis(1500),
             media: MediaConfig::default(),
             data_channel: None,
             answering_dtls_role: None,
@@ -125,7 +136,7 @@ pub enum RtcEvent {
         packet: rtc::rtp::Packet,
     },
     /// A data channel opened.
-    DataChannelOpen { id: usize },
+    DataChannelOpen { id: usize, label: String },
     /// A data-channel message.
     DataChannelMessage { id: usize, payload: BytesMut },
     /// The task stopped; `error` is set when it stopped on an error.
@@ -137,6 +148,7 @@ enum Command {
     SetRemoteDescription(Box<RTCSessionDescription>),
     AddRemoteCandidate(RTCIceCandidateInit),
     SendData { id: usize, data: BytesMut },
+    SendText { id: usize, text: String },
     RequestKeyframe { track_id: MediaStreamTrackId },
     Stats(oneshot::Sender<(RTCStatsReport, u64)>),
     Close,
@@ -183,6 +195,15 @@ impl RtcHandle {
         })
     }
 
+    /// Send a text (UTF-8, WebRTC string PPID) message on an open data channel. Browsers
+    /// deliver it to `onmessage` as a string.
+    pub fn send_text(&self, id: usize, text: impl Into<String>) -> Result<(), RtcError> {
+        self.send(Command::SendText {
+            id,
+            text: text.into(),
+        })
+    }
+
     /// Ask the sender of a video track for a keyframe (RTCP PLI).
     pub fn request_keyframe(&self, track_id: MediaStreamTrackId) -> Result<(), RtcError> {
         self.send(Command::RequestKeyframe { track_id })
@@ -210,6 +231,7 @@ pub async fn spawn(config: RtcConfig) -> Result<(RtcHandle, mpsc::Receiver<RtcEv
     }
     let socket = UdpSocket::bind(config.bind).await?;
     let local_addr = socket.local_addr()?;
+    let srflx = gather_srflx(&socket, &config.stun_servers, config.stun_timeout).await;
     let pc = build_peer_connection(&config)?;
 
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
@@ -218,6 +240,7 @@ pub async fn spawn(config: RtcConfig) -> Result<(RtcHandle, mpsc::Receiver<RtcEv
         pc,
         socket,
         local_addr,
+        srflx,
         events: ev_tx,
         data_channel: config.data_channel,
         tracks: HashMap::new(),
@@ -313,6 +336,8 @@ struct Driver {
     pc: RTCPeerConnection,
     socket: UdpSocket,
     local_addr: SocketAddr,
+    /// Server-reflexive addresses learned from STUN, each mapping `local_addr`.
+    srflx: Vec<SocketAddr>,
     events: mpsc::Sender<RtcEvent>,
     data_channel: Option<String>,
     /// track id → (receiver, whether its first packet was reported)
@@ -421,7 +446,12 @@ impl Driver {
                     self.tracks.remove(&track_id);
                 }
                 RTCPeerConnectionEvent::OnDataChannel(RTCDataChannelEvent::OnOpen(id)) => {
-                    self.emit(RtcEvent::DataChannelOpen { id }).await;
+                    let label = self
+                        .pc
+                        .data_channel(id)
+                        .map(|dc| dc.label().to_owned())
+                        .unwrap_or_default();
+                    self.emit(RtcEvent::DataChannelOpen { id, label }).await;
                 }
                 _ => {}
             }
@@ -489,14 +519,14 @@ impl Driver {
                 }
                 let offer = self.pc.create_offer(None)?;
                 self.pc.set_local_description(now, offer)?;
-                self.add_host_candidate()?;
+                self.add_local_candidates()?;
                 self.emit_local_description().await;
             }
             Command::SetRemoteDescription(desc) => {
                 let is_offer = desc.sdp_type == rtc::peer_connection::sdp::RTCSdpType::Offer;
                 self.pc.set_remote_description(now, *desc)?;
                 if is_offer {
-                    self.add_host_candidate()?;
+                    self.add_local_candidates()?;
                     let answer = self.pc.create_answer(None)?;
                     self.pc.set_local_description(now, answer)?;
                     self.emit_local_description().await;
@@ -508,6 +538,11 @@ impl Driver {
             Command::SendData { id, data } => {
                 if let Some(mut channel) = self.pc.data_channel(id) {
                     channel.send(now, data)?;
+                }
+            }
+            Command::SendText { id, text } => {
+                if let Some(mut channel) = self.pc.data_channel(id) {
+                    channel.send_text(now, text)?;
                 }
             }
             Command::RequestKeyframe { track_id } => {
@@ -529,6 +564,29 @@ impl Driver {
                 let _ = reply.send((report, self.dropped_rtp));
             }
             Command::Close => {}
+        }
+        Ok(())
+    }
+
+    /// The host candidate (the bound socket) and the server-reflexive ones learned from STUN.
+    fn add_local_candidates(&mut self) -> Result<(), RtcError> {
+        self.add_host_candidate()?;
+        for addr in self.srflx.clone() {
+            let candidate = CandidateServerReflexiveConfig {
+                base_config: CandidateConfig {
+                    network: "udp".to_owned(),
+                    address: addr.ip().to_string(),
+                    port: addr.port(),
+                    component: 1,
+                    ..Default::default()
+                },
+                rel_addr: self.local_addr.ip().to_string(),
+                rel_port: self.local_addr.port(),
+                ..Default::default()
+            }
+            .new_candidate_server_reflexive()?;
+            let init = RTCIceCandidate::from(&candidate).to_json()?;
+            self.pc.add_local_candidate(init)?;
         }
         Ok(())
     }
@@ -555,5 +613,181 @@ impl Driver {
         if let Some(desc) = self.pc.local_description() {
             self.emit(RtcEvent::LocalDescription(Box::new(desc))).await;
         }
+    }
+}
+
+/// The address of the interface the default route leaves through, or `None` without a
+/// route. Nothing is sent: connecting a UDP socket only selects the source address. Use it
+/// as [`RtcConfig::bind`] (with port 0) so the host candidate names a reachable interface.
+pub fn default_local_ip(v6: bool) -> Option<IpAddr> {
+    let (bind, probe): (SocketAddr, SocketAddr) = if v6 {
+        (
+            "[::]:0".parse().ok()?,
+            "[2001:4860:4860::8888]:53".parse().ok()?,
+        )
+    } else {
+        ("0.0.0.0:0".parse().ok()?, "8.8.8.8:53".parse().ok()?)
+    };
+    let socket = std::net::UdpSocket::bind(bind).ok()?;
+    socket.connect(probe).ok()?;
+    let ip = socket.local_addr().ok()?.ip();
+    (!ip.is_unspecified()).then_some(ip)
+}
+
+/// `host:port` from a STUN server given as `stun:host[:port]` (RFC 7064; port 3478 when
+/// absent) or a bare `host:port`. `stuns:` and `turn(s):` URIs give `None`: only plain STUN
+/// over UDP is gathered here.
+pub fn stun_host_port(uri: &str) -> Option<String> {
+    let uri = uri.trim();
+    let rest = match uri.split_once(':') {
+        Some((scheme, rest)) if scheme.eq_ignore_ascii_case("stun") => rest,
+        Some((scheme, _))
+            if scheme.eq_ignore_ascii_case("stuns")
+                || scheme.eq_ignore_ascii_case("turn")
+                || scheme.eq_ignore_ascii_case("turns") =>
+        {
+            return None;
+        }
+        _ => uri,
+    };
+    let rest = rest.split('?').next().unwrap_or(rest);
+    if rest.is_empty() {
+        return None;
+    }
+    // [v6]:port, [v6], host:port, host
+    if let Some(stripped) = rest.strip_prefix('[') {
+        let (host, after) = stripped.split_once(']')?;
+        let port = after.strip_prefix(':').unwrap_or("3478");
+        return Some(format!("[{host}]:{port}"));
+    }
+    match rest.rsplit_once(':') {
+        Some((host, port)) if !host.contains(':') && port.parse::<u16>().is_ok() => {
+            Some(format!("{host}:{port}"))
+        }
+        Some(_) => None,
+        None => Some(format!("{rest}:3478")),
+    }
+}
+
+/// Ask each STUN server for the socket's mapped address (RFC 5389 binding request), on the
+/// connection's own socket before its loop starts. Gives up on servers that do not answer
+/// within `timeout` in total; returns the distinct mapped addresses that differ from the
+/// socket's own address.
+async fn gather_srflx(
+    socket: &UdpSocket,
+    servers: &[String],
+    timeout: Duration,
+) -> Vec<SocketAddr> {
+    use rtc::stun::message::{BINDING_REQUEST, Getter as _, Message, TransactionId};
+    use rtc::stun::xoraddr::XorMappedAddress;
+
+    let Ok(local) = socket.local_addr() else {
+        return Vec::new();
+    };
+    let mut targets = Vec::new();
+    for server in servers {
+        let Some(host_port) = stun_host_port(server) else {
+            continue;
+        };
+        let lookup = tokio::time::timeout(timeout, tokio::net::lookup_host(host_port.clone()));
+        if let Ok(Ok(addrs)) = lookup.await
+            && let Some(addr) = addrs.into_iter().find(|a| a.is_ipv4() == local.is_ipv4())
+        {
+            targets.push(addr);
+        }
+    }
+    if targets.is_empty() {
+        return Vec::new();
+    }
+
+    let mut pending: HashMap<[u8; 12], SocketAddr> = HashMap::new();
+    let mut requests = Vec::new();
+    for target in &targets {
+        let mut msg = Message::new();
+        if msg
+            .build(&[Box::<TransactionId>::default(), Box::new(BINDING_REQUEST)])
+            .is_err()
+        {
+            continue;
+        }
+        pending.insert(msg.transaction_id.0, *target);
+        requests.push((msg.raw.clone(), *target));
+    }
+
+    let deadline = tokio::time::Instant::now() + timeout;
+    let mut found = Vec::new();
+    let mut buf = vec![0u8; 1500];
+    let mut next_send = tokio::time::Instant::now();
+    while !pending.is_empty() {
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
+            break;
+        }
+        if now >= next_send {
+            for (raw, target) in &requests {
+                let _ = socket.send_to(raw, target).await;
+            }
+            next_send = now + Duration::from_millis(400);
+        }
+        let wake = next_send.min(deadline);
+        match tokio::time::timeout_at(wake, socket.recv_from(&mut buf)).await {
+            Ok(Ok((n, from))) => {
+                let mut msg = Message::new();
+                msg.raw = buf[..n].to_vec();
+                if msg.decode().is_err() || pending.remove(&msg.transaction_id.0).is_none() {
+                    tracing::debug!(%from, "ignoring a non-matching datagram during STUN gathering");
+                    continue;
+                }
+                let mut xor = XorMappedAddress::default();
+                if xor.get_from(&msg).is_ok() {
+                    let mapped = SocketAddr::new(xor.ip, xor.port);
+                    if mapped != local && !found.contains(&mapped) {
+                        found.push(mapped);
+                    }
+                }
+            }
+            Ok(Err(err)) => {
+                tracing::debug!(%err, "STUN receive failed");
+            }
+            Err(_) => {}
+        }
+    }
+    found
+}
+
+#[cfg(test)]
+mod tests {
+    use super::stun_host_port;
+
+    #[test]
+    fn stun_uris_become_host_port() {
+        assert_eq!(
+            stun_host_port("stun:example.org").as_deref(),
+            Some("example.org:3478")
+        );
+        assert_eq!(
+            stun_host_port("stun:example.org:19302").as_deref(),
+            Some("example.org:19302")
+        );
+        assert_eq!(
+            stun_host_port("STUN:1.2.3.4:5").as_deref(),
+            Some("1.2.3.4:5")
+        );
+        assert_eq!(
+            stun_host_port("stun:[::1]:3478").as_deref(),
+            Some("[::1]:3478")
+        );
+        assert_eq!(stun_host_port("stun:[::1]").as_deref(), Some("[::1]:3478"));
+        assert_eq!(
+            stun_host_port("127.0.0.1:3478").as_deref(),
+            Some("127.0.0.1:3478")
+        );
+        assert_eq!(
+            stun_host_port("stun:host:3478?transport=udp").as_deref(),
+            Some("host:3478")
+        );
+        assert_eq!(stun_host_port("turn:example.org:3478"), None);
+        assert_eq!(stun_host_port("stuns:example.org:5349"), None);
+        assert_eq!(stun_host_port("stun:"), None);
     }
 }

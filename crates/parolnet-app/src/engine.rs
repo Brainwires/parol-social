@@ -1,0 +1,1453 @@
+//! The core actor: one task owns the identity, sessions, contacts, store and every contact
+//! connection. Commands from the client, relay frames from the signaling task, connection
+//! events from `parolnet-rtc` tasks and timers all arrive as [`Input`]s.
+
+use std::collections::{HashMap, VecDeque};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use parolnet_core::envelope::{decrypt_for_peer, encrypt_for_peer, try_bootstrap_and_decrypt};
+use parolnet_core::{ParolNet, ParolNetConfig};
+use parolnet_protocol::PeerId;
+use parolnet_protocol::ProtocolCodec as _;
+use parolnet_protocol::codec::CborCodec;
+use parolnet_rtc::rtc::peer_connection::sdp::RTCSessionDescription;
+use parolnet_rtc::rtc::peer_connection::state::RTCPeerConnectionState;
+use parolnet_rtc::rtc::peer_connection::transport::{RTCIceCandidateInit, RTCIceServer};
+use parolnet_rtc::{RtcConfig, RtcEvent, RtcHandle};
+use rand::Rng as _;
+use tokio::sync::mpsc;
+use zeroize::Zeroize;
+
+use crate::signaling::{self, SigEvent, SigHandle, Signer};
+use crate::store::{QueuedEnvelope, State, Store};
+use crate::wire::{
+    ClientFrame, DATA_CHANNEL_LABEL, DcFrame, SdpJson, ServerFrame, SignalKind, is_peer_id,
+    msg_type, should_initiate,
+};
+use crate::{
+    AppConfig, AppError, AppEvent, AppHandle, ChatMessage, Command, Contact, ContactView,
+    DeliveryState, Direction, PathState, RelayState, Snapshot, now_ms,
+};
+
+/// The initiator's wait for an answer (as the PWA).
+const ANSWER_TIMEOUT: Duration = Duration::from_secs(20);
+/// From starting a connection to an open data channel (STUN gathering, signaling, ICE,
+/// DTLS, SCTP).
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(45);
+/// The non-initiator waits this long (plus up to 2 s) for the initiator's offer.
+const OFFER_FALLBACK: Duration = Duration::from_secs(10);
+/// A disconnected ICE connection gets this long to recover.
+const DISCONNECT_GRACE: Duration = Duration::from_secs(5);
+const RETRY_BASE: Duration = Duration::from_secs(5);
+const RETRY_MAX: Duration = Duration::from_secs(5 * 60);
+const RETRY_MAX_ATTEMPTS: u32 = 8;
+/// New offers: at most 3 per 10 s (the relay allows 60 signaling frames a minute).
+const OFFERS_PER_WINDOW: usize = 3;
+const OFFER_WINDOW: Duration = Duration::from_secs(10);
+/// How often a contact we believe offline (from a `peer_offline` answer, without a presence
+/// subscription confirming it) is probed while we hold messages for it.
+const PROBE_EVERY: Duration = Duration::from_secs(5 * 60);
+const TICK: Duration = Duration::from_secs(15);
+const WATCH_MAX: usize = 256;
+const PENDING_ICE_MAX: usize = 32;
+
+pub(crate) enum Input {
+    Command(Command),
+    Sig(SigEvent),
+    Stun(Vec<String>),
+    RtcReady {
+        peer: String,
+        epoch: u64,
+        result: Result<RtcHandle, String>,
+    },
+    Rtc {
+        peer: String,
+        epoch: u64,
+        event: RtcEvent,
+    },
+    Timer(Timer),
+    Tick,
+}
+
+#[derive(Debug)]
+pub(crate) enum Timer {
+    AnswerTimeout { peer: String, epoch: u64 },
+    ConnectTimeout { peer: String, epoch: u64 },
+    DisconnectGrace { peer: String, epoch: u64 },
+    OfferFallback { peer: String },
+    OfferSlot { peer: String },
+    Retry { peer: String },
+}
+
+/// The presenter's half of a QR bootstrap (PNP-003), kept while its code is valid.
+struct PendingBootstrap {
+    seed: [u8; 32],
+    ratchet_secret: [u8; 32],
+}
+
+impl Drop for PendingBootstrap {
+    fn drop(&mut self) {
+        self.seed.zeroize();
+        self.ratchet_secret.zeroize();
+    }
+}
+
+struct Conn {
+    epoch: u64,
+    handle: Option<RtcHandle>,
+    initiator: bool,
+    /// An answerer's remote offer, applied once the connection task is up.
+    remote_offer: Option<RTCSessionDescription>,
+    remote_set: bool,
+    pending_ice: Vec<RTCIceCandidateInit>,
+    dc: Option<usize>,
+    last_state: Option<RTCPeerConnectionState>,
+}
+
+impl Conn {
+    fn is_open(&self) -> bool {
+        self.dc.is_some()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FailReason {
+    Timeout,
+    IceFailed,
+    Closed,
+    Error,
+}
+
+struct PeerState {
+    /// Presence: `Some(true)` online, `Some(false)` offline, `None` unknown.
+    online: Option<bool>,
+    /// `online == Some(false)` came from a `peer_offline` answer, not a presence push.
+    offline_by_error: bool,
+    conn: Option<Conn>,
+    attempt: u32,
+    failures: u32,
+    path: PathState,
+    fallback_armed: bool,
+    retry_armed: bool,
+    offer_waiting: bool,
+    last_probe: Option<Instant>,
+}
+
+impl Default for PeerState {
+    fn default() -> Self {
+        PeerState {
+            online: None,
+            offline_by_error: false,
+            conn: None,
+            attempt: 0,
+            failures: 0,
+            path: PathState::Unknown,
+            fallback_armed: false,
+            retry_armed: false,
+            offer_waiting: false,
+            last_probe: None,
+        }
+    }
+}
+
+struct Engine {
+    cfg: AppConfig,
+    client: ParolNet,
+    store: Store,
+    state: State,
+    me: String,
+    my_pk: [u8; 32],
+    input: mpsc::UnboundedSender<Input>,
+    events: mpsc::UnboundedSender<AppEvent>,
+    sig: SigHandle,
+    relay: RelayState,
+    registered: bool,
+    peers: HashMap<String, PeerState>,
+    pending_bootstrap: Option<PendingBootstrap>,
+    pairing_until: Option<Instant>,
+    stun: Vec<String>,
+    bind_ip: IpAddr,
+    next_epoch: u64,
+    offer_history: VecDeque<Instant>,
+    signaling_backoff_until: Option<Instant>,
+    rate_limit_hits: u32,
+}
+
+pub(crate) async fn start(
+    cfg: AppConfig,
+) -> Result<(AppHandle, mpsc::UnboundedReceiver<AppEvent>), AppError> {
+    crate::install_crypto_provider();
+    if !(cfg.relay_url.starts_with("ws://") || cfg.relay_url.starts_with("wss://")) {
+        return Err(AppError::Config(format!(
+            "relay URL must be ws:// or wss://, not {}",
+            cfg.relay_url
+        )));
+    }
+    let store = Store::open(&cfg.data_dir)?;
+    let identity = store.load_or_create_identity()?;
+    let my_pk = identity.public_key_bytes();
+    let me = hex::encode(identity.peer_id());
+
+    let mut secret = identity.secret_bytes();
+    let signing_key = ed25519_dalek::SigningKey::from_bytes(&secret);
+    secret.zeroize();
+    let signer: Signer = Arc::new(move |nonce: &[u8]| {
+        use ed25519_dalek::Signer as _;
+        signing_key.sign(nonce).to_bytes()
+    });
+
+    let client = ParolNet::from_identity(ParolNetConfig::default(), identity);
+    let state = store.load_state()?;
+    let mut sessions = Vec::with_capacity(state.sessions.len());
+    for (pid, data) in &state.sessions {
+        match (decode_32(pid), hex::decode(data)) {
+            (Some(p), Ok(d)) => sessions.push((p, d)),
+            _ => tracing::warn!(peer = %crate::short_id(pid), "skipping an unreadable session"),
+        }
+    }
+    if !sessions.is_empty() {
+        client
+            .import_sessions(sessions)
+            .map_err(|e| AppError::Store(format!("sessions: {e}")))?;
+    }
+
+    let bind_ip = cfg
+        .bind_ip
+        .or_else(|| parolnet_rtc::default_local_ip(false))
+        .unwrap_or(IpAddr::V4(Ipv4Addr::LOCALHOST));
+
+    let (input_tx, input_rx) = mpsc::unbounded_channel();
+    let (events_tx, events_rx) = mpsc::unbounded_channel();
+
+    let (sig_tx, mut sig_rx) = mpsc::unbounded_channel();
+    let sig = signaling::spawn(
+        cfg.relay_url.clone(),
+        me.clone(),
+        hex::encode(my_pk),
+        signer,
+        sig_tx,
+    );
+    {
+        let input = input_tx.clone();
+        tokio::spawn(async move {
+            while let Some(ev) = sig_rx.recv().await {
+                if input.send(Input::Sig(ev)).is_err() {
+                    break;
+                }
+            }
+        });
+    }
+    let stun = match &cfg.stun_servers {
+        Some(list) => list.clone(),
+        None => {
+            let input = input_tx.clone();
+            let url = cfg.relay_url.clone();
+            tokio::spawn(async move {
+                let stun = crate::ice::fetch_stun(&url).await;
+                let _ = input.send(Input::Stun(stun));
+            });
+            Vec::new()
+        }
+    };
+    {
+        let input = input_tx.clone();
+        tokio::spawn(async move {
+            let mut every = tokio::time::interval(TICK);
+            every.tick().await;
+            loop {
+                every.tick().await;
+                if input.send(Input::Tick).is_err() {
+                    break;
+                }
+            }
+        });
+    }
+
+    let handle = AppHandle {
+        tx: input_tx.clone(),
+        peer_id: me.clone(),
+        public_key: hex::encode(my_pk),
+    };
+    let mut engine = Engine {
+        cfg,
+        client,
+        store,
+        state,
+        me,
+        my_pk,
+        input: input_tx,
+        events: events_tx,
+        sig,
+        relay: RelayState::Connecting,
+        registered: false,
+        peers: HashMap::new(),
+        pending_bootstrap: None,
+        pairing_until: None,
+        stun,
+        bind_ip,
+        next_epoch: 0,
+        offer_history: VecDeque::new(),
+        signaling_backoff_until: None,
+        rate_limit_hits: 0,
+    };
+    // Messages queued in an earlier run show as queued again.
+    let queued: Vec<(String, u64)> = engine
+        .state
+        .queue
+        .iter()
+        .filter_map(|e| e.message_id.map(|id| (e.peer_id.clone(), id)))
+        .collect();
+    for (peer, id) in queued {
+        if let Some(m) = engine.state.message_mut(&peer, id) {
+            m.state = DeliveryState::Queued;
+        }
+    }
+    tokio::spawn(engine.run(input_rx));
+    Ok((handle, events_rx))
+}
+
+fn decode_32(hex_str: &str) -> Option<[u8; 32]> {
+    let v = hex::decode(hex_str).ok()?;
+    v.try_into().ok()
+}
+
+fn peer_id_of(hex_str: &str) -> Option<PeerId> {
+    decode_32(hex_str).map(PeerId)
+}
+
+fn now_secs() -> u64 {
+    now_ms() / 1000
+}
+
+impl Engine {
+    async fn run(mut self, mut rx: mpsc::UnboundedReceiver<Input>) {
+        while let Some(input) = rx.recv().await {
+            match input {
+                Input::Command(Command::Shutdown(reply)) => {
+                    self.shutdown();
+                    let _ = reply.send(());
+                    return;
+                }
+                Input::Command(cmd) => self.on_command(cmd),
+                Input::Sig(ev) => self.on_signaling(ev),
+                Input::Stun(stun) => self.stun = stun,
+                Input::RtcReady {
+                    peer,
+                    epoch,
+                    result,
+                } => self.on_rtc_ready(&peer, epoch, result),
+                Input::Rtc { peer, epoch, event } => self.on_rtc_event(&peer, epoch, event),
+                Input::Timer(t) => self.on_timer(t),
+                Input::Tick => self.on_tick(),
+            }
+        }
+        self.shutdown();
+    }
+
+    fn shutdown(&mut self) {
+        let peers: Vec<String> = self.peers.keys().cloned().collect();
+        for p in peers {
+            self.drop_conn(&p);
+        }
+        self.persist_sessions();
+        self.sig.stop();
+    }
+
+    // ── Small helpers ─────────────────────────────────────────────
+
+    fn emit(&self, ev: AppEvent) {
+        let _ = self.events.send(ev);
+    }
+
+    fn after(&self, delay: Duration, timer: Timer) {
+        let input = self.input.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(delay).await;
+            let _ = input.send(Input::Timer(timer));
+        });
+    }
+
+    fn save(&self) {
+        if let Err(e) = self.store.save_state(&self.state) {
+            tracing::error!(%e, "saving state failed");
+            self.emit(AppEvent::Notice(format!("Could not save state: {e}")));
+        }
+    }
+
+    /// Ratchet state changes on every encrypt / decrypt: export and save it.
+    fn persist_sessions(&mut self) {
+        self.state.sessions = self
+            .client
+            .export_sessions()
+            .into_iter()
+            .map(|(pid, data)| (hex::encode(pid), hex::encode(data)))
+            .collect();
+        self.save();
+    }
+
+    fn peer_mut(&mut self, peer: &str) -> &mut PeerState {
+        self.peers.entry(peer.to_owned()).or_default()
+    }
+
+    fn set_path(&mut self, peer: &str, path: PathState) {
+        let st = self.peer_mut(peer);
+        if st.path != path {
+            st.path = path;
+            self.emit(AppEvent::Path {
+                peer_id: peer.to_owned(),
+                state: path,
+            });
+        }
+    }
+
+    fn is_contact(&self, peer: &str) -> bool {
+        self.state.contact(peer).is_some()
+    }
+
+    fn pairing_open(&self) -> bool {
+        self.pairing_until.is_some_and(|t| Instant::now() < t)
+    }
+
+    fn send_watch(&self) {
+        if !self.registered {
+            return;
+        }
+        let peer_ids = self
+            .state
+            .contacts
+            .iter()
+            .take(WATCH_MAX)
+            .map(|c| c.peer_id.clone())
+            .collect();
+        self.sig.send(ClientFrame::Watch { peer_ids });
+    }
+
+    fn default_name(&self, peer: &str) -> String {
+        self.cfg
+            .default_contact_name
+            .clone()
+            .unwrap_or_else(|| crate::short_id(peer))
+    }
+
+    /// Add (or refresh) a contact. Returns it and whether it is new.
+    fn upsert_contact(&mut self, peer: &str, identity_key: Option<String>) -> (Contact, bool) {
+        if let Some(c) = self.state.contacts.iter_mut().find(|c| c.peer_id == peer) {
+            if identity_key.is_some() && c.identity_key != identity_key {
+                c.identity_key = identity_key;
+            }
+            return (c.clone(), false);
+        }
+        let contact = Contact {
+            peer_id: peer.to_owned(),
+            name: self.default_name(peer),
+            identity_key,
+            added_ms: now_ms(),
+        };
+        self.state.contacts.push(contact.clone());
+        (contact, true)
+    }
+
+    // ── Commands ──────────────────────────────────────────────────
+
+    fn on_command(&mut self, cmd: Command) {
+        match cmd {
+            Command::CreatePairingCode(reply) => {
+                let _ = reply.send(self.create_pairing_code());
+            }
+            Command::PairWithCode(code, reply) => {
+                let _ = reply.send(self.pair_with_code(&code));
+            }
+            Command::SendText(peer, text, reply) => {
+                let _ = reply.send(self.send_text(&peer, &text));
+            }
+            Command::Messages(peer, reply) => {
+                let _ = reply.send(self.state.messages.get(&peer).cloned().unwrap_or_default());
+            }
+            Command::Snapshot(reply) => {
+                let _ = reply.send(self.snapshot());
+            }
+            Command::RenameContact(peer, name, reply) => {
+                let result = match self.state.contacts.iter_mut().find(|c| c.peer_id == peer) {
+                    Some(c) => {
+                        c.name = name.trim().to_owned();
+                        Ok(c.clone())
+                    }
+                    None => Err(AppError::UnknownContact(peer)),
+                };
+                if let Ok(c) = &result {
+                    self.emit(AppEvent::ContactUpdated(c.clone()));
+                    self.save();
+                }
+                let _ = reply.send(result);
+            }
+            Command::Connect(peer) => {
+                let st = self.peer_mut(&peer);
+                st.attempt = 0;
+                self.connect(&peer, true);
+            }
+            Command::Shutdown(_) => unreachable!("handled in run"),
+        }
+    }
+
+    fn snapshot(&self) -> Snapshot {
+        Snapshot {
+            peer_id: self.me.clone(),
+            relay: self.relay.clone(),
+            contacts: self
+                .state
+                .contacts
+                .iter()
+                .map(|c| ContactView {
+                    contact: c.clone(),
+                    path: self
+                        .peers
+                        .get(&c.peer_id)
+                        .map(|p| p.path)
+                        .unwrap_or(PathState::Unknown),
+                    queued: self.state.queued_for(&c.peer_id),
+                })
+                .collect(),
+            pairing_open: self.pairing_open(),
+        }
+    }
+
+    fn create_pairing_code(&mut self) -> Result<String, AppError> {
+        let result = parolnet_core::bootstrap::generate_qr_payload_with_ratchet(&self.my_pk, None)
+            .map_err(|e| AppError::Crypto(e.to_string()))?;
+        self.pending_bootstrap = Some(PendingBootstrap {
+            seed: result.seed,
+            ratchet_secret: result.ratchet_secret,
+        });
+        self.pairing_until = Some(Instant::now() + self.cfg.pairing_window);
+        Ok(hex::encode(&result.payload_bytes))
+    }
+
+    fn pair_with_code(&mut self, code: &str) -> Result<Contact, AppError> {
+        let clean: String = code
+            .chars()
+            .filter(|c| !c.is_whitespace() && *c != '"' && *c != '\'')
+            .collect();
+        if clean.len() <= 64 || !clean.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err(AppError::InvalidCode(
+                "expected the full pairing code (hex) from the contact's app".into(),
+            ));
+        }
+        let bytes = hex::decode(&clean).map_err(|e| AppError::InvalidCode(e.to_string()))?;
+        let (payload, bs) = self
+            .client
+            .process_qr(&bytes)
+            .map_err(|e| AppError::InvalidCode(e.to_string()))?;
+        let their_ik: [u8; 32] = payload
+            .ik
+            .as_slice()
+            .try_into()
+            .map_err(|_| AppError::InvalidCode("identity key must be 32 bytes".into()))?;
+        if their_ik == self.my_pk {
+            return Err(AppError::OwnCode);
+        }
+        let ratchet_key: [u8; 32] = payload
+            .rk
+            .as_slice()
+            .try_into()
+            .map_err(|_| AppError::InvalidCode("the code has no ratchet key".into()))?;
+        let their_pid = PeerId::from_public_key(&their_ik);
+        let peer = hex::encode(their_pid.0);
+        self.client
+            .establish_session(
+                their_pid,
+                parolnet_crypto::SharedSecret(bs),
+                &ratchet_key,
+                true,
+            )
+            .map_err(|e| AppError::Crypto(e.to_string()))?;
+
+        // PNP-001 §5.3.1 / MUST-063: the first envelope carries our identity key as
+        // source_hint so the presenter can materialize its responder session.
+        let bootstrap = encrypt_for_peer(
+            self.client.sessions(),
+            &their_pid,
+            msg_type::SYSTEM,
+            &[],
+            now_secs(),
+            Some(PeerId(self.my_pk)),
+        )
+        .map_err(|e| AppError::Crypto(e.to_string()))?;
+        // A new session replaces whatever was queued under the old one.
+        let stale = self.state.take_queue_for(&peer);
+        for e in stale {
+            if let Some(id) = e.message_id {
+                self.mark_message(&peer, id, DeliveryState::Dropped);
+            }
+        }
+        self.state.enqueue_front(QueuedEnvelope {
+            peer_id: peer.clone(),
+            envelope: hex::encode(bootstrap),
+            created_ms: now_ms(),
+            message_id: None,
+        });
+        let (contact, new) = self.upsert_contact(&peer, Some(hex::encode(their_ik)));
+        self.emit(if new {
+            AppEvent::ContactAdded(contact.clone())
+        } else {
+            AppEvent::ContactUpdated(contact.clone())
+        });
+        self.persist_sessions();
+        self.send_watch();
+        // The presenter does not know us yet, so it neither watches us nor offers: offer now.
+        let st = self.peer_mut(&peer);
+        st.online = None;
+        st.offline_by_error = false;
+        st.attempt = 0;
+        st.failures = 0;
+        self.drop_conn(&peer);
+        self.connect(&peer, true);
+        Ok(contact)
+    }
+
+    fn send_text(&mut self, peer: &str, text: &str) -> Result<ChatMessage, AppError> {
+        let pid = peer_id_of(peer).ok_or_else(|| AppError::UnknownContact(peer.to_owned()))?;
+        if !self.client.has_session(&pid) {
+            return Err(AppError::NoSession(peer.to_owned()));
+        }
+        let envelope = encrypt_for_peer(
+            self.client.sessions(),
+            &pid,
+            msg_type::CHAT,
+            text.as_bytes(),
+            now_secs(),
+            None,
+        )
+        .map_err(|e| AppError::Crypto(e.to_string()))?;
+        let envelope = hex::encode(envelope);
+        let id = self.state.alloc_message_id();
+        let mut msg = ChatMessage {
+            id,
+            peer_id: peer.to_owned(),
+            direction: Direction::Sent,
+            text: text.to_owned(),
+            timestamp_ms: now_ms(),
+            state: DeliveryState::Queued,
+        };
+        if self.send_on_channel(peer, &envelope) {
+            msg.state = DeliveryState::Sent;
+        } else {
+            let dropped = self.state.enqueue(
+                QueuedEnvelope {
+                    peer_id: peer.to_owned(),
+                    envelope,
+                    created_ms: msg.timestamp_ms,
+                    message_id: Some(id),
+                },
+                now_ms(),
+            );
+            for (p, d) in dropped_owners(&self.state, dropped) {
+                self.mark_message(&p, d, DeliveryState::Dropped);
+            }
+            self.connect(peer, false);
+        }
+        self.state.push_message(msg.clone());
+        self.persist_sessions();
+        self.emit(AppEvent::Message(msg.clone()));
+        Ok(msg)
+    }
+
+    fn mark_message(&mut self, peer: &str, id: u64, state: DeliveryState) {
+        if let Some(m) = self.state.message_mut(peer, id) {
+            m.state = state;
+            self.emit(AppEvent::MessageState {
+                peer_id: peer.to_owned(),
+                id,
+                state,
+            });
+        }
+    }
+
+    /// Send a frame on the contact's open data channel. False when there is none.
+    fn send_on_channel(&mut self, peer: &str, envelope_hex: &str) -> bool {
+        let Some(conn) = self.peers.get(peer).and_then(|p| p.conn.as_ref()) else {
+            return false;
+        };
+        let (Some(dc), Some(handle)) = (conn.dc, conn.handle.as_ref()) else {
+            return false;
+        };
+        handle.send_text(dc, DcFrame::chat(envelope_hex)).is_ok()
+    }
+
+    fn flush_queue(&mut self, peer: &str) {
+        let entries = self.state.take_queue_for(peer);
+        if entries.is_empty() {
+            return;
+        }
+        let mut rest = Vec::new();
+        for e in entries {
+            if !rest.is_empty() || !self.send_on_channel(peer, &e.envelope) {
+                rest.push(e);
+                continue;
+            }
+            if let Some(id) = e.message_id {
+                self.mark_message(peer, id, DeliveryState::Sent);
+            }
+        }
+        for e in rest.into_iter().rev() {
+            self.state.enqueue_front(e);
+        }
+        self.save();
+    }
+
+    // ── Signaling ─────────────────────────────────────────────────
+
+    fn on_signaling(&mut self, ev: SigEvent) {
+        match ev {
+            SigEvent::Connecting => {
+                if !matches!(self.relay, RelayState::Connecting) {
+                    self.relay = RelayState::Connecting;
+                    self.emit(AppEvent::Relay(self.relay.clone()));
+                }
+            }
+            SigEvent::Registered { profile } => {
+                self.registered = true;
+                self.rate_limit_hits = 0;
+                self.relay = RelayState::Registered { profile };
+                self.emit(AppEvent::Relay(self.relay.clone()));
+                self.send_watch();
+                // Probe contacts we hold messages for (presence only comes from mutual
+                // watchers, so a fresh pairing gets no push).
+                let waiting: Vec<String> = self
+                    .state
+                    .contacts
+                    .iter()
+                    .filter(|c| self.state.queued_for(&c.peer_id) > 0)
+                    .map(|c| c.peer_id.clone())
+                    .collect();
+                for p in waiting {
+                    self.connect(&p, false);
+                }
+            }
+            SigEvent::Disconnected { reason } => {
+                self.registered = false;
+                self.relay = RelayState::Disconnected { reason };
+                self.emit(AppEvent::Relay(self.relay.clone()));
+            }
+            SigEvent::Frame(frame) => self.on_frame(frame),
+        }
+    }
+
+    fn on_frame(&mut self, frame: ServerFrame) {
+        match frame {
+            ServerFrame::Presence { peer_id, online } => self.on_presence(&peer_id, online),
+            ServerFrame::Signal {
+                kind,
+                from,
+                payload,
+            } => self.on_signal(kind, &from, &payload),
+            ServerFrame::Error {
+                code,
+                message,
+                peer_id,
+            } => match code.as_str() {
+                "peer_offline" => {
+                    if let Some(peer) = peer_id {
+                        let st = self.peer_mut(&peer);
+                        st.online = Some(false);
+                        st.offline_by_error = true;
+                        st.last_probe = Some(Instant::now());
+                        let open = st.conn.as_ref().is_some_and(Conn::is_open);
+                        if !open {
+                            self.drop_conn(&peer);
+                            self.set_path(&peer, PathState::Offline);
+                        }
+                    }
+                }
+                "rate_limited" => {
+                    let wait = Duration::from_secs(60)
+                        .saturating_mul(1 << self.rate_limit_hits.min(4))
+                        .min(Duration::from_secs(600));
+                    self.rate_limit_hits += 1;
+                    self.signaling_backoff_until = Some(Instant::now() + wait);
+                    tracing::warn!(?wait, "signaling rate-limited; pausing offers");
+                }
+                _ => tracing::debug!(%code, %message, "relay error"),
+            },
+            ServerFrame::Challenge { .. }
+            | ServerFrame::Registered { .. }
+            | ServerFrame::Pong
+            | ServerFrame::Other(_) => {}
+        }
+    }
+
+    fn on_presence(&mut self, peer: &str, online: bool) {
+        let st = self.peer_mut(peer);
+        let was = st.online;
+        st.online = Some(online);
+        st.offline_by_error = false;
+        if online {
+            if was != Some(true) {
+                st.attempt = 0;
+                st.failures = 0;
+            }
+            let has_conn = st.conn.is_some();
+            if !has_conn {
+                if self.is_contact(peer) {
+                    self.connect(peer, false);
+                }
+                let path = self.peers[peer].path;
+                if matches!(path, PathState::Offline | PathState::Unknown) {
+                    self.set_path(peer, PathState::Connecting);
+                }
+            }
+        } else {
+            let open = st.conn.as_ref().is_some_and(Conn::is_open);
+            if !open {
+                self.drop_conn(peer);
+                self.set_path(peer, PathState::Offline);
+            }
+        }
+    }
+
+    fn signal(&self, kind: SignalKind, to: &str, payload: String) -> bool {
+        if !self.registered {
+            return false;
+        }
+        self.sig.send(kind.frame(to.to_owned(), payload));
+        true
+    }
+
+    /// Accepting an offer shows our IP address to its sender: only contacts, a peer we
+    /// already connect to, or anyone while our pairing code is valid.
+    fn offer_allowed(&self, from: &str) -> bool {
+        self.is_contact(from)
+            || self.peers.get(from).is_some_and(|p| p.conn.is_some())
+            || self.pairing_open()
+    }
+
+    fn on_signal(&mut self, kind: SignalKind, from: &str, payload: &str) {
+        if !is_peer_id(from) || from == self.me {
+            return;
+        }
+        match kind {
+            SignalKind::Offer => {
+                if !self.offer_allowed(from) {
+                    tracing::info!(peer = %crate::short_id(from), "ignoring an offer from a non-contact");
+                    return;
+                }
+                let Some(offer) = serde_json::from_str::<SdpJson>(payload)
+                    .ok()
+                    .filter(|s| s.sdp_type == "offer")
+                    .and_then(|s| RTCSessionDescription::offer(s.sdp).ok())
+                else {
+                    tracing::debug!("malformed offer");
+                    return;
+                };
+                if let Some(conn) = self.peers.get(from).and_then(|p| p.conn.as_ref()) {
+                    if conn.initiator && !conn.remote_set && should_initiate(&self.me, from) {
+                        // Glare: the designated initiator keeps its own offer.
+                        tracing::debug!(peer = %crate::short_id(from), "glare; keeping our offer");
+                        return;
+                    }
+                    // Glare where we yield, or the peer restarted: take the new offer.
+                    self.drop_conn(from);
+                }
+                let st = self.peer_mut(from);
+                st.online = Some(true);
+                st.offline_by_error = false;
+                self.start_conn(from, false, Some(offer));
+            }
+            SignalKind::Answer => {
+                let Some(conn) = self.peers.get_mut(from).and_then(|p| p.conn.as_mut()) else {
+                    return;
+                };
+                if !conn.initiator || conn.remote_set {
+                    return;
+                }
+                let Some(answer) = serde_json::from_str::<SdpJson>(payload)
+                    .ok()
+                    .filter(|s| s.sdp_type == "answer")
+                    .and_then(|s| RTCSessionDescription::answer(s.sdp).ok())
+                else {
+                    tracing::debug!("malformed answer");
+                    return;
+                };
+                if let Some(h) = conn.handle.as_ref()
+                    && h.set_remote_description(answer).is_ok()
+                {
+                    conn.remote_set = true;
+                    for c in conn.pending_ice.drain(..) {
+                        let _ = h.add_remote_candidate(c);
+                    }
+                }
+            }
+            SignalKind::Ice => {
+                let Some(conn) = self.peers.get_mut(from).and_then(|p| p.conn.as_mut()) else {
+                    return;
+                };
+                let Ok(candidate) = serde_json::from_str::<RTCIceCandidateInit>(payload) else {
+                    return;
+                };
+                if candidate.candidate.is_empty() {
+                    return; // end-of-candidates
+                }
+                match (conn.remote_set, conn.handle.as_ref()) {
+                    (true, Some(h)) => {
+                        let _ = h.add_remote_candidate(candidate);
+                    }
+                    _ if conn.pending_ice.len() < PENDING_ICE_MAX => {
+                        conn.pending_ice.push(candidate)
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    // ── Connections ───────────────────────────────────────────────
+
+    /// Ask for a data channel to `peer`. No-op while one is open or being set up. The
+    /// designated initiator offers; the other side waits [`OFFER_FALLBACK`] for that offer
+    /// and then offers itself. `force` offers now (pairing, retries, user intent).
+    fn connect(&mut self, peer: &str, force: bool) {
+        if peer == self.me || !is_peer_id(peer) || !self.registered {
+            return;
+        }
+        let me = self.me.clone();
+        let st = self.peer_mut(peer);
+        if st.conn.is_some() {
+            return;
+        }
+        if st.online == Some(false) && !force {
+            return;
+        }
+        if force || should_initiate(&me, peer) {
+            self.schedule_offer(peer);
+        } else if !st.fallback_armed {
+            st.fallback_armed = true;
+            let jitter = Duration::from_millis(rand::thread_rng().gen_range(0..2000));
+            self.after(
+                OFFER_FALLBACK + jitter,
+                Timer::OfferFallback {
+                    peer: peer.to_owned(),
+                },
+            );
+        }
+    }
+
+    fn schedule_offer(&mut self, peer: &str) {
+        if self.peers.get(peer).is_some_and(|p| p.offer_waiting) {
+            return;
+        }
+        let now = Instant::now();
+        let mut wait = self
+            .signaling_backoff_until
+            .map(|t| t.saturating_duration_since(now))
+            .unwrap_or_default();
+        if wait.is_zero() {
+            while self
+                .offer_history
+                .front()
+                .is_some_and(|t| now.duration_since(*t) >= OFFER_WINDOW)
+            {
+                self.offer_history.pop_front();
+            }
+            if self.offer_history.len() < OFFERS_PER_WINDOW {
+                self.offer_history.push_back(now);
+            } else {
+                wait = OFFER_WINDOW
+                    .saturating_sub(now.duration_since(self.offer_history[0]))
+                    .max(Duration::from_millis(1));
+            }
+        }
+        if wait.is_zero() {
+            self.start_conn(peer, true, None);
+        } else {
+            self.peer_mut(peer).offer_waiting = true;
+            self.after(
+                wait,
+                Timer::OfferSlot {
+                    peer: peer.to_owned(),
+                },
+            );
+        }
+    }
+
+    fn start_conn(
+        &mut self,
+        peer: &str,
+        initiator: bool,
+        remote_offer: Option<RTCSessionDescription>,
+    ) {
+        self.next_epoch += 1;
+        let epoch = self.next_epoch;
+        let st = self.peer_mut(peer);
+        st.conn = Some(Conn {
+            epoch,
+            handle: None,
+            initiator,
+            remote_offer,
+            remote_set: false,
+            pending_ice: Vec::new(),
+            dc: None,
+            last_state: None,
+        });
+        st.fallback_armed = false;
+        if st.path != PathState::NoDirectPath {
+            self.set_path(peer, PathState::Connecting);
+        }
+        let config = RtcConfig {
+            bind: SocketAddr::new(self.bind_ip, 0),
+            ice_servers: self
+                .cfg
+                .user_ice_servers
+                .iter()
+                .map(|s| RTCIceServer {
+                    urls: s.urls.clone(),
+                    username: s.username.clone(),
+                    credential: s.credential.clone(),
+                })
+                .collect(),
+            stun_servers: self.stun.clone(),
+            data_channel: initiator.then(|| DATA_CHANNEL_LABEL.to_owned()),
+            ..Default::default()
+        };
+        let input = self.input.clone();
+        let peer_owned = peer.to_owned();
+        tokio::spawn(async move {
+            match parolnet_rtc::spawn(config).await {
+                Ok((handle, mut events)) => {
+                    let ready = Input::RtcReady {
+                        peer: peer_owned.clone(),
+                        epoch,
+                        result: Ok(handle),
+                    };
+                    if input.send(ready).is_err() {
+                        return;
+                    }
+                    while let Some(event) = events.recv().await {
+                        let ev = Input::Rtc {
+                            peer: peer_owned.clone(),
+                            epoch,
+                            event,
+                        };
+                        if input.send(ev).is_err() {
+                            return;
+                        }
+                    }
+                }
+                Err(e) => {
+                    let _ = input.send(Input::RtcReady {
+                        peer: peer_owned,
+                        epoch,
+                        result: Err(e.to_string()),
+                    });
+                }
+            }
+        });
+        self.after(
+            CONNECT_TIMEOUT,
+            Timer::ConnectTimeout {
+                peer: peer.to_owned(),
+                epoch,
+            },
+        );
+    }
+
+    fn conn_mut(&mut self, peer: &str, epoch: u64) -> Option<&mut Conn> {
+        self.peers
+            .get_mut(peer)?
+            .conn
+            .as_mut()
+            .filter(|c| c.epoch == epoch)
+    }
+
+    fn on_rtc_ready(&mut self, peer: &str, epoch: u64, result: Result<RtcHandle, String>) {
+        let handle = match result {
+            Ok(h) => h,
+            Err(e) => {
+                tracing::warn!(peer = %crate::short_id(peer), %e, "could not start a connection");
+                if self.conn_mut(peer, epoch).is_some() {
+                    self.conn_failed(peer, FailReason::Error);
+                }
+                return;
+            }
+        };
+        let Some(conn) = self.conn_mut(peer, epoch) else {
+            tokio::spawn(handle.close());
+            return;
+        };
+        let ok = if conn.initiator {
+            handle.create_offer().is_ok()
+        } else if let Some(offer) = conn.remote_offer.take() {
+            let ok = handle.set_remote_description(offer).is_ok();
+            conn.remote_set = ok;
+            for c in conn.pending_ice.drain(..) {
+                let _ = handle.add_remote_candidate(c);
+            }
+            ok
+        } else {
+            false
+        };
+        conn.handle = Some(handle);
+        if !ok {
+            self.conn_failed(peer, FailReason::Error);
+        }
+    }
+
+    fn on_rtc_event(&mut self, peer: &str, epoch: u64, event: RtcEvent) {
+        let me = self.me.clone();
+        let Some(conn) = self.conn_mut(peer, epoch) else {
+            return;
+        };
+        match event {
+            RtcEvent::LocalDescription(desc) => {
+                let initiator = conn.initiator;
+                let payload = serde_json::to_string(&SdpJson {
+                    sdp_type: if initiator { "offer" } else { "answer" }.to_owned(),
+                    sdp: desc.sdp.clone(),
+                })
+                .unwrap_or_default();
+                let kind = if initiator {
+                    SignalKind::Offer
+                } else {
+                    SignalKind::Answer
+                };
+                if !self.signal(kind, peer, payload) {
+                    tracing::debug!(peer = %crate::short_id(peer), "relay down; description not sent");
+                    self.conn_failed(peer, FailReason::Error);
+                    return;
+                }
+                if initiator {
+                    self.after(
+                        ANSWER_TIMEOUT,
+                        Timer::AnswerTimeout {
+                            peer: peer.to_owned(),
+                            epoch,
+                        },
+                    );
+                }
+            }
+            RtcEvent::ConnectionState(state) => {
+                conn.last_state = Some(state);
+                match state {
+                    RTCPeerConnectionState::Disconnected => self.after(
+                        DISCONNECT_GRACE,
+                        Timer::DisconnectGrace {
+                            peer: peer.to_owned(),
+                            epoch,
+                        },
+                    ),
+                    RTCPeerConnectionState::Failed => self.conn_failed(peer, FailReason::IceFailed),
+                    RTCPeerConnectionState::Closed => self.conn_failed(peer, FailReason::Closed),
+                    _ => {}
+                }
+            }
+            RtcEvent::DataChannelOpen { id, label } => {
+                if label != DATA_CHANNEL_LABEL || conn.dc.is_some() {
+                    tracing::debug!(%label, "ignoring an extra data channel");
+                    return;
+                }
+                conn.dc = Some(id);
+                if let Some(h) = conn.handle.as_ref() {
+                    let _ = h.send_text(id, DcFrame::identity(&me));
+                }
+                let st = self.peer_mut(peer);
+                st.online = Some(true);
+                st.offline_by_error = false;
+                st.attempt = 0;
+                st.failures = 0;
+                tracing::info!(peer = %crate::short_id(peer), "data channel open");
+                self.set_path(peer, PathState::Direct);
+                self.flush_queue(peer);
+            }
+            RtcEvent::DataChannelMessage { id, payload } => {
+                if conn.dc == Some(id) {
+                    self.on_data(peer, &payload);
+                }
+            }
+            RtcEvent::Closed { error } => {
+                tracing::debug!(peer = %crate::short_id(peer), ?error, "connection task ended");
+                let reason = if error.is_some() {
+                    FailReason::Error
+                } else {
+                    FailReason::Closed
+                };
+                self.conn_failed(peer, reason);
+            }
+            RtcEvent::IceConnectionState(_) | RtcEvent::Track { .. } | RtcEvent::Rtp { .. } => {}
+        }
+    }
+
+    fn drop_conn(&mut self, peer: &str) {
+        if let Some(conn) = self.peers.get_mut(peer).and_then(|p| p.conn.take())
+            && let Some(h) = conn.handle
+        {
+            tokio::spawn(h.close());
+        }
+    }
+
+    fn conn_failed(&mut self, peer: &str, reason: FailReason) {
+        let Some(conn) = self.peers.get_mut(peer).and_then(|p| p.conn.take()) else {
+            return;
+        };
+        let was_open = conn.is_open();
+        let was_initiator = conn.initiator;
+        if let Some(h) = conn.handle {
+            tokio::spawn(h.close());
+        }
+        tracing::info!(peer = %crate::short_id(peer), ?reason, was_open, "connection ended");
+        let st = self.peer_mut(peer);
+        if st.online == Some(false) {
+            self.set_path(peer, PathState::Offline);
+            return;
+        }
+        if !was_open {
+            st.failures += 1;
+        }
+        let failures = st.failures;
+        let path = if was_open {
+            PathState::Unknown
+        } else if (reason == FailReason::IceFailed && failures >= 1)
+            || (reason == FailReason::Timeout && failures >= 2)
+        {
+            PathState::NoDirectPath
+        } else {
+            PathState::Connecting
+        };
+        self.set_path(peer, path);
+        if was_open {
+            self.peer_mut(peer).attempt = 0;
+        }
+        self.schedule_retry(peer, was_initiator);
+    }
+
+    fn schedule_retry(&mut self, peer: &str, was_initiator: bool) {
+        if !self.is_contact(peer) {
+            return;
+        }
+        let we_offer = was_initiator || should_initiate(&self.me, peer);
+        let st = self.peer_mut(peer);
+        if st.online == Some(false) || st.retry_armed {
+            return;
+        }
+        if st.attempt >= RETRY_MAX_ATTEMPTS && st.online != Some(true) {
+            tracing::info!(peer = %crate::short_id(peer), "giving up until presence says online");
+            return;
+        }
+        let n = st.attempt.min(RETRY_MAX_ATTEMPTS);
+        st.attempt += 1;
+        st.retry_armed = true;
+        let base = RETRY_BASE.saturating_mul(1 << n.min(10)).min(RETRY_MAX);
+        let jitter = base.mul_f64(0.25 * rand::thread_rng().r#gen::<f64>());
+        // The side that would not offer waits longer, so the initiator's retry usually wins.
+        let extra = if we_offer {
+            Duration::ZERO
+        } else {
+            OFFER_FALLBACK
+        };
+        self.after(
+            base + jitter + extra,
+            Timer::Retry {
+                peer: peer.to_owned(),
+            },
+        );
+    }
+
+    fn on_timer(&mut self, t: Timer) {
+        match t {
+            Timer::AnswerTimeout { peer, epoch } => {
+                if self.conn_mut(&peer, epoch).is_some_and(|c| !c.remote_set) {
+                    tracing::info!(peer = %crate::short_id(&peer), "no answer");
+                    self.conn_failed(&peer, FailReason::Timeout);
+                }
+            }
+            Timer::ConnectTimeout { peer, epoch } => {
+                if self.conn_mut(&peer, epoch).is_some_and(|c| !c.is_open()) {
+                    self.conn_failed(&peer, FailReason::Timeout);
+                }
+            }
+            Timer::DisconnectGrace { peer, epoch } => {
+                if self.conn_mut(&peer, epoch).is_some_and(|c| {
+                    matches!(
+                        c.last_state,
+                        Some(RTCPeerConnectionState::Disconnected | RTCPeerConnectionState::Failed)
+                    )
+                }) {
+                    self.conn_failed(&peer, FailReason::Timeout);
+                }
+            }
+            Timer::OfferFallback { peer } => {
+                let st = self.peer_mut(&peer);
+                st.fallback_armed = false;
+                if st.conn.is_none() && st.online != Some(false) {
+                    tracing::debug!(peer = %crate::short_id(&peer), "no offer came; offering ourselves");
+                    self.schedule_offer(&peer);
+                }
+            }
+            Timer::OfferSlot { peer } => {
+                let st = self.peer_mut(&peer);
+                st.offer_waiting = false;
+                if st.conn.is_none() {
+                    self.schedule_offer(&peer);
+                }
+            }
+            Timer::Retry { peer } => {
+                let st = self.peer_mut(&peer);
+                st.retry_armed = false;
+                if st.conn.is_none() && st.online != Some(false) {
+                    self.connect(&peer, true);
+                }
+            }
+        }
+    }
+
+    fn on_tick(&mut self) {
+        if self.pairing_until.is_some_and(|t| Instant::now() >= t) {
+            self.pairing_until = None;
+            self.pending_bootstrap = None;
+        }
+        if !self.registered {
+            return;
+        }
+        let candidates: Vec<String> = self
+            .state
+            .contacts
+            .iter()
+            .filter(|c| self.state.queued_for(&c.peer_id) > 0)
+            .map(|c| c.peer_id.clone())
+            .collect();
+        for peer in candidates {
+            let st = self.peer_mut(&peer);
+            if st.conn.is_some() || st.retry_armed || st.offer_waiting || st.fallback_armed {
+                continue;
+            }
+            match st.online {
+                None => self.connect(&peer, false),
+                Some(false)
+                    if st.offline_by_error
+                        && st.last_probe.is_none_or(|t| t.elapsed() >= PROBE_EVERY) =>
+                {
+                    st.last_probe = Some(Instant::now());
+                    self.connect(&peer, true);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    // ── Incoming content ──────────────────────────────────────────
+
+    fn on_data(&mut self, peer: &str, payload: &[u8]) {
+        match DcFrame::parse(payload) {
+            DcFrame::Identity { peer_id } => {
+                if !peer_id.eq_ignore_ascii_case(peer) {
+                    tracing::warn!(
+                        peer = %crate::short_id(peer),
+                        claimed = %crate::short_id(&peer_id),
+                        "identity frame does not match the signaling peer"
+                    );
+                }
+            }
+            DcFrame::Envelope { hex: h } => match hex::decode(&h) {
+                Ok(bytes) => self.on_envelope(peer, &bytes),
+                Err(_) => tracing::debug!("non-hex envelope"),
+            },
+            DcFrame::Other => {}
+        }
+    }
+
+    fn on_envelope(&mut self, peer: &str, bytes: &[u8]) {
+        let Some(pid) = peer_id_of(peer) else {
+            return;
+        };
+        let mut decoded = None;
+        if self.client.has_session(&pid) {
+            match decrypt_for_peer(self.client.sessions(), &pid, bytes) {
+                Ok(d) => decoded = Some(d),
+                Err(e) => tracing::debug!(peer = %crate::short_id(peer), %e, "decrypt failed"),
+            }
+        }
+        let mut bootstrapped_ik = None;
+        if decoded.is_none()
+            && self.pairing_open()
+            && let Some(pb) = self.pending_bootstrap.as_ref()
+            && let Some(ik) = bootstrap_ik(bytes)
+            && PeerId::from_public_key(&ik) == pid
+        {
+            match try_bootstrap_and_decrypt(
+                self.client.sessions(),
+                bytes,
+                &self.my_pk,
+                &pb.seed,
+                &pb.ratchet_secret,
+            ) {
+                Ok(d) => {
+                    decoded = Some(d);
+                    bootstrapped_ik = Some(ik);
+                    self.pending_bootstrap = None;
+                }
+                Err(e) => tracing::info!(peer = %crate::short_id(peer), %e, "bootstrap failed"),
+            }
+        }
+        let Some(d) = decoded else {
+            return;
+        };
+        if let Some(ik) = bootstrapped_ik {
+            let (contact, new) = self.upsert_contact(peer, Some(hex::encode(ik)));
+            tracing::info!(peer = %crate::short_id(peer), "paired (presenter side)");
+            self.emit(if new {
+                AppEvent::ContactAdded(contact)
+            } else {
+                AppEvent::ContactUpdated(contact)
+            });
+            self.send_watch();
+        }
+        match d.msg_type {
+            msg_type::CHAT => {
+                let text = String::from_utf8_lossy(&d.plaintext).into_owned();
+                if !self.is_contact(peer) {
+                    let (contact, _) = self.upsert_contact(peer, None);
+                    self.emit(AppEvent::ContactAdded(contact));
+                    self.send_watch();
+                }
+                let id = self.state.alloc_message_id();
+                let msg = ChatMessage {
+                    id,
+                    peer_id: peer.to_owned(),
+                    direction: Direction::Received,
+                    text,
+                    timestamp_ms: now_ms(),
+                    state: DeliveryState::Received,
+                };
+                self.state.push_message(msg.clone());
+                self.emit(AppEvent::Message(msg));
+            }
+            msg_type::SYSTEM => {}
+            msg_type::CALL_SIGNAL => {
+                tracing::info!(peer = %crate::short_id(peer), "call signal (calls are not in this build yet)");
+            }
+            other => {
+                tracing::debug!(msg_type = other, "message type not handled in this slice");
+            }
+        }
+        self.persist_sessions();
+    }
+}
+
+/// The scanner's identity key from a bootstrap envelope's cleartext `source_hint`
+/// (PNP-001-MUST-063 packs the 32-byte Ed25519 key there).
+fn bootstrap_ik(bytes: &[u8]) -> Option<[u8; 32]> {
+    let env = CborCodec.decode(bytes).ok()?;
+    env.cleartext_header.source_hint.map(|p| p.0)
+}
+
+/// Map message ids dropped from the queue back to their peers.
+fn dropped_owners(state: &State, ids: Vec<u64>) -> Vec<(String, u64)> {
+    ids.into_iter()
+        .filter_map(|id| {
+            state
+                .messages
+                .iter()
+                .find(|(_, list)| list.iter().any(|m| m.id == id))
+                .map(|(p, _)| (p.clone(), id))
+        })
+        .collect()
+}

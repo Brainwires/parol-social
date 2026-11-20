@@ -22,7 +22,7 @@ async fn next_description(
 async fn next_open(events: &mut Receiver<RtcEvent>) -> usize {
     loop {
         match events.recv().await.expect("events") {
-            RtcEvent::DataChannelOpen { id } => return id,
+            RtcEvent::DataChannelOpen { id, .. } => return id,
             RtcEvent::Closed { error } => panic!("closed before open: {error:?}"),
             _ => {}
         }
