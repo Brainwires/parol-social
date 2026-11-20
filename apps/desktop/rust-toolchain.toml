@@ -1,0 +1,4 @@
+# gpui-pre needs a newer compiler than the root workspace's 1.92 (it uses `cfg_select!`).
+[toolchain]
+channel = "1.99.1"
+components = ["rustfmt", "clippy"]
