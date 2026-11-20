@@ -1,252 +1,143 @@
 # ParolNet
 
-> **Parol** — *parole* (speech/word) in French, *пароль* (password) in Russian, *parola* (password) in Turkish, *parola* (word) in Italian. It embodies the dual mission: **free speech protected by strong security**.
+**Calls, messages, files and data between people and apps, end-to-end encrypted, on servers anyone
+can run, with no account.**
 
-A secure, decentralized communication platform promoting free expression and open access to information. Designed for citizens in countries with oppressive authoritarian regimes who still have internet access. But usable for secure communication in general.
+ParolNet is a decentralized, end-to-end encrypted communication system: 1:1 and group voice and
+video, screen sharing, messages, file transfer, and application-defined data channels. It ships as
 
-**Current status:** ParolNet is an active prototype. The repository contains substantial crypto, protocol, relay, mesh, WASM, and PWA code, but the current browser app does not yet deliver every property described in the protocol specifications. Read [IMPLEMENTATION_STATUS.md](IMPLEMENTATION_STATUS.md) before evaluating the software for real-world risk.
+- **Rust crates** others can build on (identity, sessions, the realtime engine driver, transfer),
+- **a federated relay** anyone can run (signaling, store-and-forward, directory, TURN credentials),
+- **desktop clients** built with [GPUI](https://www.gpui.rs/) for macOS, Windows and Linux,
+- **the PWA**, which stays a first-class client on the same protocol.
 
----
+It stays strong where it counts: everything is end-to-end encrypted, there is no phone number, email
+or username, keys live only on devices, relays and media servers are treated as untrusted, and one
+account spans several devices.
 
-## Why ParolNet Exists
+> *Parol*: *parole* (word) in French, *пароль* (password) in Russian, *parola* in Italian and
+> Turkish.
 
-Billions of people live under governments that monitor their communications, block access to information, and punish dissent. Existing tools have gaps:
-
-- **Signal** requires a phone number — a government-issued identifier that links your identity to your messages. In many countries, SIM cards require ID registration.
-- **Tor** anonymizes browsing but its traffic is recognizable to deep packet inspection. Many authoritarian states block Tor entirely.
-- **VPNs** are centralized — governments pressure providers, block known VPN IPs, or simply outlaw them.
-- **Telegram** stores messages on servers and has a history of cooperating with governments under pressure.
-
-ParolNet is built from the ground up to solve these problems together:
-
-### How ParolNet Protects You
-
-**Your identity is invisible.** There is no registration. No phone number, no email, no username, no account. Your identity is a cryptographic key that exists only on your device. You connect with others by scanning a QR code in person or sharing a passphrase — no server ever learns who you are.
-
-**Traffic camouflage is a design goal.** The protocol specifications define TLS camouflage, fixed-size cells, padding, and cover traffic. The current PWA/relay path uses WebSocket/WebRTC transport and does not yet implement full HTTP/2-shaped constant-rate cover traffic.
-
-**Onion-routed conversations are a design goal.** The `parolnet-relay` crate includes 3-hop circuit primitives and onion encryption helpers. The current browser chat path sends encrypted payloads through a direct WebSocket relay or optional WebRTC data channel, not through production 3-hop circuits.
-
-**Metadata protection is partial today.** Message content is end-to-end encrypted after a secure session is established. The current app still exposes relay/WebRTC connection metadata and does not yet provide the full padding, decoy, and constant-rate protections described by PNP-004 and PNP-006.
-
-**The public relay is signaling-only.** By default the relay server only helps peers set up direct connections (registration, WebRTC offer/answer/ICE exchange between two online contacts, presence, STUN); no message, file, group, call or decoy traffic transits or is stored on it ([PNP-001 §10.5](specs/PNP-001-wire-protocol.md)). Chats and files travel peer to peer, so **a contact you connect to sees your IP address** (strangers never do); you can avoid that by adding your own TURN server in Settings. Messages to a contact who is offline wait on your device until you are both online. Operators who want store-and-forward, Privacy Pass tokens, TURN credentials or federation run the relay profile (`SIGNALING_ONLY=0`).
-
-**Your device is safe if seized.** A single panic button securely erases all keys, messages, and contacts from your device. A decoy mode makes the app appear as a calculator or notepad. Deniable encryption means you cannot be forced to prove what you sent — even to a court.
-
-**Offline and local mesh support is partial today.** The codebase has store-forward and UDP broadcast discovery primitives. BLE bootstrap and a fully integrated offline browser mesh are not complete.
+**Status: pre-release, milestone M0.** The crypto, protocol, relay and PWA code is substantial; the
+native clients, media engine integration and multi-device support are being built now. Nothing is
+audited yet (a third-party audit is planned before 1.0). Read
+[IMPLEMENTATION_STATUS.md](IMPLEMENTATION_STATUS.md) and [THREAT_MODEL.md](THREAT_MODEL.md) before
+relying on it.
 
 ---
 
-## Who This Is For
+## What it protects, and what it does not
 
-ParolNet is for anyone who needs to communicate privately in a hostile environment:
-
-- **Journalists** investigating corruption or human rights abuses
-- **Activists** organizing peaceful protests or documenting state violence
-- **Lawyers** communicating with clients about sensitive cases
-- **Ordinary citizens** who simply want to speak freely without fear
-- **Whistleblowers** exposing wrongdoing within governments or corporations
-- **Aid workers** coordinating in conflict zones
-- **Minority communities** facing persecution for their identity, beliefs, or ethnicity
-
----
-
-## How ParolNet Is Different
-
-| Feature | Signal | Tor | VPN | ParolNet |
-|---------|--------|-----|-----|----------|
-| No phone/email required | No | Yes | No | **Yes** |
-| Traffic looks like normal browsing | No | No | Partially | Design target |
-| Metadata protection | Partial | Yes | No | Partial today |
-| Works without internet | No | No | No | Partial today |
-| Panic wipe / decoy mode | No | No | No | **Yes** |
-| Decentralized (no company to pressure) | No | Yes | No | **Yes** |
-| End-to-end encrypted | Yes | No* | No | **Yes** |
-
-*Tor encrypts transport but is not a messaging protocol.
-
----
-
-## Mission Statement — In Your Language
-
-The following mission statements describe the project goal. They are not a statement that the current prototype already provides every protocol property in production use.
-
-### English
-ParolNet is free, open-source software that protects your right to private communication. No government, corporation, or individual can read your messages, track who you talk to, or shut down the network. Your voice matters. Your privacy is non-negotiable.
-
-### Chinese (Simplified) / 中文（简体）
-ParolNet 是一款免费开源软件，旨在保护您的私人通信权利。任何政府、企业或个人都无法阅读您的消息、追踪您的通信对象或关闭网络。您的声音至关重要。您的隐私不容协商。
-
-ParolNet 专为生活在审查和监控环境下的用户设计。它不需要手机号码或电子邮件注册。您的网络流量看起来与普通网页浏览完全相同——没有什么可以被封锁，因为没有什么可以被识别。即使互联网被关闭，设备之间的网状网络通信仍然可以继续工作。如果您的设备被没收，一键紧急清除功能可以安全地销毁所有密钥和消息。
-
-### Russian / Русский
-ParolNet — это бесплатное программное обеспечение с открытым исходным кодом, которое защищает ваше право на конфиденциальную связь. Ни правительство, ни корпорация, ни отдельное лицо не могут прочитать ваши сообщения, отследить, с кем вы общаетесь, или отключить сеть. Ваш голос важен. Ваша конфиденциальность не подлежит обсуждению.
-
-ParolNet разработан для людей, живущих в условиях цензуры и слежки. Для регистрации не нужен номер телефона или электронная почта. Ваш интернет-трафик выглядит как обычный просмотр веб-страниц — блокировать нечего, потому что отличить невозможно. Даже при отключении интернета связь между устройствами продолжается через mesh-сеть. Если ваше устройство изъято, функция экстренного уничтожения данных безопасно удалит все ключи и сообщения.
-
-### Persian (Farsi) / فارسی
-پارولنت یک نرم‌افزار رایگان و متن‌باز است که از حق شما برای ارتباطات خصوصی محافظت می‌کند. هیچ دولت، شرکت یا فردی نمی‌تواند پیام‌های شما را بخواند، ردیابی کند که با چه کسی صحبت می‌کنید، یا شبکه را خاموش کند. صدای شما اهمیت دارد. حریم خصوصی شما قابل مذاکره نیست.
-
-پارولنت برای افرادی طراحی شده که در شرایط سانسور و نظارت زندگی می‌کنند. نیازی به شماره تلفن یا ایمیل برای ثبت‌نام نیست. ترافیک اینترنت شما دقیقاً مانند مرور عادی وب به نظر می‌رسد — چیزی برای مسدود کردن وجود ندارد چون چیزی قابل تشخیص نیست. حتی زمانی که اینترنت قطع شود، ارتباط بین دستگاه‌ها از طریق شبکه مش ادامه می‌یابد. اگر دستگاه شما مصادره شود، دکمه پاکسازی اضطراری تمام کلیدها و پیام‌ها را به‌طور امن از بین می‌برد.
-
-### Kurdish (Kurmanji) / Kurdî
-ParolNet nermalava belaş û çavkaniya vekirî ye ku mafê te yê danûstendinên taybet diparêze. Tu hukumet, pargîdanî an kesek nikare peyamên te bixwîne, bişopîne ku tu bi kê re diaxivî, an torê bigire. Dengê te girîng e. Nepenîtiya te nayê danûstandin.
-
-ParolNet ji bo kesên ku di bin sansur û çavdêriyê de dijîn hatiye çêkirin. Ji bo tomarkirinê ne jimareya têlefonê û ne jî e-nameyek hewce ye. Seyrûsefera te ya înternetê wekî gerandina webê ya normal xuya dike. Tiştek tune ku were asteng kirin ji ber ku tiştek tune ku were nasîn. Dema ku înternet were qutkirin jî, pêwendiya di navbera amûran de bi tora mesh-ê didome.
-
-### Azerbaijani / Azərbaycanca
-ParolNet pulsuz və açıq mənbəli proqram təminatıdır ki, sizin şəxsi ünsiyyət hüququnuzu qoruyur. Heç bir hökumət, şirkət və ya şəxs mesajlarınızı oxuya, kiminlə danışdığınızı izləyə və ya şəbəkəni bağlaya bilməz. Səsiniz vacibdir. Məxfiliyiniz danışıq mövzusu deyil.
-
-ParolNet senzura və nəzarət altında yaşayan insanlar üçün hazırlanıb. Qeydiyyat üçün telefon nömrəsi və ya e-poçt tələb olunmur. İnternet trafikiniz adi veb-baxışa bənzəyir — heç nə bloklanmır, çünki heç nə fərqləndirilə bilməz. İnternet kəsildikdə belə, cihazlar arası əlaqə mesh şəbəkə vasitəsilə davam edir.
-
-### Arabic / العربية
-بارولنت هو برنامج مجاني ومفتوح المصدر يحمي حقك في التواصل الخاص. لا يمكن لأي حكومة أو شركة أو فرد قراءة رسائلك أو تتبع من تتحدث إليه أو إغلاق الشبكة. صوتك مهم. خصوصيتك غير قابلة للتفاوض.
-
-صُمم بارولنت للأشخاص الذين يعيشون في ظل الرقابة والمراقبة. لا حاجة لرقم هاتف أو بريد إلكتروني للتسجيل. تبدو حركة الإنترنت الخاصة بك مطابقة تماماً لتصفح الويب العادي — لا يوجد شيء يمكن حجبه لأنه لا يوجد شيء يمكن تمييزه. حتى عند قطع الإنترنت، يستمر التواصل بين الأجهزة عبر الشبكة المتداخلة. إذا تمت مصادرة جهازك، فإن زر المسح الطارئ يدمر جميع المفاتيح والرسائل بشكل آمن.
-
-### Korean / 한국어
-ParolNet은 사적인 통신에 대한 귀하의 권리를 보호하는 무료 오픈소스 소프트웨어입니다. 어떤 정부, 기업, 개인도 귀하의 메시지를 읽거나 누구와 대화하는지 추적하거나 네트워크를 차단할 수 없습니다. 귀하의 목소리는 중요합니다. 귀하의 프라이버시는 협상의 대상이 아닙니다.
-
-ParolNet은 검열과 감시 환경에서 살아가는 사람들을 위해 설계되었습니다. 등록에 전화번호나 이메일이 필요하지 않습니다. 귀하의 인터넷 트래픽은 일반 웹 브라우징과 완전히 동일하게 보입니다 — 구별할 수 있는 것이 없기 때문에 차단할 수 있는 것도 없습니다. 인터넷이 차단되더라도 메시 네트워크를 통해 기기 간 통신이 계속됩니다. 기기가 압수되면 긴급 삭제 버튼이 모든 키와 메시지를 안전하게 파괴합니다.
-
-### Turkish / Turkce
-ParolNet, ozel iletisim hakkinizi koruyan ucretsiz ve acik kaynakli bir yazilimdir. Hicbir hukumet, sirket veya birey mesajlarinizi okuyamaz, kiminle konustugunuzu izleyemez veya agi kapatamaz. Sesiniz onemlidir. Gizliliginiz pazarlik konusu degildir.
-
-ParolNet, sansur ve gozetim altinda yasayan insanlar icin tasarlanmistir. Kayit icin telefon numarasi veya e-posta gerekmez. Internet trafiginiz normal web taramasina benzer — engellenecek bir sey yoktur cunku ayirt edilecek bir sey yoktur. Internet kesildiginde bile, cihazlar arasi iletisim mesh agi uzerinden devam eder. Cihaziniz el konulursa, acil silme dugmesi tum anahtarlari ve mesajlari guvenli bir sekilde yok eder.
-
----
-
-## Core Principles
-
-- **Untrackable**: Traffic should be difficult to distinguish from normal HTTPS browsing when the full transport design is implemented
-- **Zero-trust**: Assume the network and all servers are compromised
-- **Decentralized**: No single point of failure or control
-- **Metadata-minimal**: Protect who talks to whom, not just content
-- **No registration**: No phone, email, or username — identity is a cryptographic key
-- **Offline-first**: Works in degraded network conditions via mesh networking
-- **Open source**: Auditable, forkable, community-owned
+- **Content.** Messages, files, calls and data channels are end-to-end encrypted between devices.
+  Relays, TURN servers and (from M2) media servers see ciphertext only.
+- **Identity.** An identity is an Ed25519 key; its `PeerId` is the SHA-256 of the public key. You
+  add contacts by QR code or a pairing code and verify them with safety numbers. There is nothing
+  to register.
+- **Servers anyone can run.** Relays federate; you choose your home relay or run your own.
+- **Signaling-only public relay.** By default a relay only helps contacts set up direct connections
+  (registration, WebRTC offer / answer / ICE between two online contacts, presence, STUN URIs); no
+  message, file, group, call or decoy traffic transits or is stored on it
+  ([PNP-001 §10.5](specs/PNP-001-wire-protocol.md)). Content travels peer to peer, so a contact you
+  connect to sees your IP address unless you add your own TURN server; messages to an offline
+  contact wait on your device. Operators who want store-and-forward, tokens, TURN credentials or
+  federation run the relay profile (`SIGNALING_ONLY=0`).
+- **Metadata, honestly stated.** Your home relay learns your `PeerId`, your IP address, when you are
+  online and the `PeerId`s you exchange signaling with (and, on a relay-profile relay, envelopes). A media server (M2) learns who is in a room
+  and packet sizes and timing. The default mode does **not** hide that you use ParolNet, resist
+  traffic analysis, circumvent censorship or offer deniability. The experimental `hardened` mode
+  (onion circuits, bridges, traffic shaping, messages only) is described with its limits in
+  [THREAT_MODEL.md](THREAT_MODEL.md), appendix A.
 
 ## Architecture
 
 ```
-                  +-----------------+
-                  |  parolnet-core  |  Public API: bootstrap, send, recv, panic_wipe
-                  +--------+--------+
-                           |
-          +----------------+----------------+
-          |                |                |
-+---------+--+  +----------+--+  +----------+--+
-| parolnet-  |  | parolnet-   |  | parolnet-   |
-| relay      |  | mesh        |  | wasm        |
-| (onion     |  | (gossip,    |  | (browser    |
-|  circuits) |  |  offline)   |  |  bindings)  |
-+-----+------+  +------+------+  +------+------+
-      |                |                |
-+-----+----------------+------+        |
-|    parolnet-transport       |        |
-|    (TLS, WebSocket, DPI     |        |
-|     evasion, traffic shape) |        |
-+-------------+---------------+        |
-              |                        |
-      +-------+--------+      +-------+------+
-      | parolnet-       |      | parolnet-    |
-      | protocol        +------+ crypto       |
-      | (wire format,   |      | (X3DH, DR,   |
-      |  envelope, CBOR)|      |  AEAD, KDF)  |
-      +-----------------+      +--------------+
+apps/desktop (GPUI)      pwa/ (JS + wasm)        later: iOS / Android shells (UniFFI)
+        \                    |                         /
+         parolnet-app   (headless app core: accounts, conversations, calls as observable state)
+            |        |          |            |            |
+   parolnet-core  parolnet-call  parolnet-transfer  parolnet-mls  parolnet-store
+                  |        \
+              parolnet-media  parolnet-rtc ── webrtc-rs-rtc (sans-I/O) ── rtc-turn / rtc-stun / rtc-ice
+                                   |
+   relay-server (+ feature sfu → parolnet-sfu)      coturn (until a Rust TURN server)
 ```
 
-## Protocol Specifications
+| Crate | Role | State |
+| --- | --- | --- |
+| `parolnet-crypto` | Ed25519 identity, X3DH, Double Ratchet, AEAD, KDF (pure Rust, wasm) | exists |
+| `parolnet-protocol` | Envelopes, CBOR, message padding (wasm) | exists |
+| `parolnet-transport`, `-relay`, `-mesh` | Relay connections, federation, directory, tokens; onion circuits and mesh (optional) | exists |
+| `parolnet-core` | Client library: bootstrap, sessions, groups, files | exists |
+| `parolnet-wasm` | Browser bindings for the PWA | exists |
+| `parolnet-relay-server` | Axum relay: `/ws` store-and-forward, federation, `/turn-credentials` | exists |
+| `parolnet-rtc` | Async driver for the sans-I/O [`webrtc-rs-rtc`](https://github.com/Brainwires/webrtc-rs-rtc) engine (native) | M0 skeleton |
+| `apps/desktop` | GPUI desktop client | M0 spike |
+| `parolnet-media`, `-call`, `-transfer`, `-store`, `-app`, `-simnet` | Media, calls, PNP-010 transfer, storage, app core, network simulator | M1 |
+| `parolnet-mls`, `-sframe`, `-sfu` | MLS groups and devices, SFrame, the SFU | M2 |
 
-Nine protocol specifications define the design target. Implementation coverage varies; see [IMPLEMENTATION_STATUS.md](IMPLEMENTATION_STATUS.md).
+Media: Opus audio with echo cancellation (AEC3), VP8 video (VP9 / AV1 later), DTLS-SRTP end to end
+for 1:1 and mesh calls, SFrame keyed from MLS for SFU calls.
 
-| Spec | Name | Purpose |
-|------|------|---------|
-| [PNP-001](specs/PNP-001-wire-protocol.md) | Wire Protocol | Envelope format, bucket padding, message types |
-| [PNP-002](specs/PNP-002-handshake-protocol.md) | Handshake Protocol | X3DH key agreement, Double Ratchet initialization |
-| [PNP-003](specs/PNP-003-bootstrap-protocol.md) | Bootstrap Protocol | QR code / passphrase peer introduction, zero breadcrumbs |
-| [PNP-004](specs/PNP-004-relay-circuit.md) | Relay Circuit Protocol | 3-hop onion routing, 512-byte fixed cells |
-| [PNP-005](specs/PNP-005-gossip-mesh.md) | Gossip/Mesh Protocol | Epidemic propagation, store-and-forward, PoW anti-spam |
-| [PNP-006](specs/PNP-006-traffic-shaping.md) | Traffic Shaping Protocol | DPI evasion, TLS fingerprint mimicry, constant-rate padding |
-| [PNP-007](specs/PNP-007-media-file-transfer.md) | Media and File Transfer | Audio, video, call signaling, file chunks |
-| [PNP-008](specs/PNP-008-relay-federation.md) | Relay Federation | Bootstrap resilience, directory sync, bridge design |
-| [PNP-009](specs/PNP-009-group-communication.md) | Group Communication | Sender keys, group calls, group files |
+## Protocol specifications
 
-## Tech Stack
+The specs in [`specs/`](specs/) are the source of truth for wire formats and behaviour.
 
-- **Language**: Rust (2024 edition, memory-safe, no runtime)
-- **Crypto**: x25519-dalek, ed25519-dalek, ChaCha20-Poly1305, HKDF-SHA-256
-- **Transport**: Custom TLS over rustls (no QUIC — maximum fingerprint control)
-- **Serialization**: CBOR (RFC 8949) via ciborium
-- **Async**: tokio
-- **WASM**: wasm-bindgen for browser PWA delivery
-- **Relay**: Axum WebSocket relay server; signaling-only by default (register, SDP/ICE exchange, presence push, directory read, STUN URIs), with an opt-in relay profile adding store-forward, tokens, TURN credentials and federation
-- **Storage**: AES-256-GCM encrypted IndexedDB with PBKDF2 key derivation
-- **License**: MIT OR Apache-2.0
+| Spec | Name | Notes |
+|------|------|-------|
+| [PNP-001](specs/PNP-001-wire-protocol.md) | Wire Protocol | Envelopes, padding of messages |
+| [PNP-002](specs/PNP-002-handshake-protocol.md) | Handshake Protocol | X3DH + Double Ratchet (1:1 until MLS replaces it in M4) |
+| [PNP-003](specs/PNP-003-bootstrap-protocol.md) | Bootstrap Protocol | QR / passphrase pairing |
+| [PNP-004](specs/PNP-004-relay-circuit.md) | Relay Circuit Protocol | Onion circuits: experimental, `hardened` only |
+| [PNP-005](specs/PNP-005-gossip-mesh.md) | Gossip/Mesh Protocol | Store-and-forward, LAN discovery: optional (`mesh`) |
+| [PNP-006](specs/PNP-006-traffic-shaping.md) | Traffic Shaping Protocol | Experimental, `hardened` only |
+| [PNP-007](specs/PNP-007-media-file-transfer.md) | Media and File Transfer | To be superseded by PNP-010 (files) and PNP-011 (calls) in M1 |
+| [PNP-008](specs/PNP-008-relay-federation.md) | Relay Federation | Directory, federation, bridges |
+| [PNP-009](specs/PNP-009-group-communication.md) | Group Communication | Sender keys: replaced by MLS (PNP-012) in M2 |
 
 ## Building
 
 ```bash
-# Check all crates compile
-cargo check --workspace
-
-# Run tests
+cargo check --workspace                 # the library, relay and CLI crates
 cargo test --workspace
-
-# Build WASM bindings
-wasm-pack build crates/parolnet-wasm
-
-# Generate documentation
-cargo doc --workspace --no-deps --open
+wasm-pack build crates/parolnet-wasm    # the PWA's wasm
+cargo deny check licenses sources bans  # the licence gate (no GPL / AGPL)
 ```
 
-## Development
-
-### Full deploy (relay server + PWA)
+The desktop app is its own Cargo workspace (it needs a newer toolchain and system libraries):
 
 ```bash
-./deploy.sh        # Builds WASM, compiles relay, rebuilds Docker image, restarts container
+brew install libvpx                     # macOS; apt install libvpx-dev (+ X11/Wayland headers) on Linux;
+                                        # vcpkg install libvpx:x64-windows-static-md on Windows
+cd apps/desktop && cargo run --release  # see apps/desktop/README.md
 ```
 
-### Live PWA development
-
-For iterating on the PWA without rebuilding the Docker container:
+### Relay server and PWA
 
 ```bash
-# 1. Deploy once to get the container running
-./deploy.sh
-
-# 2. Restart with volume mounts (docker-compose.override.yml binds ./pwa into the container)
-docker compose down && docker compose up -d
-
-# 3. Edit HTML/CSS/JS files — refresh browser to see changes instantly
-
-# 4. If you change Rust/WASM code:
-./build.sh          # Rebuilds WASM only, no Docker rebuild
+npm run build:all        # the wasm and the PWA bundle
+npm run docker:rebuild   # + the relay image, then restarts the container
 ```
 
-The `docker-compose.override.yml` file bind-mounts `./pwa` into the running nginx container. It's gitignored and created automatically — remove it when you want production behavior.
+For PWA work without rebuilding the image, a `docker-compose.override.yml` (gitignored) that
+bind-mounts `./pwa` into the running container lets you edit and reload; `npm run build:wasm`
+rebuilds only the wasm. See [GETTING-STARTED.md](GETTING-STARTED.md) and
+[STARTUP-GUIDE.md](STARTUP-GUIDE.md).
 
-## Security Model
+## Roadmap
 
-### What observers see
-In the full protocol design, ParolNet traffic should resemble HTTPS/2 browsing with padding and cover traffic. In the current PWA/relay implementation, observers can see WebSocket and WebRTC connection behavior to relays and peers.
+| Milestone | Scope |
+| --- | --- |
+| **M0** | GPUI + `webrtc-rs-rtc` spike, licence gate, repositioning (this) |
+| **M1** | Desktop 1:1: pairing, messages, PNP-010 file transfer, voice and video calls with the PWA |
+| **M2** | MLS groups and multi-device, SFrame, the SFU, group calls |
+| **M3** | Screen sharing |
+| **M4** | 1:1 on MLS, fuzzing, external audit, 1.0 |
 
-### What observers cannot determine
-- That the traffic is ParolNet rather than web browsing, once the full transport design is implemented
-- The identity of communicating parties, once 3-hop circuits are used by the application path
-- Message content
-- Which traffic is real vs. cover traffic, once cover traffic is implemented end-to-end
+The milestone notes live in [`docs/`](docs/); the M0 findings are in
+[docs/m0-spike.md](docs/m0-spike.md). The project's earlier strategy and roadmap documents are kept
+in [`docs/archive/`](docs/archive/).
 
-### Threat model
-- Assumes network is fully compromised (DPI, traffic analysis)
-- Assumes any individual relay may be compromised (zero-trust)
-- Design target protects against: censorship, surveillance, metadata collection, device seizure (panic wipe + encrypted storage)
-- Does NOT protect against: global passive adversary with simultaneous control of all relay hops
+## Licence
 
-## Project Status
-
-**Phase**: Active prototype. Crypto/session primitives, wire/protocol types, relay/circuit primitives, gossip/store-forward primitives, authority tooling, relay server endpoints, WASM bindings, and the PWA shell exist. The current PWA message path does not yet use production 3-hop onion routing or full traffic shaping. See [IMPLEMENTATION_STATUS.md](IMPLEMENTATION_STATUS.md).
-
-See [ROADMAP.md](ROADMAP.md) for the full development plan.
-See [STRATEGIES.md](STRATEGIES.md) for the adoption and distribution strategy.
+MIT OR Apache-2.0, at your option. Dependencies must carry a permissive licence; `cargo-deny`
+enforces it in CI.
