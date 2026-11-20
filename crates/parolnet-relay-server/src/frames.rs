@@ -27,6 +27,10 @@ pub struct IncomingMessage {
     /// §10.3 MUST-065) so the relay can echo it back in the `pong` and the
     /// client can match request↔response for RTT.
     pub ts: Option<u64>,
+    /// PeerIds to watch for presence (`watch` frames). Replaces the
+    /// previous set; presence is pushed only between mutual watchers.
+    #[serde(default)]
+    pub peer_ids: Vec<String>,
 }
 
 #[derive(Default, Serialize)]
@@ -46,4 +50,31 @@ pub struct OutgoingMessage {
     /// Echoed client ts on `pong` responses (PNP-001 §10.3 MUST-065).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ts: Option<u64>,
+    /// Machine-readable error code on `error` frames (`signaling_only`,
+    /// `not_registered`, `peer_offline`, `rate_limited`, `payload_too_large`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub code: Option<String>,
+    /// Relay profile on `registered` frames: `signaling-only` or `relay`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub profile: Option<String>,
+    /// Presence state on `presence` frames.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub online: Option<bool>,
+}
+
+impl OutgoingMessage {
+    /// An `error` frame with a machine-readable `code`.
+    pub fn error(code: &str, message: &str) -> Self {
+        Self {
+            msg_type: "error".into(),
+            code: Some(code.into()),
+            message: Some(message.into()),
+            ..Default::default()
+        }
+    }
+
+    /// Serialize to a JSON string (infallible for this shape).
+    pub fn to_json(&self) -> String {
+        serde_json::to_string(self).unwrap_or_default()
+    }
 }
