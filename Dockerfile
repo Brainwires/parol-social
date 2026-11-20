@@ -15,6 +15,9 @@ FROM nginx:alpine
 # beside it; the entrypoint installs it when SIGNALING_ONLY=0.
 COPY server/nginx.conf /etc/nginx/conf.d/default.conf
 COPY server/nginx.relay.conf /etc/nginx/parolnet-relay.conf
+# Abuse log directory and the (possibly empty) fail2ban ban list directory
+# that the nginx configs include; see ops/fail2ban.md.
+RUN mkdir -p /var/log/nginx/parolnet /etc/nginx/banned
 
 # Static files
 COPY server/index.html /usr/share/nginx/html/index.html

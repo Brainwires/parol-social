@@ -29,7 +29,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed — Docker image: no TURN server, signaling-only nginx
 - The image no longer bundles coturn; `server/turnserver.conf` is removed and only port 80 is exposed. `docker-compose.yml` publishes only the web port and sets `SIGNALING_ONLY=1`, `STUN_URIS`, `TRUSTED_PROXY_IPS=127.0.0.1` and `PAROLNET_ANALYTICS=0`.
-- `server/nginx.conf` is the signaling-only profile: no access log, the client address (`CF-Connecting-IP`, else the socket address) forwarded to the relay and used for per-client connection and request limits, relay-profile endpoints closed. `server/nginx.relay.conf` is installed by the entrypoint when `SIGNALING_ONLY=0`.
+- `server/nginx.conf` is the signaling-only profile: the client address (`CF-Connecting-IP`, else the socket address) forwarded to the relay and used for per-client connection and request limits (overflow answered 429), relay-profile endpoints closed. `server/nginx.relay.conf` is installed by the entrypoint when `SIGNALING_ONLY=0`.
+- Both nginx configs write one abuse access log (`/var/log/nginx/parolnet/access.log`: client address, method, path without the query string so PeerIds are never logged, status, size, time, user agent) and refuse clients listed in an nginx `geo` ban map (`/etc/nginx/banned/*.conf`, empty by default). `ops/fail2ban/` ships the filter, ban action, jail and logrotate snippet that feed and fill it on the host; `ops/fail2ban.md` explains why bans live in nginx (behind a Cloudflare tunnel a host firewall ban would block cloudflared). Compose mounts `/var/log/parolnet` and `/etc/parolnet/banned`.
 - `ops/turn.md`, `ops/deploy-secondary.md` and `.env.example` updated: TURN is now an external server that relay-profile operators run themselves.
 
 ### Changed — Specs: signaling-only relay profile

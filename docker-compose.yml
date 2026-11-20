@@ -20,6 +20,11 @@ services:
       - TRUSTED_PROXY_IPS=127.0.0.1
       - PAROLNET_ANALYTICS=0
     volumes:
+      # Abuse access log (no query strings) read by the host's fail2ban jail,
+      # and the ban list its action writes (ops/fail2ban.md). Without
+      # fail2ban, leave /etc/parolnet/banned empty: nothing is banned.
+      - /var/log/parolnet:/var/log/nginx/parolnet
+      - /etc/parolnet/banned:/etc/nginx/banned:ro
       # Persistent relay identity — survives container rebuilds so the
       # Ed25519 pubkey (and therefore the relay's PeerId and authority
       # endorsements) remains stable.
