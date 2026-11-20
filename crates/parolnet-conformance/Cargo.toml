@@ -31,6 +31,7 @@ parolnet-protocol = { workspace = true }
 parolnet-transport = { workspace = true }
 parolnet-mesh = { workspace = true }
 parolnet-relay = { workspace = true }
+parolnet-relay-server = { path = "../parolnet-relay-server" }
 parolnet-core = { workspace = true, features = ["native"] }
 zeroize = { workspace = true }
 proptest = { workspace = true }

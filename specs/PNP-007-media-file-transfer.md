@@ -1,12 +1,16 @@
 # PNP-007: ParolNet Media and File Transfer Protocol
 
 ### Status: CANDIDATE
-### Version: 0.2
-### Date: 2026-04-17
+### Version: 0.3
+### Date: 2026-11-20
 
 ---
 
 ## Changelog
+
+**v0.3 (2026-11-20) — Signaling-only relay profile**
+
+- Added §7.8 "Transport on Signaling-Only Relays": file chunks, file control messages and call signalling never transit a signaling-only relay (PNP-001 §10.5); they ride the direct data channel with backpressure. New clauses **PNP-007-MUST-090**, **PNP-007-SHOULD-013**.
 
 **v0.2 (2026-04-17) — Harmonization pass**
 
@@ -488,6 +492,10 @@ FileChunk = {
 1. Progress MUST be computed as: `progress = chunk_index / ceil(file_size / chunk_size)`. **PNP-007-MUST-066**
 2. Implementations SHOULD provide progress indication to the user. **PNP-007-SHOULD-007**
 3. The sender SHOULD pace chunk transmission to avoid overwhelming the relay circuit. A sending rate of one chunk per padding interval (matching the active bandwidth mode) is RECOMMENDED. **PNP-007-SHOULD-008**
+
+### 7.8 Transport on Signaling-Only Relays
+
+A relay in the signaling-only profile (PNP-001 §10.5) carries no envelopes, so FILE_OFFER, FILE_CONTROL, FILE_CHUNK and CALL_* messages MUST NOT be sent through it; it refuses the `message` frames that would carry them. **PNP-007-MUST-090** Clients SHOULD send them only over the direct peer-to-peer data channel, SHOULD apply send-side backpressure (pause while the channel's buffered amount is above a threshold, resume on the low-water event), and SHOULD fan group files out per member over each member's own channel. **PNP-007-SHOULD-013** Media (§5 – §6) is peer-to-peer; a relay in this profile hands out no TURN credentials and hosts no selective forwarding unit, so a pair with no direct path needs a TURN server one of the users configures.
 
 ## 8. Traffic Shaping for Media (MediaCall Mode)
 
