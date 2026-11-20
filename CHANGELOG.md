@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed — Repositioning (M0): general-purpose E2EE calls, messages, files and data
+- ParolNet is now a general-purpose, decentralized, end-to-end encrypted communication system with Rust crates, a federated relay, GPUI desktop clients and the PWA. README rewritten; CLAUDE.md updated (invariant 3: messages are padded, media and bulk transfer are not; invariant 6 scoped to the E2EE layer; licence and pinning policy).
+- THREAT_MODEL.md 1.0 (outline): in-scope adversaries (network observer, compromised relay / TURN / SFU, malicious group member, stolen linked device, update channel and supply chain), explicit non-goals of the default mode, an exact metadata statement, and the experimental `hardened` mode in an appendix. Version 0.2, ROADMAP.md and STRATEGIES.md moved to `docs/archive/`.
+
+### Added — `parolnet-rtc` (M0 skeleton)
+- Async driver for the sans-I/O `rtc` engine (`Brainwires/webrtc-rs-rtc`, pinned by tag `v0.22.0+brainwires.1`): one tokio task per connection owning its UDP socket and timers, a command channel (offer, answer, remote candidates, data, keyframe requests, stats) and an event channel. Host candidates only for now. A loopback test connects two drivers over ICE + DTLS + SCTP and exchanges data-channel messages.
+
+### Added — Desktop spike (`apps/desktop`, own workspace)
+- A GPUI window (`gpui-pre =0.3.12`, `gpui-component =0.10.0`) shows a VP8 stream received from headless Chromium through `parolnet-rtc`, decoded with libvpx; macOS draws an NV12 IOSurface `CVPixelBuffer` with `gpui::surface()`, other platforms a BGRA `RenderImage`. A headless mode checks decoded video and an Opus tone decoded by opus-rs. `desktop-spike.yml` runs it on five desktop targets with a screenshot (dispatch or the `desktop-spike` PR label). Findings and go / no-go notes in `docs/m0-spike.md`.
+
+### Added — Licence gate
+- `cargo-deny` (`deny.toml`, `apps/desktop/deny.toml`) in CI: permissive licences only, no GPL / LGPL / AGPL, MPL-2.0 only for three named GPUI dependencies; git sources limited to the engine fork. `parolnet-cli` and `parolnet-authority-cli` now declare `MIT OR Apache-2.0`.
+
+### Changed — Codec2 is opt-in; `mesh` is a feature
+- The `codec2` crate is LGPL-2.1, so `parolnet-core` builds Codec2 only with the opt-in `codec2` feature; without it `AudioConfig::low_bandwidth()` encoders and decoders return `CodecInit`. Codec2 tests run under the feature. PNP-011 removes Codec2 in M1.
+- `parolnet-core`'s `parolnet-mesh` dependency is behind a new `mesh` feature (default on; `parolnet-cli` and `parolnet-conformance` enable it).
+
 ### Fixed — PWA QR pairing regression: lookup-null falls through to home relay
 - Reverts the narrow "lookup-null without cache confirmation → persist to `pending_sends`" branch introduced in the prior "durable cross-relay sends" fix. That branch broke QR pairing: first-contact bootstrap envelopes legitimately have no presence-cache entry and often see a null `peer_lookup` result if the provider's presence hasn't propagated yet, so the bootstrap was silently queued instead of sent. The scanner's UI reported "connected" (the scan itself succeeded) while the provider never received the envelope.
 - `sendRawEnvelope` now treats `homeRelay === null` the same as `homeRelay === connMgr.relayUrl` — route through our own home relay, which delivers directly on common-case single-relay deployments and falls back to "peer not connected" if it genuinely can't deliver, letting the caller retry. Cross-relay failure queueing (openOutbound / acquireToken / sendToRelayUrl) remains intact, `flushMessageQueue` still routes through the full `sendRawEnvelope` path, and `MAX_QUEUE_AGE_MS = 24h` is unchanged.
