@@ -3,7 +3,7 @@
 //! The headless ParolNet client core that native clients (the GPUI desktop today, mobile
 //! shells later) build on: commands in, observable state out, no UI types.
 //!
-//! M1 first slice:
+//! M1:
 //! - **Identity**: an Ed25519 key in the data directory (`PeerId = SHA-256(pubkey)`).
 //! - **Pairing**: the PWA's QR / code bootstrap (PNP-003 + PNP-001 §5.3.1). The presenter
 //!   shows [`AppHandle::create_pairing_code`]; the scanner calls
@@ -14,12 +14,17 @@
 //! - **Transport**: one direct WebRTC connection per contact through `parolnet-rtc`, with
 //!   the `parolnet` data channel and the PWA's JSON frames on it. ICE is host + STUN (from
 //!   the relay's `/turn-credentials`); TURN is user-supplied only.
+//! - **Channel binding** (PNP-001 §10.5.1): both DTLS fingerprints are bound into the session
+//!   by a CHANNEL_BINDING envelope on the channel; content and call signals wait for it.
 //! - **Chat**: 1:1 text as PNP-001 TEXT envelopes, interoperable with the PWA; a sender-side
-//!   queue holds envelopes until the contact's data channel opens.
+//!   queue holds envelopes until the contact's data channel opens and verifies.
+//! - **Calls** ([`call`]): 1:1 voice / video on their own connection, signalled inside the
+//!   session; the client encodes and decodes (see [`CallMedia`]).
 //!
 //! The core runs as one tokio task (an actor): [`start`] returns an [`AppHandle`] for
 //! commands and a channel of [`AppEvent`]s.
 
+pub mod call;
 mod engine;
 pub mod ice;
 mod signaling;
@@ -34,7 +39,9 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, oneshot};
 
+pub use call::{CallEnd, CallInfo, CallMedia, CallState, FrameSink, MediaEvent};
 pub use ice::IceServer;
+pub use parolnet_rtc::MediaKind;
 
 /// Errors surfaced to the client.
 #[derive(Debug, thiserror::Error)]
@@ -55,6 +62,12 @@ pub enum AppError {
     Crypto(String),
     #[error("configuration: {0}")]
     Config(String),
+    #[error("no verified direct connection to {0} yet")]
+    NotConnected(String),
+    #[error("already in a call")]
+    Busy,
+    #[error("unknown call {0}")]
+    UnknownCall(String),
     #[error("the app core has stopped")]
     Stopped,
 }
@@ -187,6 +200,8 @@ pub enum AppEvent {
     },
     /// Something the user should know (a failed pairing, an unsupported message).
     Notice(String),
+    /// A call started, changed state or ended.
+    Call(CallInfo),
 }
 
 /// A contact with its live state.
@@ -218,6 +233,11 @@ pub(crate) enum Command {
     Snapshot(oneshot::Sender<Snapshot>),
     RenameContact(String, String, oneshot::Sender<Result<Contact, AppError>>),
     Connect(String),
+    StartCall(String, bool, oneshot::Sender<Result<CallInfo, AppError>>),
+    AcceptCall(String, oneshot::Sender<Result<CallInfo, AppError>>),
+    RejectCall(String),
+    Hangup(String),
+    TakeCallMedia(String, oneshot::Sender<Result<CallMedia, AppError>>),
     Shutdown(oneshot::Sender<()>),
 }
 
@@ -294,6 +314,39 @@ impl AppHandle {
         let _ = self
             .tx
             .send(engine::Input::Command(Command::Connect(peer_id.to_owned())));
+    }
+
+    /// Call a contact over a verified direct connection: audio, plus video when `video`.
+    pub async fn start_call(&self, peer_id: &str, video: bool) -> Result<CallInfo, AppError> {
+        let p = peer_id.to_owned();
+        self.ask(|tx| Command::StartCall(p, video, tx)).await?
+    }
+
+    /// Accept an incoming call (with video when the caller offered it).
+    pub async fn accept_call(&self, call_id: &str) -> Result<CallInfo, AppError> {
+        let c = call_id.to_owned();
+        self.ask(|tx| Command::AcceptCall(c, tx)).await?
+    }
+
+    /// Decline an incoming call.
+    pub fn reject_call(&self, call_id: &str) {
+        let _ = self.tx.send(engine::Input::Command(Command::RejectCall(
+            call_id.to_owned(),
+        )));
+    }
+
+    /// End a call (outgoing, connecting or active).
+    pub fn hangup(&self, call_id: &str) {
+        let _ = self
+            .tx
+            .send(engine::Input::Command(Command::Hangup(call_id.to_owned())));
+    }
+
+    /// The call's media: where to send our encoded frames and the contact's RTP. Once per
+    /// call; take it when the call starts (outgoing) or is accepted.
+    pub async fn take_call_media(&self, call_id: &str) -> Result<CallMedia, AppError> {
+        let c = call_id.to_owned();
+        self.ask(|tx| Command::TakeCallMedia(c, tx)).await?
     }
 
     /// Close every connection, save state and stop the core.

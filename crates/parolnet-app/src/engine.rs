@@ -16,11 +16,16 @@ use parolnet_protocol::codec::CborCodec;
 use parolnet_rtc::rtc::peer_connection::sdp::RTCSessionDescription;
 use parolnet_rtc::rtc::peer_connection::state::RTCPeerConnectionState;
 use parolnet_rtc::rtc::peer_connection::transport::{RTCIceCandidateInit, RTCIceServer};
-use parolnet_rtc::{RtcConfig, RtcEvent, RtcHandle};
+use parolnet_rtc::rtc::rtp_transceiver::rtp_sender::RtpCodecKind;
+use parolnet_rtc::{MediaConfig, MediaKind, RtcConfig, RtcEvent, RtcHandle};
 use rand::Rng as _;
 use tokio::sync::mpsc;
 use zeroize::Zeroize;
 
+use crate::call::{
+    CallEnd, CallInfo, CallMedia, CallSignal, CallState, FrameSink, MediaEvent, OutFrame,
+    new_call_id,
+};
 use crate::signaling::{self, SigEvent, SigHandle, Signer};
 use crate::store::{QueuedEnvelope, State, Store};
 use crate::wire::{
@@ -56,6 +61,13 @@ const PENDING_ICE_MAX: usize = 32;
 /// PNP-001-MUST-081: the peer's channel binding must verify this long after the data channel
 /// opens, or the connection is closed.
 const BINDING_TIMEOUT: Duration = Duration::from_secs(20);
+/// An unanswered call rings this long (as the PWA).
+const CALL_RING_TIMEOUT: Duration = Duration::from_secs(60);
+/// From accepting (or the answer) to media flowing.
+const CALL_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+const CALL_PENDING_ICE_MAX: usize = 64;
+/// Media events waiting for the client (RTP beyond this is dropped).
+const CALL_MEDIA_CAPACITY: usize = 2048;
 
 pub(crate) enum Input {
     Command(Command),
@@ -73,6 +85,14 @@ pub(crate) enum Input {
     },
     Timer(Timer),
     Tick,
+    CallRtcReady {
+        call_id: String,
+        result: Result<RtcHandle, String>,
+    },
+    CallRtc {
+        call_id: String,
+        event: RtcEvent,
+    },
 }
 
 #[derive(Debug)]
@@ -81,6 +101,8 @@ pub(crate) enum Timer {
     ConnectTimeout { peer: String, epoch: u64 },
     DisconnectGrace { peer: String, epoch: u64 },
     BindingTimeout { peer: String, epoch: u64 },
+    CallRing { call_id: String },
+    CallConnect { call_id: String },
     OfferFallback { peer: String },
     OfferSlot { peer: String },
     Retry { peer: String },
@@ -138,6 +160,21 @@ enum FailReason {
     Binding,
 }
 
+/// A call and its own WebRTC connection.
+struct Call {
+    info: CallInfo,
+    handle: Option<RtcHandle>,
+    /// Incoming: the caller's offer until we accept.
+    remote_offer: Option<String>,
+    remote_set: bool,
+    pending_ice: Vec<RTCIceCandidateInit>,
+    /// Our frames, until the connection exists (then a pump task owns it).
+    frames_rx: Option<mpsc::UnboundedReceiver<OutFrame>>,
+    /// The client's media end, until taken.
+    media: Option<CallMedia>,
+    media_tx: mpsc::Sender<MediaEvent>,
+}
+
 struct PeerState {
     /// Presence: `Some(true)` online, `Some(false)` offline, `None` unknown.
     online: Option<bool>,
@@ -191,6 +228,7 @@ struct Engine {
     offer_history: VecDeque<Instant>,
     signaling_backoff_until: Option<Instant>,
     rate_limit_hits: u32,
+    calls: HashMap<String, Call>,
 }
 
 pub(crate) async fn start(
@@ -309,6 +347,7 @@ pub(crate) async fn start(
         offer_history: VecDeque::new(),
         signaling_backoff_until: None,
         rate_limit_hits: 0,
+        calls: HashMap::new(),
     };
     // Messages queued in an earlier run show as queued again.
     let queued: Vec<(String, u64)> = engine
@@ -359,12 +398,18 @@ impl Engine {
                 Input::Rtc { peer, epoch, event } => self.on_rtc_event(&peer, epoch, event),
                 Input::Timer(t) => self.on_timer(t),
                 Input::Tick => self.on_tick(),
+                Input::CallRtcReady { call_id, result } => self.on_call_ready(&call_id, result),
+                Input::CallRtc { call_id, event } => self.on_call_rtc(&call_id, event),
             }
         }
         self.shutdown();
     }
 
     fn shutdown(&mut self) {
+        let calls: Vec<String> = self.calls.keys().cloned().collect();
+        for id in calls {
+            self.hangup_call(&id);
+        }
         let peers: Vec<String> = self.peers.keys().cloned().collect();
         for p in peers {
             self.drop_conn(&p);
@@ -504,6 +549,21 @@ impl Engine {
                 let st = self.peer_mut(&peer);
                 st.attempt = 0;
                 self.connect(&peer, true);
+            }
+            Command::StartCall(peer, video, reply) => {
+                let _ = reply.send(self.start_call(&peer, video));
+            }
+            Command::AcceptCall(id, reply) => {
+                let _ = reply.send(self.accept_call(&id));
+            }
+            Command::RejectCall(id) => self.reject_call(&id),
+            Command::Hangup(id) => self.hangup_call(&id),
+            Command::TakeCallMedia(id, reply) => {
+                let r = match self.calls.get_mut(&id) {
+                    Some(c) => c.media.take().ok_or(AppError::UnknownCall(id)),
+                    None => Err(AppError::UnknownCall(id)),
+                };
+                let _ = reply.send(r);
             }
             Command::Shutdown(_) => unreachable!("handled in run"),
         }
@@ -1336,7 +1396,10 @@ impl Engine {
                 };
                 self.conn_failed(peer, reason);
             }
-            RtcEvent::IceConnectionState(_) | RtcEvent::Track { .. } | RtcEvent::Rtp { .. } => {}
+            RtcEvent::IceConnectionState(_)
+            | RtcEvent::Track { .. }
+            | RtcEvent::Rtp { .. }
+            | RtcEvent::KeyframeRequested => {}
         }
     }
 
@@ -1438,6 +1501,32 @@ impl Engine {
                     )
                 }) {
                     self.conn_failed(&peer, FailReason::Timeout);
+                }
+            }
+            Timer::CallRing { call_id } => {
+                let ringing = self.calls.get(&call_id).is_some_and(|c| {
+                    matches!(c.info.state, CallState::Outgoing | CallState::Incoming)
+                });
+                if ringing {
+                    if self.calls[&call_id].info.incoming {
+                        self.end_call(&call_id, CallEnd::NoAnswer);
+                    } else {
+                        self.signal_call_end(&call_id, false);
+                        self.end_call(&call_id, CallEnd::NoAnswer);
+                    }
+                }
+            }
+            Timer::CallConnect { call_id } => {
+                if self
+                    .calls
+                    .get(&call_id)
+                    .is_some_and(|c| c.info.state == CallState::Connecting)
+                {
+                    self.signal_call_end(&call_id, false);
+                    self.end_call(
+                        &call_id,
+                        CallEnd::Failed("the media connection did not come up".into()),
+                    );
                 }
             }
             Timer::BindingTimeout { peer, epoch } => {
@@ -1599,14 +1688,460 @@ impl Engine {
             }
             msg_type::SYSTEM => {}
             msg_type::CHANNEL_BINDING => self.on_binding(peer, &d.plaintext),
-            msg_type::CALL_SIGNAL => {
-                tracing::info!(peer = %crate::short_id(peer), "call signal (calls are not in this build yet)");
-            }
+            msg_type::CALL_SIGNAL => match CallSignal::parse(&d.plaintext) {
+                Some(sig) => self.on_call_signal(peer, sig),
+                None => tracing::debug!(peer = %crate::short_id(peer), "malformed call signal"),
+            },
             other => {
                 tracing::debug!(msg_type = other, "message type not handled in this slice");
             }
         }
         self.persist_sessions();
+    }
+}
+
+// ── Calls ─────────────────────────────────────────────────────
+
+impl Engine {
+    fn emit_call(&self, call_id: &str) {
+        if let Some(c) = self.calls.get(call_id) {
+            self.emit(AppEvent::Call(c.info.clone()));
+        }
+    }
+
+    fn set_call_state(&mut self, call_id: &str, state: CallState) {
+        if let Some(c) = self.calls.get_mut(call_id)
+            && c.info.state != state
+        {
+            c.info.state = state;
+            self.emit_call(call_id);
+        }
+    }
+
+    fn busy(&self) -> bool {
+        self.calls.values().any(|c| !c.info.is_over())
+    }
+
+    fn new_call(&mut self, call_id: String, peer: &str, video: bool, incoming: bool) {
+        let (frames_tx, frames_rx) = mpsc::unbounded_channel();
+        let (media_tx, media_rx) = mpsc::channel(CALL_MEDIA_CAPACITY);
+        let info = CallInfo {
+            call_id: call_id.clone(),
+            peer_id: peer.to_owned(),
+            video,
+            incoming,
+            state: if incoming {
+                CallState::Incoming
+            } else {
+                CallState::Outgoing
+            },
+        };
+        self.calls.insert(
+            call_id.clone(),
+            Call {
+                info,
+                handle: None,
+                remote_offer: None,
+                remote_set: false,
+                pending_ice: Vec::new(),
+                frames_rx: Some(frames_rx),
+                media: Some(CallMedia {
+                    frames: FrameSink(frames_tx),
+                    events: media_rx,
+                }),
+                media_tx,
+            },
+        );
+        self.after(CALL_RING_TIMEOUT, Timer::CallRing { call_id });
+    }
+
+    /// Send a call signal on the contact's verified data channel (never queued: a ring
+    /// delivered hours later is wrong).
+    fn send_call_signal(&mut self, peer: &str, sig: &CallSignal) -> bool {
+        let Some(pid) = peer_id_of(peer) else {
+            return false;
+        };
+        if !self
+            .peers
+            .get(peer)
+            .and_then(|p| p.conn.as_ref())
+            .is_some_and(Conn::is_verified)
+        {
+            return false;
+        }
+        let envelope = match encrypt_for_peer(
+            self.client.sessions(),
+            &pid,
+            msg_type::CALL_SIGNAL,
+            sig.to_json().as_bytes(),
+            now_secs(),
+            None,
+        ) {
+            Ok(e) => hex::encode(e),
+            Err(e) => {
+                tracing::warn!(%e, "call signal encrypt failed");
+                return false;
+            }
+        };
+        let ok = self.send_on_channel(peer, &envelope);
+        self.persist_sessions();
+        ok
+    }
+
+    fn start_call(&mut self, peer: &str, video: bool) -> Result<CallInfo, AppError> {
+        if !self.is_contact(peer) {
+            return Err(AppError::UnknownContact(peer.to_owned()));
+        }
+        // PNP-001-MUST-081: call signals only on a verified channel.
+        if !self
+            .peers
+            .get(peer)
+            .and_then(|p| p.conn.as_ref())
+            .is_some_and(Conn::is_verified)
+        {
+            self.connect(peer, true);
+            return Err(AppError::NotConnected(peer.to_owned()));
+        }
+        if self.busy() {
+            return Err(AppError::Busy);
+        }
+        let call_id = new_call_id();
+        self.new_call(call_id.clone(), peer, video, false);
+        self.spawn_call_conn(&call_id, true);
+        self.emit_call(&call_id);
+        Ok(self.calls[&call_id].info.clone())
+    }
+
+    fn accept_call(&mut self, call_id: &str) -> Result<CallInfo, AppError> {
+        let Some(c) = self.calls.get(call_id) else {
+            return Err(AppError::UnknownCall(call_id.to_owned()));
+        };
+        if c.info.state != CallState::Incoming {
+            return Err(AppError::UnknownCall(call_id.to_owned()));
+        }
+        self.set_call_state(call_id, CallState::Connecting);
+        self.spawn_call_conn(call_id, false);
+        self.after(
+            CALL_CONNECT_TIMEOUT,
+            Timer::CallConnect {
+                call_id: call_id.to_owned(),
+            },
+        );
+        Ok(self.calls[call_id].info.clone())
+    }
+
+    fn reject_call(&mut self, call_id: &str) {
+        if self
+            .calls
+            .get(call_id)
+            .is_some_and(|c| c.info.state == CallState::Incoming)
+        {
+            self.signal_call_end(call_id, true);
+            self.end_call(call_id, CallEnd::Declined);
+        }
+    }
+
+    fn hangup_call(&mut self, call_id: &str) {
+        let Some(c) = self.calls.get(call_id) else {
+            return;
+        };
+        if c.info.is_over() {
+            return;
+        }
+        if c.info.state == CallState::Incoming {
+            self.reject_call(call_id);
+            return;
+        }
+        self.signal_call_end(call_id, false);
+        self.end_call(call_id, CallEnd::HungUp);
+    }
+
+    /// Tell the contact the call is over (`reject` for an unanswered incoming call).
+    fn signal_call_end(&mut self, call_id: &str, reject: bool) {
+        let Some(peer) = self.calls.get(call_id).map(|c| c.info.peer_id.clone()) else {
+            return;
+        };
+        let sig = if reject {
+            CallSignal::Reject {
+                call_id: call_id.to_owned(),
+            }
+        } else {
+            CallSignal::Hangup {
+                call_id: call_id.to_owned(),
+            }
+        };
+        if !self.send_call_signal(&peer, &sig) {
+            tracing::debug!(call = %call_id, "call end not delivered (no verified channel)");
+        }
+    }
+
+    fn end_call(&mut self, call_id: &str, why: CallEnd) {
+        let Some(mut c) = self.calls.remove(call_id) else {
+            return;
+        };
+        if c.info.is_over() {
+            return;
+        }
+        c.info.state = CallState::Ended(why);
+        tracing::info!(call = %call_id, state = ?c.info.state, "call over");
+        self.emit(AppEvent::Call(c.info.clone()));
+        if let Some(h) = c.handle.take() {
+            tokio::spawn(h.close());
+        }
+    }
+
+    fn spawn_call_conn(&mut self, call_id: &str, initiator: bool) {
+        let Some(c) = self.calls.get_mut(call_id) else {
+            return;
+        };
+        let video = c.info.video;
+        let frames_rx = c.frames_rx.take();
+        let media_tx = c.media_tx.clone();
+        let config = RtcConfig {
+            bind: SocketAddr::new(self.bind_ip, 0),
+            ice_servers: self
+                .cfg
+                .user_ice_servers
+                .iter()
+                .map(|s| RTCIceServer {
+                    urls: s.urls.clone(),
+                    username: s.username.clone(),
+                    credential: s.credential.clone(),
+                })
+                .collect(),
+            stun_servers: self.stun.clone(),
+            media: MediaConfig {
+                recv_opus: true,
+                send_opus: true,
+                recv_vp8: video,
+                send_vp8: video,
+            },
+            ..Default::default()
+        };
+        let input = self.input.clone();
+        let id = call_id.to_owned();
+        tracing::info!(call = %call_id, initiator, video, "starting the call connection");
+        tokio::spawn(async move {
+            let (handle, mut events) = match parolnet_rtc::spawn(config).await {
+                Ok(x) => x,
+                Err(e) => {
+                    let _ = input.send(Input::CallRtcReady {
+                        call_id: id,
+                        result: Err(e.to_string()),
+                    });
+                    return;
+                }
+            };
+            if let Some(rx) = frames_rx {
+                tokio::spawn(crate::call::pump_frames(rx, handle.frame_sender()));
+            }
+            if input
+                .send(Input::CallRtcReady {
+                    call_id: id.clone(),
+                    result: Ok(handle),
+                })
+                .is_err()
+            {
+                return;
+            }
+            let mut kinds: HashMap<String, MediaKind> = HashMap::new();
+            while let Some(event) = events.recv().await {
+                match event {
+                    RtcEvent::Track {
+                        track_id,
+                        kind,
+                        mime_type,
+                    } => {
+                        let kind = match kind {
+                            RtpCodecKind::Video => MediaKind::Video,
+                            _ => MediaKind::Audio,
+                        };
+                        kinds.insert(track_id, kind);
+                        let _ = media_tx.try_send(MediaEvent::Track { kind, mime_type });
+                    }
+                    RtcEvent::Rtp { track_id, packet } => {
+                        if let Some(kind) = kinds.get(&track_id) {
+                            let _ = media_tx.try_send(MediaEvent::Rtp {
+                                kind: *kind,
+                                packet,
+                            });
+                        }
+                    }
+                    RtcEvent::KeyframeRequested => {
+                        let _ = media_tx.try_send(MediaEvent::KeyframeRequested);
+                    }
+                    other => {
+                        if input
+                            .send(Input::CallRtc {
+                                call_id: id.clone(),
+                                event: other,
+                            })
+                            .is_err()
+                        {
+                            return;
+                        }
+                    }
+                }
+            }
+        });
+    }
+
+    fn on_call_ready(&mut self, call_id: &str, result: Result<RtcHandle, String>) {
+        let handle = match result {
+            Ok(h) => h,
+            Err(e) => {
+                self.signal_call_end(call_id, false);
+                self.end_call(call_id, CallEnd::Failed(e));
+                return;
+            }
+        };
+        let Some(c) = self.calls.get_mut(call_id) else {
+            tokio::spawn(handle.close());
+            return;
+        };
+        let ok = if !c.info.incoming {
+            handle.create_offer().is_ok()
+        } else if let Some(offer) = c.remote_offer.take() {
+            match RTCSessionDescription::offer(offer) {
+                Ok(desc) => {
+                    let ok = handle.set_remote_description(desc).is_ok();
+                    c.remote_set = ok;
+                    for cand in c.pending_ice.drain(..) {
+                        let _ = handle.add_remote_candidate(cand);
+                    }
+                    ok
+                }
+                Err(_) => false,
+            }
+        } else {
+            false
+        };
+        c.handle = Some(handle);
+        if !ok {
+            self.signal_call_end(call_id, false);
+            self.end_call(call_id, CallEnd::Failed("bad session description".into()));
+        }
+    }
+
+    fn on_call_rtc(&mut self, call_id: &str, event: RtcEvent) {
+        let Some(c) = self.calls.get(call_id) else {
+            return;
+        };
+        let peer = c.info.peer_id.clone();
+        let video = c.info.video;
+        match event {
+            RtcEvent::LocalDescription(desc) => {
+                let sig = if c.info.incoming {
+                    CallSignal::Answer {
+                        call_id: call_id.to_owned(),
+                        video,
+                        sdp: desc.sdp.clone(),
+                    }
+                } else {
+                    CallSignal::Offer {
+                        call_id: call_id.to_owned(),
+                        video,
+                        sdp: desc.sdp.clone(),
+                    }
+                };
+                if !self.send_call_signal(&peer, &sig) {
+                    self.end_call(
+                        call_id,
+                        CallEnd::Failed("no verified connection to the contact".into()),
+                    );
+                }
+            }
+            RtcEvent::ConnectionState(state) => match state {
+                RTCPeerConnectionState::Connected => {
+                    self.set_call_state(call_id, CallState::Active);
+                }
+                RTCPeerConnectionState::Failed | RTCPeerConnectionState::Closed => {
+                    self.signal_call_end(call_id, false);
+                    self.end_call(
+                        call_id,
+                        CallEnd::Failed(format!("media connection {state}")),
+                    );
+                }
+                _ => {}
+            },
+            RtcEvent::Closed { error } => {
+                self.end_call(
+                    call_id,
+                    CallEnd::Failed(error.unwrap_or_else(|| "media connection closed".into())),
+                );
+            }
+            _ => {}
+        }
+    }
+
+    fn on_call_signal(&mut self, peer: &str, sig: CallSignal) {
+        let call_id = sig.call_id().to_owned();
+        if let Some(c) = self.calls.get(&call_id)
+            && c.info.peer_id != peer
+        {
+            tracing::warn!(peer = %crate::short_id(peer), "call signal for someone else's call");
+            return;
+        }
+        match sig {
+            CallSignal::Offer { video, sdp, .. } => {
+                if self.calls.contains_key(&call_id) {
+                    return; // a duplicate
+                }
+                if self.busy() {
+                    let _ = self.send_call_signal(peer, &CallSignal::Reject { call_id });
+                    return;
+                }
+                self.new_call(call_id.clone(), peer, video, true);
+                if let Some(c) = self.calls.get_mut(&call_id) {
+                    c.remote_offer = Some(sdp);
+                }
+                self.emit_call(&call_id);
+            }
+            CallSignal::Answer { sdp, .. } => {
+                let Some(c) = self.calls.get_mut(&call_id) else {
+                    return;
+                };
+                if c.info.incoming || c.remote_set {
+                    return;
+                }
+                let applied = match (c.handle.as_ref(), RTCSessionDescription::answer(sdp)) {
+                    (Some(h), Ok(desc)) => h.set_remote_description(desc).is_ok(),
+                    _ => false,
+                };
+                if !applied {
+                    self.signal_call_end(&call_id, false);
+                    self.end_call(&call_id, CallEnd::Failed("bad answer".into()));
+                    return;
+                }
+                c.remote_set = true;
+                if let Some(h) = c.handle.as_ref() {
+                    for cand in c.pending_ice.drain(..) {
+                        let _ = h.add_remote_candidate(cand);
+                    }
+                }
+                self.set_call_state(&call_id, CallState::Connecting);
+                self.after(CALL_CONNECT_TIMEOUT, Timer::CallConnect { call_id });
+            }
+            CallSignal::Ice { candidate, .. } => {
+                let Some(c) = self.calls.get_mut(&call_id) else {
+                    return;
+                };
+                if candidate.candidate.is_empty() {
+                    return;
+                }
+                match (c.remote_set, c.handle.as_ref()) {
+                    (true, Some(h)) => {
+                        let _ = h.add_remote_candidate(candidate);
+                    }
+                    _ if c.pending_ice.len() < CALL_PENDING_ICE_MAX => {
+                        c.pending_ice.push(candidate)
+                    }
+                    _ => {}
+                }
+            }
+            CallSignal::Hangup { .. } => self.end_call(&call_id, CallEnd::RemoteHungUp),
+            CallSignal::Reject { .. } => self.end_call(&call_id, CallEnd::Rejected),
+        }
     }
 }
 

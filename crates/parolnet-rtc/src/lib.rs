@@ -9,7 +9,8 @@
 //! Status (M1): it gathers the host candidate of the socket it binds and, when STUN servers
 //! are given, one server-reflexive candidate per server (a binding request on the same socket
 //! before the loop starts); it answers or makes a non-trickle offer, delivers RTP packets and
-//! data-channel messages (binary and text), requests keyframes and reports stats. Remote mDNS
+//! data-channel messages (binary and text), sends VP8 and Opus tracks (encoded frames in,
+//! packetized here), requests keyframes and reports stats. Remote mDNS
 //! host candidates (`<uuid>.local`, what Chromium and Safari announce instead of a private
 //! address) are resolved with an mDNS query: the engine asks, and this driver opens the
 //! multicast socket (`224.0.0.251:5353`) the first time a remote description or candidate
@@ -26,7 +27,7 @@ use bytes::BytesMut;
 use rtc::ice::mdns::MulticastDnsMode;
 use rtc::interceptor::Registry;
 use rtc::mdns::{MDNS_PORT, MulticastSocket};
-use rtc::media_stream::MediaStreamTrackId;
+use rtc::media_stream::{MediaStreamTrack, MediaStreamTrackId};
 use rtc::peer_connection::configuration::RTCConfigurationBuilder;
 use rtc::peer_connection::configuration::interceptor_registry::register_default_interceptors;
 use rtc::peer_connection::configuration::media_engine::{
@@ -42,11 +43,16 @@ use rtc::peer_connection::transport::{
     RTCIceCandidate, RTCIceCandidateInit, RTCIceServer,
 };
 use rtc::peer_connection::{RTCPeerConnection, RTCPeerConnectionBuilder};
+use rtc::rtcp::payload_feedbacks::full_intra_request::FullIntraRequest;
 use rtc::rtcp::payload_feedbacks::picture_loss_indication::PictureLossIndication;
+use rtc::rtp::packetizer::Packetizer;
 use rtc::rtp_transceiver::rtp_sender::{
-    RTCPFeedback, RTCRtpCodec, RTCRtpCodecParameters, RtpCodecKind,
+    RTCPFeedback, RTCRtpCodec, RTCRtpCodecParameters, RTCRtpCodingParameters,
+    RTCRtpEncodingParameters, RtpCodecKind,
 };
-use rtc::rtp_transceiver::{RTCRtpReceiverId, RTCRtpTransceiverDirection, RTCRtpTransceiverInit};
+use rtc::rtp_transceiver::{
+    RTCRtpReceiverId, RTCRtpSenderId, RTCRtpTransceiverDirection, RTCRtpTransceiverInit,
+};
 use rtc::sansio::Protocol;
 use rtc::shared::{TaggedBytesMut, TransportContext, TransportProtocol};
 use rtc::statistics::StatsSelector;
@@ -70,14 +76,37 @@ pub enum RtcError {
     Stopped,
 }
 
-/// Media this connection is willing to receive.
+/// Media this connection sends and receives.
 #[derive(Debug, Clone, Default)]
 pub struct MediaConfig {
-    /// Add a receive-only VP8 video transceiver.
+    /// Receive VP8 video (a receive-only transceiver unless `send_vp8` is set too).
     pub recv_vp8: bool,
-    /// Add a receive-only Opus audio transceiver.
+    /// Receive Opus audio (a receive-only transceiver unless `send_opus` is set too).
     pub recv_opus: bool,
+    /// Send a VP8 video track: encoded frames through [`RtcHandle::send_frame`].
+    pub send_vp8: bool,
+    /// Send an Opus audio track: encoded packets through [`RtcHandle::send_frame`].
+    pub send_opus: bool,
 }
+
+/// The kind of a local track.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum MediaKind {
+    Audio,
+    Video,
+}
+
+impl MediaKind {
+    fn codec_kind(self) -> RtpCodecKind {
+        match self {
+            MediaKind::Audio => RtpCodecKind::Audio,
+            MediaKind::Video => RtpCodecKind::Video,
+        }
+    }
+}
+
+/// Payload size of an outgoing RTP packet (headers and SRTP stay under a 1280-byte path MTU).
+const RTP_OUTBOUND_MTU: usize = 1200;
 
 /// One connection's configuration.
 #[derive(Debug, Clone)]
@@ -150,6 +179,8 @@ pub enum RtcEvent {
     DataChannelOpen { id: usize, label: String },
     /// A data-channel message.
     DataChannelMessage { id: usize, payload: BytesMut },
+    /// The peer asked for a keyframe of our video track (RTCP PLI or FIR).
+    KeyframeRequested,
     /// The task stopped; `error` is set when it stopped on an error.
     Closed { error: Option<String> },
 }
@@ -158,11 +189,57 @@ enum Command {
     CreateOffer,
     SetRemoteDescription(Box<RTCSessionDescription>),
     AddRemoteCandidate(RTCIceCandidateInit),
-    SendData { id: usize, data: BytesMut },
-    SendText { id: usize, text: String },
-    RequestKeyframe { track_id: MediaStreamTrackId },
+    SendData {
+        id: usize,
+        data: BytesMut,
+    },
+    SendText {
+        id: usize,
+        text: String,
+    },
+    RequestKeyframe {
+        track_id: MediaStreamTrackId,
+    },
+    RequestKeyframes,
+    SendFrame {
+        kind: MediaKind,
+        data: bytes::Bytes,
+        samples: u32,
+    },
     Stats(oneshot::Sender<(RTCStatsReport, u64)>),
     Close,
+}
+
+/// A cloneable handle that only sends media frames (for capture / encode threads).
+#[derive(Clone)]
+pub struct FrameSender {
+    commands: mpsc::UnboundedSender<Command>,
+}
+
+impl FrameSender {
+    /// See [`RtcHandle::send_frame`].
+    pub fn send_frame(
+        &self,
+        kind: MediaKind,
+        data: impl Into<bytes::Bytes>,
+        samples: u32,
+    ) -> Result<(), RtcError> {
+        self.commands
+            .send(Command::SendFrame {
+                kind,
+                data: data.into(),
+                samples,
+            })
+            .map_err(|_| RtcError::Stopped)
+    }
+
+    /// Ask the sender of every remote video track for a keyframe (RTCP PLI), e.g. when the
+    /// decoder lost its reference.
+    pub fn request_keyframes(&self) -> Result<(), RtcError> {
+        self.commands
+            .send(Command::RequestKeyframes)
+            .map_err(|_| RtcError::Stopped)
+    }
 }
 
 /// The application's end of a connection.
@@ -215,6 +292,30 @@ impl RtcHandle {
         })
     }
 
+    /// Send one encoded frame on the local track of `kind`: a VP8 frame (`samples` in the
+    /// 90 kHz clock, 3000 for 30 fps) or an Opus packet (`samples` at 48 kHz, 960 for 20 ms).
+    /// It is packetized and sent once the track is negotiated and the connection is up;
+    /// before that it is dropped.
+    pub fn send_frame(
+        &self,
+        kind: MediaKind,
+        data: impl Into<bytes::Bytes>,
+        samples: u32,
+    ) -> Result<(), RtcError> {
+        self.send(Command::SendFrame {
+            kind,
+            data: data.into(),
+            samples,
+        })
+    }
+
+    /// A sender of media frames that can move to another task or thread.
+    pub fn frame_sender(&self) -> FrameSender {
+        FrameSender {
+            commands: self.commands.clone(),
+        }
+    }
+
     /// Ask the sender of a video track for a keyframe (RTCP PLI).
     pub fn request_keyframe(&self, track_id: MediaStreamTrackId) -> Result<(), RtcError> {
         self.send(Command::RequestKeyframe { track_id })
@@ -243,7 +344,7 @@ pub async fn spawn(config: RtcConfig) -> Result<(RtcHandle, mpsc::Receiver<RtcEv
     let socket = UdpSocket::bind(config.bind).await?;
     let local_addr = socket.local_addr()?;
     let srflx = gather_srflx(&socket, &config.stun_servers, config.stun_timeout).await;
-    let pc = build_peer_connection(&config)?;
+    let (pc, senders) = build_peer_connection(&config)?;
 
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
     let (ev_tx, ev_rx) = mpsc::channel(config.event_capacity.max(16));
@@ -256,6 +357,11 @@ pub async fn spawn(config: RtcConfig) -> Result<(RtcHandle, mpsc::Receiver<RtcEv
         data_channel: config.data_channel,
         tracks: HashMap::new(),
         dropped_rtp: 0,
+        senders: senders
+            .into_iter()
+            .map(|(kind, id)| (kind, (id, None)))
+            .collect(),
+        connected: false,
         mdns_enabled: config.mdns,
         mdns: None,
         mdns_answers: 0,
@@ -286,30 +392,72 @@ fn video_feedback() -> Vec<RTCPFeedback> {
     .collect()
 }
 
-fn build_peer_connection(config: &RtcConfig) -> Result<RTCPeerConnection, RtcError> {
+type Senders = Vec<(MediaKind, RTCRtpSenderId)>;
+
+fn local_track(kind: MediaKind, codec: &RTCRtpCodec) -> MediaStreamTrack {
+    let name = match kind {
+        MediaKind::Audio => "audio",
+        MediaKind::Video => "video",
+    };
+    MediaStreamTrack::new(
+        "parolnet".to_owned(),
+        format!("parolnet-{name}"),
+        format!("parolnet-{name}"),
+        kind.codec_kind(),
+        vec![RTCRtpEncodingParameters {
+            rtp_coding_parameters: RTCRtpCodingParameters {
+                ssrc: Some(rand_ssrc()),
+                ..Default::default()
+            },
+            codec: codec.clone(),
+            ..Default::default()
+        }],
+    )
+}
+
+/// A random SSRC (RFC 3550 §8.1) without pulling in a RNG crate: the std hasher is seeded
+/// randomly per process, mixed with the time and a counter.
+fn rand_ssrc() -> u32 {
+    use std::hash::{BuildHasher, Hasher};
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let mut h = std::collections::hash_map::RandomState::new().build_hasher();
+    h.write_u64(COUNTER.fetch_add(1, Ordering::Relaxed));
+    h.write_u128(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos(),
+    );
+    (h.finish() as u32).max(1)
+}
+
+fn build_peer_connection(config: &RtcConfig) -> Result<(RTCPeerConnection, Senders), RtcError> {
+    let vp8 = RTCRtpCodec {
+        mime_type: MIME_TYPE_VP8.to_owned(),
+        clock_rate: 90_000,
+        channels: 0,
+        sdp_fmtp_line: String::new(),
+        rtcp_feedback: video_feedback(),
+    };
+    let opus = RTCRtpCodec {
+        mime_type: MIME_TYPE_OPUS.to_owned(),
+        clock_rate: 48_000,
+        channels: 2,
+        sdp_fmtp_line: "minptime=10;useinbandfec=1".to_owned(),
+        rtcp_feedback: vec![],
+    };
     let mut media_engine = MediaEngine::default();
     media_engine.register_codec(
         RTCRtpCodecParameters {
-            rtp_codec: RTCRtpCodec {
-                mime_type: MIME_TYPE_VP8.to_owned(),
-                clock_rate: 90_000,
-                channels: 0,
-                sdp_fmtp_line: String::new(),
-                rtcp_feedback: video_feedback(),
-            },
+            rtp_codec: vp8.clone(),
             payload_type: 96,
         },
         RtpCodecKind::Video,
     )?;
     media_engine.register_codec(
         RTCRtpCodecParameters {
-            rtp_codec: RTCRtpCodec {
-                mime_type: MIME_TYPE_OPUS.to_owned(),
-                clock_rate: 48_000,
-                channels: 2,
-                sdp_fmtp_line: "minptime=10;useinbandfec=1".to_owned(),
-                rtcp_feedback: vec![],
-            },
+            rtp_codec: opus.clone(),
             payload_type: 111,
         },
         RtpCodecKind::Audio,
@@ -341,13 +489,21 @@ fn build_peer_connection(config: &RtcConfig) -> Result<RTCPeerConnection, RtcErr
             ..Default::default()
         })
     };
-    if config.media.recv_opus {
+    // Audio before video, as browsers order getUserMedia's tracks.
+    let mut senders = Vec::new();
+    if config.media.send_opus {
+        let id = pc.add_track(local_track(MediaKind::Audio, &opus))?;
+        senders.push((MediaKind::Audio, id));
+    } else if config.media.recv_opus {
         pc.add_transceiver_from_kind(RtpCodecKind::Audio, recvonly())?;
     }
-    if config.media.recv_vp8 {
+    if config.media.send_vp8 {
+        let id = pc.add_track(local_track(MediaKind::Video, &vp8))?;
+        senders.push((MediaKind::Video, id));
+    } else if config.media.recv_vp8 {
         pc.add_transceiver_from_kind(RtpCodecKind::Video, recvonly())?;
     }
-    Ok(pc)
+    Ok((pc, senders))
 }
 
 struct Driver {
@@ -361,6 +517,10 @@ struct Driver {
     /// track id → (receiver, whether its first packet was reported)
     tracks: HashMap<MediaStreamTrackId, (RTCRtpReceiverId, bool)>,
     dropped_rtp: u64,
+    /// Local tracks: the sender and, once negotiated, its packetizer.
+    senders: HashMap<MediaKind, (RTCRtpSenderId, Option<Box<dyn Packetizer>>)>,
+    /// The peer connection reached `connected` (SRTP keys exist).
+    connected: bool,
     /// Whether remote `.local` candidates are resolved.
     mdns_enabled: bool,
     /// The multicast socket for mDNS queries, opened on the first remote `.local` candidate.
@@ -489,6 +649,7 @@ impl Driver {
         while let Some(event) = self.pc.poll_event() {
             match event {
                 RTCPeerConnectionEvent::OnConnectionStateChangeEvent(state) => {
+                    self.connected = state == RTCPeerConnectionState::Connected;
                     self.emit(RtcEvent::ConnectionState(state)).await;
                     if matches!(
                         state,
@@ -528,6 +689,15 @@ impl Driver {
                     let event = RtcEvent::Rtp { track_id, packet };
                     if self.events.try_send(event).is_err() {
                         self.dropped_rtp += 1;
+                    }
+                }
+                RTCMessage::RtcpPacket(_track_id, packets) => {
+                    let wants_keyframe = packets.iter().any(|p| {
+                        p.as_any().is::<PictureLossIndication>()
+                            || p.as_any().is::<FullIntraRequest>()
+                    });
+                    if wants_keyframe && self.senders.contains_key(&MediaKind::Video) {
+                        self.emit(RtcEvent::KeyframeRequested).await;
                     }
                 }
                 RTCMessage::DataChannelMessage(id, message) => {
@@ -626,11 +796,88 @@ impl Driver {
                     )?;
                 }
             }
+            Command::RequestKeyframes => {
+                let tracks: Vec<MediaStreamTrackId> = self.tracks.keys().cloned().collect();
+                for track_id in tracks {
+                    if let Some((receiver_id, _)) = self.tracks.get(&track_id).copied()
+                        && let Some(mut receiver) = self.pc.rtp_receiver(receiver_id)
+                        && receiver.track().kind() == RtpCodecKind::Video
+                        && let Some(media_ssrc) = { receiver.track().ssrcs().next() }
+                    {
+                        receiver.write_rtcp(
+                            now,
+                            vec![Box::new(PictureLossIndication {
+                                sender_ssrc: 0,
+                                media_ssrc,
+                            })],
+                        )?;
+                    }
+                }
+            }
+            Command::SendFrame {
+                kind,
+                data,
+                samples,
+            } => {
+                if self.connected
+                    && let Err(err) = self.send_frame(now, kind, &data, samples)
+                {
+                    tracing::debug!(?kind, %err, "frame not sent");
+                }
+            }
             Command::Stats(reply) => {
                 let report = self.pc.get_stats(now, StatsSelector::None);
                 let _ = reply.send((report, self.dropped_rtp));
             }
             Command::Close => {}
+        }
+        Ok(())
+    }
+
+    /// Packetize one encoded frame and hand the packets to the engine (SRTP, interceptors).
+    fn send_frame(
+        &mut self,
+        now: Instant,
+        kind: MediaKind,
+        data: &bytes::Bytes,
+        samples: u32,
+    ) -> Result<(), RtcError> {
+        let Some((sender_id, packetizer)) = self.senders.get_mut(&kind) else {
+            return Ok(());
+        };
+        let Some(mut sender) = self.pc.rtp_sender(*sender_id) else {
+            return Ok(());
+        };
+        if packetizer.is_none() {
+            // Negotiated once the remote description is applied: the payload type is the
+            // answer's (or the offer's, when we answer).
+            let Some(ssrc) = sender.track().ssrcs().last() else {
+                return Ok(());
+            };
+            let Some(codec) = sender
+                .get_parameters()
+                .rtp_parameters
+                .codecs
+                .first()
+                .cloned()
+            else {
+                return Ok(());
+            };
+            *packetizer = Some(Box::new(rtc::rtp::packetizer::new_packetizer(
+                now,
+                RTP_OUTBOUND_MTU,
+                codec.payload_type,
+                ssrc,
+                codec.rtp_codec.payloader()?,
+                Box::new(rtc::rtp::sequence::new_random_sequencer()),
+                codec.rtp_codec.clock_rate,
+            )));
+        }
+        let Some(packetizer) = packetizer.as_mut() else {
+            return Ok(());
+        };
+        for packet in packetizer.packetize(now, data, samples)? {
+            sender.write_rtp(now, packet)?;
         }
         Ok(())
     }

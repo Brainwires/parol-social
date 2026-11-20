@@ -1846,9 +1846,9 @@ dependencies = [
 
 [[package]]
 name = "opus-rs"
-version = "0.1.22"
+version = "0.1.42"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "28911d75055df30f4e6203424619fd81d6435c5d63a9d9942968848db545f3b9"
+checksum = "bafbcaf2ed381cdf68ced4ed8d16517de90ffd7424e36f0b9e45d67fbe30b1f9"
 
 [[package]]
 name = "parking_lot"
@@ -1880,6 +1880,7 @@ dependencies = [
  "ed25519-dalek",
  "futures-util",
  "hex",
+ "opus-rs",
  "parolnet-core",
  "parolnet-crypto",
  "parolnet-protocol",

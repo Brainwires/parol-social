@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added — 1:1 voice and video calls (M1, second slice)
+- `parolnet-app`: calls on their own WebRTC connection, set up by `CALL_SIGNAL` envelopes (`offer` / `answer` / `ice` / `hangup` / `reject`, the PWA's JSON) on the verified data channel, so the call's DTLS fingerprints are end-to-end authenticated. `start_call` / `accept_call` / `reject_call` / `hangup` / `take_call_media`; `AppEvent::Call` with ringing, connecting, active and ended states (hung up, declined, busy, no answer after 60 s, failed). The client feeds encoded VP8 / Opus frames to a `FrameSink` and receives RTP as `MediaEvent`s.
+- `parolnet-rtc`: send tracks (`MediaConfig::send_vp8` / `send_opus`, `RtcHandle::send_frame`, a cloneable `FrameSender`): frames are packetized with the negotiated payload type and SSRC; `RtcEvent::KeyframeRequested` on a PLI / FIR; `request_keyframes`.
+- Desktop: Call and Video call buttons, an incoming-call banner (Accept / Decline), the call panel with the remote video tile (the M0 decode and render path), Mute and Hang up. Video sends a synthetic test pattern (colour bars, moving box, frame counter) through a libvpx VP8 encoder (a C shim compiled against the system headers); audio is the default microphone through opus-rs, playback through cpal (camera capture and echo cancellation are still to come). `parolnet-desktop --call-check` runs the same call media headless.
+- Interop: the desktop video-calls the PWA in Chromium (fake devices) and both decode each other's VP8 and Opus; `apps/desktop/interop/desktop-call.mjs` checks the desktop's call media against the bot.
+
+### Security — Direct data-channel binding (PNP-001 v0.12 §10.5.1), safety numbers (PNP-002 v0.4 §10)
+- A hostile signaling relay could swap the plaintext SDP's DTLS fingerprints and sit on the "direct" connection. Each side now sends a CHANNEL_BINDING envelope (new message type 0x14) inside the ratchet session, on the channel, naming its own DTLS fingerprints and the ones it received; the receiver compares them with its own view and closes the connection on a mismatch or when no binding arrives within 20 s. Until then the path is not shown as direct and only the QR bootstrap envelope may cross; queued content and call signals wait. Desktop and PWA (through `parolnet-wasm`) run the same `parolnet-protocol` code. New clauses MUST-079..081, SHOULD-018; conformance tests in `pnp_001_channel_binding.rs`.
+- Safety numbers are specified (60 digits from both PeerIds, the PWA's existing derivation) with a test vector; the desktop shows them under Verify.
+
+### Added — Desktop ↔ PWA interop test (`apps/desktop/interop/pwa-interop.mjs`, CI job `pwa-interop`)
+- The bot against the real PWA in headless Chromium through the relay binary: PWA code → desktop, desktop code → the PWA's Paste Code tab, the sender queue across a PWA restart, a refused tampered binding, and a video call, in two ICE modes (Chromium's mDNS host candidates, and loopback).
+- `parolnet-rtc` resolves remote mDNS (`*.local`) host candidates: the driver opens the `224.0.0.251:5353` socket on the first `.local` candidate and routes the engine's queries and answers.
+- PWA: Paste Code with a full pairing code pairs like a camera scan (session, bootstrap envelope, connect).
+
 ### Added — `parolnet-app`, the headless client core (M1, first slice)
 - Identity load / create in a data directory; contacts; PWA-compatible pairing: the presenter's code is the PWA's QR payload (hex), the scanner establishes the Double Ratchet session and sends the bootstrap envelope (PNP-001 §5.3.1, `source_hint` = its identity key) as the first frame on the data channel; the presenter accepts offers from strangers only while its code is valid (30 minutes).
 - Signaling-only relay client: challenge-response `register`, keepalive, reconnect with backoff, `watch` / `presence`, non-trickle `rtc_offer` / `rtc_answer` (browser `RTCSessionDescription` JSON), `rtc_ice`; `peer_offline` and `rate_limited` handling; the PWA's deterministic initiator, offer stagger, glare rule and retry backoff.
@@ -19,7 +34,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added — Desktop chat UI v0 (`apps/desktop`)
 - Contact list with direct-path badges, pairing screen (QR code and text of our code, code entry), chat view with delivery state, rename, retry and the "No direct path to <name>. Either side can add a TURN server in Settings." state; `--relay` and `--data-dir` flags. The M0 video spike stays behind `--spike` (and its existing flags).
-- `apps/desktop/interop/pwa-chat.mjs`: the desktop ↔ PWA interop test plan (stub, not implemented yet).
 
 ### Changed — Relay defaults to the signaling-only profile (PNP-001 v0.11 §10.5)
 - `parolnet-relay-server` now runs the **signaling-only** profile unless `SIGNALING_ONLY=0`: it accepts only `register`, `ping`, `rtc_offer` / `rtc_answer` / `rtc_ice` between two online registered peers, and `watch`; it keeps no store-and-forward mailbox, mints no Privacy Pass tokens, starts no mesh supernode, refuses `message` / `gossip` frames (`error` code `signaling_only`) and closes the socket on binary frames. `/tokens/issue`, `/telemetry`, `/endorse`, `/directory/push`, `/federation/v1` and `/stats` are not served; `/turn-credentials` returns only the STUN URIs from `STUN_URIS`; `/bootstrap` returns an empty list. No user content transits or is stored on such a relay. The previous behaviour is the **relay profile**, an explicit operator opt-in.

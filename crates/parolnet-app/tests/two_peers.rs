@@ -311,3 +311,143 @@ async fn offers_from_strangers_are_ignored() {
 async fn bob_code_of(app: &AppHandle) -> String {
     app.create_pairing_code().await.unwrap()
 }
+
+/// Pair two fresh apps and wait for the verified direct path on both sides.
+async fn paired_pair(
+    relay: &Relay,
+    dir: &Path,
+) -> (
+    (AppHandle, UnboundedReceiver<AppEvent>),
+    (AppHandle, UnboundedReceiver<AppEvent>),
+) {
+    let (alice, mut alice_rx) = start(config(dir, relay, "alice")).await;
+    let (bob, mut bob_rx) = start(config(dir, relay, "bob")).await;
+    registered(&mut alice_rx).await;
+    registered(&mut bob_rx).await;
+    let code = alice.create_pairing_code().await.unwrap();
+    bob.pair_with_code(&code).await.unwrap();
+    for rx in [&mut alice_rx, &mut bob_rx] {
+        wait_for(rx, "verified direct path", 30, |e| {
+            matches!(
+                e,
+                AppEvent::Path {
+                    state: PathState::Direct,
+                    ..
+                }
+            )
+        })
+        .await;
+    }
+    ((alice, alice_rx), (bob, bob_rx))
+}
+
+async fn call_state(
+    rx: &mut UnboundedReceiver<AppEvent>,
+    what: &str,
+    mut pred: impl FnMut(&parolnet_app::CallInfo) -> bool,
+) -> parolnet_app::CallInfo {
+    let ev = wait_for(rx, what, 30, |e| matches!(e, AppEvent::Call(c) if pred(c))).await;
+    let AppEvent::Call(c) = ev else {
+        unreachable!()
+    };
+    c
+}
+
+/// Feed opaque frames into a call and count the contact's RTP per kind until both kinds
+/// reach `want`.
+async fn exchange_media(media: parolnet_app::CallMedia, want: usize) -> (usize, usize) {
+    use parolnet_app::{MediaEvent, MediaKind};
+    let parolnet_app::CallMedia { frames, mut events } = media;
+    let feeder = tokio::spawn(async move {
+        let mut tick = tokio::time::interval(Duration::from_millis(20));
+        loop {
+            tick.tick().await;
+            if !frames.send(MediaKind::Audio, vec![0xf8; 60], 960)
+                || !frames.send(MediaKind::Video, vec![0x10; 3000], 1800)
+            {
+                break;
+            }
+        }
+    });
+    let (mut audio, mut video) = (0, 0);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    while audio < want || video < want {
+        match tokio::time::timeout_at(deadline, events.recv()).await {
+            Ok(Some(MediaEvent::Rtp { kind, .. })) => match kind {
+                MediaKind::Audio => audio += 1,
+                MediaKind::Video => video += 1,
+            },
+            Ok(Some(_)) => {}
+            Ok(None) => break,
+            Err(_) => break,
+        }
+    }
+    feeder.abort();
+    (audio, video)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn video_call_both_ways_then_hang_up() {
+    let relay = start_relay().await;
+    let dir = unique_dir("call");
+    let ((alice, mut alice_rx), (bob, mut bob_rx)) = paired_pair(&relay, &dir).await;
+
+    let call = alice.start_call(bob.peer_id(), true).await.unwrap();
+    assert_eq!(call.state, parolnet_app::CallState::Outgoing);
+    assert!(matches!(
+        alice.start_call(bob.peer_id(), false).await,
+        Err(parolnet_app::AppError::Busy)
+    ));
+    let alice_media = alice.take_call_media(&call.call_id).await.unwrap();
+
+    let ring = call_state(&mut bob_rx, "incoming call", |c| {
+        c.state == parolnet_app::CallState::Incoming
+    })
+    .await;
+    assert_eq!(ring.call_id, call.call_id);
+    assert_eq!(ring.peer_id, alice.peer_id());
+    assert!(ring.video && ring.incoming);
+    bob.accept_call(&ring.call_id).await.unwrap();
+    let bob_media = bob.take_call_media(&ring.call_id).await.unwrap();
+
+    for rx in [&mut alice_rx, &mut bob_rx] {
+        call_state(rx, "active call", |c| {
+            c.state == parolnet_app::CallState::Active
+        })
+        .await;
+    }
+    let (a, b) = tokio::join!(
+        exchange_media(alice_media, 25),
+        exchange_media(bob_media, 25)
+    );
+    assert!(a.0 >= 25 && a.1 >= 25, "alice received audio/video {a:?}");
+    assert!(b.0 >= 25 && b.1 >= 25, "bob received audio/video {b:?}");
+
+    alice.hangup(&call.call_id);
+    let end = call_state(&mut bob_rx, "remote hang-up", |c| c.is_over()).await;
+    assert_eq!(
+        end.state,
+        parolnet_app::CallState::Ended(parolnet_app::CallEnd::RemoteHungUp)
+    );
+
+    // A declined call.
+    let call2 = bob.start_call(alice.peer_id(), false).await.unwrap();
+    let ring2 = call_state(&mut alice_rx, "second ring", |c| {
+        c.call_id == call2.call_id && c.state == parolnet_app::CallState::Incoming
+    })
+    .await;
+    assert!(!ring2.video);
+    alice.reject_call(&ring2.call_id);
+    let end2 = call_state(&mut bob_rx, "declined", |c| {
+        c.call_id == call2.call_id && c.is_over()
+    })
+    .await;
+    assert_eq!(
+        end2.state,
+        parolnet_app::CallState::Ended(parolnet_app::CallEnd::Rejected)
+    );
+
+    alice.shutdown().await;
+    bob.shutdown().await;
+    let _ = std::fs::remove_dir_all(&dir);
+}

@@ -1,6 +1,6 @@
-// Desktop <-> PWA chat interop test.
+// Desktop <-> PWA interop test: pairing, chat, the sender queue, the channel binding, calls.
 //
-//   node apps/desktop/interop/pwa-chat.mjs
+//   node apps/desktop/interop/pwa-interop.mjs
 //
 // Peers
 //   - "desktop": the headless `parolnet-app` bot (examples/bot.rs), the same core the GPUI app
@@ -30,6 +30,16 @@
 //   4. Channel binding (PNP-001 §10.5.1): every case above requires both sides to verify the
 //      other's binding before the path is direct; here the PWA binds a fingerprint it did not
 //      see (as if a relay had swapped the desktop's), and the desktop must refuse the channel.
+//   5. The desktop video-calls the PWA (Chromium's fake camera and microphone); the PWA
+//      accepts; the desktop sends its test pattern (VP8) and a tone (Opus): RTP flows both
+//      ways and Chromium decodes the desktop's video and audio; the desktop hangs up.
+//   6. The PWA video-calls the desktop; the same checks; the PWA hangs up. Off by default
+//      (INTEROP_PWA_CALLS=1 runs it): when Chromium is the ICE controlling side (it offers)
+//      and holds media permission it gathers on every interface and later moves the
+//      nomination to another pair; webrtc-rs-rtc's controlled agent keeps its first selected
+//      pair (rtc-ice agent_selector.rs, handle_binding_request: `if get_selected_pair()
+//      .is_none()`), so media stops after a second. Needs the engine fix (follow the latest
+//      nomination) in a webrtc-rs-rtc release.
 //
 // Environment: PAROLNET_RELAY_BIN, PAROLNET_BOT_BIN (default: $CARGO_TARGET_DIR or target/,
 // debug profile), CHROME_PATH, INTEROP_ICE, INTEROP_KEEP=1 (keep temp dirs), INTEROP_VERBOSE=1
@@ -57,6 +67,7 @@ const verbose = process.env.INTEROP_VERBOSE === "1";
 const keep = process.env.INTEROP_KEEP === "1";
 
 const cleanups = [];
+const openPwas = new Set();
 const work = mkdtempSync(join(tmpdir(), "parolnet-interop-"));
 cleanups.push(() => keep || rmSync(work, { recursive: true, force: true }));
 
@@ -256,14 +267,19 @@ class Bot {
 
 // ── PWA in Chromium ──────────────────────────────────────────
 
-async function launchBrowser(profileDir) {
+/// `media`: a synthetic camera and microphone with the permission granted. That also makes
+/// Chromium gather host candidates on every interface (it does so once a page holds media
+/// permission), so only the call cases use it.
+async function launchBrowser(profileDir, { media = false } = {}) {
   const args = [
     "--no-first-run",
     "--no-default-browser-check",
     // Nothing leaves the machine: the PWA's STUN fallback (parol.social) and any other remote
     // host fail to resolve, so ICE uses host candidates only.
     "--host-resolver-rules=MAP * ~NOTFOUND, EXCLUDE 127.0.0.1, EXCLUDE localhost",
+    "--autoplay-policy=no-user-gesture-required",
   ];
+  if (media) args.push("--use-fake-device-for-media-stream", "--use-fake-ui-for-media-stream");
   if (mode === "loopback") {
     args.push("--allow-loopback-in-peer-connection", "--disable-features=WebRtcHideLocalIpsWithMdns");
   }
@@ -296,6 +312,17 @@ class Pwa {
       });
     }
     const p = new Pwa(page, name);
+    // Keep every RTCPeerConnection the PWA makes, for call stats.
+    await page.evaluateOnNewDocument(() => {
+      const Orig = window.RTCPeerConnection;
+      window.__pcs = [];
+      window.RTCPeerConnection = class extends Orig {
+        constructor(...args) {
+          super(...args);
+          window.__pcs.push(this);
+        }
+      };
+    });
     page.on("console", (msg) => {
       const text = msg.text();
       p.console.push(text);
@@ -317,6 +344,31 @@ class Pwa {
     this.page = page;
     this.name = name;
     this.console = [];
+    openPwas.add(this);
+  }
+
+  /// ICE / DTLS state of every connection, for a failure report.
+  async diag() {
+    return this.page
+      .evaluate(async () => {
+        const out = [];
+        for (const pc of window.__pcs || []) {
+          const r = { state: pc.connectionState, ice: pc.iceConnectionState, pairs: [], transports: [] };
+          const stats = await pc.getStats();
+          const byId = new Map();
+          stats.forEach((s) => byId.set(s.id, s));
+          stats.forEach((s) => {
+            if (s.type === "transport") r.transports.push({ dtls: s.dtlsState, role: s.dtlsRole, selected: s.selectedCandidatePairId });
+            if (s.type === "candidate-pair" && (s.nominated || s.state === "succeeded")) {
+              const l = byId.get(s.localCandidateId), rc = byId.get(s.remoteCandidateId);
+              r.pairs.push(`${s.id} ${s.state}${s.nominated ? " nominated" : ""} ${l?.address}:${l?.port}(${l?.candidateType}) -> ${rc?.address}:${rc?.port}(${rc?.candidateType})`);
+            }
+          });
+          out.push(r);
+        }
+        return out;
+      })
+      .catch((e) => `diag failed: ${e.message}`);
   }
 
   async showCode() {
@@ -374,6 +426,35 @@ class Pwa {
       },
       to,
       text,
+    );
+  }
+
+  /// What the PWA's call connection receives: decoded video frames and audio.
+  async callStats() {
+    return this.page.evaluate(async () => {
+      const out = { videoFrames: 0, videoPackets: 0, audioPackets: 0, audioSamples: 0, connected: false };
+      for (const pc of window.__pcs || []) {
+        if (pc.connectionState === "closed") continue;
+        if (!pc.getReceivers().some((r) => r.track && r.track.kind === "video" || r.track && r.track.kind === "audio")) continue;
+        if (pc.connectionState === "connected") out.connected = true;
+        (await pc.getStats()).forEach((s) => {
+          if (s.type !== "inbound-rtp") return;
+          if (s.kind === "video") {
+            out.videoFrames = Math.max(out.videoFrames, s.framesDecoded || 0);
+            out.videoPackets = Math.max(out.videoPackets, s.packetsReceived || 0);
+          } else if (s.kind === "audio") {
+            out.audioPackets = Math.max(out.audioPackets, s.packetsReceived || 0);
+            out.audioSamples = Math.max(out.audioSamples, s.totalSamplesReceived || 0);
+          }
+        });
+      }
+      return out;
+    });
+  }
+
+  async openCallPcs() {
+    return this.page.evaluate(
+      () => (window.__pcs || []).filter((pc) => pc.connectionState !== "closed" && pc.getTransceivers().length > 0).length,
     );
   }
 
@@ -502,6 +583,74 @@ async function caseTamperedBindingIsRefused(ctx) {
   return bot;
 }
 
+/// Wait until the bot reports at least `n` RTP packets of each kind for `callId`.
+async function botMedia(bot, callId, n, what) {
+  return bot.wait(what, (e) => e.event === "media" && e.call_id === callId && e.audio_rx >= n && e.video_rx >= n, 30_000);
+}
+
+async function pwaDecodes(pwa, what) {
+  return until(what, 30_000, async () => {
+    const s = await pwa.callStats();
+    return s.connected && s.videoFrames >= 20 && s.audioPackets >= 50 && s.audioSamples > 0 ? s : null;
+  });
+}
+
+async function caseCalls(ctx) {
+  const profile = mkdtempSync(join(work, "chrome-5-"));
+  const browser = await launchBrowser(profile, { media: true });
+  cleanups.push(() => browser.close().catch(() => {}));
+  const bot = new Bot("calls", ctx.relayPort, ctx.bindIp);
+  const ready = await bot.wait("ready", (e) => e.event === "ready");
+  bot.peerId = ready.peer_id;
+  await bot.wait("registered", (e) => e.event === "relay" && e.state.includes("Registered"));
+  const pwa = await Pwa.open(browser, ctx.pwaPort, "calls");
+  const code = await pwa.showCode();
+  bot.send(`pair ${code}`);
+  await bot.wait("direct path", (e) => e.event === "path" && e.peer_id === pwa.peerId && e.state === "Direct", 45_000);
+  await bothVerified(bot, pwa, "calls");
+
+  // Case 5: the desktop calls.
+  let tag = "case 5 (desktop video-calls the PWA)";
+  const mark = bot.events.length;
+  bot.send(`call ${pwa.peerId} video`);
+  const out = await bot.wait("outgoing", (e) => e.event === "call" && e.state === "Outgoing", 10_000, mark);
+  await until(`${tag}: the PWA rings`, 20_000, () =>
+    pwa.page.evaluate(() => !document.getElementById("incoming-call-notification")?.classList.contains("hidden")),
+  );
+  await pwa.page.evaluate(() => window.acceptIncomingCall());
+  await bot.wait("active", (e) => e.event === "call" && e.call_id === out.call_id && e.state === "Active", 30_000, mark);
+  const m6 = await botMedia(bot, out.call_id, 50, `${tag}: the desktop receives Chromium's VP8 and Opus`);
+  const s6 = await pwaDecodes(pwa, `${tag}: Chromium decodes the desktop's VP8 and Opus`);
+  log(`${tag}: desktop got audio ${m6.audio_rx} / video ${m6.video_rx} packets; PWA decoded ${s6.videoFrames} frames, ${s6.audioSamples} audio samples`);
+  bot.send(`hangup ${out.call_id}`);
+  await bot.wait("ended", (e) => e.event === "call" && e.call_id === out.call_id && e.state === "Ended(HungUp)", 10_000, mark);
+  await until(`${tag}: the PWA closes its call connection`, 15_000, async () => (await pwa.openCallPcs()) === 0);
+  log(`${tag}: hung up by the desktop`);
+  if (process.env.INTEROP_PWA_CALLS === "1") {
+    // Case 6: the PWA calls (see the header).
+    tag = "case 6 (PWA video-calls the desktop)";
+    await pwa.page.evaluate((peer) => {
+      window.openChat(peer);
+      return window.initiateCall(peer, true);
+    }, bot.peerId);
+    const ring = await bot.wait("incoming call", (e) => e.event === "call" && e.state === "Incoming" && e.peer_id === pwa.peerId, 30_000);
+    if (!ring.video) throw new Error(`${tag}: the PWA's offer should carry video`);
+    bot.send(`accept ${ring.call_id}`);
+    await bot.wait("active", (e) => e.event === "call" && e.call_id === ring.call_id && e.state === "Active", 30_000);
+    const m5 = await botMedia(bot, ring.call_id, 50, `${tag}: the desktop receives Chromium's VP8 and Opus`);
+    const s5 = await pwaDecodes(pwa, `${tag}: Chromium decodes the desktop's VP8 and Opus`);
+    log(`${tag}: desktop got audio ${m5.audio_rx} / video ${m5.video_rx} packets; PWA decoded ${s5.videoFrames} frames, ${s5.audioSamples} audio samples`);
+    await pwa.page.evaluate(() => window.hangupCall());
+    await bot.wait("remote hang-up", (e) => e.event === "call" && e.call_id === ring.call_id && e.state === "Ended(RemoteHungUp)", 15_000);
+    log(`${tag}: hung up by the PWA`);
+  } else {
+    log("case 6 (PWA video-calls the desktop): skipped (INTEROP_PWA_CALLS=1; needs the engine's renomination fix)");
+  }
+  await bot.quit();
+  await browser.close();
+  return bot;
+}
+
 // ── Main ─────────────────────────────────────────────────────
 
 async function main() {
@@ -516,13 +665,15 @@ async function main() {
   bots.push(await caseDesktopEntersPwaCode(ctx));
   bots.push(await casePwaPastesDesktopCode(ctx));
   bots.push(await caseTamperedBindingIsRefused(ctx));
+  if (process.env.INTEROP_CALLS !== "0") bots.push(await caseCalls(ctx));
 
   if (mode === "mdns") {
     const resolved = bots.some((b) => b.stderr.some((l) => l.includes("mDNS traffic received")));
     if (!resolved) throw new Error("mDNS mode: the desktop never received an mDNS answer for Chromium's .local candidates");
     log("mDNS: the desktop resolved Chromium's .local candidates");
   }
-  log("PASS: desktop <-> PWA chat interop (4 cases)");
+  const cases = 4 + (process.env.INTEROP_CALLS === "0" ? 0 : process.env.INTEROP_PWA_CALLS === "1" ? 2 : 1);
+  log(`PASS: desktop <-> PWA interop (${cases} cases)`);
 }
 
 let status = 0;
@@ -531,6 +682,11 @@ try {
 } catch (e) {
   status = 1;
   console.error(`FAIL: ${e.message}`);
+  for (const p of openPwas) {
+    try {
+      console.error(`pwa ${p.name} connections: ${JSON.stringify(await p.diag(), null, 1)}`);
+    } catch {}
+  }
 }
 for (const c of cleanups.reverse()) {
   try {

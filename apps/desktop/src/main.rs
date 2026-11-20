@@ -3,6 +3,9 @@
 //! Without spike flags it is the M1 client (`chat.rs`): contact list, pairing, 1:1 chat over
 //! direct data channels, `parolnet-desktop [--relay wss://host/ws] [--data-dir DIR]`.
 //!
+//! `--call-check` places a call from a headless core with the window's call media and reports
+//! what was decoded (`call_check.rs`).
+//!
 //! With `--spike` (or any of the spike's flags below) it is the M0 spike: a GPUI window that
 //! shows a VP8 stream received from a peer (Chromium in the tests) through `webrtc-rs-rtc`,
 //! decoded with libvpx. The call view of M1 grows out of it.
@@ -20,13 +23,17 @@
 //! decoded audio's strongest frequency to be that tone (the sender plays 1000 Hz). Window mode prints `spike-window first-frame` once a picture is on screen and,
 //! with `--exit-after`, quits that many seconds later (CI takes its screenshot in between).
 
+mod call;
+mod call_check;
 mod chat;
 mod frame;
 #[cfg(target_os = "macos")]
 mod macos;
 mod receiver;
+mod testpattern;
 mod ui;
 mod vp8;
+mod vp8enc;
 
 use std::net::SocketAddr;
 use std::sync::atomic::Ordering;
@@ -110,7 +117,9 @@ fn main() -> anyhow::Result<()> {
         .with_writer(std::io::stderr)
         .init();
     let raw: Vec<String> = std::env::args().skip(1).collect();
-    if raw.iter().any(|a| SPIKE_FLAGS.contains(&a.as_str())) {
+    if raw.iter().any(|a| a == "--call-check") {
+        call_check::main(&raw)
+    } else if raw.iter().any(|a| SPIKE_FLAGS.contains(&a.as_str())) {
         spike_main()
     } else {
         chat::main(&raw)

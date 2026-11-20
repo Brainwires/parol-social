@@ -35,7 +35,7 @@ pub struct VideoView {
 }
 
 impl VideoView {
-    fn new(
+    pub(crate) fn new(
         slot: FrameSlot,
         stats: Arc<Stats>,
         exit_after: Option<Duration>,

@@ -19,9 +19,12 @@ use gpui_component::Root;
 use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::input::{Input, InputEvent, InputState};
 use parolnet_app::{
-    AppConfig, AppEvent, AppHandle, ChatMessage, Contact, DeliveryState, Direction, PathState,
-    RelayState,
+    AppConfig, AppEvent, AppHandle, CallEnd, CallInfo, CallMedia, CallState, ChatMessage, Contact,
+    DeliveryState, Direction, PathState, RelayState,
 };
+
+use crate::call::CallSession;
+use crate::ui::VideoView;
 use tokio::sync::mpsc::UnboundedReceiver;
 
 /// The public relay. Signaling only: no message, file or call traffic passes through it.
@@ -109,6 +112,30 @@ pub fn safety_lines(number: &str) -> (String, String) {
     (groups[..mid].join(" "), groups[mid..].join(" "))
 }
 
+/// The call panel's line.
+pub fn call_status_text(call: &CallInfo, name: &str) -> String {
+    let kind = if call.video { "video call" } else { "call" };
+    match &call.state {
+        CallState::Outgoing => format!("Calling {name} ({kind})…"),
+        CallState::Incoming => format!("{name} is calling you ({kind})"),
+        CallState::Connecting => format!("Connecting the {kind} with {name}…"),
+        CallState::Active => format!("In a {kind} with {name}, end-to-end encrypted"),
+        CallState::Ended(why) => call_end_text(why, name),
+    }
+}
+
+/// Why a call ended, for the notice line.
+pub fn call_end_text(why: &CallEnd, name: &str) -> String {
+    match why {
+        CallEnd::HungUp => "Call ended.".to_owned(),
+        CallEnd::RemoteHungUp => format!("{name} ended the call."),
+        CallEnd::Declined => "You declined the call.".to_owned(),
+        CallEnd::Rejected => format!("{name} declined the call (or is busy)."),
+        CallEnd::NoAnswer => format!("No answer from {name}."),
+        CallEnd::Failed(e) => format!("The call failed: {e}"),
+    }
+}
+
 /// A short badge for the contact list.
 pub fn path_badge(path: PathState) -> (&'static str, u32) {
     match path {
@@ -174,6 +201,13 @@ enum Pane {
     Chat,
 }
 
+/// The call the window shows (one at a time).
+struct UiCall {
+    info: CallInfo,
+    session: Option<CallSession>,
+    video: Option<Entity<VideoView>>,
+}
+
 struct ContactRow {
     contact: Contact,
     path: PathState,
@@ -194,12 +228,16 @@ pub struct ChatView {
     name_input: Entity<InputState>,
     /// The chat header shows the safety number (PNP-002 §10).
     show_safety: bool,
+    /// Where call media tasks run.
+    runtime: tokio::runtime::Handle,
+    call: Option<UiCall>,
 }
 
 impl ChatView {
     fn new(
         app: AppHandle,
         mut events: UnboundedReceiver<AppEvent>,
+        runtime: tokio::runtime::Handle,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -283,6 +321,8 @@ impl ChatView {
             qr: None,
             notice: None,
             show_safety: false,
+            runtime,
+            call: None,
             code_input,
             composer,
             name_input,
@@ -322,6 +362,7 @@ impl ChatView {
                     row.path = state;
                 }
             }
+            AppEvent::Call(info) => self.on_call(info),
             AppEvent::Message(m) => {
                 let list = self.messages.entry(m.peer_id.clone()).or_default();
                 if !list.iter().any(|x| x.id == m.id) {
@@ -367,6 +408,168 @@ impl ChatView {
         self.pane = Pane::Chat;
         self.notice = None;
         cx.notify();
+    }
+
+    fn name_of(&self, peer: &str) -> String {
+        self.contacts
+            .iter()
+            .find(|r| r.contact.peer_id == peer)
+            .map(|r| r.contact.name.clone())
+            .unwrap_or_else(|| parolnet_app::short_id(peer))
+    }
+
+    fn on_call(&mut self, info: CallInfo) {
+        if let CallState::Ended(why) = &info.state {
+            if self
+                .call
+                .as_ref()
+                .is_some_and(|c| c.info.call_id == info.call_id)
+            {
+                self.call = None; // drops the session: capture and playback stop
+            }
+            self.notice = Some(call_end_text(why, &self.name_of(&info.peer_id)));
+            return;
+        }
+        match self.call.as_mut() {
+            Some(c) if c.info.call_id == info.call_id => c.info = info,
+            Some(_) => {} // the core refuses a second call; ignore
+            None => {
+                if info.state == CallState::Incoming {
+                    self.selected = Some(info.peer_id.clone());
+                    self.pane = Pane::Chat;
+                }
+                self.call = Some(UiCall {
+                    info,
+                    session: None,
+                    video: None,
+                });
+            }
+        }
+    }
+
+    /// Start the call's media and its video tile.
+    fn attach_media(&mut self, call_id: &str, media: CallMedia, cx: &mut Context<Self>) {
+        let Some(call) = self.call.as_mut().filter(|c| c.info.call_id == call_id) else {
+            return; // ended meanwhile; dropping `media` is enough
+        };
+        let session = CallSession::start(media, call.info.video, true, &self.runtime);
+        if call.info.video {
+            let (slot, stats) = (session.slot.clone(), session.stats.video.clone());
+            call.video = Some(cx.new(|cx| VideoView::new(slot, stats, None, cx)));
+        }
+        if !session.has_audio_devices() {
+            self.notice = Some("No microphone or speakers found: the call has no sound.".into());
+        }
+        call.session = Some(session);
+    }
+
+    fn start_call(&mut self, peer: String, video: bool, cx: &mut Context<Self>) {
+        let app = self.app.clone();
+        cx.spawn(async move |this, cx| {
+            let result = match app.start_call(&peer, video).await {
+                Ok(info) => app
+                    .take_call_media(&info.call_id)
+                    .await
+                    .map(|media| (info, media)),
+                Err(e) => Err(e),
+            };
+            let _ = this.update(cx, |view, cx| {
+                match result {
+                    Ok((info, media)) => {
+                        let id = info.call_id.clone();
+                        view.on_call(info);
+                        view.attach_media(&id, media, cx);
+                    }
+                    Err(e) => view.notice = Some(format!("Could not call: {e}")),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn accept_call(&mut self, call_id: String, cx: &mut Context<Self>) {
+        let app = self.app.clone();
+        cx.spawn(async move |this, cx| {
+            let result = match app.accept_call(&call_id).await {
+                Ok(_) => app.take_call_media(&call_id).await,
+                Err(e) => Err(e),
+            };
+            let _ = this.update(cx, |view, cx| {
+                match result {
+                    Ok(media) => view.attach_media(&call_id, media, cx),
+                    Err(e) => view.notice = Some(format!("Could not answer: {e}")),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn render_call(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+        let call = self.call.as_ref()?;
+        let name = self.name_of(&call.info.peer_id);
+        let id = call.info.call_id.clone();
+        let mut controls = div().flex().gap_2();
+        if call.info.state == CallState::Incoming {
+            let (accept_id, decline_id) = (id.clone(), id.clone());
+            controls =
+                controls
+                    .child(
+                        Button::new("accept-call")
+                            .label("Accept")
+                            .primary()
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.accept_call(accept_id.clone(), cx)
+                            })),
+                    )
+                    .child(Button::new("decline-call").label("Decline").on_click(
+                        cx.listener(move |this, _, _, _| this.app.reject_call(&decline_id)),
+                    ));
+        } else {
+            let muted = call.session.as_ref().is_some_and(CallSession::muted);
+            controls = controls
+                .child(
+                    Button::new("mute")
+                        .label(if muted { "Unmute" } else { "Mute" })
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            if let Some(s) = this.call.as_ref().and_then(|c| c.session.as_ref()) {
+                                s.set_muted(!s.muted());
+                            }
+                            cx.notify();
+                        })),
+                )
+                .child(
+                    Button::new("hang-up")
+                        .label("Hang up")
+                        .on_click(cx.listener(move |this, _, _, _| this.app.hangup(&id))),
+                );
+        }
+        let mut panel = div()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .p_3()
+            .border_b_1()
+            .border_color(rgb(0x30363d))
+            .bg(rgb(0x161b22))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_3()
+                    .child(
+                        div()
+                            .flex_1()
+                            .text_color(rgb(0xe6edf3))
+                            .child(call_status_text(&call.info, &name)),
+                    )
+                    .child(controls),
+            );
+        if let Some(video) = &call.video {
+            panel = panel.child(div().h(px(300.)).child(video.clone()));
+        }
+        Some(panel)
     }
 
     fn send(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -653,6 +856,15 @@ impl ChatView {
                     .label("Rename")
                     .on_click(cx.listener(|this, _, window, cx| this.rename(window, cx))),
             )
+            .when(path == PathState::Direct && self.call.is_none(), |h| {
+                let (a, v) = (peer.to_owned(), peer.to_owned());
+                h.child(Button::new("call").label("Call").on_click(
+                    cx.listener(move |this, _, _, cx| this.start_call(a.clone(), false, cx)),
+                ))
+                .child(Button::new("video-call").label("Video call").on_click(
+                    cx.listener(move |this, _, _, cx| this.start_call(v.clone(), true, cx)),
+                ))
+            })
             .child(
                 Button::new("verify")
                     .label(if self.show_safety {
@@ -822,11 +1034,13 @@ impl Render for ChatView {
                 .child("Pick a contact, or add one.")
                 .into_any_element(),
         };
+        let call = self.render_call(cx);
         let mut right = div()
             .flex_1()
             .h_full()
             .flex()
             .flex_col()
+            .children(call)
             .child(div().flex_1().min_h_0().child(main));
         if let Some(n) = &self.notice {
             right = right.child(
@@ -865,12 +1079,16 @@ pub fn main(raw: &[String]) -> anyhow::Result<()> {
         opts.relay_url,
         opts.data_dir.display()
     );
-    run_window(app, events);
+    run_window(app, events, runtime.handle().clone());
     drop(runtime);
     Ok(())
 }
 
-fn run_window(app: AppHandle, events: UnboundedReceiver<AppEvent>) {
+fn run_window(
+    app: AppHandle,
+    events: UnboundedReceiver<AppEvent>,
+    runtime: tokio::runtime::Handle,
+) {
     let mut events = Some(events);
     gpui_platform::application().run(move |cx: &mut App| {
         gpui_component::init(cx);
@@ -883,7 +1101,7 @@ fn run_window(app: AppHandle, events: UnboundedReceiver<AppEvent>) {
                 ..Default::default()
             },
             move |window, cx| {
-                let view = cx.new(|cx| ChatView::new(app, events, window, cx));
+                let view = cx.new(|cx| ChatView::new(app, events, runtime, window, cx));
                 cx.new(|cx| Root::new(view, window, cx))
             },
         )
@@ -915,6 +1133,31 @@ mod tests {
         assert_eq!(path_badge(PathState::NoDirectPath).0, "no path");
         assert!(path_text(PathState::BindingFailed, "Pat", 0).contains("end-to-end check"));
         assert_eq!(path_badge(PathState::BindingFailed).0, "check failed");
+    }
+
+    #[test]
+    fn call_lines() {
+        let mut c = CallInfo {
+            call_id: "ab".into(),
+            peer_id: "cd".into(),
+            video: true,
+            incoming: true,
+            state: CallState::Incoming,
+        };
+        assert_eq!(
+            call_status_text(&c, "Pat"),
+            "Pat is calling you (video call)"
+        );
+        c.state = CallState::Active;
+        assert!(call_status_text(&c, "Pat").starts_with("In a video call with Pat"));
+        c.video = false;
+        c.state = CallState::Outgoing;
+        assert_eq!(call_status_text(&c, "Pat"), "Calling Pat (call)…");
+        assert_eq!(
+            call_end_text(&CallEnd::RemoteHungUp, "Pat"),
+            "Pat ended the call."
+        );
+        assert!(call_end_text(&CallEnd::Failed("x".into()), "Pat").contains('x'));
     }
 
     #[test]

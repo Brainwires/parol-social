@@ -41,6 +41,11 @@ impl I420Frame {
         }
     }
 
+    /// Y, U and V planes back to back (what the VP8 encoder takes).
+    pub fn data(&self) -> &[u8] {
+        &self.data
+    }
+
     pub fn plane(&self, plane: usize) -> &[u8] {
         &self.data[self.plane_range(plane)]
     }

@@ -1,8 +1,8 @@
 name: Desktop spike (M0)
 
 # The GPUI video spike on the five desktop targets: build, a headless decode check (VP8 + an
-# Opus tone from headless Chromium through webrtc-rs-rtc), then a real window that shows the
-# stream and a screenshot of it. Heavy, so it runs only by hand: dispatched, or once on a pull
+# Opus tone from headless Chromium through webrtc-rs-rtc), the desktop's call media against the
+# headless bot (desktop-call.mjs), then a real window that shows the stream and a screenshot. Heavy, so it runs only by hand: dispatched, or once on a pull
 # request by adding the `desktop-spike` label (a workflow file can be dispatched only once it is on
 # the default branch).
 on:
@@ -44,7 +44,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            pkg-config libvpx-dev libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev \
+            pkg-config libvpx-dev libasound2-dev libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev \
             libx11-xcb-dev libxcb1-dev libfontconfig-dev libvulkan1 mesa-vulkan-drivers \
             xvfb imagemagick
           # Ubuntu 24.04 restricts unprivileged user namespaces through AppArmor, which leaves
@@ -108,6 +108,14 @@ jobs:
           bin=apps/desktop/target/release/parolnet-desktop
           [ -f "$bin.exe" ] && bin="$bin.exe"
           apps/desktop/spike/ci-run.sh headless "$bin" spike-out
+
+      - name: Call check against the bot (desktop call media, no window)
+        # The relay and the bot come from the root workspace (its own toolchain pin).
+        run: |
+          cargo build --locked -p parolnet-relay-server --bin parolnet-relay -p parolnet-app --example bot
+          bin=apps/desktop/target/release/parolnet-desktop
+          [ -f "$bin.exe" ] && bin="$bin.exe"
+          node apps/desktop/interop/desktop-call.mjs "$bin"
 
       - name: Window and screenshot (Linux, Xvfb)
         if: runner.os == 'Linux'

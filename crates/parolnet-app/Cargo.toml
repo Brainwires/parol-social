@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
-description = "Headless ParolNet client core: identity, contacts, pairing, signaling, direct data channels, 1:1 chat (native)"
+description = "Headless ParolNet client core: identity, contacts, pairing, signaling, direct data channels, 1:1 chat and calls (native)"
 
 [dependencies]
 # Default features off: no mesh, no audio codecs, no transport stack. The app talks to the
@@ -29,4 +29,6 @@ zeroize.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["full", "test-util"] }
+# The bot example's call audio (a tone, Opus-encoded in pure Rust; the M0 interop pin).
+opus-rs = "=0.1.42"
 tracing-subscriber = { workspace = true, features = ["env-filter"] }

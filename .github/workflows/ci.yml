@@ -167,9 +167,9 @@ jobs:
       - name: Build the relay and the desktop bot
         run: cargo build -p parolnet-relay-server --bin parolnet-relay -p parolnet-app --example bot
       - name: Interop (mDNS host candidates)
-        run: INTEROP_ICE=mdns node apps/desktop/interop/pwa-chat.mjs
+        run: INTEROP_ICE=mdns node apps/desktop/interop/pwa-interop.mjs
       - name: Interop (loopback host candidates)
-        run: INTEROP_ICE=loopback node apps/desktop/interop/pwa-chat.mjs
+        run: INTEROP_ICE=loopback node apps/desktop/interop/pwa-interop.mjs
 
   msrv:
     name: MSRV (1.91.0)

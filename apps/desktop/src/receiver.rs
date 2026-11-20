@@ -161,6 +161,7 @@ async fn run_session(
         media: MediaConfig {
             recv_vp8: true,
             recv_opus: options.audio_sink.is_some(),
+            ..Default::default()
         },
         ..Default::default()
     })
@@ -280,11 +281,11 @@ async fn run_session(
 }
 
 /// VP8 key frames have bit 0 of the first byte clear (RFC 6386 section 9.1).
-fn is_keyframe(frame: &[u8]) -> bool {
+pub(crate) fn is_keyframe(frame: &[u8]) -> bool {
     frame.first().is_some_and(|b| b & 1 == 0)
 }
 
-fn decode_loop(
+pub(crate) fn decode_loop(
     samples: std::sync::mpsc::Receiver<Vec<u8>>,
     want_keyframe: tokio::sync::mpsc::UnboundedSender<()>,
     slot: FrameSlot,

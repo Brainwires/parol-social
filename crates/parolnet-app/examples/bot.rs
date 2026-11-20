@@ -6,18 +6,129 @@
 //! ```
 //!
 //! Prints one JSON object per line on stdout: `ready` (peer id), `code` (with
-//! `--show-code`), `contact`, `path`, `relay`, `message`, `notice`. Reads commands on stdin,
-//! one per line: `send <peer-id> <text>`, `code`, `pair <code>`, `quit`. With `--echo` every
-//! received message is answered with `echo: <text>`.
+//! `--show-code`), `contact`, `path`, `relay`, `message`, `notice`, `call` (state changes) and,
+//! once a second during a call, `media` (RTP packets received per kind). Reads commands on
+//! stdin, one per line: `send <peer-id> <text>`, `code`, `pair <code>`, `call <peer-id>
+//! [video]`, `accept [call-id]`, `reject [call-id]`, `hangup [call-id]`, `quit`. With `--echo`
+//! every received message is answered with `echo: <text>`.
+//!
+//! In a call the bot sends a 440 Hz tone (Opus, encoded with opus-rs) and, for a video call,
+//! loops `testpattern.ivf` (VP8, 160x120, 30 fps: colour bars, a moving box and a frame
+//! counter, written by the desktop app's encoder test `write_bot_ivf`).
 
 use std::path::PathBuf;
+use std::time::Duration;
 
-use parolnet_app::{AppConfig, AppEvent, Direction};
+use parolnet_app::{
+    AppConfig, AppEvent, AppHandle, CallMedia, CallState, Direction, MediaEvent, MediaKind,
+};
 use serde_json::json;
 use tokio::io::{AsyncBufReadExt as _, BufReader};
 
+const TEST_PATTERN: &[u8] = include_bytes!("testpattern.ivf");
+
 fn out(v: serde_json::Value) {
     println!("{v}");
+}
+
+/// The frames of an IVF file.
+fn ivf_frames(data: &[u8]) -> Vec<Vec<u8>> {
+    let mut frames = Vec::new();
+    let header = data
+        .get(6..8)
+        .map(|b| u16::from_le_bytes([b[0], b[1]]) as usize)
+        .unwrap_or(32);
+    let mut at = header;
+    while at + 12 <= data.len() {
+        let len = u32::from_le_bytes([data[at], data[at + 1], data[at + 2], data[at + 3]]) as usize;
+        at += 12;
+        let Some(frame) = data.get(at..at + len) else {
+            break;
+        };
+        frames.push(frame.to_vec());
+        at += len;
+    }
+    frames
+}
+
+/// Send the tone and the test pattern; report what arrives.
+async fn run_media(call_id: String, media: CallMedia, video: bool) {
+    let CallMedia { frames, mut events } = media;
+    let sender = {
+        let frames = frames.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut enc = match opus_rs::OpusEncoder::new(48_000, 1, opus_rs::Application::Voip) {
+                Ok(e) => e,
+                Err(e) => {
+                    eprintln!("opus encoder: {e}");
+                    return;
+                }
+            };
+            let pattern = ivf_frames(TEST_PATTERN);
+            let mut pcm = vec![0f32; 960];
+            let mut buf = vec![0u8; 1500];
+            let mut phase = 0f32;
+            let step = 2.0 * std::f32::consts::PI * 440.0 / 48_000.0;
+            let start = std::time::Instant::now();
+            for tick in 0u64.. {
+                // 20 ms of audio every tick; a video frame every 33 ms or so (every third
+                // 20 ms tick would be 60 ms; pace video by time instead).
+                for s in pcm.iter_mut() {
+                    *s = 0.3 * phase.sin();
+                    phase = (phase + step) % (2.0 * std::f32::consts::PI);
+                }
+                if let Ok(n) = enc.encode(&pcm, 960, &mut buf)
+                    && !frames.send(MediaKind::Audio, buf[..n].to_vec(), 960)
+                {
+                    return;
+                }
+                if video && !pattern.is_empty() {
+                    let due = (start.elapsed().as_millis() as u64 * 30) / 1000;
+                    let sent = (tick * 20 * 30) / 1000;
+                    if due >= sent {
+                        let f = &pattern[(sent as usize) % pattern.len()];
+                        if !frames.send(MediaKind::Video, f.clone(), 3000) {
+                            return;
+                        }
+                    }
+                }
+                let next = start + Duration::from_millis((tick + 1) * 20);
+                std::thread::sleep(next.saturating_duration_since(std::time::Instant::now()));
+            }
+        })
+    };
+    let (mut audio, mut video_rx) = (0u64, 0u64);
+    let mut report = tokio::time::interval(Duration::from_secs(1));
+    loop {
+        tokio::select! {
+            ev = events.recv() => match ev {
+                Some(MediaEvent::Rtp { kind: MediaKind::Audio, .. }) => audio += 1,
+                Some(MediaEvent::Rtp { kind: MediaKind::Video, .. }) => video_rx += 1,
+                Some(MediaEvent::Track { kind, mime_type }) => out(json!({
+                    "event": "track", "call_id": call_id, "kind": format!("{kind:?}"), "mime_type": mime_type
+                })),
+                Some(MediaEvent::KeyframeRequested) => {}
+                None => break,
+            },
+            _ = report.tick() => out(json!({
+                "event": "media", "call_id": call_id, "audio_rx": audio, "video_rx": video_rx
+            })),
+        }
+    }
+    out(
+        json!({"event": "media", "call_id": call_id, "audio_rx": audio, "video_rx": video_rx, "final": true}),
+    );
+    drop(frames);
+    let _ = sender.await;
+}
+
+async fn start_media(app: &AppHandle, call_id: &str, video: bool) {
+    match app.take_call_media(call_id).await {
+        Ok(media) => {
+            tokio::spawn(run_media(call_id.to_owned(), media, video));
+        }
+        Err(e) => out(json!({"event": "error", "text": e.to_string()})),
+    }
 }
 
 #[tokio::main]
@@ -64,6 +175,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         out(json!({"event": "paired", "peer_id": c.peer_id}));
     }
 
+    // The latest call (for `accept` / `reject` / `hangup` without an id).
+    let mut last_call: Option<(String, bool)> = None;
     let mut stdin = BufReader::new(tokio::io::stdin()).lines();
     loop {
         tokio::select! {
@@ -85,28 +198,76 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                     AppEvent::Message(_) | AppEvent::MessageState { .. } => {}
                     AppEvent::Notice(n) => out(json!({"event": "notice", "text": n})),
+                    AppEvent::Call(c) => {
+                        let state = match &c.state {
+                            CallState::Ended(why) => format!("Ended({why:?})"),
+                            s => format!("{s:?}"),
+                        };
+                        out(json!({
+                            "event": "call", "call_id": c.call_id, "peer_id": c.peer_id,
+                            "state": state, "video": c.video, "incoming": c.incoming
+                        }));
+                        if c.state == CallState::Incoming {
+                            last_call = Some((c.call_id.clone(), c.video));
+                        }
+                    }
                 }
             }
             line = stdin.next_line() => {
                 let Ok(Some(line)) = line else { break };
                 let line = line.trim();
-                if line == "quit" {
-                    break;
-                } else if line == "code" {
-                    out(json!({"event": "code", "code": app.create_pairing_code().await?}));
-                } else if let Some(code) = line.strip_prefix("pair ") {
-                    match app.pair_with_code(code.trim()).await {
+                let mut words = line.split_whitespace();
+                match words.next() {
+                    Some("quit") => break,
+                    Some("code") => {
+                        out(json!({"event": "code", "code": app.create_pairing_code().await?}));
+                    }
+                    Some("pair") => match app.pair_with_code(words.next().unwrap_or("")).await {
                         Ok(c) => out(json!({"event": "paired", "peer_id": c.peer_id})),
                         Err(e) => out(json!({"event": "error", "text": e.to_string()})),
+                    },
+                    Some("send") => {
+                        let rest = line.strip_prefix("send").unwrap_or("").trim_start();
+                        let (peer, text) = rest.split_once(' ').unwrap_or((rest, ""));
+                        match app.send_text(peer, text).await {
+                            Ok(m) => out(json!({"event": "sent", "id": m.id, "state": format!("{:?}", m.state)})),
+                            Err(e) => out(json!({"event": "error", "text": e.to_string()})),
+                        }
                     }
-                } else if let Some(rest) = line.strip_prefix("send ") {
-                    let (peer, text) = rest.split_once(' ').unwrap_or((rest, ""));
-                    match app.send_text(peer, text).await {
-                        Ok(m) => out(json!({"event": "sent", "id": m.id, "state": format!("{:?}", m.state)})),
-                        Err(e) => out(json!({"event": "error", "text": e.to_string()})),
+                    Some("call") => {
+                        let peer = words.next().unwrap_or("");
+                        let video = words.next() == Some("video");
+                        match app.start_call(peer, video).await {
+                            Ok(c) => {
+                                last_call = Some((c.call_id.clone(), video));
+                                start_media(&app, &c.call_id, video).await;
+                            }
+                            Err(e) => out(json!({"event": "error", "text": e.to_string()})),
+                        }
                     }
-                } else if !line.is_empty() {
-                    out(json!({"event": "error", "text": format!("unknown command {line:?}")}));
+                    Some("accept") => {
+                        let id = words.next().map(str::to_owned).or_else(|| last_call.as_ref().map(|c| c.0.clone()));
+                        let Some(id) = id else {
+                            out(json!({"event": "error", "text": "no call to accept"}));
+                            continue;
+                        };
+                        match app.accept_call(&id).await {
+                            Ok(c) => start_media(&app, &id, c.video).await,
+                            Err(e) => out(json!({"event": "error", "text": e.to_string()})),
+                        }
+                    }
+                    Some(cmd @ ("reject" | "hangup")) => {
+                        let id = words.next().map(str::to_owned).or_else(|| last_call.as_ref().map(|c| c.0.clone()));
+                        match id {
+                            Some(id) if cmd == "reject" => app.reject_call(&id),
+                            Some(id) => app.hangup(&id),
+                            None => out(json!({"event": "error", "text": "no call"})),
+                        }
+                    }
+                    Some(other) => {
+                        out(json!({"event": "error", "text": format!("unknown command {other:?}")}));
+                    }
+                    None => {}
                 }
             }
         }

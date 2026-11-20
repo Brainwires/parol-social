@@ -27,6 +27,8 @@ image = { version = "0.25", default-features = false, features = ["png"] }
 yuv = "0.8"
 # M0 interop check of the pure-Rust Opus decoder against Chromium's libopus (docs/m0-spike.md).
 opus-rs = "=0.1.42"
+# Call audio: microphone and speakers.
+cpal = "0.18"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
@@ -35,6 +37,7 @@ objc2-core-foundation = { version = "0.3.2", features = ["CFDictionary", "CFStri
 objc2-core-video = { version = "0.3.2", features = ["CVBase", "CVBuffer", "CVImageBuffer", "CVPixelBuffer", "CVReturn"] }
 
 [build-dependencies]
+cc = "1"
 pkg-config = "0.3"
 vcpkg = "0.2"
 
