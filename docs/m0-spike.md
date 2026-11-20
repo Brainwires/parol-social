@@ -32,7 +32,7 @@ one PLI; no decode errors, no NACKs. The decoded frame matches the canvas (bars,
 | libvpx VP8 decode (hand-written FFI, six functions) | all | verified on macOS arm64 |
 | I420 → full-range NV12 (`420f`, levels expanded from VP8's limited range in the copy) IOSurface `CVPixelBuffer` → `gpui::surface()` | macOS | buffer path unit-tested; on-screen in CI. GPUI's Metal surface pass accepts only `420f`: the first CI run's video-range (`420v`) buffers were refused frame by frame while the app still counted them presented, so `ci-run.sh` now fails on renderer errors |
 | I420 → BGRA (`yuv` crate, SIMD) → `RenderImage` → `img()`, previous image dropped each frame | Windows, Linux (and macOS with `--bgra`) | conversion unit-tested; on-screen in CI |
-| Window, latest-frame slot, ~120 Hz poll, status line (`gpui-component` `Root` + `Label`; macOS text needs `gpui-platform`'s `font-kit` feature, else GPUI draws none) | all | builds clean (clippy `-D warnings`) on macOS arm64; runs in CI |
+| Window, latest-frame slot, ~120 Hz poll, status line (`gpui-component` `Root` + `Label`; macOS text needs `gpui-platform`'s `font-kit` feature, else GPUI draws none; Linux needs its `x11` / `wayland` features, else GPUI runs headless and the window never draws) | all | builds clean (clippy `-D warnings`) on macOS arm64; runs in CI |
 
 No window was opened on a developer machine. `desktop-spike.yml` (dispatch, or label a PR
 `desktop-spike`) builds on linux-x64, macos-arm64, macos-x64, windows-x64 and windows-arm64, runs
