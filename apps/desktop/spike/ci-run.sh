@@ -70,6 +70,13 @@ case "$mode" in
     wait "$sender" || true
     cat "$out/window.log"
     grep -q "spike-window presented=[1-9]" "$out/window.log"
+    # The app counts a frame presented once it hands it to GPUI; the renderer can still refuse
+    # it (macOS logged "unsupported surface pixel format" while the count kept rising), or draw
+    # no text, so those count as failures too.
+    if grep -E "failed to render|no text will be rendered" "$out/window.log" | head -3 | grep .; then
+      echo "the window did not render (see above)" >&2
+      exit 1
+    fi
     exit "$status"
     ;;
   *)

@@ -15,7 +15,7 @@ parolnet-rtc = { path = "../../crates/parolnet-rtc" }
 # GPUI: exact pins, Cargo.lock committed; upgrades are their own train. gpui-pre is the
 # snapshot of zed@main that gpui-component publishes against (docs/m0-spike.md, "GPUI pin").
 gpui = { package = "gpui-pre", version = "=0.3.12" }
-gpui-platform = { package = "gpui-pre-platform", version = "=0.3.12" }
+gpui-platform = { package = "gpui-pre-platform", version = "=0.3.12", features = ["font-kit"] }
 gpui-component = { version = "=0.10.0", default-features = false }
 
 tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "sync", "time", "macros"] }
