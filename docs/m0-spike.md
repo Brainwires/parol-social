@@ -97,7 +97,7 @@ ring (default `crypto-ring`), which CLAUDE.md invariant 6 now scopes away from t
   sections; the spike sidesteps it by accepting both.
 - **Simulcast send (E3, M2)** builds on the send-encoding changes.
 Bump the tag in one place (root `Cargo.toml`, then `cargo update -p rtc` in both workspaces) when
-`v0.22.0+brainwires.2` exists. E1 (renegotiation rebinding, camera on / off mid-call) looks to start on the
+`v0.22.0+brainwires.2` exists. (Done: M1 pins `v0.22.0+brainwires.3`.) E1 (renegotiation rebinding, camera on / off mid-call) looks to start on the
 fork's `fix/set-direction-renegotiation` branch and is the next engine item M1 waits on.
 
 Engine log noise seen in the spike (not errors): `discard success message ... no such remote`

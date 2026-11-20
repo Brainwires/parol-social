@@ -75,8 +75,11 @@ parolnet-core (depends on all above)
 parolnet-wasm (depends on crypto + protocol, WASM target only)
 
 parolnet-rtc (native only; drives the sans-I/O `rtc` engine; no workspace deps)
+  |
+  v
+parolnet-app (native; headless client core: crypto + protocol + core (no default features) + rtc)
 
-apps/desktop (own workspace; GPUI; depends on parolnet-rtc, later parolnet-app)
+apps/desktop (own workspace; GPUI; depends on parolnet-app and parolnet-rtc)
 ```
 
 `parolnet-core` features: `native` (default), `mesh` (default; store-forward and LAN discovery),

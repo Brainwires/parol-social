@@ -1,7 +1,12 @@
-# ParolNet desktop (M0 spike)
+# ParolNet desktop
 
-The start of the GPUI desktop client. Today it is the M0 spike: a window that shows a VP8 stream
-received through `webrtc-rs-rtc` (via `parolnet-rtc`) and decoded with libvpx. Findings:
+The GPUI desktop client. By default it is the M1 chat client (UI v0 over `parolnet-app`):
+contacts, pairing by QR code or code (compatible with the PWA), 1:1 end-to-end encrypted chat over
+a direct data channel per contact, and the direct-path state. Status and limits:
+[docs/m1-desktop.md](../../docs/m1-desktop.md).
+
+With `--spike` (or any spike flag) it is the M0 spike: a window that shows a VP8 stream received
+through `webrtc-rs-rtc` (via `parolnet-rtc`) and decoded with libvpx. Findings:
 [docs/m0-spike.md](../../docs/m0-spike.md).
 
 This directory is its own Cargo workspace: it pins a newer toolchain (`rust-toolchain.toml`) and
@@ -25,8 +30,15 @@ cargo test
 ## Run
 
 ```sh
+# the chat client (data in the platform's per-user data directory)
+cargo run --release -- [--relay wss://parol.social/ws] [--data-dir DIR]
+```
+
+The spike:
+
+```sh
 # terminal 1: the window (or --headless to decode without one)
-cargo run --release -- --signal 127.0.0.1:8189
+cargo run --release -- --spike --signal 127.0.0.1:8189
 # terminal 2, from the repository root (npm ci once): headless Chromium sends to it
 node apps/desktop/spike/send.mjs http://127.0.0.1:8189/whip 30
 ```

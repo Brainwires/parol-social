@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added — `parolnet-app`, the headless client core (M1, first slice)
+- Identity load / create in a data directory; contacts; PWA-compatible pairing: the presenter's code is the PWA's QR payload (hex), the scanner establishes the Double Ratchet session and sends the bootstrap envelope (PNP-001 §5.3.1, `source_hint` = its identity key) as the first frame on the data channel; the presenter accepts offers from strangers only while its code is valid (30 minutes).
+- Signaling-only relay client: challenge-response `register`, keepalive, reconnect with backoff, `watch` / `presence`, non-trickle `rtc_offer` / `rtc_answer` (browser `RTCSessionDescription` JSON), `rtc_ice`; `peer_offline` and `rate_limited` handling; the PWA's deterministic initiator, offer stagger, glare rule and retry backoff.
+- One direct WebRTC connection per contact through `parolnet-rtc` with the PWA's `parolnet` data channel and JSON frames (`identity`, `chat` with a hex PNP-001 envelope); 1:1 chat as TEXT envelopes; a sender-side queue with the PWA's limits (30 days, 500 per contact, 2000 total) flushed when the channel opens; path states including "no direct path". STUN comes from the relay's `/turn-credentials` (TURN URIs from a relay are ignored); user ICE servers are passed through.
+- State (contacts, sessions, queue, history) is one JSON file written atomically with owner-only permissions; it is not encrypted at rest yet (`parolnet-store` replaces it).
+- `examples/bot.rs`: a headless peer for scripts and interop tests. Tests: wire-format and store unit tests, and an end-to-end test with two app instances against the relay binary (pairing, chat both ways, queue across a restart with presence push, offers from strangers ignored).
+
+### Changed — `parolnet-rtc`
+- Server-reflexive candidates: `RtcConfig::stun_servers` (`stun:` URIs or `host:port`) are asked for the socket's mapped address before the connection loop starts (`stun_timeout`, default 1.5 s). Text data-channel messages (`RtcHandle::send_text`); `RtcEvent::DataChannelOpen` carries the label; `default_local_ip()` and `stun_host_port()` helpers. Engine pin `v0.22.0+brainwires.3`.
+
+### Added — Desktop chat UI v0 (`apps/desktop`)
+- Contact list with direct-path badges, pairing screen (QR code and text of our code, code entry), chat view with delivery state, rename, retry and the "No direct path to <name>. Either side can add a TURN server in Settings." state; `--relay` and `--data-dir` flags. The M0 video spike stays behind `--spike` (and its existing flags).
+- `apps/desktop/interop/pwa-chat.mjs`: the desktop ↔ PWA interop test plan (stub, not implemented yet).
+
 ### Changed — Relay defaults to the signaling-only profile (PNP-001 v0.11 §10.5)
 - `parolnet-relay-server` now runs the **signaling-only** profile unless `SIGNALING_ONLY=0`: it accepts only `register`, `ping`, `rtc_offer` / `rtc_answer` / `rtc_ice` between two online registered peers, and `watch`; it keeps no store-and-forward mailbox, mints no Privacy Pass tokens, starts no mesh supernode, refuses `message` / `gossip` frames (`error` code `signaling_only`) and closes the socket on binary frames. `/tokens/issue`, `/telemetry`, `/endorse`, `/directory/push`, `/federation/v1` and `/stats` are not served; `/turn-credentials` returns only the STUN URIs from `STUN_URIS`; `/bootstrap` returns an empty list. No user content transits or is stored on such a relay. The previous behaviour is the **relay profile**, an explicit operator opt-in.
 - `registered` frames and `/turn-credentials` carry `profile` (`signaling-only` or `relay`). Error frames carry a machine-readable `code`.

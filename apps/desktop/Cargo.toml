@@ -7,10 +7,11 @@ version = "0.0.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 publish = false
-description = "ParolNet desktop client (M0: GPUI video spike)"
+description = "ParolNet desktop client (GPUI): M1 chat UI v0, plus the M0 video spike"
 
 [dependencies]
 parolnet-rtc = { path = "../../crates/parolnet-rtc" }
+parolnet-app = { path = "../../crates/parolnet-app" }
 
 # GPUI: exact pins, Cargo.lock committed; upgrades are their own train. gpui-pre is the
 # snapshot of zed@main that gpui-component publishes against (docs/m0-spike.md, "GPUI pin").
@@ -20,6 +21,8 @@ gpui-component = { version = "=0.10.0", default-features = false }
 
 tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "sync", "time", "macros"] }
 anyhow = "1"
+# Pairing QR code (the PWA scans the same hex payload).
+qrcode = { version = "0.14", default-features = false }
 image = { version = "0.25", default-features = false, features = ["png"] }
 yuv = "0.8"
 # M0 interop check of the pure-Rust Opus decoder against Chromium's libopus (docs/m0-spike.md).

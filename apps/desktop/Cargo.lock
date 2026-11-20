@@ -120,6 +120,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "aes-gcm"
+version = "0.10.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "831010a0f742e1209b3bcea8fab6a8e149051ba6099432c8cb2cc117dec3ead1"
+dependencies = [
+ "aead",
+ "aes",
+ "cipher",
+ "ctr",
+ "ghash",
+ "subtle",
+]
+
+[[package]]
 name = "ahash"
 version = "0.8.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -629,6 +643,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ac07cdecf99051d9a5238b80f35af32cdeba5b336e55d957b318b50137e18da5"
 
 [[package]]
+name = "base64ct"
+version = "1.8.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2af50177e190e07a26ab74f8b1efbfe2ef87da2116221318cb1c2e82baf7de06"
+
+[[package]]
 name = "bit-set"
 version = "0.10.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -910,6 +930,17 @@ checksum = "f079e83a288787bcd14a6aea84cee5c87a67c5a3e660c30f557a3d24761b3527"
 
 [[package]]
 name = "chacha20"
+version = "0.9.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c3613f74bd2eac03dad61bd53dbe620703d4371614fe0bc3b9f04dd36fe4e818"
+dependencies = [
+ "cfg-if",
+ "cipher",
+ "cpufeatures 0.2.17",
+]
+
+[[package]]
+name = "chacha20"
 version = "0.10.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "65c35e4b699c7e15ccbe7ee35c005e4fc0a278d22238a2857e6ce2dadeda1b06"
@@ -917,6 +948,19 @@ dependencies = [
  "cfg-if",
  "cpufeatures 0.3.1",
  "rand_core 0.10.1",
+]
+
+[[package]]
+name = "chacha20poly1305"
+version = "0.10.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "10cd79432192d1c0f4e1a0fef9527696cc039165d729fb41b3f4f4f354c2dc35"
+dependencies = [
+ "aead",
+ "chacha20 0.9.1",
+ "cipher",
+ "poly1305",
+ "zeroize",
 ]
 
 [[package]]
@@ -934,6 +978,33 @@ dependencies = [
 ]
 
 [[package]]
+name = "ciborium"
+version = "0.2.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "42e69ffd6f0917f5c029256a24d0161db17cea3997d185db0d35926308770f0e"
+dependencies = [
+ "ciborium-io",
+ "ciborium-ll",
+ "serde",
+]
+
+[[package]]
+name = "ciborium-io"
+version = "0.2.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "05afea1e0a06c9be33d539b876f1ce3692f4afea2cb41f740e7743225ed1c757"
+
+[[package]]
+name = "ciborium-ll"
+version = "0.2.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "57663b653d948a338bfb3eeba9bb2fd5fcfaecb9e199e87e1eda4d9e8b240fd9"
+dependencies = [
+ "ciborium-io",
+ "half",
+]
+
+[[package]]
 name = "cipher"
 version = "0.4.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -943,6 +1014,12 @@ dependencies = [
  "inout",
  "zeroize",
 ]
+
+[[package]]
+name = "cmov"
+version = "0.5.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0c9ea0ac24bc397ab3c98583a3c9ba74fa56b09a4449bbe172b9b1ddb016027a"
 
 [[package]]
 name = "cocoa"
@@ -1009,6 +1086,12 @@ dependencies = [
  "cfg-if",
  "wasm-bindgen",
 ]
+
+[[package]]
+name = "const-oid"
+version = "0.9.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c2459377285ad874054d797f3ccebf984978aa39129f6eafde5cdc8315b612f8"
 
 [[package]]
 name = "const-oid"
@@ -1305,6 +1388,42 @@ dependencies = [
 ]
 
 [[package]]
+name = "ctutils"
+version = "0.4.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "261af4dc7a06ea8a527a8717d8cbba3417530d6ea14e1edb3de6b67806be474f"
+dependencies = [
+ "cmov",
+]
+
+[[package]]
+name = "curve25519-dalek"
+version = "4.1.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "97fb8b7c4503de7d6ae7b42ab72a5a59857b4c937ec27a3d4539dba95b5ab2be"
+dependencies = [
+ "cfg-if",
+ "cpufeatures 0.2.17",
+ "curve25519-dalek-derive",
+ "digest 0.10.7",
+ "fiat-crypto",
+ "rustc_version",
+ "subtle",
+ "zeroize",
+]
+
+[[package]]
+name = "curve25519-dalek-derive"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f46882e17999c6cc590af592290432be3bce0428cb0d5f8b6715e4dc7b383eb3"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
+]
+
+[[package]]
 name = "data-encoding"
 version = "2.11.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1315,6 +1434,16 @@ name = "data-url"
 version = "0.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "be1e0bca6c3637f992fc1cc7cbc52a78c1ef6db076dbf1059c4323d6a2048376"
+
+[[package]]
+name = "der"
+version = "0.7.10"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e7c1832837b905bbfb5101e07cc24c8deddf52f93225eee6ead5f4d63d53ddcb"
+dependencies = [
+ "const-oid 0.9.6",
+ "zeroize",
+]
 
 [[package]]
 name = "der-parser"
@@ -1390,8 +1519,9 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f1dd6dbb5841937940781866fa1281a1ff7bd3bf827091440879f9994983d5c2"
 dependencies = [
  "block-buffer 0.12.1",
- "const-oid",
+ "const-oid 0.10.3",
  "crypto-common 0.2.2",
+ "ctutils",
 ]
 
 [[package]]
@@ -1511,6 +1641,31 @@ name = "dyn-clone"
 version = "1.0.20"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d0881ea181b1df73ff77ffaaf9c7544ecc11e82fba9b5f27b262a3c73a332555"
+
+[[package]]
+name = "ed25519"
+version = "2.2.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "115531babc129696a58c64a4fef0a8bf9e9698629fb97e9e40767d235cfbcd53"
+dependencies = [
+ "pkcs8",
+ "signature",
+]
+
+[[package]]
+name = "ed25519-dalek"
+version = "2.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "70e796c081cee67dc755e1a36a0a172b897fab85fc3f6bc48307991f64e4eca9"
+dependencies = [
+ "curve25519-dalek",
+ "ed25519",
+ "rand_core 0.6.4",
+ "serde",
+ "sha2 0.10.9",
+ "subtle",
+ "zeroize",
+]
 
 [[package]]
 name = "either"
@@ -1724,6 +1879,12 @@ checksum = "1e6853b52649d4ac5c0bd02320cddc5ba956bdb407c4b75a2c6b75bf51500f8c"
 dependencies = [
  "simd-adler32",
 ]
+
+[[package]]
+name = "fiat-crypto"
+version = "0.2.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "28dea519a9695b9977216879a3ebfddf92f1c08c05d984f8996aecd6ecdc811d"
 
 [[package]]
 name = "filedescriptor"
@@ -2061,6 +2222,16 @@ dependencies = [
  "r-efi 6.0.0",
  "rand_core 0.10.1",
  "wasm-bindgen",
+]
+
+[[package]]
+name = "ghash"
+version = "0.5.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f0d8a4362ccb29cb0b265253fb0a2728f592895ee6854fd9bc13f2ffda266ff1"
+dependencies = [
+ "opaque-debug",
+ "polyval",
 ]
 
 [[package]]
@@ -2906,7 +3077,16 @@ version = "0.12.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7b5f8eb2ad728638ea2c7d47a21db23b7b58a72ed6a38256b8a1849f15fbbdf7"
 dependencies = [
- "hmac",
+ "hmac 0.12.1",
+]
+
+[[package]]
+name = "hkdf"
+version = "0.13.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4aaa26c720c68b866f2c96ef5c1264b3e6f473fe5d4ce61cd44bbe913e553018"
+dependencies = [
+ "hmac 0.13.0",
 ]
 
 [[package]]
@@ -2916,6 +3096,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6c49c37c09c17a53d937dfbb742eb3a961d65a994e6bcdcf37e7399d0cc8ab5e"
 dependencies = [
  "digest 0.10.7",
+]
+
+[[package]]
+name = "hmac"
+version = "0.13.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6303bc9732ae41b04cb554b844a762b4115a61bfaa81e3e83050991eeb56863f"
+dependencies = [
+ "digest 0.11.3",
 ]
 
 [[package]]
@@ -3015,6 +3204,7 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "tower-service",
+ "webpki-roots 1.0.12",
 ]
 
 [[package]]
@@ -3023,6 +3213,7 @@ version = "0.1.21"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ddc03d96684f9226b8a787cdb71488417b53ab5ea8fdb1dac946cb9431cc8bff"
 dependencies = [
+ "base64 0.23.1",
  "bytes",
  "futures-channel",
  "futures-util",
@@ -3030,7 +3221,9 @@ dependencies = [
  "http-body",
  "httparse",
  "hyper",
+ "ipnet",
  "libc",
+ "percent-encoding",
  "pin-project-lite",
  "socket2",
  "tokio",
@@ -4647,8 +4840,8 @@ dependencies = [
  "futures-lite",
  "futures-util",
  "getrandom 0.4.3",
- "hkdf",
- "hmac",
+ "hkdf 0.12.4",
+ "hmac 0.12.1",
  "md-5",
  "num",
  "num-bigint-dig",
@@ -4662,6 +4855,12 @@ dependencies = [
  "zeroize",
  "zvariant",
 ]
+
+[[package]]
+name = "opaque-debug"
+version = "0.3.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c08d65885ee38876c4f86fa503fb49d7b507c2b62552df7c70b2fce627e06381"
 
 [[package]]
 name = "open"
@@ -4740,6 +4939,72 @@ dependencies = [
 ]
 
 [[package]]
+name = "parolnet-app"
+version = "0.1.0"
+dependencies = [
+ "ed25519-dalek",
+ "futures-util",
+ "hex",
+ "parolnet-core",
+ "parolnet-crypto",
+ "parolnet-protocol",
+ "parolnet-rtc",
+ "rand 0.8.8",
+ "reqwest",
+ "rustls",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.21",
+ "tokio",
+ "tokio-tungstenite",
+ "tracing",
+ "zeroize",
+]
+
+[[package]]
+name = "parolnet-core"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "ciborium",
+ "hex",
+ "hmac 0.13.0",
+ "parolnet-crypto",
+ "parolnet-protocol",
+ "rand 0.8.8",
+ "rand_core 0.6.4",
+ "serde",
+ "serde_bytes",
+ "serde_json",
+ "sha2 0.11.1",
+ "subtle",
+ "thiserror 2.0.21",
+ "tracing",
+ "x25519-dalek",
+ "zeroize",
+]
+
+[[package]]
+name = "parolnet-crypto"
+version = "0.1.0"
+dependencies = [
+ "aes-gcm",
+ "chacha20poly1305",
+ "curve25519-dalek",
+ "ed25519-dalek",
+ "hkdf 0.13.0",
+ "hmac 0.13.0",
+ "rand 0.8.8",
+ "rand_core 0.6.4",
+ "serde",
+ "sha2 0.11.1",
+ "subtle",
+ "thiserror 2.0.21",
+ "x25519-dalek",
+ "zeroize",
+]
+
+[[package]]
 name = "parolnet-desktop"
 version = "0.0.0"
 dependencies = [
@@ -4751,13 +5016,33 @@ dependencies = [
  "objc2-core-foundation",
  "objc2-core-video",
  "opus-rs",
+ "parolnet-app",
  "parolnet-rtc",
  "pkg-config",
+ "qrcode",
  "tokio",
  "tracing",
  "tracing-subscriber",
  "vcpkg",
  "yuv",
+]
+
+[[package]]
+name = "parolnet-protocol"
+version = "0.1.0"
+dependencies = [
+ "ciborium",
+ "ed25519-dalek",
+ "hex",
+ "parolnet-crypto",
+ "rand 0.8.8",
+ "serde",
+ "serde_bytes",
+ "sha2 0.11.1",
+ "subtle",
+ "thiserror 2.0.21",
+ "tracing",
+ "zeroize",
 ]
 
 [[package]]
@@ -4809,7 +5094,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f8ed6a7761f76e3b9f92dfb0a60a6a6477c61024b775147ff0973a02653abaf2"
 dependencies = [
  "digest 0.10.7",
- "hmac",
+ "hmac 0.12.1",
 ]
 
 [[package]]
@@ -4963,6 +5248,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "pkcs8"
+version = "0.10.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f950b2377845cebe5cf8b5165cb3cc1a5e0fa5cfa3e1f7f55707d8fd82e0a7b7"
+dependencies = [
+ "der",
+ "spki",
+]
+
+[[package]]
 name = "pkg-config"
 version = "0.3.34"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5015,12 +5310,35 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2f3a9f18d041e6d0e102a0a46750538147e5e8992d3b4873aaafee2520b00ce3"
 
 [[package]]
+name = "poly1305"
+version = "0.8.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8159bd90725d2df49889a078b54f4f79e87f1f8a8444194cdca81d38f5393abf"
+dependencies = [
+ "cpufeatures 0.2.17",
+ "opaque-debug",
+ "universal-hash",
+]
+
+[[package]]
 name = "polycool"
 version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "50596ddc09eb5ad5f75cacd40209568e66df71baf86e1499a0e99c4cff12a5a6"
 dependencies = [
  "arrayvec",
+]
+
+[[package]]
+name = "polyval"
+version = "0.6.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9d1fe60d06143b2430aa532c94cfe9e29783047f06c0d7fd359a9a51b729fa25"
+dependencies = [
+ "cfg-if",
+ "cpufeatures 0.2.17",
+ "opaque-debug",
+ "universal-hash",
 ]
 
 [[package]]
@@ -5147,6 +5465,12 @@ checksum = "7f6d64c71eb498fe9eae14ce4ec935c555749aef511cca85b5568910d6e48001"
 dependencies = [
  "bytemuck",
 ]
+
+[[package]]
+name = "qrcode"
+version = "0.14.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d68782463e408eb1e668cf6152704bd856c78c5b6417adaee3203d8f4c1fc9ec"
 
 [[package]]
 name = "quick-error"
@@ -5276,7 +5600,7 @@ version = "0.10.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8f6fa277c67e6ea590466f04c3fe82cb509f0864fe470643e5570de9514a9b11"
 dependencies = [
- "chacha20",
+ "chacha20 0.10.2",
  "getrandom 0.4.3",
  "rand_core 0.10.1",
 ]
@@ -5565,6 +5889,43 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "19b30a45b0cd0bcca8037f3d0dc3421eaf95327a17cad11964fb8179b4fc4832"
 
 [[package]]
+name = "reqwest"
+version = "0.12.28"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "eddd3ca559203180a307f12d114c268abf583f59b03cb906fd0b3ff8646c1147"
+dependencies = [
+ "base64 0.22.1",
+ "bytes",
+ "futures-core",
+ "http",
+ "http-body",
+ "http-body-util",
+ "hyper",
+ "hyper-rustls",
+ "hyper-util",
+ "js-sys",
+ "log",
+ "percent-encoding",
+ "pin-project-lite",
+ "rustls",
+ "rustls-pki-types",
+ "serde",
+ "serde_json",
+ "serde_urlencoded",
+ "sync_wrapper",
+ "tokio",
+ "tokio-rustls",
+ "tower",
+ "tower-http",
+ "tower-service",
+ "url",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "web-sys",
+ "webpki-roots 1.0.12",
+]
+
+[[package]]
 name = "resvg"
 version = "0.45.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5677,8 +6038,8 @@ dependencies = [
 
 [[package]]
 name = "rtc"
-version = "0.22.0+brainwires.2"
-source = "git+https://github.com/Brainwires/webrtc-rs-rtc?tag=v0.22.0%2Bbrainwires.2#f0ebf8f2c1e28da83def5b01172025108115013a"
+version = "0.22.0+brainwires.3"
+source = "git+https://github.com/Brainwires/webrtc-rs-rtc?tag=v0.22.0%2Bbrainwires.3#29e3e7ef726c144b172f6d2286dd7d59e54b593c"
 dependencies = [
  "bytes",
  "hex",
@@ -5713,13 +6074,13 @@ dependencies = [
 
 [[package]]
 name = "rtc-crypto"
-version = "0.22.0+brainwires.2"
-source = "git+https://github.com/Brainwires/webrtc-rs-rtc?tag=v0.22.0%2Bbrainwires.2#f0ebf8f2c1e28da83def5b01172025108115013a"
+version = "0.22.0+brainwires.3"
+source = "git+https://github.com/Brainwires/webrtc-rs-rtc?tag=v0.22.0%2Bbrainwires.3#29e3e7ef726c144b172f6d2286dd7d59e54b593c"
 dependencies = [
  "aes",
  "ccm",
  "ctr",
- "hmac",
+ "hmac 0.12.1",
  "md-5",
  "rand 0.10.4",
  "ring",
@@ -5731,8 +6092,8 @@ dependencies = [
 
 [[package]]
 name = "rtc-datachannel"
-version = "0.22.0+brainwires.2"
-source = "git+https://github.com/Brainwires/webrtc-rs-rtc?tag=v0.22.0%2Bbrainwires.2#f0ebf8f2c1e28da83def5b01172025108115013a"
+version = "0.22.0+brainwires.3"
+source = "git+https://github.com/Brainwires/webrtc-rs-rtc?tag=v0.22.0%2Bbrainwires.3#29e3e7ef726c144b172f6d2286dd7d59e54b593c"
 dependencies = [
  "bytes",
  "log",
@@ -5743,8 +6104,8 @@ dependencies = [
 
 [[package]]
 name = "rtc-dtls"
-version = "0.22.0+brainwires.2"
-source = "git+https://github.com/Brainwires/webrtc-rs-rtc?tag=v0.22.0%2Bbrainwires.2#f0ebf8f2c1e28da83def5b01172025108115013a"
+version = "0.22.0+brainwires.3"
+source = "git+https://github.com/Brainwires/webrtc-rs-rtc?tag=v0.22.0%2Bbrainwires.3#29e3e7ef726c144b172f6d2286dd7d59e54b593c"
 dependencies = [
  "bytecheck",
  "byteorder",
@@ -5762,8 +6123,8 @@ dependencies = [
 
 [[package]]
 name = "rtc-ice"
-version = "0.22.0+brainwires.2"
-source = "git+https://github.com/Brainwires/webrtc-rs-rtc?tag=v0.22.0%2Bbrainwires.2#f0ebf8f2c1e28da83def5b01172025108115013a"
+version = "0.22.0+brainwires.3"
+source = "git+https://github.com/Brainwires/webrtc-rs-rtc?tag=v0.22.0%2Bbrainwires.3#29e3e7ef726c144b172f6d2286dd7d59e54b593c"
 dependencies = [
  "bytes",
  "crc",
@@ -5780,8 +6141,8 @@ dependencies = [
 
 [[package]]
 name = "rtc-interceptor"
-version = "0.22.0+brainwires.2"
-source = "git+https://github.com/Brainwires/webrtc-rs-rtc?tag=v0.22.0%2Bbrainwires.2#f0ebf8f2c1e28da83def5b01172025108115013a"
+version = "0.22.0+brainwires.3"
+source = "git+https://github.com/Brainwires/webrtc-rs-rtc?tag=v0.22.0%2Bbrainwires.3#29e3e7ef726c144b172f6d2286dd7d59e54b593c"
 dependencies = [
  "bytes",
  "log",
@@ -5795,8 +6156,8 @@ dependencies = [
 
 [[package]]
 name = "rtc-interceptor-derive"
-version = "0.22.0+brainwires.2"
-source = "git+https://github.com/Brainwires/webrtc-rs-rtc?tag=v0.22.0%2Bbrainwires.2#f0ebf8f2c1e28da83def5b01172025108115013a"
+version = "0.22.0+brainwires.3"
+source = "git+https://github.com/Brainwires/webrtc-rs-rtc?tag=v0.22.0%2Bbrainwires.3#29e3e7ef726c144b172f6d2286dd7d59e54b593c"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -5805,8 +6166,8 @@ dependencies = [
 
 [[package]]
 name = "rtc-mdns"
-version = "0.22.0+brainwires.2"
-source = "git+https://github.com/Brainwires/webrtc-rs-rtc?tag=v0.22.0%2Bbrainwires.2#f0ebf8f2c1e28da83def5b01172025108115013a"
+version = "0.22.0+brainwires.3"
+source = "git+https://github.com/Brainwires/webrtc-rs-rtc?tag=v0.22.0%2Bbrainwires.3#29e3e7ef726c144b172f6d2286dd7d59e54b593c"
 dependencies = [
  "bytes",
  "log",
@@ -5817,8 +6178,8 @@ dependencies = [
 
 [[package]]
 name = "rtc-media"
-version = "0.22.0+brainwires.2"
-source = "git+https://github.com/Brainwires/webrtc-rs-rtc?tag=v0.22.0%2Bbrainwires.2#f0ebf8f2c1e28da83def5b01172025108115013a"
+version = "0.22.0+brainwires.3"
+source = "git+https://github.com/Brainwires/webrtc-rs-rtc?tag=v0.22.0%2Bbrainwires.3#29e3e7ef726c144b172f6d2286dd7d59e54b593c"
 dependencies = [
  "byteorder",
  "bytes",
@@ -5830,8 +6191,8 @@ dependencies = [
 
 [[package]]
 name = "rtc-rtcp"
-version = "0.22.0+brainwires.2"
-source = "git+https://github.com/Brainwires/webrtc-rs-rtc?tag=v0.22.0%2Bbrainwires.2#f0ebf8f2c1e28da83def5b01172025108115013a"
+version = "0.22.0+brainwires.3"
+source = "git+https://github.com/Brainwires/webrtc-rs-rtc?tag=v0.22.0%2Bbrainwires.3#29e3e7ef726c144b172f6d2286dd7d59e54b593c"
 dependencies = [
  "bytes",
  "rtc-shared",
@@ -5839,8 +6200,8 @@ dependencies = [
 
 [[package]]
 name = "rtc-rtp"
-version = "0.22.0+brainwires.2"
-source = "git+https://github.com/Brainwires/webrtc-rs-rtc?tag=v0.22.0%2Bbrainwires.2#f0ebf8f2c1e28da83def5b01172025108115013a"
+version = "0.22.0+brainwires.3"
+source = "git+https://github.com/Brainwires/webrtc-rs-rtc?tag=v0.22.0%2Bbrainwires.3#29e3e7ef726c144b172f6d2286dd7d59e54b593c"
 dependencies = [
  "bytes",
  "memchr",
@@ -5851,8 +6212,8 @@ dependencies = [
 
 [[package]]
 name = "rtc-sctp"
-version = "0.22.0+brainwires.2"
-source = "git+https://github.com/Brainwires/webrtc-rs-rtc?tag=v0.22.0%2Bbrainwires.2#f0ebf8f2c1e28da83def5b01172025108115013a"
+version = "0.22.0+brainwires.3"
+source = "git+https://github.com/Brainwires/webrtc-rs-rtc?tag=v0.22.0%2Bbrainwires.3#29e3e7ef726c144b172f6d2286dd7d59e54b593c"
 dependencies = [
  "bytes",
  "crc32c",
@@ -5866,8 +6227,8 @@ dependencies = [
 
 [[package]]
 name = "rtc-sdp"
-version = "0.22.0+brainwires.2"
-source = "git+https://github.com/Brainwires/webrtc-rs-rtc?tag=v0.22.0%2Bbrainwires.2#f0ebf8f2c1e28da83def5b01172025108115013a"
+version = "0.22.0+brainwires.3"
+source = "git+https://github.com/Brainwires/webrtc-rs-rtc?tag=v0.22.0%2Bbrainwires.3#29e3e7ef726c144b172f6d2286dd7d59e54b593c"
 dependencies = [
  "rand 0.10.4",
  "rtc-shared",
@@ -5876,8 +6237,8 @@ dependencies = [
 
 [[package]]
 name = "rtc-shared"
-version = "0.22.0+brainwires.2"
-source = "git+https://github.com/Brainwires/webrtc-rs-rtc?tag=v0.22.0%2Bbrainwires.2#f0ebf8f2c1e28da83def5b01172025108115013a"
+version = "0.22.0+brainwires.3"
+source = "git+https://github.com/Brainwires/webrtc-rs-rtc?tag=v0.22.0%2Bbrainwires.3#29e3e7ef726c144b172f6d2286dd7d59e54b593c"
 dependencies = [
  "bitflags 1.3.2",
  "bytes",
@@ -5892,8 +6253,8 @@ dependencies = [
 
 [[package]]
 name = "rtc-srtp"
-version = "0.22.0+brainwires.2"
-source = "git+https://github.com/Brainwires/webrtc-rs-rtc?tag=v0.22.0%2Bbrainwires.2#f0ebf8f2c1e28da83def5b01172025108115013a"
+version = "0.22.0+brainwires.3"
+source = "git+https://github.com/Brainwires/webrtc-rs-rtc?tag=v0.22.0%2Bbrainwires.3#29e3e7ef726c144b172f6d2286dd7d59e54b593c"
 dependencies = [
  "byteorder",
  "bytes",
@@ -5905,8 +6266,8 @@ dependencies = [
 
 [[package]]
 name = "rtc-stun"
-version = "0.22.0+brainwires.2"
-source = "git+https://github.com/Brainwires/webrtc-rs-rtc?tag=v0.22.0%2Bbrainwires.2#f0ebf8f2c1e28da83def5b01172025108115013a"
+version = "0.22.0+brainwires.3"
+source = "git+https://github.com/Brainwires/webrtc-rs-rtc?tag=v0.22.0%2Bbrainwires.3#29e3e7ef726c144b172f6d2286dd7d59e54b593c"
 dependencies = [
  "base64 0.22.1",
  "bytes",
@@ -5921,8 +6282,8 @@ dependencies = [
 
 [[package]]
 name = "rtc-turn"
-version = "0.22.0+brainwires.2"
-source = "git+https://github.com/Brainwires/webrtc-rs-rtc?tag=v0.22.0%2Bbrainwires.2#f0ebf8f2c1e28da83def5b01172025108115013a"
+version = "0.22.0+brainwires.3"
+source = "git+https://github.com/Brainwires/webrtc-rs-rtc?tag=v0.22.0%2Bbrainwires.3#29e3e7ef726c144b172f6d2286dd7d59e54b593c"
 dependencies = [
  "bytes",
  "log",
@@ -6072,6 +6433,7 @@ version = "0.23.46"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "48e13bd8c0e9365c43cfa5c9e8f9ad49d3c8444926c9aac819e0e4dc503c8fdf"
 dependencies = [
+ "log",
  "once_cell",
  "ring",
  "rustls-pki-types",
@@ -6480,6 +6842,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "signature"
+version = "2.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "77549399552de45a898a580c1b41d445bf730df867cc44e6c0233bbc4b8329de"
+dependencies = [
+ "rand_core 0.6.4",
+]
+
+[[package]]
 name = "simd-adler32"
 version = "0.3.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6627,6 +6998,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d9571ea910ebd84c86af4b3ed27f9dbdc6ad06f17c5f96146b2b671e2976744f"
 dependencies = [
  "bitflags 2.13.2",
+]
+
+[[package]]
+name = "spki"
+version = "0.7.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d91ed6c858b01f942cd56b37a94b3e0a1798290327d1236e4d9cf4eaca44d29d"
+dependencies = [
+ "base64ct",
+ "der",
 ]
 
 [[package]]
@@ -6898,7 +7279,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.3.4",
+ "getrandom 0.4.3",
  "once_cell",
  "rustix",
  "windows-sys 0.61.2",
@@ -7120,6 +7501,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "tokio-tungstenite"
+version = "0.26.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7a9daff607c6d2bf6c16fd681ccb7eecc83e4e2cdc1ca067ffaadfca5de7f084"
+dependencies = [
+ "futures-util",
+ "log",
+ "rustls",
+ "rustls-pki-types",
+ "tokio",
+ "tokio-rustls",
+ "tungstenite",
+ "webpki-roots 0.26.11",
+]
+
+[[package]]
 name = "tokio-util"
 version = "0.7.20"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7241,6 +7638,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "tower-http"
+version = "0.6.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4cfcf7e2740e6fc6d4d688b4ef00650406bb94adf4731e43c096c3a19fe40840"
+dependencies = [
+ "bitflags 2.13.2",
+ "bytes",
+ "futures-util",
+ "http",
+ "http-body",
+ "pin-project-lite",
+ "tower",
+ "tower-layer",
+ "tower-service",
+ "url",
+]
+
+[[package]]
 name = "tower-layer"
 version = "0.3.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7341,6 +7756,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "tungstenite"
+version = "0.26.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4793cb5e56680ecbb1d843515b23b6de9a75eb04b66643e256a396d43be33c13"
+dependencies = [
+ "bytes",
+ "data-encoding",
+ "http",
+ "httparse",
+ "log",
+ "rand 0.9.5",
+ "rustls",
+ "rustls-pki-types",
+ "sha1",
+ "thiserror 2.0.21",
+ "utf-8",
+]
+
+[[package]]
 name = "typenum"
 version = "1.20.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7428,6 +7862,16 @@ name = "unicode-width"
 version = "0.2.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ca718471876992059f251e33aafc334346ada08042b7661dd1fe313a9bced557"
+
+[[package]]
+name = "universal-hash"
+version = "0.5.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fc1de2c688dc15305988b563c3854064043356019f97a4b46276fe734c4f07ea"
+dependencies = [
+ "crypto-common 0.1.7",
+ "subtle",
+]
 
 [[package]]
 name = "untrusted"
@@ -7824,6 +8268,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "webpki-roots"
+version = "0.26.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "521bc38abb08001b01866da9f51eb7c5d647a19260e00054a8c7fd5f9e57f7a9"
+dependencies = [
+ "webpki-roots 1.0.12",
+]
+
+[[package]]
+name = "webpki-roots"
+version = "1.0.12"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7265c9301c16a8711c992c2d8da90ee77ef54b1ed51482d6dfeb00dc756b1297"
+dependencies = [
+ "rustls-pki-types",
+]
+
+[[package]]
 name = "weezl"
 version = "0.1.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -8043,7 +8505,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.48.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -8712,6 +9174,18 @@ name = "x11rb-protocol"
 version = "0.13.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ea6fc2961e4ef194dcbfe56bb845534d0dc8098940c7e5c012a258bfec6701bd"
+
+[[package]]
+name = "x25519-dalek"
+version = "2.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c7e468321c81fb07fa7f4c636c3972b9100f0346e5b6a9f2bd0603a52f7ed277"
+dependencies = [
+ "curve25519-dalek",
+ "rand_core 0.6.4",
+ "serde",
+ "zeroize",
+]
 
 [[package]]
 name = "x509-parser"

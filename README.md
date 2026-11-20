@@ -69,10 +69,11 @@ apps/desktop (GPUI)      pwa/ (JS + wasm)        later: iOS / Android shells (Un
 | `parolnet-transport`, `-relay`, `-mesh` | Relay connections, federation, directory, tokens; onion circuits and mesh (optional) | exists |
 | `parolnet-core` | Client library: bootstrap, sessions, groups, files | exists |
 | `parolnet-wasm` | Browser bindings for the PWA | exists |
-| `parolnet-relay-server` | Axum relay: `/ws` store-and-forward, federation, `/turn-credentials` | exists |
-| `parolnet-rtc` | Async driver for the sans-I/O [`webrtc-rs-rtc`](https://github.com/Brainwires/webrtc-rs-rtc) engine (native) | M0 skeleton |
-| `apps/desktop` | GPUI desktop client | M0 spike |
-| `parolnet-media`, `-call`, `-transfer`, `-store`, `-app`, `-simnet` | Media, calls, PNP-010 transfer, storage, app core, network simulator | M1 |
+| `parolnet-relay-server` | Axum relay: signaling-only by default (register, SDP / ICE, presence, STUN URIs); opt-in relay profile with store-and-forward, federation, TURN credentials | exists |
+| `parolnet-rtc` | Async driver for the sans-I/O [`webrtc-rs-rtc`](https://github.com/Brainwires/webrtc-rs-rtc) engine (native): host + STUN candidates, data channels, RTP | M1 in progress |
+| `parolnet-app` | Headless client core: identity, PWA-compatible pairing, signaling-only relay client, a direct data channel per contact, 1:1 encrypted chat, sender-side queue | M1 first slice |
+| `apps/desktop` | GPUI desktop client: contacts, pairing, chat (UI v0); the M0 video spike behind `--spike` | M1 first slice |
+| `parolnet-media`, `-call`, `-transfer`, `-store`, `-simnet` | Media, calls, PNP-010 transfer, storage, app core, network simulator | M1 |
 | `parolnet-mls`, `-sframe`, `-sfu` | MLS groups and devices, SFrame, the SFU | M2 |
 
 Media: Opus audio with echo cancellation (AEC3), VP8 video (VP9 / AV1 later), DTLS-SRTP end to end

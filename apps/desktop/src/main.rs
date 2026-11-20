@@ -1,8 +1,14 @@
-//! ParolNet desktop, M0 spike: a GPUI window that shows a VP8 stream received from a peer
-//! (Chromium in the tests) through `webrtc-rs-rtc`, decoded with libvpx.
+//! ParolNet desktop.
+//!
+//! Without spike flags it is the M1 client (`chat.rs`): contact list, pairing, 1:1 chat over
+//! direct data channels, `parolnet-desktop [--relay wss://host/ws] [--data-dir DIR]`.
+//!
+//! With `--spike` (or any of the spike's flags below) it is the M0 spike: a GPUI window that
+//! shows a VP8 stream received from a peer (Chromium in the tests) through `webrtc-rs-rtc`,
+//! decoded with libvpx. The call view of M1 grows out of it.
 //!
 //! ```text
-//! parolnet-desktop [--headless] [--signal 127.0.0.1:8189] [--bind 127.0.0.1:0]
+//! parolnet-desktop --spike [--headless] [--signal 127.0.0.1:8189] [--bind 127.0.0.1:0]
 //!                  [--frames N] [--timeout SECS] [--out frame.png]   (headless)
 //!                  [--expect-tone HZ]                                (headless, Opus)
 //!                  [--exit-after SECS] [--bgra]                      (window)
@@ -14,6 +20,7 @@
 //! decoded audio's strongest frequency to be that tone (the sender plays 1000 Hz). Window mode prints `spike-window first-frame` once a picture is on screen and,
 //! with `--exit-after`, quits that many seconds later (CI takes its screenshot in between).
 
+mod chat;
 mod frame;
 #[cfg(target_os = "macos")]
 mod macos;
@@ -59,6 +66,7 @@ fn parse_args() -> anyhow::Result<Args> {
     while let Some(arg) = it.next() {
         let mut value = || it.next().with_context(|| format!("{arg} needs a value"));
         match arg.as_str() {
+            "--spike" => {}
             "--headless" => args.headless = true,
             "--bgra" => args.bgra = true,
             "--signal" => args.signal = value()?.parse()?,
@@ -69,7 +77,7 @@ fn parse_args() -> anyhow::Result<Args> {
             "--expect-tone" => args.expect_tone = Some(value()?.parse()?),
             "--exit-after" => args.exit_after = Some(Duration::from_secs(value()?.parse()?)),
             "-h" | "--help" => {
-                for line in include_str!("main.rs").lines().skip(4).take(4) {
+                for line in include_str!("main.rs").lines().skip(10).take(4) {
                     println!("{}", line.trim_start_matches("//! "));
                 }
                 std::process::exit(0);
@@ -80,6 +88,20 @@ fn parse_args() -> anyhow::Result<Args> {
     Ok(args)
 }
 
+/// Flags that select the M0 spike (kept so `spike/ci-run.sh` runs unchanged).
+const SPIKE_FLAGS: &[&str] = &[
+    "--spike",
+    "--headless",
+    "--signal",
+    "--bind",
+    "--frames",
+    "--timeout",
+    "--out",
+    "--expect-tone",
+    "--exit-after",
+    "--bgra",
+];
+
 fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -87,6 +109,15 @@ fn main() -> anyhow::Result<()> {
         )
         .with_writer(std::io::stderr)
         .init();
+    let raw: Vec<String> = std::env::args().skip(1).collect();
+    if raw.iter().any(|a| SPIKE_FLAGS.contains(&a.as_str())) {
+        spike_main()
+    } else {
+        chat::main(&raw)
+    }
+}
+
+fn spike_main() -> anyhow::Result<()> {
     let args = parse_args()?;
     eprintln!("libvpx {}", vp8::libvpx_version());
 

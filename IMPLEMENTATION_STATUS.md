@@ -34,11 +34,29 @@ The root Cargo workspace has 14 members; the desktop app is a separate workspace
 | `parolnet-authority-cli` | Authority key and relay endorsement CLI |
 | `parolnet-cli` | Headless test client (QR bootstrap, messaging over the relay) |
 | `parolnet-clause`, `parolnet-conformance` | Spec-clause attribute and the conformance suite |
-| `parolnet-rtc` | **New (M0).** Async driver for the sans-I/O `webrtc-rs-rtc` engine |
+| `parolnet-rtc` | **New (M0, extended in M1).** Async driver for the sans-I/O `webrtc-rs-rtc` engine |
+| `parolnet-app` | **New (M1).** Headless client core: identity, pairing, signaling, direct data channels, 1:1 chat |
 | `xtask` | Clause and test-vector tooling |
-| `apps/desktop` (own workspace) | **New (M0).** GPUI video spike, the start of the desktop client |
+| `apps/desktop` (own workspace) | **New (M0/M1).** GPUI client: contacts, pairing, chat (UI v0); the M0 video spike behind `--spike` |
 
-## M0 (this milestone)
+## M1 (in progress): first slice
+
+See [docs/m1-desktop.md](docs/m1-desktop.md) for what runs end to end, the tests and the next slice.
+
+- **`parolnet-app`** (new): identity load / create, the PWA's QR / code pairing (PNP-003 +
+  PNP-001 §5.3.1), the relay's signaling-only profile (register by challenge, `watch` /
+  `presence`, non-trickle `rtc_offer` / `rtc_answer`, `rtc_ice`), one direct WebRTC connection per
+  contact with the PWA's `parolnet` data channel and JSON frames, 1:1 chat as PNP-001 TEXT
+  envelopes, a sender-side queue (PWA limits) flushed when the channel opens, and the
+  "no direct path" state. State is a JSON file in the data directory, **not yet encrypted at
+  rest** (`parolnet-store` replaces it).
+- **`parolnet-rtc`**: server-reflexive candidates from STUN (binding request on the connection's
+  socket before its loop starts), text data-channel messages, the channel label on open,
+  `default_local_ip`. Engine pin `v0.22.0+brainwires.3`.
+- **Desktop**: chat UI v0 (contact list with path badges, pairing screen with QR code and code
+  entry, chat view with delivery state, rename, retry, the no-path message).
+
+## M0
 
 - **`parolnet-rtc` skeleton.** One tokio task per peer connection owns its UDP socket and the
   engine's timers; commands in (offer, answer, remote candidates, data, keyframe requests, stats),
