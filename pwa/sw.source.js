@@ -2,7 +2,7 @@
 // Cache-first strategy: the app works entirely offline after first load.
 // If the source site goes down, the app continues to function from cache.
 
-const CACHE_NAME = 'parolnet-v9';
+const CACHE_NAME = 'parolnet-v10';
 
 // ── SRI hashes for critical resources ─────────────────────────
 // SHA-256 hashes of critical cached resources. On cache hit for these files,
@@ -654,6 +654,15 @@ self.addEventListener('message', event => {
             swSuspendRelay();
             break;
         case 'relay_register':
+            // A socket may register only one peer id (the signaling-only
+            // server refuses a second register with another id). After an
+            // identity rotation, reconnect so the new id registers on a
+            // fresh socket (onopen sends it; onclose schedules the redial).
+            if (relayWs && relayWs.readyState === 1 && relayPeerId && d.peerId && d.peerId !== relayPeerId) {
+                relayPeerId = d.peerId;
+                try { relayWs.close(4001, 're-register'); } catch {}
+                break;
+            }
             relayPeerId = d.peerId;
             if (relayWs && relayWs.readyState === 1) {
                 relayWs.send(JSON.stringify({ type: 'register', peer_id: d.peerId }));
@@ -684,6 +693,14 @@ self.addEventListener('message', event => {
         case 'relay_signaling':
             if (relayWs && relayWs.readyState === 1) {
                 relayWs.send(JSON.stringify({ type: d.msgType, to: d.to, payload: d.payload }));
+            }
+            break;
+        case 'relay_watch':
+            // Presence subscription (replaces the previous set on the
+            // server). Only meaningful once registered; the page re-sends
+            // it after every `registered` reply.
+            if (relayWs && relayWs.readyState === 1 && relayRegistered && Array.isArray(d.peerIds)) {
+                relayWs.send(JSON.stringify({ type: 'watch', peer_ids: d.peerIds.slice(0, 256) }));
             }
             break;
         case 'relay_status_query':

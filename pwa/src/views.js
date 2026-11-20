@@ -3,6 +3,7 @@ import { wasm, cryptoStore, currentView, setCurrentView } from './state.js';
 import { safeEval, showToast } from './utils.js';
 import { dbGet, dbPut, dbDelete, dbGetRaw } from './db.js';
 import { loadContacts, stopQRScanner, renderBootstrapQR } from './ui-chat.js';
+import { openPairingWindow } from './webrtc.js';
 import { loadGroups } from './messaging.js';
 import { executePanicWipe } from './settings.js';
 
@@ -22,6 +23,9 @@ export function showView(viewName) {
     // Render QR when entering add-contact view
     if (viewName === 'add-contact') {
         renderBootstrapQR();
+        // Someone may scan this QR now: accept their data-channel offer
+        // (webrtc.js only accepts offers from contacts otherwise).
+        openPairingWindow(30 * 60_000);
     }
 
     // Refresh contact list when entering contacts view

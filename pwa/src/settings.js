@@ -10,17 +10,25 @@ import { t } from './i18n.js';
 import { startCoverTraffic, stopCoverTraffic } from './cover-traffic.js';
 import { sendRawEnvelope } from './messaging.js';
 import { enableOnion, disableOnion, isOnionActive } from './onion.js';
+import { relayPathsAllowed, isSignalingOnly, getServerProfile } from './relay-profile.js';
 
 // ── Cover Traffic (PNP-006) ────────────────────────────────
-// Default ON: the threat model requires decoy traffic to hide real activity.
-// Users may disable in bandwidth-constrained environments.
-let coverTrafficEnabled = true;
+// Default OFF. Decoys only make sense on the relay path (they confuse an
+// observer of the relay WebSocket); a direct data channel has no such
+// observer. On a signaling-only relay cover traffic is forced off: decoys
+// are user-originated content and must never reach that server. Users of a
+// relay-profile server may turn it on.
+let coverTrafficEnabled = false;
 
 function coverTrafficDeps() {
     return {
         mode: 'NORMAL',
         wasm,
-        sendRawEnvelope,
+        // Never queue a decoy, and never send one unless the home relay is
+        // known to be a relay-profile server.
+        sendRawEnvelope: (to, env) => relayPathsAllowed()
+            ? sendRawEnvelope(to, env, { noQueue: true })
+            : Promise.resolve({ ok: false, reason: 'cover-traffic-off' }),
         listContacts: () => dbGetAll('contacts'),
     };
 }
@@ -28,7 +36,7 @@ function coverTrafficDeps() {
 export async function loadCoverTrafficSetting() {
     try {
         const saved = await dbGet('settings', 'cover_traffic_enabled');
-        if (saved) coverTrafficEnabled = saved.value !== 'false';
+        if (saved) coverTrafficEnabled = saved.value === 'true';
     } catch {}
     return coverTrafficEnabled;
 }
@@ -42,7 +50,7 @@ export async function setCoverTrafficEnabled(enabled) {
     try {
         await dbPut('settings', { key: 'cover_traffic_enabled', value: String(coverTrafficEnabled) });
     } catch {}
-    if (coverTrafficEnabled) {
+    if (coverTrafficEnabled && relayPathsAllowed()) {
         startCoverTraffic(coverTrafficDeps());
     } else {
         stopCoverTraffic();
@@ -52,13 +60,74 @@ export async function setCoverTrafficEnabled(enabled) {
 
 export function updateCoverTrafficUI() {
     const toggle = document.getElementById('cover-traffic-toggle');
-    if (toggle) toggle.checked = coverTrafficEnabled;
+    if (toggle) {
+        toggle.checked = coverTrafficEnabled && !isSignalingOnly();
+        toggle.disabled = isSignalingOnly();
+    }
 }
 
+// Starts only once the home relay is known to be a relay-profile server;
+// applyServerProfile() starts / stops it when the profile changes.
 export function startCoverTrafficFromSettings() {
-    if (coverTrafficEnabled) {
+    if (coverTrafficEnabled && relayPathsAllowed()) {
         startCoverTraffic(coverTrafficDeps());
     }
+}
+
+/// Home-relay profile changed (relay-profile.js). Signaling-only: cover
+/// traffic stops, onion mode is turned off and both rows are hidden in
+/// Settings. Relay: cover traffic resumes if the user enabled it.
+export function applyServerProfile(profile) {
+    if (profile === 'relay') {
+        if (coverTrafficEnabled) startCoverTraffic(coverTrafficDeps());
+    } else {
+        stopCoverTraffic();
+    }
+    if (profile === 'signaling-only' && isOnionActive()) {
+        disableOnion({ relayUrl: currentRelayUrl() }).catch(e =>
+            console.warn('[Onion] disable on signaling-only relay failed:', e && e.message));
+    }
+    updateRelayFeatureRows();
+}
+
+/// Show / hide the relay-only features (cover traffic, onion mode) and the
+/// server-profile line in the Network settings section.
+export function updateRelayFeatureRows() {
+    if (typeof document === 'undefined') return;
+    const sigOnly = isSignalingOnly();
+    for (const id of ['cover-traffic-setting', 'onion-mode-setting']) {
+        const el = document.getElementById(id);
+        if (el) el.style.display = sigOnly ? 'none' : '';
+    }
+    const note = document.getElementById('server-profile-note');
+    if (note) {
+        const p = getServerProfile();
+        note.textContent = p === 'signaling-only' ? t('settings.serverSignalingOnly')
+            : p === 'relay' ? t('settings.serverRelayProfile') : '';
+        note.style.display = note.textContent ? '' : 'none';
+    }
+    updateCoverTrafficUI();
+    updateOnionModeUI();
+}
+
+// ── Direct-connection IP notice ────────────────────────────
+// Shown once (first open after this update, i.e. before the first direct
+// connection), remembered under `ip_notice_ack`. Settings carries the same
+// explanation permanently.
+export async function showIpNoticeIfNeeded() {
+    try {
+        const ack = await dbGet('settings', 'ip_notice_ack');
+        if (ack && ack.value === 'true') return;
+    } catch {}
+    const el = document.getElementById('ip-notice');
+    if (el) el.classList.remove('hidden');
+}
+
+export async function dismissIpNotice(openSettingsAfter) {
+    const el = document.getElementById('ip-notice');
+    if (el) el.classList.add('hidden');
+    try { await dbPut('settings', { key: 'ip_notice_ack', value: 'true' }); } catch {}
+    if (openSettingsAfter) openSettings();
 }
 
 // ── High anonymity mode (H3 onion, opt-in) ─────────────────
@@ -94,6 +163,7 @@ export function updateOnionModeUI() {
 
 export async function enableOnionModeFromBoot() {
     if (!onionModeEnabled) return;
+    if (isSignalingOnly()) return;
     const relayUrl = currentRelayUrl();
     if (!relayUrl) return;
     try {
@@ -117,6 +187,13 @@ export async function setOnionModeEnabled(enabled) {
     }
     const toggle = document.getElementById('onion-mode-toggle');
 
+    if (want && isSignalingOnly()) {
+        // Onion cells are content through the relay: refused by a
+        // signaling-only server.
+        if (toggle) toggle.checked = false;
+        showToast(t('settings.serverSignalingOnly'));
+        return;
+    }
     if (want) {
         // Confirm: user is opting into the background-notifications tradeoff.
         const proceed = confirm(t('settings.onionModeConfirm'));
@@ -162,6 +239,7 @@ export function openSettings() {
     updateCoverTrafficUI();
     updateRelaySection();
     updateOnionModeUI();
+    updateRelayFeatureRows();
 
     const encSetup = document.getElementById('encryption-setup');
     const encStatus = document.getElementById('encryption-status');

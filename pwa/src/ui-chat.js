@@ -12,10 +12,11 @@ import {
     updateContactState, loadAllContactStates,
 } from './db.js';
 import { showView } from './views.js';
-import { initWebRTC, hasDirectConnection, sendViaWebRTC, rtcConnections,
-         seenGossipMessages, markGossipSeen,
-         waitForTurnReady, hasTurnConfigured, isWebrtcPrivacyMode } from './webrtc.js';
-import { sendToRelay, connMgr, queueMessage } from './connection.js';
+import { hasDirectConnection, sendViaWebRTC, rtcConnections,
+         seenGossipMessages, markGossipSeen, waitForTurnReady,
+         connectToPeer, isPeerKnownOffline, openPairingWindow } from './webrtc.js';
+import { sendToRelay, connMgr, queueMessage, queuedCountFor, requestDirectPath } from './connection.js';
+import { relayPathsAllowed } from './relay-profile.js';
 import { sendRawEnvelope, sendCallSignal } from './messaging.js';
 import { startCallConnection, acceptCallConnection, teardownCallConnection, setCallStatus, startMediaWatchdog } from './call.js';
 import { spendOneToken, maybeRefill } from './token-pool.js';
@@ -185,10 +186,69 @@ export function openChat(peerId) {
         });
     }
     loadMessages(peerId);
+    updateChatPathBanner(peerId);
 
-    if (typeof RTCPeerConnection !== 'undefined') {
-        initWebRTC(peerId, true).catch(e => console.log('[WebRTC] Init failed:', e));
+    // Deterministic initiator (relay-profile.js shouldInitiate); glare is
+    // resolved in webrtc.js handleRTCOffer.
+    connectToPeer(peerId, { reason: 'user' });
+}
+
+// ── Direct-path state in the chat view ──────────────────────
+//
+// "Waiting for <name> to come online" while messages to the open contact sit
+// in the sender queue; "No direct path to <name> ..." after ICE failed while
+// messages were queued or the user was trying to chat / call. Cleared when
+// the data channel opens.
+const noPathPeers = new Set();
+const noPathToastAt = new Map();
+const NO_PATH_TOAST_INTERVAL_MS = 10 * 60_000;
+
+function displayNameFor(peerId) {
+    if (peerId && peerId === currentPeerId) {
+        const nameEl = document.getElementById('chat-peer-name');
+        if (nameEl && nameEl.textContent) return nameEl.textContent;
     }
+    return peerId ? peerId.slice(0, 8) : '';
+}
+
+export function updateChatPathBanner(peerId = currentPeerId) {
+    const el = document.getElementById('chat-path-banner');
+    if (!el || !peerId || peerId !== currentPeerId) return;
+    let text = '';
+    if (!hasDirectConnection(peerId)) {
+        const name = displayNameFor(peerId);
+        if (noPathPeers.has(peerId)) {
+            text = t('chat.noDirectPath', { name });
+        } else if (queuedCountFor(peerId) > 0) {
+            text = t('chat.waitingForPeer', { name });
+        }
+    }
+    el.textContent = text;
+    el.classList.toggle('hidden', !text);
+}
+
+if (typeof window !== 'undefined' && !window._parolnetPathBannerWired) {
+    window._parolnetPathBannerWired = true;
+    window.addEventListener('parolnet:queue-changed', (ev) => {
+        const ids = (ev.detail && ev.detail.peerIds) || [];
+        if (currentPeerId && ids.includes(currentPeerId)) updateChatPathBanner(currentPeerId);
+    });
+    window.addEventListener('parolnet:peer-path', (ev) => {
+        const d = ev.detail || {};
+        if (!d.peerId) return;
+        if (d.state === 'open' || d.state === 'offline') {
+            // Offline is the waiting state, not a path failure.
+            noPathPeers.delete(d.peerId);
+        } else if (d.state === 'failed' && (d.intent || queuedCountFor(d.peerId) > 0)) {
+            noPathPeers.add(d.peerId);
+            const last = noPathToastAt.get(d.peerId) || 0;
+            if (Date.now() - last > NO_PATH_TOAST_INTERVAL_MS) {
+                noPathToastAt.set(d.peerId, Date.now());
+                showToast(t('chat.noDirectPath', { name: displayNameFor(d.peerId) }));
+            }
+        }
+        if (d.peerId === currentPeerId) updateChatPathBanner(d.peerId);
+    });
 }
 
 async function loadMessages(peerId) {
@@ -256,12 +316,11 @@ export async function sendMessage() {
             sent = sendViaWebRTC(currentPeerId, relayPayload);
         }
 
-        // Fallback: home-relay send. PNP-001-MUST-048: the outer frame MUST carry
-        // a Privacy Pass token. Before v0.10 this path called sendToRelay with no
-        // token → the `!token` short-circuit in connection.js made every call
-        // return false, which is why the misleading "message queued" toast was
-        // firing on every send.
-        if (!sent && connMgr.isRelayConnected()) {
+        // Fallback (relay-profile servers only): home-relay send.
+        // PNP-001-MUST-048: the outer frame MUST carry a Privacy Pass token.
+        // A signaling-only relay (or one whose profile is not known yet)
+        // never sees the message: it waits in the sender queue below.
+        if (!sent && relayPathsAllowed() && connMgr.isRelayConnected()) {
             let token = null;
             try {
                 token = spendOneToken(connMgr.relayUrl);
@@ -285,6 +344,7 @@ export async function sendMessage() {
         // reconnect. Per PNP-001-SHOULD-015 we do NOT show a modal toast;
         // a provisional indicator belongs on the message row itself (follow-up).
         queueMessage(currentPeerId, relayPayload);
+        requestDirectPath(currentPeerId);
     }
 
     // Broadcast via gossip mesh for redundancy
@@ -384,15 +444,20 @@ export async function initiateCall(peerId, withVideo) {
     if (!peerId) return;
     setCurrentCallId(null);
 
-    // TURN readiness gate. In privacy mode the RTCPeerConnection runs with
-    // iceTransportPolicy: 'relay', so with no TURN entries ICE has nowhere
-    // to go and the call would sit at "Calling…" until the watchdog fires.
-    // Wait up to 5 s for credentials to land; fail-fast otherwise.
-    await waitForTurnReady(5000);
-    if (isWebrtcPrivacyMode() && !hasTurnConfigured()) {
-        showErrorToast(t('toast.callNoTurn'));
+    // Call signaling rides the data channel. On a signaling-only relay
+    // there is no other path, so without an open channel the call cannot
+    // start: show the waiting / no-path state and try to connect instead.
+    if (!relayPathsAllowed() && !hasDirectConnection(peerId)) {
+        const name = displayNameFor(peerId);
+        connectToPeer(peerId, { reason: 'user' });
+        showToast(isPeerKnownOffline(peerId)
+            ? t('chat.waitingForPeer', { name })
+            : (noPathPeers.has(peerId) ? t('chat.noDirectPath', { name }) : t('toast.callNeedsDirectPath', { name })));
         return;
     }
+
+    // Give ICE server discovery (STUN, or the user's own TURN) up to 5 s.
+    await waitForTurnReady(5000);
 
     try {
         const constraints = { audio: true };
@@ -485,14 +550,9 @@ export async function answerIncomingCall(callId, opts) {
     const withVideo = !!(opts && opts.withVideo);
     const peerId = currentPeerId;
 
-    // TURN readiness gate (mirror of initiateCall). The callee can't answer
-    // either if no relay candidate is available — privacy mode demands TURN.
+    // Give ICE server discovery up to 5 s (mirror of initiateCall). Relay-
+    // only mode is only ever active with the user's own TURN configured.
     await waitForTurnReady(5000);
-    if (isWebrtcPrivacyMode() && !hasTurnConfigured()) {
-        showErrorToast(t('toast.callNoTurn'));
-        if (wasm && wasm.hangup_call) { try { wasm.hangup_call(callId); } catch {} }
-        return;
-    }
 
     // Acquire local media on the callee side. Without this step the call
     // appeared "connected" in the UI but no microphone was ever opened,
@@ -891,10 +951,14 @@ function handleScannedQR(data) {
                 // sendRawEnvelope handles markRealSend internally and spends
                 // a Privacy Pass token; without it the relay silently drops
                 // the frame and the presenter never materializes our session.
+                // On a signaling-only relay there is no relay path: the
+                // envelope is queued and rides the data channel once it
+                // opens (connectToPeer below; the presenter accepts our
+                // offer while its add-contact screen is open).
                 const result = await sendRawEnvelope(peerId, envelope);
                 if (!result.ok) {
-                    console.log('[Bootstrap] relay offline / no token — queued for later send:', result.reason);
-                    queueMessage(peerId, envelope);
+                    console.log('[Bootstrap] not sent yet — queued for later send:', result.reason);
+                    if (!result.queued) queueMessage(peerId, envelope);
                 } else {
                     console.log('[Bootstrap] envelope handed to relay');
                 }
@@ -902,6 +966,9 @@ function handleScannedQR(data) {
                 console.warn('[Bootstrap] envelope_encode failed:', e);
             }
         }
+        // The presenter does not know us yet, so it neither watches us nor
+        // offers: we offer right away instead of waiting for a tie-break.
+        connectToPeer(peerId, { reason: 'user', force: true });
         openChat(peerId);
     }).catch(e => console.warn('Failed to save contact:', e));
 }
@@ -986,6 +1053,9 @@ export function copyBootstrapCode() {
         showToast('No code to copy');
         return;
     }
+    // The code may be pasted by the contact some time later: accept their
+    // data-channel offer for a day (webrtc.js isAllowedRtcPeer).
+    openPairingWindow(24 * 60 * 60_000);
     navigator.clipboard.writeText(codeEl.textContent).then(() => {
         showToast('Code copied to clipboard');
     }).catch(() => {

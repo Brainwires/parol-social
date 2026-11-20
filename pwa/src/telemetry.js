@@ -1,6 +1,7 @@
 // ParolNet PWA — Telemetry
 import { isDevMode } from './utils.js';
 import { connMgr } from './connection.js';
+import { relayPathsAllowed } from './relay-profile.js';
 
 export const telemetry = {
     sid: Array.from(crypto.getRandomValues(new Uint8Array(8))).map(b => b.toString(16).padStart(2, '0')).join(''),
@@ -16,6 +17,10 @@ export const telemetry = {
     async flush() {
         if (!isDevMode()) return;
         if (this.events.length === 0) return;
+        // A signaling-only relay has no /telemetry endpoint and must not
+        // receive anything beyond signaling; send only to a known
+        // relay-profile server.
+        if (!relayPathsAllowed()) return;
         // Skip telemetry if no relay server is configured/connected
         const relayUrl = connMgr && connMgr.relayUrl;
         if (!relayUrl) return;

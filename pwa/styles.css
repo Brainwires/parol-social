@@ -1486,3 +1486,34 @@ button.success {
 [dir="rtl"] .setting-row { direction: rtl; }
 [dir="rtl"] .contact-overflow-menu { right: auto; left: 8px; }
 [dir="rtl"] .contact-overflow-menu button { text-align: right; }
+
+/* ── Direct-path state (signaling-only relay) ──────────────── */
+.chat-path-banner {
+    padding: 8px 16px;
+    font-size: 13px;
+    line-height: 1.4;
+    background: rgba(240, 165, 0, 0.15);
+    color: var(--text, #fff);
+    border-bottom: 1px solid var(--border, #333);
+}
+
+.ip-notice-body {
+    padding: 12px 16px;
+    overflow-y: auto;
+    font-size: 14px;
+    line-height: 1.5;
+}
+
+.ip-notice-body p {
+    margin: 0 0 10px;
+}
+
+.ip-exposure-note {
+    font-size: 0.85em;
+    opacity: 0.8;
+    margin-bottom: 12px;
+    padding: 8px 12px;
+    border-left: 3px solid #f0a500;
+    background: rgba(240, 165, 0, 0.08);
+    border-radius: 4px;
+}

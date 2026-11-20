@@ -3,10 +3,15 @@
 // Separate from webrtc.js's data-channel mesh PC on purpose: that PC exists
 // for the lifetime of a chat session and carries the Signal-style ratchet
 // traffic; a call PC is short-lived (ring → pickup → hangup) and carries
-// RTP media tracks. Both reuse the same getRtcConfig() so the privacy-mode
-// `iceTransportPolicy: 'relay'` discipline (no public IP leak to the
-// contact) applies uniformly — a call must never be the vector that
-// circumvents the data-channel TURN-only guarantee.
+// RTP media tracks. Both reuse the same getRtcConfig(), so the ICE policy is
+// uniform: direct + STUN by default, or ONLY the user's own TURN server when
+// "Relay through my own TURN server" is on — a call must never be the vector
+// that circumvents that relay-only choice.
+//
+// Call signals (offer / answer / ice / hangup) are CALL_SIGNAL envelopes sent
+// through sendCallSignal -> sendRawEnvelope, i.e. over the 'parolnet' data
+// channel; on a signaling-only relay they never touch the server, and
+// initiateCall refuses to start without an open data channel.
 //
 // Public surface is deliberately narrow (five verbs) so the caller in
 // ui-chat.js doesn't need to reach into RTCPeerConnection internals:
@@ -17,7 +22,7 @@
 //   teardownCallConnection — close PC, clear state, unbind media sinks
 
 import { localStream, setRemoteStream } from './state.js';
-import { getRtcConfig, isWebrtcPrivacyMode } from './webrtc.js';
+import { getRtcConfig, isRelayOnlyActive } from './webrtc.js';
 import { sendCallSignal } from './messaging.js';
 import { showErrorToast } from './utils.js';
 import { t } from './i18n.js';
@@ -60,11 +65,11 @@ export function startMediaWatchdog(peerId) {
 }
 
 function filterIceCandidateInPrivacyMode(candidateStr) {
-    // Same predicate as initWebRTC's onicecandidate handler. Privacy mode
-    // must never allow host or server-reflexive candidates on the wire —
+    // Same predicate as initWebRTC's onicecandidate handler. Relay-only
+    // mode must never allow host or server-reflexive candidates on the wire —
     // both leak the client's public IP to the remote peer even when
     // iceTransportPolicy: 'relay' is set on the local PC.
-    if (!isWebrtcPrivacyMode()) return false;
+    if (!isRelayOnlyActive()) return false;
     return candidateStr.includes('typ host') || candidateStr.includes('typ srflx');
 }
 
@@ -134,10 +139,7 @@ async function logIceStats(peerId, pc) {
 function createCallPc(peerId, callId) {
     const cfg = getRtcConfig();
     console.log('[Call]', peerId.slice(0, 8), 'createCallPc — iceServers:', (cfg.iceServers || []).length,
-                'policy:', cfg.iceTransportPolicy || 'all', 'privacy:', isWebrtcPrivacyMode());
-    if (isWebrtcPrivacyMode() && (!cfg.iceServers || cfg.iceServers.length === 0)) {
-        console.warn('[Call] privacy mode ON but iceServers is empty — TURN credentials may not have loaded yet');
-    }
+                'policy:', cfg.iceTransportPolicy || 'all', 'relayOnly:', isRelayOnlyActive());
     const pc = new RTCPeerConnection(cfg);
 
     // Per-PC ICE candidate counters. Useful when the connection never comes
