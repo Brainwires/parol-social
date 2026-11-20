@@ -3,6 +3,7 @@ name = "parolnet-cli"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.91"
+license = "MIT OR Apache-2.0"
 description = "Headless ParolNet test client — QR bootstrap / messaging over the relay WS"
 
 [[bin]]
@@ -10,7 +11,7 @@ name = "parolnet-cli"
 path = "src/main.rs"
 
 [dependencies]
-parolnet-core = { path = "../parolnet-core", features = ["native"] }
+parolnet-core = { path = "../parolnet-core", features = ["native", "mesh"] }
 parolnet-crypto = { path = "../parolnet-crypto" }
 parolnet-protocol = { path = "../parolnet-protocol" }
 parolnet-relay = { path = "../parolnet-relay" }

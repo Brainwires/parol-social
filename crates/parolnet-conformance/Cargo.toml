@@ -31,7 +31,7 @@ parolnet-protocol = { workspace = true }
 parolnet-transport = { workspace = true }
 parolnet-mesh = { workspace = true }
 parolnet-relay = { workspace = true }
-parolnet-core = { workspace = true, features = ["native"] }
+parolnet-core = { workspace = true, features = ["native", "mesh"] }
 zeroize = { workspace = true }
 proptest = { workspace = true }
 serde = { workspace = true }

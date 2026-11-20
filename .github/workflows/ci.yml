@@ -26,6 +26,21 @@ jobs:
             ${{ runner.os }}-cargo-check-
       - run: cargo check --workspace
 
+  deny:
+    name: Licence gate (cargo-deny)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny
+      # No GPL / LGPL / AGPL anywhere; MPL-2.0 only for the crates deny.toml names. Advisories are
+      # not gated here yet (the existing tree carries known ones: see IMPLEMENTATION_STATUS.md).
+      - name: Workspace
+        run: cargo deny check licenses sources bans
+      - name: Desktop app (its own workspace)
+        run: cargo deny --manifest-path apps/desktop/Cargo.toml --config apps/desktop/deny.toml check licenses sources bans
+
   test:
     name: Tests
     runs-on: ubuntu-latest
