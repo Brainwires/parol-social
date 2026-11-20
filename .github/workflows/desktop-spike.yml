@@ -1,0 +1,109 @@
+name: Desktop spike (M0)
+
+# The GPUI video spike on the five desktop targets: build, a headless decode check (VP8 + an
+# Opus tone from headless Chromium through webrtc-rs-rtc), then a real window that shows the
+# stream and a screenshot of it. Heavy, so it runs only by hand: dispatched, or once on a pull
+# request by adding the `desktop-spike` label (a workflow file can be dispatched only once it is on
+# the default branch).
+on:
+  workflow_dispatch:
+  pull_request:
+    types: [labeled]
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  spike:
+    name: spike (${{ matrix.label }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { label: linux-x64, os: ubuntu-24.04 }
+          - { label: macos-arm64, os: macos-15 }
+          - { label: macos-x64, os: macos-15-intel }
+          - { label: windows-x64, os: windows-2025, triplet: x64-windows-static-md }
+          - { label: windows-arm64, os: windows-11-arm, triplet: arm64-windows-static-md }
+    if: github.event_name == 'workflow_dispatch' || github.event.label.name == 'desktop-spike'
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 75
+    defaults:
+      run:
+        shell: bash
+    env:
+      VCPKGRS_TRIPLET: ${{ matrix.triplet }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: System packages (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config libvpx-dev libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev \
+            libx11-xcb-dev libxcb1-dev libfontconfig-dev libvulkan1 mesa-vulkan-drivers \
+            xvfb imagemagick
+      - name: System packages (macOS)
+        if: runner.os == 'macOS'
+        run: brew install libvpx pkgconf
+      - name: System packages (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          echo "VCPKG_ROOT=$VCPKG_INSTALLATION_ROOT" >> "$GITHUB_ENV"
+          "$VCPKG_INSTALLATION_ROOT/vcpkg" install "libvpx:${{ matrix.triplet }}"
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+      - name: Chromium for the sender (puppeteer)
+        run: npm ci --omit=dev
+
+      - name: Toolchain (apps/desktop/rust-toolchain.toml)
+        working-directory: apps/desktop
+        run: rustup show active-toolchain || rustup toolchain install
+
+      - uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            apps/desktop/target
+          key: ${{ matrix.label }}-desktop-spike-${{ hashFiles('apps/desktop/Cargo.lock') }}
+          restore-keys: ${{ matrix.label }}-desktop-spike-
+
+      - name: Build
+        working-directory: apps/desktop
+        run: cargo build --release --locked
+
+      - name: Unit tests
+        working-directory: apps/desktop
+        run: cargo test --release --locked
+
+      - name: Headless decode check
+        run: |
+          bin=apps/desktop/target/release/parolnet-desktop
+          [ -f "$bin.exe" ] && bin="$bin.exe"
+          apps/desktop/spike/ci-run.sh headless "$bin" spike-out
+
+      - name: Window and screenshot (Linux, Xvfb)
+        if: runner.os == 'Linux'
+        run: |
+          xvfb-run -a -s "-screen 0 1280x800x24" \
+            apps/desktop/spike/ci-run.sh window apps/desktop/target/release/parolnet-desktop spike-out
+      - name: Window and screenshot
+        if: runner.os != 'Linux'
+        run: |
+          bin=apps/desktop/target/release/parolnet-desktop
+          [ -f "$bin.exe" ] && bin="$bin.exe"
+          apps/desktop/spike/ci-run.sh window "$bin" spike-out
+
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: spike-${{ matrix.label }}
+          path: spike-out/
+          if-no-files-found: warn
