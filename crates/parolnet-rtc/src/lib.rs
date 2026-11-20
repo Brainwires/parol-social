@@ -6,10 +6,14 @@
 //! talks to it through a command channel ([`RtcHandle`]) and an event channel
 //! ([`RtcEvent`]).
 //!
-//! Status (M1, first slice): it gathers the host candidate of the socket it binds and, when
-//! STUN servers are given, one server-reflexive candidate per server (a binding request on the
-//! same socket before the loop starts); it answers or makes a non-trickle offer, delivers RTP
-//! packets and data-channel messages (binary and text), requests keyframes and reports stats.
+//! Status (M1): it gathers the host candidate of the socket it binds and, when STUN servers
+//! are given, one server-reflexive candidate per server (a binding request on the same socket
+//! before the loop starts); it answers or makes a non-trickle offer, delivers RTP packets and
+//! data-channel messages (binary and text), requests keyframes and reports stats. Remote mDNS
+//! host candidates (`<uuid>.local`, what Chromium and Safari announce instead of a private
+//! address) are resolved with an mDNS query: the engine asks, and this driver opens the
+//! multicast socket (`224.0.0.251:5353`) the first time a remote description or candidate
+//! names a `.local` host, so a connection that never sees one never touches multicast.
 //! Still to come in M1 (see `docs/m0-spike.md`): TURN candidates for a user-supplied TURN
 //! server (`rtc-turn`), IPv6 and several sockets per connection, interface-change restarts,
 //! and the virtual-time mode that runs the same loop over `parolnet-simnet`.
@@ -19,7 +23,9 @@ use std::net::{IpAddr, SocketAddr};
 use std::time::{Duration, Instant};
 
 use bytes::BytesMut;
+use rtc::ice::mdns::MulticastDnsMode;
 use rtc::interceptor::Registry;
+use rtc::mdns::{MDNS_PORT, MulticastSocket};
 use rtc::media_stream::MediaStreamTrackId;
 use rtc::peer_connection::configuration::RTCConfigurationBuilder;
 use rtc::peer_connection::configuration::interceptor_registry::register_default_interceptors;
@@ -97,6 +103,10 @@ pub struct RtcConfig {
     /// Capacity of the event channel. RTP events are dropped (and counted) when it is full;
     /// control events wait for room.
     pub event_capacity: usize,
+    /// Resolve the peer's mDNS (`*.local`) host candidates with an mDNS query on the local
+    /// network. Off: such candidates are dropped (the connection can still succeed through a
+    /// server-reflexive or peer-reflexive candidate).
+    pub mdns: bool,
 }
 
 impl Default for RtcConfig {
@@ -110,6 +120,7 @@ impl Default for RtcConfig {
             data_channel: None,
             answering_dtls_role: None,
             event_capacity: 4096,
+            mdns: true,
         }
     }
 }
@@ -245,6 +256,9 @@ pub async fn spawn(config: RtcConfig) -> Result<(RtcHandle, mpsc::Receiver<RtcEv
         data_channel: config.data_channel,
         tracks: HashMap::new(),
         dropped_rtp: 0,
+        mdns_enabled: config.mdns,
+        mdns: None,
+        mdns_answers: 0,
     };
     let task = tokio::spawn(driver.run(cmd_rx));
     Ok((
@@ -302,7 +316,11 @@ fn build_peer_connection(config: &RtcConfig) -> Result<RTCPeerConnection, RtcErr
     )?;
     let registry = register_default_interceptors(Registry::new(), &mut media_engine)?;
 
-    let mut settings = SettingEngineBuilder::new();
+    let mut settings = SettingEngineBuilder::new().with_multicast_dns_mode(if config.mdns {
+        MulticastDnsMode::QueryOnly
+    } else {
+        MulticastDnsMode::Disabled
+    });
     if let Some(role) = config.answering_dtls_role {
         settings = settings.with_answering_dtls_role(role);
     }
@@ -343,6 +361,12 @@ struct Driver {
     /// track id → (receiver, whether its first packet was reported)
     tracks: HashMap<MediaStreamTrackId, (RTCRtpReceiverId, bool)>,
     dropped_rtp: u64,
+    /// Whether remote `.local` candidates are resolved.
+    mdns_enabled: bool,
+    /// The multicast socket for mDNS queries, opened on the first remote `.local` candidate.
+    mdns: Option<UdpSocket>,
+    /// mDNS datagrams received (answers to our queries, and other hosts' traffic).
+    mdns_answers: u64,
 }
 
 /// The longest the loop sleeps when the engine names no deadline.
@@ -364,6 +388,7 @@ impl Driver {
         commands: &mut mpsc::UnboundedReceiver<Command>,
     ) -> Result<(), RtcError> {
         let mut buf = vec![0u8; 2048];
+        let mut mdns_buf = vec![0u8; 2048];
         loop {
             self.flush_writes().await;
             if self.drain_events().await? {
@@ -403,12 +428,48 @@ impl Driver {
                         tracing::debug!(%peer_addr, %err, "datagram rejected");
                     }
                 }
+                received = recv_optional(self.mdns.as_ref(), &mut mdns_buf) => {
+                    let (n, peer_addr) = received?;
+                    self.mdns_answers += 1;
+                    if self.mdns_answers == 1 {
+                        tracing::info!(%peer_addr, "mDNS traffic received");
+                    }
+                    let local_addr = self
+                        .mdns
+                        .as_ref()
+                        .and_then(|s| s.local_addr().ok())
+                        .unwrap_or_else(|| SocketAddr::from(([0, 0, 0, 0], MDNS_PORT)));
+                    // Other hosts' mDNS traffic arrives here too; the engine ignores it.
+                    if let Err(err) = self.pc.handle_read(TaggedBytesMut {
+                        now: Instant::now(),
+                        transport: TransportContext {
+                            local_addr,
+                            peer_addr,
+                            ecn: None,
+                            transport_protocol: TransportProtocol::UDP,
+                        },
+                        message: BytesMut::from(&mdns_buf[..n]),
+                    }) {
+                        tracing::trace!(%peer_addr, %err, "mDNS datagram rejected");
+                    }
+                }
             }
         }
     }
 
     async fn flush_writes(&mut self) {
         while let Some(msg) = self.pc.poll_write() {
+            if msg.transport.peer_addr.port() == MDNS_PORT
+                && msg.transport.peer_addr.ip().is_multicast()
+            {
+                // An mDNS query for a remote `.local` candidate.
+                if let Some(mdns) = self.mdns.as_ref()
+                    && let Err(err) = mdns.send_to(&msg.message, msg.transport.peer_addr).await
+                {
+                    tracing::debug!(%err, "mDNS query not sent");
+                }
+                continue;
+            }
             if let Err(err) = self
                 .socket
                 .send_to(&msg.message, msg.transport.peer_addr)
@@ -523,6 +584,9 @@ impl Driver {
                 self.emit_local_description().await;
             }
             Command::SetRemoteDescription(desc) => {
+                if has_mdns_candidate(&desc.sdp) {
+                    self.open_mdns();
+                }
                 let is_offer = desc.sdp_type == rtc::peer_connection::sdp::RTCSdpType::Offer;
                 self.pc.set_remote_description(now, *desc)?;
                 if is_offer {
@@ -533,6 +597,9 @@ impl Driver {
                 }
             }
             Command::AddRemoteCandidate(candidate) => {
+                if has_mdns_candidate(&candidate.candidate) {
+                    self.open_mdns();
+                }
                 self.pc.add_remote_candidate(candidate)?;
             }
             Command::SendData { id, data } => {
@@ -566,6 +633,28 @@ impl Driver {
             Command::Close => {}
         }
         Ok(())
+    }
+
+    /// Open the mDNS multicast socket (once) so the engine's queries for remote `.local`
+    /// candidates go out and their answers come back. A failure (port in use without
+    /// `SO_REUSEPORT`, no multicast route) only costs those candidates.
+    fn open_mdns(&mut self) {
+        if !self.mdns_enabled || self.mdns.is_some() {
+            return;
+        }
+        let socket = MulticastSocket::new()
+            .into_std()
+            .and_then(UdpSocket::from_std);
+        match socket {
+            Ok(s) => {
+                tracing::debug!(local = ?s.local_addr().ok(), "mDNS socket open");
+                self.mdns = Some(s);
+            }
+            Err(err) => {
+                tracing::warn!(%err, "cannot open the mDNS socket; .local candidates stay unresolved");
+                self.mdns_enabled = false;
+            }
+        }
     }
 
     /// The host candidate (the bound socket) and the server-reflexive ones learned from STUN.
@@ -614,6 +703,32 @@ impl Driver {
             self.emit(RtcEvent::LocalDescription(Box::new(desc))).await;
         }
     }
+}
+
+/// Receive on an optional socket; never resolves without one.
+async fn recv_optional(
+    socket: Option<&UdpSocket>,
+    buf: &mut [u8],
+) -> std::io::Result<(usize, SocketAddr)> {
+    match socket {
+        Some(s) => s.recv_from(buf).await,
+        None => std::future::pending().await,
+    }
+}
+
+/// True when an SDP blob or a single candidate line names an mDNS (`*.local`) host
+/// candidate: `candidate:<foundation> <component> <transport> <priority> <address> ...`.
+pub fn has_mdns_candidate(sdp_or_candidate: &str) -> bool {
+    sdp_or_candidate.lines().any(|line| {
+        let line = line.trim();
+        let line = line.strip_prefix("a=").unwrap_or(line);
+        let Some(rest) = line.strip_prefix("candidate:") else {
+            return false;
+        };
+        rest.split_ascii_whitespace()
+            .nth(4)
+            .is_some_and(|addr| addr.to_ascii_lowercase().ends_with(".local"))
+    })
 }
 
 /// The address of the interface the default route leaves through, or `None` without a
@@ -757,7 +872,22 @@ async fn gather_srflx(
 
 #[cfg(test)]
 mod tests {
-    use super::stun_host_port;
+    use super::{has_mdns_candidate, stun_host_port};
+
+    #[test]
+    fn mdns_candidates_are_recognized() {
+        let chrome = "candidate:1840965416 1 udp 2122260223 \
+                      2a4d4a5e-2cf8-4b2b-9a9f-3c1c3e52a7a1.local 54400 typ host generation 0";
+        assert!(has_mdns_candidate(chrome));
+        let sdp =
+            format!("v=0\r\nm=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\na={chrome}\r\n");
+        assert!(has_mdns_candidate(&sdp));
+        assert!(!has_mdns_candidate(
+            "a=candidate:1 1 udp 2122260223 192.168.1.4 54400 typ host"
+        ));
+        assert!(!has_mdns_candidate("a=ice-ufrag:abc.local"));
+        assert!(!has_mdns_candidate(""));
+    }
 
     #[test]
     fn stun_uris_become_host_port() {

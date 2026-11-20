@@ -1102,6 +1102,15 @@ export function connectViaPassphrase() {
     let clean = raw.replace(/[\s\n\r"']/g, '');
     console.log('[AddContact] Input cleaned:', clean.slice(0, 80), 'length:', clean.length);
 
+    // A full pairing code (the hex QR payload from the contact's "Show QR"
+    // screen, or a desktop's pairing code) pairs exactly like a camera scan:
+    // establish the encrypted session, send the bootstrap envelope, connect.
+    if (/^[0-9a-fA-F]+$/.test(clean) && clean.length > 64) {
+        if (input) input.value = '';
+        handleScannedQR(clean);
+        return;
+    }
+
     let peerId = null;
 
     if (clean.startsWith('parolnet:')) {

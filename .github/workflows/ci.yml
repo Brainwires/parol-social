@@ -130,6 +130,47 @@ jobs:
       - name: Test-vector validity
         run: cargo xtask vectors --validate
 
+  pwa-interop:
+    name: Desktop <-> PWA interop (headless Chromium)
+    # The headless desktop core (parolnet-app's bot) against the real PWA in Chromium through
+    # the relay binary in its signaling-only profile: pairing both ways, chat both ways, the
+    # sender queue. Twice: as Chromium ships (mDNS host candidates the desktop resolves) and
+    # with loopback candidates.
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-interop-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-interop-
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+      - name: Chromium (puppeteer) and esbuild
+        run: npm ci
+      - name: Allow Chrome's sandbox
+        # Ubuntu 24.04 restricts unprivileged user namespaces through AppArmor.
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+      - name: Install wasm-pack
+        run: curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
+      - name: Build the PWA
+        run: npm run build:wasm && npm run build
+      - name: Build the relay and the desktop bot
+        run: cargo build -p parolnet-relay-server --bin parolnet-relay -p parolnet-app --example bot
+      - name: Interop (mDNS host candidates)
+        run: INTEROP_ICE=mdns node apps/desktop/interop/pwa-chat.mjs
+      - name: Interop (loopback host candidates)
+        run: INTEROP_ICE=loopback node apps/desktop/interop/pwa-chat.mjs
+
   msrv:
     name: MSRV (1.91.0)
     runs-on: ubuntu-latest
