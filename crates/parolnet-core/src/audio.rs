@@ -1,6 +1,8 @@
 //! Audio codec pipeline (PNP-007 Section 5).
 //!
-//! Supports Opus (primary, high quality) and Codec2 (fallback, ultra-low bitrate).
+//! Supports Opus (primary, high quality) and, with the opt-in `codec2` feature, Codec2
+//! (ultra-low bitrate). Codec2 is LGPL-2.1, so default builds leave it out (the licence gate in
+//! `deny.toml`); it goes away with PNP-011 in M1.
 //! Pure Rust implementations -- no C dependencies.
 
 use parolnet_protocol::media::AudioCodec;
@@ -14,6 +16,7 @@ pub struct AudioEncoder {
 #[allow(clippy::large_enum_variant)]
 enum AudioCodecImpl {
     Opus(OpusEncoderInner),
+    #[cfg(feature = "codec2")]
     Codec2(Codec2EncoderInner),
 }
 
@@ -22,6 +25,7 @@ struct OpusEncoderInner {
     frame_size: usize,
 }
 
+#[cfg(feature = "codec2")]
 struct Codec2EncoderInner {
     codec: codec2::Codec2,
 }
@@ -35,6 +39,7 @@ pub struct AudioDecoder {
 #[allow(clippy::large_enum_variant)]
 enum AudioDecoderImpl {
     Opus(OpusDecoderInner),
+    #[cfg(feature = "codec2")]
     Codec2(Codec2DecoderInner),
 }
 
@@ -43,6 +48,7 @@ struct OpusDecoderInner {
     frame_size: usize,
 }
 
+#[cfg(feature = "codec2")]
 struct Codec2DecoderInner {
     codec: codec2::Codec2,
 }
@@ -114,6 +120,7 @@ impl AudioEncoder {
                     codec_type: AudioCodec::Opus,
                 })
             }
+            #[cfg(feature = "codec2")]
             AudioCodec::Codec2 => {
                 let codec = codec2::Codec2::new(codec2::Codec2Mode::MODE_3200);
                 Ok(Self {
@@ -121,6 +128,10 @@ impl AudioEncoder {
                     codec_type: AudioCodec::Codec2,
                 })
             }
+            #[cfg(not(feature = "codec2"))]
+            AudioCodec::Codec2 => Err(AudioError::CodecInit(
+                "Codec2 is not built in (opt-in `codec2` feature, LGPL-2.1)".into(),
+            )),
         }
     }
 
@@ -142,6 +153,7 @@ impl AudioEncoder {
                 output.truncate(len);
                 Ok(output)
             }
+            #[cfg(feature = "codec2")]
             AudioCodecImpl::Codec2(enc) => {
                 // codec2: encode(&mut self, bits: &mut [u8], speech: &[i16])
                 let bytes_per_frame = enc.codec.bits_per_frame().div_ceil(8);
@@ -156,6 +168,7 @@ impl AudioEncoder {
     pub fn frame_samples(&self) -> usize {
         match &self.codec {
             AudioCodecImpl::Opus(enc) => enc.frame_size,
+            #[cfg(feature = "codec2")]
             AudioCodecImpl::Codec2(enc) => enc.codec.samples_per_frame(),
         }
     }
@@ -180,6 +193,7 @@ impl AudioDecoder {
                     codec_type: AudioCodec::Opus,
                 })
             }
+            #[cfg(feature = "codec2")]
             AudioCodec::Codec2 => {
                 let codec = codec2::Codec2::new(codec2::Codec2Mode::MODE_3200);
                 Ok(Self {
@@ -187,6 +201,10 @@ impl AudioDecoder {
                     codec_type: AudioCodec::Codec2,
                 })
             }
+            #[cfg(not(feature = "codec2"))]
+            AudioCodec::Codec2 => Err(AudioError::CodecInit(
+                "Codec2 is not built in (opt-in `codec2` feature, LGPL-2.1)".into(),
+            )),
         }
     }
 
@@ -207,6 +225,7 @@ impl AudioDecoder {
                     .collect();
                 Ok(i16_output)
             }
+            #[cfg(feature = "codec2")]
             AudioDecoderImpl::Codec2(dec) => {
                 let samples = dec.codec.samples_per_frame();
                 let mut pcm = vec![0i16; samples];

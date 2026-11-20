@@ -7,8 +7,14 @@ rust-version.workspace = true
 description = "ParolNet client library: session management, bootstrap, panic wipe, decoy mode"
 
 [features]
-default = ["native"]
-native = ["parolnet-transport", "parolnet-mesh", "parolnet-relay", "tokio", "tracing-subscriber", "opus-rs", "codec2"]
+default = ["native", "mesh"]
+native = ["parolnet-transport", "parolnet-relay", "tokio", "tracing-subscriber", "opus-rs"]
+# Store-forward and LAN discovery (parolnet-mesh). Optional: the desktop client builds without
+# it until M4 (plan section 1).
+mesh = ["native", "dep:parolnet-mesh"]
+# Codec2 is LGPL-2.1 and fails the licence gate (deny.toml). Opt-in only until PNP-011
+# removes it from the protocol in M1.
+codec2 = ["dep:codec2"]
 wasm = ["js-sys"]
 
 [dependencies]
