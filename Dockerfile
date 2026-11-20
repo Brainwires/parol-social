@@ -5,14 +5,19 @@ WORKDIR /build
 COPY . .
 RUN cargo build --release -p parolnet-relay-server --features analytics
 
-# Stage 2: Runtime with nginx + relay + coturn
+# Stage 2: Runtime with nginx + relay. No TURN server: the default relay
+# profile is signaling-only (PNP-001 §10.5) and carries no user traffic.
+# Relay-profile operators who want TURN run their own TURN server and set
+# SIGNALING_ONLY=0, TURN_SECRET and TURN_URIS (see ops/turn.md).
 FROM nginx:alpine
 
-# TURN/STUN server (coturn) + envsubst for config templating
-RUN apk add --no-cache coturn gettext
-
-# Nginx config
+# Nginx config (signaling-only profile). The relay-profile config is kept
+# beside it; the entrypoint installs it when SIGNALING_ONLY=0.
 COPY server/nginx.conf /etc/nginx/conf.d/default.conf
+COPY server/nginx.relay.conf /etc/nginx/parolnet-relay.conf
+# Abuse log directory and the (possibly empty) fail2ban ban list directory
+# that the nginx configs include; see ops/fail2ban.md.
+RUN mkdir -p /var/log/nginx/parolnet /etc/nginx/banned
 
 # Static files
 COPY server/index.html /usr/share/nginx/html/index.html
@@ -37,10 +42,7 @@ COPY --from=builder /build/target/release/parolnet-relay /usr/local/bin/parolnet
 COPY server/entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
 
-# TURN/STUN config template
-COPY server/turnserver.conf /etc/turnserver.conf.template
-
-EXPOSE 80 3478/udp 3478/tcp 5349/tcp
+EXPOSE 80
 
 # Persistent relay identity — mount this as a volume to keep the Ed25519
 # signing key stable across container restarts. On first boot the relay

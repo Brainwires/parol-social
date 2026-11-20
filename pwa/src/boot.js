@@ -7,8 +7,10 @@ import { showToast, showErrorToast, detectPlatform, showLocalNotification, reque
 import { dbGet, dbPut, dbGetRaw } from './db.js';
 import { telemetry } from './telemetry.js';
 import { showView, calcPress, loadPanicCode } from './views.js';
-import { rtcConnections, initWebRTC, hasDirectConnection, loadCustomStunServers } from './webrtc.js';
-import { connMgr, flushMessageQueue, hydratePendingSends } from './connection.js';
+import { rtcConnections, loadCustomStunServers, setRelayOnlyMode,
+         saveOwnTurnServerFromForm, clearCustomStunServers } from './webrtc.js';
+import { onServerProfileChange, setServerProfile, relayPathsAllowed, PROFILE_UNKNOWN } from './relay-profile.js';
+import { connMgr, flushMessageQueue, hydratePendingSends, sendPresenceWatch } from './connection.js';
 import { requestBatch, maybeRefill } from './token-pool.js';
 import {
     handleRelayMessage, switchListTab, showCreateGroupDialog, createGroup,
@@ -31,7 +33,8 @@ import {
     addDuressCredential, setCoverTrafficEnabled, loadCoverTrafficSetting,
     startCoverTrafficFromSettings, regenerateIdentity, zeroizeExpiredRetiredIdentity,
     addManualRelay,
-    loadOnionModeSetting, setOnionModeEnabled, enableOnionModeFromBoot
+    loadOnionModeSetting, setOnionModeEnabled, enableOnionModeFromBoot,
+    applyServerProfile, showIpNoticeIfNeeded, dismissIpNotice
 } from './settings.js';
 import { initI18n, t, changeLanguage, applyToDOM, getCurrentLang } from './i18n.js';
 import { showSafetyNumberModal } from './safety-number.js';
@@ -140,6 +143,25 @@ async function onWasmReady() {
     }
     loadContacts();
     renderBootstrapQR();
+    if (!(wasm.is_decoy_enabled && wasm.is_decoy_enabled())) {
+        // One-time notice: direct connections show your IP to contacts.
+        showIpNoticeIfNeeded().catch(() => {});
+    }
+
+    // Home-relay profile (relay-profile.js) drives which features run: on a
+    // relay-profile server the token pool, cover traffic (if enabled) and
+    // the relay send paths; on a signaling-only server none of them.
+    if (!_profileListenerWired) {
+        _profileListenerWired = true;
+        onServerProfileChange((profile) => {
+            console.log('[Profile] home relay profile:', profile);
+            applyServerProfile(profile);
+            if (profile === 'relay') {
+                if (connMgr.isRelayConnected()) kickOffInitialTokenFetch();
+                flushMessageQueue();
+            }
+        });
+    }
 
     // Enforce H5 grace-window zeroize across restarts: if the retired
     // identity record has expired, erase it now (PNP-002-MUST-039).
@@ -147,9 +169,9 @@ async function onWasmReady() {
         console.warn('[Boot] retired-identity zeroize failed:', e && e.message);
     }
 
-    // Load & start wire-level cover traffic (PNP-006). Default ON.
-    // Safe to start before relay reports connected — the timer tolerates
-    // transient "no session / no peer" conditions by skipping the tick.
+    // Load wire-level cover traffic (PNP-006). Default OFF; it only starts
+    // once the home relay is known to be a relay-profile server (the
+    // profile listener above starts it then).
     await loadCoverTrafficSetting();
     startCoverTrafficFromSettings();
 
@@ -202,7 +224,7 @@ async function onWasmReady() {
             if (connMgr.isRelayConnected() || ++statusChecks > 10) {
                 clearInterval(checkStatus);
                 updateConnectionStatus();
-                if (connMgr.isRelayConnected()) kickOffInitialTokenFetch();
+                if (connMgr.isRelayConnected() && relayPathsAllowed()) kickOffInitialTokenFetch();
             } else if (navigator.serviceWorker && navigator.serviceWorker.controller) {
                 navigator.serviceWorker.controller.postMessage({ type: 'relay_status_query' });
             }
@@ -291,9 +313,12 @@ async function onWasmReady() {
 // fired before the first batch lands will patiently await it rather than
 // dropping. The 3-tier retry ladder below rides the transient-failure
 // window silently and only surfaces a toast once the outage exceeds ~7 s.
+let _profileListenerWired = false;
 let _initialTokenFetchInFlight = false;
 async function kickOffInitialTokenFetch() {
     if (!connMgr.relayUrl) return;
+    // No tokens on a signaling-only relay (and none before we know).
+    if (!relayPathsAllowed()) return;
     if (_initialTokenFetchInFlight) return;
     _initialTokenFetchInFlight = true;
 
@@ -563,16 +588,16 @@ function registerServiceWorker() {
             updateConnectionStatus();
             if (d.connected) {
                 telemetry.track('relay_connect');
+                // Also sent on `registered`; whichever of the two SW
+                // messages arrives last has the socket marked connected.
+                if (!wasConnected) sendPresenceWatch(true).catch(() => {});
                 flushMessageQueue();
             } else if (wasConnected) {
                 telemetry.track('relay_disconnect');
-                if (window._knownPeers && typeof RTCPeerConnection !== 'undefined') {
-                    for (const pid of window._knownPeers) {
-                        if (!hasDirectConnection(pid)) {
-                            initWebRTC(pid, true).catch(() => {});
-                        }
-                    }
-                }
+                // The next `registered` reply re-announces the profile;
+                // until then content waits in the sender queue. Open data
+                // channels keep working without the relay.
+                setServerProfile(PROFILE_UNKNOWN);
             }
         }
     });
@@ -715,6 +740,11 @@ window.executePanicWipe = executePanicWipe;
 window.regenerateIdentity = regenerateIdentity;
 window.setCoverTrafficEnabled = setCoverTrafficEnabled;
 window.setOnionModeEnabled = setOnionModeEnabled;
+window.setRelayOnlyMode = setRelayOnlyMode;
+window.setWebRTCPrivacyMode = setRelayOnlyMode;
+window.saveOwnTurnServer = saveOwnTurnServerFromForm;
+window.clearOwnTurnServer = clearCustomStunServers;
+window.dismissIpNotice = dismissIpNotice;
 window.addDuressCredential = addDuressCredential;
 window.addManualRelay = addManualRelay;
 window.toggleMute = toggleMute;

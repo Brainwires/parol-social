@@ -10,8 +10,11 @@ import { showToast, showErrorToast, escapeHtml, escapeAttr, formatTime, formatSi
 import { dbGet, dbPut, dbGetAll, dbGetByIndex, dbDelete, updateContactState } from './db.js';
 import { showView } from './views.js';
 import { hasDirectConnection, sendViaWebRTC, seenGossipMessages, markGossipSeen,
-         handleRTCOffer, handleRTCAnswer, handleRTCIce } from './webrtc.js';
-import { sendToRelay, discoverPeers, startDiscoveryInterval, connMgr, queueMessage } from './connection.js';
+         handleRTCOffer, handleRTCAnswer, handleRTCIce, waitForSendBuffer,
+         setPeerOnline, noteSignalingRateLimited, refreshIceServersFromRelay } from './webrtc.js';
+import { sendToRelay, connMgr, queueMessage, onRelayRegistered, requestDirectPath } from './connection.js';
+import { setServerProfile, getServerProfile, chooseSendRoute, relayPathsAllowed,
+         PROFILE_SIGNALING_ONLY } from './relay-profile.js';
 import { maybeRefill, acquireToken } from './token-pool.js';
 import { lookupHomeRelay } from './peer-relay-cache.js';
 import { isOnionActive, sendViaOnion } from './onion.js';
@@ -106,7 +109,9 @@ function encodeEnvelope(toPeerId, msgType, obj) {
 async function sendEnvelope(toPeerId, msgType, obj) {
     const env = encodeEnvelope(toPeerId, msgType, obj);
     if (!env) return false;
-    const result = await sendRawEnvelope(toPeerId, env);
+    // Call signals are time-critical: never park them in the sender queue.
+    const isCallSignal = msgType === MSG_TYPE_CALL_SIGNAL || msgType === MSG_TYPE_GROUP_CALL_SIGNAL;
+    const result = await sendRawEnvelope(toPeerId, env, isCallSignal ? { noQueue: true } : undefined);
     return result.ok;
 }
 
@@ -115,6 +120,12 @@ async function sendEnvelope(toPeerId, msgType, obj) {
 /// Returns `{ ok: boolean, reason?: string, alreadyToasted?: boolean }` so
 /// callers can avoid surfacing a second generic toast when a specific one
 /// (e.g. relayTokenEmpty, peerLookupFailed) was already shown.
+//
+/// Signaling-only relay (or profile not yet known): content NEVER touches the
+/// relay. With no open data channel the envelope waits in the sender queue
+/// (`queued: true` in the result) and a connection attempt starts if the
+/// peer is not known to be offline. `opts.noQueue` (call signals, file
+/// chunks) skips the queue: the caller handles the failure itself.
 export async function sendRawEnvelope(toPeerId, env, opts) {
     if (!env) return { ok: false, reason: 'missing-envelope' };
     // `noPersist` is set by flushMessageQueue: the caller already owns a
@@ -122,19 +133,36 @@ export async function sendRawEnvelope(toPeerId, env, opts) {
     // failure would duplicate it. The outer flush loop handles re-queue +
     // backoff for no-persist callers.
     const noPersist = !!(opts && opts.noPersist);
+    const noQueue = !!(opts && opts.noQueue);
     const persistOnFail = () => {
-        if (noPersist) return;
+        if (noPersist || noQueue) return;
         try { queueMessage(toPeerId, env); } catch (_) {}
     };
 
     markRealSend();
-    if (hasDirectConnection(toPeerId)) {
+    const route = chooseSendRoute({
+        hasDirect: hasDirectConnection(toPeerId),
+        profile: getServerProfile(),
+        onionActive: isOnionActive(),
+    });
+    if (route === 'direct') {
         const ok = sendViaWebRTC(toPeerId, env);
         if (ok) { console.log('[Send] direct-webrtc to', toPeerId.slice(0, 8)); return { ok: true }; }
         console.warn('[Send] webrtc-send-failed to', toPeerId.slice(0, 8));
+        if (!relayPathsAllowed()) {
+            persistOnFail();
+            return { ok: false, reason: 'webrtc-send-failed', queued: !noPersist && !noQueue };
+        }
         return { ok: false, reason: 'webrtc-send-failed' };
     }
-    if (isOnionActive()) {
+    if (route === 'queue') {
+        persistOnFail();
+        requestDirectPath(toPeerId);
+        console.log('[Send] no data channel to', toPeerId.slice(0, 8),
+                    noPersist || noQueue ? '(not queued)' : '(queued until it opens)');
+        return { ok: false, reason: 'awaiting-direct-path', queued: !noPersist && !noQueue };
+    }
+    if (route === 'onion') {
         const ok = sendViaOnion(toPeerId, env);
         if (ok) { console.log('[Send] onion to', toPeerId.slice(0, 8)); return { ok: true }; }
         console.warn('[Send] onion-send-failed to', toPeerId.slice(0, 8));
@@ -247,7 +275,8 @@ export async function sendCallSignal(peerId, action, payload = {}) {
         const inner = new TextEncoder().encode(JSON.stringify({ action, ...payload }));
         const nowSecs = BigInt(Math.floor(Date.now() / 1000));
         const envelope = wasm.envelope_encode(peerId, MSG_TYPE_CALL_SIGNAL, inner, nowSecs);
-        const result = await sendRawEnvelope(peerId, envelope);
+        // Never queue a call signal: a ring delivered hours later is wrong.
+        const result = await sendRawEnvelope(peerId, envelope, { noQueue: true });
         console.log('[CallSignal]', action, '→', peerId.slice(0, 8), 'ok:', result.ok,
                     result.reason ? '(' + result.reason + ')' : '');
         return result;
@@ -294,9 +323,17 @@ export function handleRelayMessage(msg) {
             }
 
         case 'registered':
-            console.log('Registered with relay. Online peers:', msg.online_peers);
-            discoverPeers();
-            startDiscoveryInterval();
+            // Missing `profile` = an older full relay.
+            setServerProfile(msg.profile || 'relay');
+            console.log('Registered with relay. Profile:', getServerProfile(), 'Online peers:', msg.online_peers);
+            onRelayRegistered();
+            refreshIceServersFromRelay();
+            return { delivered: true };
+
+        case 'presence':
+            if (typeof msg.peer_id === 'string' && /^[0-9a-fA-F]{64}$/.test(msg.peer_id)) {
+                setPeerOnline(msg.peer_id.toLowerCase(), !!msg.online);
+            }
             return { delivered: true };
 
         case 'message':
@@ -323,7 +360,25 @@ export function handleRelayMessage(msg) {
             return { delivered: true };
 
         case 'error':
-            console.warn('Relay error:', msg.message);
+            console.warn('Relay error:', msg.code || '', msg.message);
+            switch (msg.code) {
+                case 'peer_offline':
+                    // Signaling target is not online: show the waiting
+                    // state (via setPeerOnline -> peer-path 'offline').
+                    if (typeof msg.peer_id === 'string') setPeerOnline(msg.peer_id.toLowerCase(), false);
+                    return { delivered: true };
+                case 'rate_limited':
+                    noteSignalingRateLimited();
+                    return { delivered: true };
+                case 'signaling_only':
+                    // We sent a content frame the server refuses: it is a
+                    // signaling-only relay whatever `registered` said.
+                    setServerProfile(PROFILE_SIGNALING_ONLY);
+                    return { delivered: true };
+                case 'payload_too_large':
+                case 'not_registered':
+                    return { delivered: true };
+            }
             if (msg.message === 'peer not connected') {
                 showToast(t('toast.peerNotOnline'));
             }
@@ -513,9 +568,11 @@ export async function sendGroupMessage() {
     };
     for (const memberId of (group.members || [])) {
         if (memberId === myPeerId) continue;
+        // Pairwise fan-out: members without an open data channel on a
+        // signaling-only relay get it queued per member.
         const sent = await sendEnvelope(memberId, MSG_TYPE_GROUP_TEXT, obj);
         if (!sent) {
-            console.warn('[Group] No session with member; message dropped for', memberId.slice(0, 8));
+            console.warn('[Group] not delivered now (queued or no session) for', memberId.slice(0, 8));
         }
     }
 
@@ -851,9 +908,20 @@ async function sendFileChunked(fileId, toPeerId) {
             const nowSecs = BigInt(Math.floor(Date.now() / 1000));
             const envelope = wasm.envelope_encode(toPeerId, MSG_TYPE_FILE_CHUNK, encoder.encode(inner), nowSecs);
             // sendRawEnvelope picks WebRTC when available, falls back to the
-            // token-gated relay path. Without the token the relay silently
-            // dropped every chunk — file transfers were a no-op.
-            await sendRawEnvelope(toPeerId, envelope);
+            // token-gated relay path on a relay-profile server. Chunks are
+            // never queued: on a signaling-only relay a lost data channel
+            // aborts the transfer instead of parking megabytes in the queue.
+            const direct = hasDirectConnection(toPeerId);
+            if (direct && !(await waitForSendBuffer(toPeerId))) {
+                console.warn('[File] data channel closed mid-transfer');
+                break;
+            }
+            const res = await sendRawEnvelope(toPeerId, envelope, { noQueue: true });
+            if (!res.ok && !relayPathsAllowed()) {
+                console.warn('[File] no direct path to', toPeerId.slice(0, 8), '— transfer stopped');
+                showToast(t('chat.noDirectPathShort'));
+                break;
+            }
             chunkIndex++;
             if (chunkIndex % 10 === 0) {
                 await new Promise(r => setTimeout(r, 0));
@@ -1086,8 +1154,16 @@ export async function onGroupFileSelected(event) {
         const CHUNK_SIZE = 16384;
         const totalChunks = Math.ceil(data.length / CHUNK_SIZE);
 
+        let skippedNoPath = 0;
         for (const memberId of (group.members || [])) {
             if (memberId === myPeerId) continue;
+            // Files ride the data channel only; members without one are
+            // skipped (no relay path, and chunks are never queued).
+            if (!relayPathsAllowed() && !hasDirectConnection(memberId)) {
+                skippedNoPath++;
+                requestDirectPath(memberId);
+                continue;
+            }
             const offerSent = await sendEnvelope(memberId, MSG_TYPE_GROUP_FILE_OFFER, {
                 groupId: currentGroupId,
                 fileId,
@@ -1103,19 +1179,25 @@ export async function onGroupFileSelected(event) {
 
             for (let i = 0; i < totalChunks; i++) {
                 const chunk = data.slice(i * CHUNK_SIZE, (i + 1) * CHUNK_SIZE);
-                await sendEnvelope(memberId, MSG_TYPE_GROUP_FILE_CHUNK, {
+                if (hasDirectConnection(memberId) && !(await waitForSendBuffer(memberId))) break;
+                const chunkEnv = encodeEnvelope(memberId, MSG_TYPE_GROUP_FILE_CHUNK, {
                     groupId: currentGroupId,
                     fileId,
                     chunkIndex: i,
                     totalChunks,
                     data: Array.from(chunk)
                 });
+                if (!chunkEnv) break;
+                const chunkRes = await sendRawEnvelope(memberId, chunkEnv, { noQueue: true });
+                if (!chunkRes.ok && !relayPathsAllowed()) break;
                 if (i % 10 === 0 && i > 0) {
                     await new Promise(r => setTimeout(r, 0));
                 }
             }
         }
-        statusEl.textContent = 'Sent';
+        statusEl.textContent = skippedNoPath > 0
+            ? t('chat.groupFileSkipped', { count: String(skippedNoPath) })
+            : 'Sent';
     } catch(e) {
         statusEl.textContent = 'Failed: ' + e.message;
         console.error('[GroupFile] Send failed:', e);

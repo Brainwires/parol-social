@@ -1,12 +1,18 @@
 # PNP-001: ParolNet Wire Protocol
 
 ### Status: CANDIDATE
-### Version: 0.10
-### Date: 2026-04-19
+### Version: 0.11
+### Date: 2026-11-20
 
 ---
 
 ## Changelog
+
+**v0.11 (2026-11-20) — Signaling-only relay profile; resource bounds for every relay**
+
+- Added §10.5 "Signaling-Only Relay Profile". A relay in this profile only helps peers establish direct connections: registration, WebRTC SDP / ICE exchange between two online peers, presence, directory reads and STUN URIs. It accepts no `message` / `gossip` frames and no onion cells, holds no store-and-forward buffer, mints no Privacy Pass tokens, issues no TURN credentials and does not federate, so no user content transits or rests on it. It is the default profile of the reference relay; the full feature set (now called the *relay profile*) is an explicit operator opt-in.
+- Added §10.6 "Resource Bounds" with frame-size, rate, connection, registration and storage caps that apply to every relay, closing unbounded-memory and unmetered-forwarding paths reachable by anonymous clients.
+- New clauses: **PNP-001-MUST-070** … **PNP-001-MUST-078**, **PNP-001-SHOULD-016**, **PNP-001-SHOULD-017**. §10.2 issuance accounting now points at MUST-078 for per-address issuance limits. MUST count: 78.
 
 **v0.10 (2026-04-19) — Client-relay WS liveness, queued-response semantics, token epoch hygiene**
 
@@ -556,7 +562,7 @@ On receiving an outer frame the relay MUST:
 
 All three rejection paths drop the frame silently (no error to the sender).
 
-**Issuance accounting.** Relays MAY enforce a per-identity cumulative budget on BlindedElements evaluated per (identity, epoch). Such a budget is a belt-and-suspenders abuse control on top of the two real defenses — the Ed25519 signature gate (MUST-052) and the per-epoch spent-set (MUST-050) — and is NOT REQUIRED. **PNP-001-MAY-005** Identity creation is free (PNP-002 requires no registration), so a per-identity budget does not deter attackers; network-layer rate limiting (e.g., fail2ban on `POST /tokens/issue`) is the deployment-preferred abuse control. If a relay does enforce a cumulative budget, it MUST track the running total per (identity, epoch), reject overflow with HTTP 429 without advancing the counter, and reset on epoch rotation so that partial-batch rejections leave the cap intact.
+**Issuance accounting.** Independently of any per-identity budget, a relay MUST bound issuance per client network address and per request (§10.6, **PNP-001-MUST-078**); a signaling-only relay (§10.5) does not offer issuance at all. Relays MAY enforce a per-identity cumulative budget on BlindedElements evaluated per (identity, epoch). Such a budget is a belt-and-suspenders abuse control on top of the two real defenses — the Ed25519 signature gate (MUST-052) and the per-epoch spent-set (MUST-050) — and is NOT REQUIRED. **PNP-001-MAY-005** Identity creation is free (PNP-002 requires no registration), so a per-identity budget does not deter attackers; network-layer rate limiting (e.g., fail2ban on `POST /tokens/issue`) is the deployment-preferred abuse control. If a relay does enforce a cumulative budget, it MUST track the running total per (identity, epoch), reject overflow with HTTP 429 without advancing the counter, and reset on epoch rotation so that partial-batch rejections leave the cap intact.
 
 > **Implementation note (non-normative).** The reference relay in this repo — `crates/parolnet-relay-server` — ships with the cumulative-budget rate limit **disabled** as of PNP-001 v0.8. The earlier v0.7 draft required the cap (then `MUST-063`), but operational experience showed it rejected legitimate clients — a browser tab across a handful of reloads would exhaust the 8192 budget while an attacker rotating identities never hit it. The `budget_per_epoch` parameter in the table below and the `budget` field in `TokenIssueResponse` above are still honoured by the protocol: they describe what a relay would enforce *if* it opted back in via MAY-005. Operators considering re-enabling the cap should treat it as a tunable response to observed abuse, not a default.
 
@@ -624,7 +630,54 @@ The `ts` echo lets the client measure round-trip time and unambiguously match po
 |-----------|-------|
 | `Token` type, `TokenAuthority`, epoch rotation | `crates/parolnet-relay/src/tokens.rs` |
 | `POST /tokens/issue` + frame router | `crates/parolnet-relay-server/src/main.rs` |
+| Profile, admission checks, signaling / connection limits, presence watch | `crates/parolnet-relay-server/src/policy.rs` |
+| Store-and-forward bounds (relay profile) | `crates/parolnet-relay-server/src/storage.rs` |
 | VOPRF crate | `voprf = "0.5"` (audited, RustCrypto-adjacent) |
+
+### 10.5 Signaling-Only Relay Profile
+
+A relay operates in exactly one of two profiles:
+
+- **signaling-only** — the relay helps peers set up direct connections and carries nothing else. It is the default profile of the reference relay.
+- **relay** — the full feature set of §10.1 – §10.2 (store-and-forward, Privacy Pass tokens, onion cells per PNP-004, gossip per PNP-005, TURN credentials, federation per PNP-008). An operator selects it explicitly (`SIGNALING_ONLY=0` in the reference relay).
+
+**Profile announcement.** The relay MUST include `profile` in every `registered` frame, with the value `"signaling-only"` or `"relay"`, and MUST include the same `profile` field in its `GET /turn-credentials` response. **PNP-001-MUST-070** A client that receives no `profile` field MUST treat the relay as `"relay"` (pre-v0.11 relays). The reference relay MUST default to `"signaling-only"` when no profile is configured.
+
+**What a signaling-only relay accepts.** On the client WebSocket a signaling-only relay MUST accept only the text frame types `register`, `ping`, `rtc_offer`, `rtc_answer`, `rtc_ice` and `watch`, MUST answer any other type with `{type:"error", code:"signaling_only"}` without acting on it, and MUST close the socket (close code 1003) on a binary frame. **PNP-001-MUST-071** It MUST NOT keep a store-and-forward buffer, MUST NOT serve `POST /tokens/issue`, `POST /telemetry`, `POST /endorse`, `POST /directory/push` or the federation link, and MUST NOT issue TURN credentials: `GET /turn-credentials` returns only STUN URIs with empty `username` / `credential`. `GET /directory` stays readable.
+
+**Signaling frames.** `rtc_offer` / `rtc_answer` / `rtc_ice` MUST be forwarded only from a registered socket to a peer that is registered and online at that moment, with `from` set to the sender's registered PeerId; they MUST NOT be queued for a peer that is offline. When the recipient is not online the relay MUST answer `{type:"error", code:"peer_offline", peer_id:<to>}`. **PNP-001-MUST-073** The `payload` of an `rtc_offer` or `rtc_answer` MUST NOT exceed 16384 bytes and that of an `rtc_ice` MUST NOT exceed 2048 bytes; a larger payload is refused with `code:"payload_too_large"`. **PNP-001-MUST-072** Per registered sender the relay MUST forward at most 60 signaling frames per minute and 240 per hour, and at most 64 frames per 10 minutes for one (sender, recipient) pair, refusing the excess with `code:"rate_limited"`. **PNP-001-MUST-074** With these caps a modified client can tunnel at most a few kilobytes per second to one cooperating online peer, which is the floor for any signaling service.
+
+**Presence push.** A registered client MAY send `{type:"watch", peer_ids:[<hex PeerId>, …]}`. Each `watch` replaces the sender's previous set; the relay keeps at most 256 ids per sender and drops malformed ids and the sender's own id. The relay MUST report presence only between **mutual** watchers: it sends `{type:"presence", peer_id:X, online:true}` to W only if W watches X and X watches W — immediately after either `watch` makes the pair mutual while both are online, and when X registers later — and `{type:"presence", peer_id:X, online:false}` when X's socket closes. **PNP-001-MUST-076** A stranger who watches a PeerId therefore learns nothing from the push. The watch set is dropped when the socket closes. `watch` and `presence` are available in both profiles.
+
+**Client behaviour (non-normative rationale, normative SHOULD).** Because a signaling-only relay forwards at most a few dozen signaling frames per minute per sender, clients SHOULD send connection SDP non-trickle (wait for ICE gathering to complete, bounded at a few seconds, and send the candidates inside the offer / answer), SHOULD stagger new connection attempts, and SHOULD back off on `rate_limited` instead of retrying at once. **PNP-001-SHOULD-016** With no relay message path, all content (chat, group fan-out, files, call signalling) rides the direct peer-to-peer data channel; messages for a contact who is offline queue on the sender until both are online. Direct connections reveal each side's network address to the contact (never to strangers, since connections are only attempted to contacts); clients SHOULD say so plainly and SHOULD let the user configure their own TURN server, which then relays only for that user.
+
+**Logging.** A relay SHOULD NOT write PeerIds at its default log level, SHOULD NOT write access logs that pair client addresses with PeerIds, and SHOULD NOT accept PeerIds in request URLs; the reference signaling-only relay answers `GET /bootstrap` with an empty list and ignores its `exclude` parameter. **PNP-001-SHOULD-017**
+
+### 10.6 Resource Bounds
+
+These bounds apply to every relay, whatever its profile. They close paths by which an anonymous client could make a relay hold unbounded memory or forward unmetered traffic.
+
+**Connections and registration.** The relay MUST: cap the size of one WebSocket message (32768 bytes in the signaling-only profile, 131072 bytes in the relay profile; larger messages close the socket); limit new WebSockets per client network address (20 per minute) and concurrent WebSockets per address (8) and in total (5000 by default); close a socket that has not completed registration within 10 seconds; accept from an unregistered socket only `register` and `ping` (anything else is refused with `code:"not_registered"`, including onion cells and `message` / `gossip` frames in the relay profile); allow at most 4 `register` frames per socket and at most 3 PeerIds registered at once from one address; and apply a per-socket frame budget to every frame, registered or not. **PNP-001-MUST-075** Behind a reverse proxy the client address is the one the proxy reports, accepted only from configured trusted proxies.
+
+**Store-and-forward (relay profile).** The per-recipient bounds of PNP-005 §5.4 (256 messages, 4 MB) are not sufficient on their own because the recipient PeerId is never checked to exist. The relay MUST refuse to buffer a frame larger than the per-recipient size cap, MUST cap the number of recipients with buffered messages (4096 in the reference relay) and MUST cap the total bytes buffered across all recipients (64 MB in the reference relay); a refused frame is answered with an `error` frame, not `queued`. **PNP-001-MUST-077**
+
+**Issuance and onion state (relay profile).** The relay MUST cap the BlindedElements accepted in one `POST /tokens/issue` request (1024) and MUST rate-limit issuance requests per client network address (10 per minute), answering the excess with HTTP 429; it MUST cap the onion circuits one socket may hold (64). **PNP-001-MUST-078**
+
+| Parameter | Value |
+|-----------|-------|
+| `max_ws_message_bytes` (signaling-only / relay) | 32768 / 131072 |
+| `max_sdp_payload_bytes` / `max_ice_payload_bytes` | 16384 / 2048 |
+| signaling per sender | 60 / min, 240 / h |
+| signaling per (sender, recipient) | 64 / 10 min |
+| new sockets per address | 20 / min |
+| concurrent sockets per address / total | 8 / 5000 |
+| register deadline | 10 s |
+| register frames per socket | 4 |
+| registered PeerIds per address | 3 |
+| watch ids per socket | 256 |
+| buffered recipients / total bytes (relay profile) | 4096 / 64 MB |
+| BlindedElements per issuance request / requests per address (relay profile) | 1024 / 10 per min |
+| onion circuits per socket (relay profile) | 64 |
 
 [RFC 9497]: https://www.rfc-editor.org/rfc/rfc9497.html
 [RFC 9578]: https://www.rfc-editor.org/rfc/rfc9578.html

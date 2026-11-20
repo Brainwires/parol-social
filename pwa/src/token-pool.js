@@ -23,6 +23,11 @@
 // hex handle only for the brief window between request + response; once
 // `token_unblind` consumes it, the Rust side zeroizes its scalar copy and
 // we drop our handle reference.
+//
+// On a signaling-only home relay the pool is never primed or refilled
+// (relay-profile.js): there is nothing to spend tokens on there.
+
+import { isSignalingOnly } from './relay-profile.js';
 
 // `wasm` is looked up lazily from state.js via dynamic import. Keeping
 // the import indirect lets the unit tests in `pwa/tests/unit.test.mjs`
@@ -351,6 +356,10 @@ function randomNonceHex(bytes = 32) {
 // ── Batch fetch ────────────────────────────────────────────────
 export async function requestBatch(relayUrl, batchSize = DEFAULT_BATCH_SIZE) {
     const pool = tokenPoolFor(relayUrl);
+    // Nothing to spend tokens on at a signaling-only home relay (and
+    // /tokens/issue is 404 there). Cross-relay pools are gated upstream:
+    // sendRawEnvelope never reaches the cross-relay path in that profile.
+    if (isSignalingOnly()) return { ok: false, reason: 'signaling-only' };
     if (pool._requestBatchImpl) {
         // Wrap the test-injected impl so it still participates in the
         // ready-promise signal. Without this the acquireToken unit tests
@@ -560,6 +569,7 @@ export async function acquireToken(relayUrl, opts = {}) {
 // are fine as long as the running total stays under the cap; when we hit
 // it we log and wait for the boundary.
 export function maybeRefill(relayUrl) {
+    if (isSignalingOnly()) return;
     const pool = tokenPoolFor(relayUrl);
     if (pool.refilling) return;
     const now = Math.floor(Date.now() / 1000);

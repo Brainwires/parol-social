@@ -1,12 +1,16 @@
 # PNP-005: ParolNet Gossip/Mesh Protocol
 
 ### Status: CANDIDATE
-### Version: 0.2
-### Date: 2026-04-17
+### Version: 0.3
+### Date: 2026-11-20
 
 ---
 
 ## Changelog
+
+**v0.3 (2026-11-20) — Signaling-only relay profile**
+
+- Added §5.10 "Signaling-Only Relay Profile": a relay in the PNP-001 §10.5 signaling-only profile takes no part in the mesh (no gossip frames, no supernode) and keeps no store-and-forward buffer. New clauses **PNP-005-MUST-049**, **PNP-005-SHOULD-017**. §5.4 points at the global buffer bounds of PNP-001 §10.6.
 
 **v0.2 (2026-04-17) — Harmonization pass**
 
@@ -249,6 +253,11 @@ Upon receiving a gossip message, a node MUST perform the following checks in ord
    c. Among messages still tied, the oldest message (by origination timestamp) is evicted first.
 4. Upon peer reconnection, the node MUST deliver buffered messages after the sync phase (§5.7) to avoid duplicates. **PNP-005-MUST-031**
 5. Expired messages MUST be purged from the buffer during periodic housekeeping (at least every 60 seconds). **PNP-005-MUST-032**
+6. A relay holding store-and-forward buffers for clients MUST also apply the global bounds of PNP-001 §10.6 (MUST-077), because the recipient PeerId of a client frame is never checked to exist. A signaling-only relay holds no buffer at all (§5.10).
+
+### 5.10 Signaling-Only Relay Profile
+
+A relay operating the signaling-only profile (PNP-001 §10.5) MUST NOT accept, forward or fan out `gossip` frames from clients, MUST NOT run a mesh supernode for its clients, and MUST NOT keep a store-and-forward buffer for them. **PNP-005-MUST-049** Offline delivery is then the sender's job: a client SHOULD queue messages for an offline contact locally (bounded in age and size) and deliver them over the direct data channel once both are online, using presence push (PNP-001 §10.5) to learn when the contact comes online. **PNP-005-SHOULD-017** Peer-to-peer gossip between clients over their own direct connections is unaffected.
 
 ### 5.5 Deduplication Bloom Filter
 

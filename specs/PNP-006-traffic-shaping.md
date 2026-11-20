@@ -1,12 +1,16 @@
 # PNP-006: ParolNet Traffic Shaping Protocol
 
 ### Status: CANDIDATE
-### Version: 0.2
-### Date: 2026-04-17
+### Version: 0.3
+### Date: 2026-11-20
 
 ---
 
 ## Changelog
+
+**v0.3 (2026-11-20) — Signaling-only relay profile**
+
+- Added §4.7 "Cover Traffic and Signaling-Only Relays": decoys never go to a signaling-only relay (PNP-001 §10.5), which refuses them, and clients default cover traffic off there. New clauses **PNP-006-MUST-045**, **PNP-006-SHOULD-015**.
 
 **v0.2 (2026-04-17) — Harmonization pass**
 
@@ -120,6 +124,10 @@ These modes govern the PNP-004 circuit padding rate (see PNP-004 §5.9). PMFTP (
    c. Occasional large bursts of 20-50 cells (simulating a page load).
 2. This shaping is RECOMMENDED but not REQUIRED. It is most effective when the node is under active DPI surveillance. Implementations MAY provide a "stealth mode" that enables full traffic pattern mimicry at the cost of increased latency. **PNP-006-MAY-003**
 3. The traffic pattern profile SHOULD be configurable and updatable without a software release, loaded from a "traffic profile" configuration file. **PNP-006-SHOULD-004**
+
+### 4.7 Cover Traffic and Signaling-Only Relays
+
+Dummy messages travel as relay `message` frames or onion cells. A relay in the signaling-only profile (PNP-001 §10.5) MUST refuse both (`code:"signaling_only"` for the frame, socket close for a cell), so cover traffic cannot be relayed through it. **PNP-006-MUST-045** On such a relay a client SHOULD keep cover traffic off by default and SHOULD NOT send decoys to it; decoys have no meaning on a direct peer-to-peer path, where the contact already sees the client's address. **PNP-006-SHOULD-015** Relay-profile deployments keep §4.3 unchanged.
 
 ## 5. TLS Fingerprint Requirements
 

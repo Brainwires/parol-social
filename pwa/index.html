@@ -153,6 +153,7 @@
                 <button onclick="initiateCall(currentPeerId, true)" data-i18n-title="btn.videoCall" title="Video call">📹</button>
             </div>
         </header>
+        <div id="chat-path-banner" class="chat-path-banner hidden" role="status" aria-live="polite"></div>
         <div id="message-list" class="message-list"></div>
         <div class="chat-input">
             <button class="attach-btn" onclick="attachFile()" title="Attach file">📎</button>
@@ -214,6 +215,24 @@
                 <input type="text" id="add-member-input" placeholder="Paste Peer ID..." data-i18n-placeholder="placeholder.peerId"
                        style="width:100%;padding:8px 12px;background:var(--input-bg);border:1px solid var(--border);border-radius:var(--radius-sm);color:var(--text);font-size:14px;outline:none;margin-bottom:8px;">
                 <button onclick="addMemberFromInput()" class="btn-sm" data-i18n="btn.add">Add</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- One-time notice: direct connections show your IP to contacts -->
+    <div id="ip-notice" class="modal-overlay hidden" role="dialog" aria-modal="true" aria-labelledby="ip-notice-title">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h2 id="ip-notice-title" data-i18n="notice.ipTitle">Direct connections</h2>
+            </div>
+            <div class="ip-notice-body">
+                <p data-i18n="notice.ipBody">ParolNet now connects you directly to your contacts. The server only helps you find each other; your messages, files and calls never pass through it.</p>
+                <p data-i18n="notice.ipExposure">A direct connection shows your IP address to the contact you connect with. It is never shown to strangers: connections are only made to your contacts.</p>
+                <p data-i18n="notice.ipAvoid">To hide your IP address, add your own TURN server in Settings and turn on "Relay through my own TURN server".</p>
+            </div>
+            <div class="modal-footer">
+                <button onclick="dismissIpNotice(true)" class="btn-sm" data-i18n="notice.ipOpenSettings">Open Settings</button>
+                <button onclick="dismissIpNotice(false)" class="btn-sm" data-i18n="notice.ipOk">I understand</button>
             </div>
         </div>
     </div>
@@ -345,19 +364,40 @@
                         <span id="settings-contact-channels" style="color: #fff;">0</span>
                     </div>
                 </div>
-                <h3 style="color: #aaa; font-size: 13px; text-transform: uppercase; margin-bottom: 8px;" data-i18n="settings.webrtcPrivacy">WebRTC Privacy</h3>
+                <p id="server-profile-note" style="font-size: 0.8em; opacity: 0.7; margin-bottom: 12px; display: none;"></p>
+                <h3 style="color: #aaa; font-size: 13px; text-transform: uppercase; margin-bottom: 8px;" data-i18n="settings.directConnections">Direct connections</h3>
+                <p class="ip-exposure-note" data-i18n="settings.ipExposureNotice">Messages, files and calls go directly between you and your contact. A direct connection shows your IP address to the contact you connect with (never to strangers: connections are only made to your contacts). To hide it, add your own TURN server below and turn on "Relay through my own TURN server".</p>
+                <div class="setting-row" style="flex-direction:column;align-items:stretch;gap:8px;margin-bottom: 8px;">
+                    <span data-i18n="settings.ownTurnServer">Your own TURN server</span>
+                    <input type="text" id="own-turn-url" placeholder="turn:turn.example.com:3478" data-i18n-placeholder="settings.ownTurnUrlPlaceholder"
+                        autocomplete="off" spellcheck="false"
+                        style="padding: 8px 12px; border-radius: 8px; border: 1px solid #444; background: #1a1a2e; color: #fff; font-size: 14px;">
+                    <input type="text" id="own-turn-username" placeholder="Username" data-i18n-placeholder="settings.ownTurnUsername"
+                        autocomplete="off" spellcheck="false"
+                        style="padding: 8px 12px; border-radius: 8px; border: 1px solid #444; background: #1a1a2e; color: #fff; font-size: 14px;">
+                    <input type="password" id="own-turn-credential" placeholder="Password" data-i18n-placeholder="settings.ownTurnCredential"
+                        autocomplete="off"
+                        style="padding: 8px 12px; border-radius: 8px; border: 1px solid #444; background: #1a1a2e; color: #fff; font-size: 14px;">
+                    <div style="display: flex; gap: 8px;">
+                        <button onclick="saveOwnTurnServer()"
+                            style="padding: 8px 16px; border-radius: 8px; border: none; background: #007aff; color: #fff; font-size: 14px; cursor: pointer;" data-i18n="btn.save">Save</button>
+                        <button id="own-turn-clear" onclick="clearOwnTurnServer()" style="display: none; padding: 8px 16px; border-radius: 8px; border: none; background: #444; color: #fff; font-size: 14px; cursor: pointer;" data-i18n="btn.remove">Remove</button>
+                    </div>
+                    <span id="own-turn-status" style="font-size: 0.8em; opacity: 0.7;"></span>
+                </div>
                 <div class="setting-row" style="margin-bottom: 8px;">
-                    <span data-i18n="settings.relayOnlyMode">Relay-only mode</span>
+                    <span data-i18n="settings.relayOwnTurn">Relay through my own TURN server</span>
                     <label style="position:relative;display:inline-block;width:44px;height:24px;">
-                        <input type="checkbox" id="webrtc-privacy-toggle"
-                            onchange="setWebRTCPrivacyMode(this.checked)"
+                        <input type="checkbox" id="webrtc-relay-only-toggle"
+                            onchange="setRelayOnlyMode(this.checked)" disabled
                             style="opacity:0;width:0;height:0;">
                         <span style="position:absolute;cursor:pointer;top:0;left:0;right:0;bottom:0;background:#444;border-radius:12px;transition:.3s;"></span>
                     </label>
                 </div>
-                <p style="font-size: 0.8em; opacity: 0.6; margin-bottom: 8px;" data-i18n="settings.relayOnlyDescription">When enabled, WebRTC connections route through TURN relays only. Your IP address is never exposed to peers. Disabling this may improve connection speed but reveals your IP.</p>
+                <p style="font-size: 0.8em; opacity: 0.6; margin-bottom: 8px;" data-i18n="settings.relayOwnTurnDescription">When on, every connection goes through your own TURN server only, so contacts see the server's address instead of yours. Needs a TURN server configured above. If a contact cannot be reached directly ("No direct path"), either of you can add a TURN server here.</p>
                 <p id="webrtc-privacy-warning" style="font-size: 0.8em; color: #ff9500; display: none; margin-bottom: 12px;"></p>
 
+                <div id="cover-traffic-setting">
                 <div class="setting-row" style="margin-bottom: 8px;">
                     <span data-i18n="settings.coverTraffic">Cover traffic</span>
                     <label style="position:relative;display:inline-block;width:44px;height:24px;">
@@ -368,7 +408,9 @@
                     </label>
                 </div>
                 <p style="font-size: 0.8em; opacity: 0.6; margin-bottom: 12px;" data-i18n="settings.coverTrafficDescription">Emits a small encrypted message roughly every half-second to hide your real activity. Uses about 8 KB/s of data when idle.</p>
+                </div>
 
+                <div id="onion-mode-setting">
                 <div class="setting-row" style="margin-bottom: 8px;">
                     <span data-i18n="settings.onionMode">High anonymity mode</span>
                     <label style="position:relative;display:inline-block;width:44px;height:24px;">
@@ -379,6 +421,7 @@
                     </label>
                 </div>
                 <p style="font-size: 0.8em; opacity: 0.6; margin-bottom: 12px;" data-i18n="settings.onionModeDescription">Route relay traffic through a 3-hop onion circuit so no single observer can link sender to recipient. Background notifications are disabled while this is on — the app must stay open to receive messages.</p>
+                </div>
 
                 <h3 style="color: #aaa; font-size: 13px; text-transform: uppercase; margin-bottom: 8px;" data-i18n="settings.relayServer">Relay Server</h3>
                 <div style="display: flex; gap: 8px; margin-bottom: 4px;">

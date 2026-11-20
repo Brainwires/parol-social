@@ -6,6 +6,7 @@
 pub mod authority_keys;
 pub mod frames;
 pub mod identity;
+pub mod policy;
 pub mod rate_limit;
 pub mod storage;
 pub mod telemetry;

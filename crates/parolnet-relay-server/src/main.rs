@@ -1,10 +1,15 @@
 use parolnet_relay_server::frames::{IncomingMessage, OutgoingMessage};
+use parolnet_relay_server::policy::{
+    BinaryAdmission, Budget, FrameBudget, IpSlots, MAX_CIRCUITS_PER_CONN, MAX_REGISTER_ATTEMPTS,
+    MAX_TOKENS_PER_ISSUE, RelayPolicy, SignalReject, SignalingLimiter, SlotGuard,
+    TOKEN_ISSUE_PER_MINUTE_PER_IP, WatchRegistry,
+};
 use parolnet_relay_server::rate_limit::{
     ConnRateLimiter, LOOKUP_RATE_LIMIT, LOOKUP_RATE_WINDOW_SECS, LookupRateLimiter, MSG_RATE_LIMIT,
     MSG_RATE_WINDOW_SECS, MsgRateLimiter, PUSH_RATE_LIMIT, PUSH_RATE_WINDOW_SECS, PushRateLimiter,
-    RateLimiter, WS_CONN_RATE_LIMIT, WS_CONN_RATE_WINDOW_SECS,
+    RateLimiter, WS_CONN_RATE_WINDOW_SECS,
 };
-use parolnet_relay_server::storage::RelayMessageStore;
+use parolnet_relay_server::storage::{RelayMessageStore, StoreOutcome};
 use parolnet_relay_server::telemetry::{ClientStats, TelemetryBatch, handle_telemetry};
 use parolnet_relay_server::ws_conn::WsConnection;
 
@@ -40,6 +45,12 @@ use tokio::sync::{Mutex, mpsc};
 use tracing::info;
 
 type PeerMap = Arc<Mutex<HashMap<String, mpsc::UnboundedSender<Message>>>>;
+
+/// WebSocket close code: policy violation (RFC 6455 §7.4.1).
+const CLOSE_POLICY: u16 = 1008;
+/// WebSocket close code: unsupported data (binary frames on a
+/// signaling-only relay).
+const CLOSE_UNSUPPORTED: u16 = 1003;
 
 /// Maximum number of dynamically discovered peer relay URLs.
 const MAX_DISCOVERED_PEERS: usize = 50;
@@ -548,22 +559,13 @@ fn resolve_peer_relay_identity(
 
 // ---- H9 Privacy Pass token issuance --------------------------------------
 
-/// Issuance rate limiting has been disabled. The original per-identity
-/// budget cap existed as belt-and-suspenders on top of two real defenses
-/// that stand on their own:
-///
-///  - **PNP-001-MUST-052** Ed25519 signature gate on every `/tokens/issue`
-///    request — only holders of the identity key can request tokens.
-///  - **PNP-001-MUST-050** per-epoch spent-set — prevents token replay
-///    regardless of how many tokens were minted.
-///
-/// Because identity creation is free (no registration, keygen is cheap),
-/// a per-identity budget does not stop an attacker — they just rotate
-/// identities. The cap mostly penalized legitimate users on browser
-/// reloads. Network-layer abuse is handled by fail2ban on the host. The
-/// `IssueLimiter` type is retained as a unit type for a future re-enable
-/// path if a concrete abuse scenario materializes.
-type IssueLimiter = Arc<Mutex<()>>;
+/// Per-client-IP issuance limiter (relay profile). Identity creation is
+/// free, so a per-identity budget does not stop anyone; the Ed25519 gate
+/// (PNP-001-MUST-052) and the spent-set (MUST-050) stop forgery and replay
+/// but not volume. Without a per-IP limit any client could mint 8192 tokens
+/// per request without bound, which made the token gate no abuse control
+/// at all.
+type IssueLimiter = Arc<RateLimiter<IpAddr>>;
 
 /// CBOR shape of an inbound `POST /tokens/issue` request body.
 #[derive(Deserialize)]
@@ -603,14 +605,18 @@ struct TokenIssueResponse {
 ///   1. Decode CBOR body.
 ///   2. Verify Ed25519(challenge_nonce) under the supplied pubkey
 ///      (PNP-001-MUST-052 — authenticated issuance).
-///   3. Cap one batch per identity per epoch.
+///   3. Per-IP request limit and a per-request element cap.
 ///   4. Deserialize each `BlindedElement` (32-byte Ristretto255).
 ///   5. Call `TokenAuthority::issue` and return evaluated elements.
 async fn handle_tokens_issue(
     authority: Arc<Mutex<TokenAuthority>>,
     issue_limiter: IssueLimiter,
+    client_ip: IpAddr,
     body: axum::body::Bytes,
 ) -> impl IntoResponse {
+    if issue_limiter.is_limited(&client_ip) {
+        return (StatusCode::TOO_MANY_REQUESTS, "rate limited").into_response();
+    }
     let req: TokenIssueRequest = match ciborium::from_reader(body.as_ref()) {
         Ok(r) => r,
         Err(e) => {
@@ -618,6 +624,10 @@ async fn handle_tokens_issue(
             return (StatusCode::BAD_REQUEST, "invalid CBOR").into_response();
         }
     };
+
+    if req.blinded_bytes_list.len() > MAX_TOKENS_PER_ISSUE {
+        return (StatusCode::BAD_REQUEST, "too many blinded elements").into_response();
+    }
 
     // 1. Decode Ed25519 material.
     let pubkey_bytes = match hex::decode(&req.ed25519_pubkey_hex) {
@@ -660,11 +670,8 @@ async fn handle_tokens_issue(
         .unwrap_or_default()
         .as_secs();
 
-    // Advance the authority state. No per-identity rate limit — see the
-    // comment on `IssueLimiter` above for why. MUST-050 (spent-set replay
-    // protection) and MUST-052 (Ed25519 sig gate, checked above) remain the
-    // real defenses; fail2ban handles network-layer abuse.
-    let _ = issue_limiter;
+    // Advance the authority state. Volume is bounded by the per-IP
+    // `IssueLimiter` and `MAX_TOKENS_PER_ISSUE` checked above.
     let current_epoch: [u8; 4] = {
         let mut a = authority.lock().await;
         a.tick(now);
@@ -730,9 +737,30 @@ fn parse_outer_token(hex_str: &str) -> Option<Token> {
     ciborium::from_reader(bytes.as_slice()).ok()
 }
 
+/// ICE servers for WebRTC. On a signaling-only relay this serves only the
+/// STUN URIs from `STUN_URIS` and never mints a TURN credential, whatever
+/// `TURN_SECRET` holds: TURN would carry user traffic.
+fn stun_only_response(policy: &RelayPolicy) -> axum::response::Response {
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "username": "",
+            "credential": "",
+            "ttl": 86400,
+            "uris": policy.stun_uris,
+            "profile": policy.profile(),
+        })),
+    )
+        .into_response()
+}
+
 /// Generate time-limited TURN credentials using HMAC-SHA1 (RFC 7635-adjacent).
-/// Requires `TURN_SECRET` env var. Returns 404 if TURN is not configured.
-async fn handle_turn_credentials() -> impl IntoResponse {
+/// Relay profile only. Requires `TURN_SECRET` env var. Returns 404 if TURN
+/// is not configured.
+async fn handle_turn_credentials(policy: Arc<RelayPolicy>) -> axum::response::Response {
+    if policy.signaling_only {
+        return stun_only_response(&policy);
+    }
     let secret = match std::env::var("TURN_SECRET") {
         Ok(s) if !s.is_empty() => s,
         _ => {
@@ -806,7 +834,8 @@ async fn handle_turn_credentials() -> impl IntoResponse {
             "username": username,
             "credential": credential,
             "ttl": ttl,
-            "uris": uris
+            "uris": uris,
+            "profile": policy.profile(),
         })),
     )
         .into_response()
@@ -1016,7 +1045,7 @@ async fn relay_directory_sync(
 /// proof, and admitting on it would let any prober dedup-kick a legitimate
 /// peer's link (claim their id, get kicked, repeat).
 async fn handle_federation_link(mut socket: WebSocket, peer_addr: std::net::SocketAddr) {
-    info!("federation link upgrade accepted from {peer_addr}");
+    tracing::debug!("federation link upgrade accepted from {peer_addr}");
 
     while let Some(msg) = socket.recv().await {
         let data = match msg {
@@ -1075,10 +1104,18 @@ async fn handle_peers(
 /// GET /bootstrap?exclude=<peer_id> — returns up to 20 known peer IDs,
 /// excluding the optionally specified peer. Used by clients for peer discovery
 /// to establish direct WebRTC connections.
+///
+/// A signaling-only relay returns an empty list and ignores `exclude`: it
+/// hands no stranger a list of online PeerIds, and no PeerId rides in a URL
+/// (clients learn contacts' presence from `watch` instead).
 async fn handle_bootstrap(
     Query(params): Query<HashMap<String, String>>,
     peers: PeerMap,
+    signaling_only: bool,
 ) -> Json<Vec<String>> {
+    if signaling_only {
+        return Json(Vec::new());
+    }
     let peer_list = peers.lock().await;
     let exclude = params.get("exclude").cloned().unwrap_or_default();
     let known: Vec<String> = peer_list
@@ -1090,81 +1127,9 @@ async fn handle_bootstrap(
     Json(known)
 }
 
-#[tokio::main]
-async fn main() {
-    // Install rustls crypto provider for reqwest TLS support
-    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
-
-    tracing_subscriber::fmt::init();
-
-    let port: u16 = std::env::var("RELAY_PORT")
-        .ok()
-        .and_then(|p| p.parse().ok())
-        .unwrap_or(9000);
-
-    // Bridge mode configuration
-    let bridge_mode = std::env::var("BRIDGE_MODE").unwrap_or_default() == "true";
-    let bridge_front_domain: Option<String> = std::env::var("BRIDGE_FRONT_DOMAIN")
-        .ok()
-        .filter(|s| !s.is_empty());
-    let trusted_proxies: Arc<HashSet<IpAddr>> = {
-        let ips: HashSet<IpAddr> = std::env::var("TRUSTED_PROXY_IPS")
-            .unwrap_or_default()
-            .split(',')
-            .filter_map(|s| s.trim().parse::<IpAddr>().ok())
-            .collect();
-        if !ips.is_empty() {
-            info!(
-                "Configured {} trusted proxy IPs for X-Forwarded-For",
-                ips.len()
-            );
-        }
-        Arc::new(ips)
-    };
-    if bridge_mode {
-        info!("Bridge mode enabled — relay will NOT join public directory");
-        if let Some(ref fd) = bridge_front_domain {
-            info!("Bridge front domain: {fd}");
-        }
-    }
-
-    let peers: PeerMap = Arc::new(Mutex::new(HashMap::new()));
-    let store = Arc::new(Mutex::new(RelayMessageStore::new()));
-    let stats = Arc::new(analytics::Stats::new());
-    let client_stats = Arc::new(ClientStats::new());
-    let directory: Arc<Mutex<RelayDirectory>> = Arc::new(Mutex::new(RelayDirectory::new()));
-
-    // Bridge disclosure counter (PNP-008-MUST-089). In-memory only — a
-    // process restart zeroes it, which is the whole point: a seized bridge
-    // yields no disclosure history.
-    let bridge_disclosure_limiter: Arc<Mutex<DisclosureLimiter>> =
-        Arc::new(Mutex::new(DisclosureLimiter::new()));
-
-    // Bridge IP audit log (PNP-008-MUST-054 / MUST-090). Scheduled scrubber
-    // runs independently of request traffic.
-    let bridge_ip_audit: Arc<Mutex<IpAuditLog>> = Arc::new(Mutex::new(IpAuditLog::new()));
-    if bridge_mode {
-        let audit = bridge_ip_audit.clone();
-        let limiter = bridge_disclosure_limiter.clone();
-        tokio::spawn(async move {
-            let mut interval =
-                tokio::time::interval(Duration::from_secs(IP_LOG_SCRUBBER_INTERVAL_SECS));
-            interval.tick().await;
-            loop {
-                interval.tick().await;
-                let now = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs();
-                let evicted = audit.lock().await.purge(now);
-                limiter.lock().await.gc();
-                if evicted > 0 {
-                    info!("bridge IP audit log purged {evicted} stale entries");
-                }
-            }
-        });
-    }
-
+/// Build the VOPRF token authority (relay profile only). Loads and persists
+/// its keys under `RELAY_AUTHORITY_KEY_FILE` and spawns the rotation ticker.
+fn start_token_authority() -> Arc<Mutex<TokenAuthority>> {
     // H9 Privacy Pass token authority. The VOPRF secret is generated once on
     // boot and rotated on every 1-hour epoch boundary (PNP-001-MUST-051).
     //
@@ -1174,10 +1139,7 @@ async fn main() {
     // restart rotated the VOPRF secret under the same (wall-clock-derived)
     // epoch_id and silently invalidated every client's in-pool tokens —
     // sends appeared to succeed but never delivered.
-    let startup_secs = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
+    let startup_secs = unix_now();
     let authority_key_path = parolnet_relay_server::authority_keys::key_file_path();
     let (persisted_keys, authority_source) =
         parolnet_relay_server::authority_keys::load_or_empty(&authority_key_path)
@@ -1214,7 +1176,6 @@ async fn main() {
         }
     }));
     let token_authority: Arc<Mutex<TokenAuthority>> = Arc::new(Mutex::new(authority));
-    let issue_limiter: IssueLimiter = Arc::new(Mutex::new(()));
     // Spawn a ticker so rotation happens even when there's no /tokens/issue
     // traffic to drive it.
     {
@@ -1224,14 +1185,108 @@ async fn main() {
             interval.tick().await;
             loop {
                 interval.tick().await;
-                let now = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs();
-                ta.lock().await.tick(now);
+                ta.lock().await.tick(unix_now());
             }
         });
     }
+    token_authority
+}
+
+#[tokio::main]
+async fn main() {
+    // Install rustls crypto provider for reqwest TLS support
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+
+    tracing_subscriber::fmt::init();
+
+    let port: u16 = std::env::var("RELAY_PORT")
+        .ok()
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(9000);
+
+    // Operating profile. Signaling-only is the default; the relay profile
+    // (mailbox, tokens, onion cells, gossip, TURN credentials, federation)
+    // needs SIGNALING_ONLY=0.
+    let policy = Arc::new(RelayPolicy::from_env());
+    if policy.signaling_only {
+        info!(
+            "Relay profile: signaling-only (no message relay, mailbox, tokens, onion, gossip, TURN or federation; set SIGNALING_ONLY=0 for the relay profile)"
+        );
+    } else {
+        info!("Relay profile: relay (SIGNALING_ONLY=0)");
+    }
+
+    // Bridge mode configuration
+    let bridge_mode = std::env::var("BRIDGE_MODE").unwrap_or_default() == "true";
+    let bridge_front_domain: Option<String> = std::env::var("BRIDGE_FRONT_DOMAIN")
+        .ok()
+        .filter(|s| !s.is_empty());
+    let trusted_proxies: Arc<HashSet<IpAddr>> = {
+        let ips: HashSet<IpAddr> = std::env::var("TRUSTED_PROXY_IPS")
+            .unwrap_or_default()
+            .split(',')
+            .filter_map(|s| s.trim().parse::<IpAddr>().ok())
+            .collect();
+        if !ips.is_empty() {
+            info!(
+                "Configured {} trusted proxy IPs for X-Forwarded-For",
+                ips.len()
+            );
+        }
+        Arc::new(ips)
+    };
+    if bridge_mode {
+        info!("Bridge mode enabled — relay will NOT join public directory");
+        if let Some(ref fd) = bridge_front_domain {
+            info!("Bridge front domain: {fd}");
+        }
+    }
+
+    let peers: PeerMap = Arc::new(Mutex::new(HashMap::new()));
+    let store: Option<Arc<Mutex<RelayMessageStore>>> = if policy.signaling_only {
+        None
+    } else {
+        Some(Arc::new(Mutex::new(RelayMessageStore::new())))
+    };
+    let stats = Arc::new(analytics::Stats::new());
+    let client_stats = Arc::new(ClientStats::new());
+    let directory: Arc<Mutex<RelayDirectory>> = Arc::new(Mutex::new(RelayDirectory::new()));
+
+    // Bridge disclosure counter (PNP-008-MUST-089). In-memory only — a
+    // process restart zeroes it, which is the whole point: a seized bridge
+    // yields no disclosure history.
+    let bridge_disclosure_limiter: Arc<Mutex<DisclosureLimiter>> =
+        Arc::new(Mutex::new(DisclosureLimiter::new()));
+
+    // Bridge IP audit log (PNP-008-MUST-054 / MUST-090). Scheduled scrubber
+    // runs independently of request traffic.
+    let bridge_ip_audit: Arc<Mutex<IpAuditLog>> = Arc::new(Mutex::new(IpAuditLog::new()));
+    if bridge_mode {
+        let audit = bridge_ip_audit.clone();
+        let limiter = bridge_disclosure_limiter.clone();
+        tokio::spawn(async move {
+            let mut interval =
+                tokio::time::interval(Duration::from_secs(IP_LOG_SCRUBBER_INTERVAL_SECS));
+            interval.tick().await;
+            loop {
+                interval.tick().await;
+                let evicted = audit.lock().await.purge(unix_now());
+                limiter.lock().await.gc();
+                if evicted > 0 {
+                    info!("bridge IP audit log purged {evicted} stale entries");
+                }
+            }
+        });
+    }
+
+    // Token authority: relay profile only. A signaling-only relay has
+    // nothing to spend tokens on and writes no authority key file.
+    let token_authority: Option<Arc<Mutex<TokenAuthority>>> = if policy.signaling_only {
+        None
+    } else {
+        Some(start_token_authority())
+    };
+    let issue_limiter: IssueLimiter = Arc::new(RateLimiter::new(TOKEN_ISSUE_PER_MINUTE_PER_IP, 60));
 
     // Parse peer relay URLs from PEER_RELAY_URLS env var (comma-separated)
     let peer_relay_urls: Arc<Mutex<Vec<String>>> = {
@@ -1251,19 +1306,27 @@ async fn main() {
     };
 
     let conn_rate_limiter: ConnRateLimiter = Arc::new(RateLimiter::new(
-        WS_CONN_RATE_LIMIT,
+        policy.conn_per_minute_per_ip,
         WS_CONN_RATE_WINDOW_SECS,
     ));
     let msg_rate_limiter: MsgRateLimiter =
         Arc::new(RateLimiter::new(MSG_RATE_LIMIT, MSG_RATE_WINDOW_SECS));
     let push_rate_limiter: PushRateLimiter =
         Arc::new(RateLimiter::new(PUSH_RATE_LIMIT, PUSH_RATE_WINDOW_SECS));
+    let signal_limiter = Arc::new(SignalingLimiter::new(&policy));
+    // Concurrent sockets per client IP and in total; registered PeerIds per
+    // client IP.
+    let conn_slots = IpSlots::new(policy.max_conns_per_ip, policy.max_conns_global);
+    let peer_slots = IpSlots::new(policy.max_peers_per_ip, usize::MAX);
+    let watches = Arc::new(Mutex::new(WatchRegistry::new()));
 
     // Spawn periodic rate limiter cleanup (every 5 minutes)
     {
         let conn_rl = conn_rate_limiter.clone();
         let msg_rl = msg_rate_limiter.clone();
         let push_rl = push_rate_limiter.clone();
+        let sig_rl = signal_limiter.clone();
+        let issue_rl = issue_limiter.clone();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_secs(300));
             loop {
@@ -1271,6 +1334,8 @@ async fn main() {
                 conn_rl.cleanup();
                 msg_rl.cleanup();
                 push_rl.cleanup();
+                sig_rl.cleanup();
+                issue_rl.cleanup();
             }
         });
     }
@@ -1334,11 +1399,16 @@ async fn main() {
         pa
     }));
 
-    let peer_manager = Arc::new(PeerManager::new(our_peer_id, relay_signing_key));
+    // Gossip supernode: relay profile only.
+    let peer_manager: Option<Arc<PeerManager>> = if policy.signaling_only {
+        None
+    } else {
+        Some(Arc::new(PeerManager::new(our_peer_id, relay_signing_key)))
+    };
 
     // Spawn periodic maintenance (dedup rotation, stored-message expiry)
-    {
-        let pm = peer_manager.clone();
+    if let Some(ref pm) = peer_manager {
+        let pm = pm.clone();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(43200)); // 12 hours
             loop {
@@ -1353,7 +1423,7 @@ async fn main() {
     }
 
     // Spawn periodic message store expiry (every hour)
-    {
+    if let Some(ref store) = store {
         let store = store.clone();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_secs(3600));
@@ -1369,17 +1439,18 @@ async fn main() {
 
     // Spawn relay-to-relay directory sync (every 60s)
     // In bridge mode, skip sync — bridge relays must not appear in or push to the public directory.
-    if !bridge_mode {
+    // A signaling-only relay does not federate: `/directory` stays read-only.
+    if !bridge_mode && !policy.signaling_only {
         let dir = directory.clone();
         let urls = peer_relay_urls.clone();
         tokio::spawn(relay_directory_sync(dir, our_peer_id, urls));
     } else {
-        info!("Directory sync disabled in bridge mode");
+        info!("Directory sync disabled (bridge mode or signaling-only profile)");
     }
 
     // Spawn federation presence fetch (every 300 s, PNP-008-MUST-069).
     // Also skipped in bridge mode so bridges don't leak their federation peers.
-    if !bridge_mode {
+    if !bridge_mode && !policy.signaling_only {
         let pa = presence_authority.clone();
         let dir = directory.clone();
         let urls = peer_relay_urls.clone();
@@ -1408,29 +1479,41 @@ async fn main() {
 
     // Determine whether the /stats endpoint should be active
     #[cfg(feature = "analytics")]
-    let analytics_enabled = std::env::var("PAROLNET_ANALYTICS").unwrap_or_default() == "1";
+    let analytics_enabled =
+        !policy.signaling_only && std::env::var("PAROLNET_ANALYTICS").unwrap_or_default() == "1";
 
     #[cfg(feature = "analytics")]
     if analytics_enabled {
         info!("Analytics enabled");
     } else {
-        info!("Analytics compiled in but disabled (set PAROLNET_ANALYTICS=1 to enable)");
+        info!(
+            "Analytics compiled in but disabled (relay profile + PAROLNET_ANALYTICS=1 to enable)"
+        );
     }
+
+    let ws_ctx = WsCtx {
+        policy: policy.clone(),
+        peers: peers.clone(),
+        store: store.clone(),
+        stats: stats.clone(),
+        peer_manager: peer_manager.clone(),
+        msg_rate_limiter: msg_rate_limiter.clone(),
+        token_authority: token_authority.clone(),
+        presence_authority: presence_authority.clone(),
+        signal_limiter: signal_limiter.clone(),
+        peer_slots: peer_slots.clone(),
+        watches: watches.clone(),
+    };
 
     #[allow(unused_mut)]
     let mut app = Router::new()
         .route(
             "/ws",
             get({
-                let peers = peers.clone();
-                let store = store.clone();
-                let stats = stats.clone();
-                let peer_manager = peer_manager.clone();
+                let ctx = ws_ctx.clone();
                 let conn_rl = conn_rate_limiter.clone();
-                let msg_rl = msg_rate_limiter.clone();
+                let conn_slots = conn_slots.clone();
                 let tp = trusted_proxies.clone();
-                let ta = token_authority.clone();
-                let pa = presence_authority.clone();
                 move |ws: WebSocketUpgrade,
                       headers: axum::http::HeaderMap,
                       connect_info: axum::extract::ConnectInfo<std::net::SocketAddr>| async move {
@@ -1439,20 +1522,14 @@ async fn main() {
                     if conn_rl.is_limited(&client_ip) {
                         return StatusCode::TOO_MANY_REQUESTS.into_response();
                     }
-                    ws.on_upgrade(move |socket| {
-                        handle_socket(socket, peers, store, stats, peer_manager, msg_rl, ta, pa)
-                    })
-                    .into_response()
-                }
-            }),
-        )
-        .route(
-            FEDERATION_LINK_PATH,
-            get({
-                move |ws: WebSocketUpgrade,
-                      connect_info: axum::extract::ConnectInfo<std::net::SocketAddr>| async move {
-                    let peer_addr = connect_info.0;
-                    ws.on_upgrade(move |socket| handle_federation_link(socket, peer_addr))
+                    // Concurrent sockets per IP and in total.
+                    let Some(slot) = conn_slots.try_acquire(client_ip) else {
+                        return StatusCode::TOO_MANY_REQUESTS.into_response();
+                    };
+                    let max = ctx.policy.max_ws_message_bytes;
+                    ws.max_message_size(max)
+                        .max_frame_size(max)
+                        .on_upgrade(move |socket| handle_socket(socket, ctx, client_ip, slot))
                         .into_response()
                 }
             }),
@@ -1460,7 +1537,13 @@ async fn main() {
         .route("/health", get(|| async { "OK" }))
         .route(
             "/turn-credentials",
-            get(|| async { handle_turn_credentials().await }),
+            get({
+                let policy = policy.clone();
+                move || {
+                    let policy = policy.clone();
+                    async move { handle_turn_credentials(policy).await }
+                }
+            }),
         )
         .route(
             "/peers",
@@ -1476,19 +1559,10 @@ async fn main() {
             "/bootstrap",
             get({
                 let peers = peers.clone();
+                let signaling_only = policy.signaling_only;
                 move |query: Query<HashMap<String, String>>| {
                     let peers = peers.clone();
-                    async move { handle_bootstrap(query, peers).await }
-                }
-            }),
-        )
-        .route(
-            "/telemetry",
-            post({
-                let client_stats = client_stats.clone();
-                move |body: Json<TelemetryBatch>| {
-                    let client_stats = client_stats.clone();
-                    async move { handle_telemetry(client_stats, body).await }
+                    async move { handle_bootstrap(query, peers, signaling_only).await }
                 }
             }),
         )
@@ -1499,47 +1573,6 @@ async fn main() {
                 move || {
                     let directory = directory.clone();
                     async move { handle_directory(directory).await }
-                }
-            }),
-        )
-        .route(
-            "/endorse",
-            post({
-                let directory = directory.clone();
-                move |body: axum::body::Bytes| {
-                    let directory = directory.clone();
-                    async move { handle_endorse(directory, body).await }
-                }
-            }),
-        )
-        .route(
-            "/directory/push",
-            post({
-                let directory = directory.clone();
-                let push_rl = push_rate_limiter.clone();
-                let tp = trusted_proxies.clone();
-                move |headers: axum::http::HeaderMap,
-                      connect_info: axum::extract::ConnectInfo<std::net::SocketAddr>,
-                      body: axum::body::Bytes| {
-                    let directory = directory.clone();
-                    let push_rl = push_rl.clone();
-                    let client_ip = get_client_ip(connect_info.0.ip(), &headers, &tp);
-                    async move {
-                        handle_directory_push(directory, our_peer_id, push_rl, client_ip, body)
-                            .await
-                    }
-                }
-            }),
-        )
-        .route(
-            "/tokens/issue",
-            post({
-                let ta = token_authority.clone();
-                let il = issue_limiter.clone();
-                move |body: axum::body::Bytes| {
-                    let ta = ta.clone();
-                    let il = il.clone();
-                    async move { handle_tokens_issue(ta, il, body).await }
                 }
             }),
         )
@@ -1573,23 +1606,97 @@ async fn main() {
                     async move { handle_peers_lookup(pa, rl, client_ip, query).await }
                 }
             }),
-        )
-        .layer({
-            let cors_origins = std::env::var("CORS_ORIGINS").unwrap_or_default();
-            if cors_origins.is_empty() {
-                tower_http::cors::CorsLayer::permissive()
-            } else {
-                use tower_http::cors::{AllowOrigin, CorsLayer};
-                let origins: Vec<axum::http::HeaderValue> = cors_origins
-                    .split(',')
-                    .filter_map(|o| o.trim().parse().ok())
-                    .collect();
-                CorsLayer::new()
-                    .allow_origin(AllowOrigin::list(origins))
-                    .allow_methods(tower_http::cors::Any)
-                    .allow_headers(tower_http::cors::Any)
-            }
-        });
+        );
+
+    // Relay-profile endpoints. A signaling-only relay does not register
+    // them at all (404): no federation link, telemetry, endorsement,
+    // directory push or token minting.
+    if let Some(ref ta) = token_authority {
+        app = app
+            .route(
+                FEDERATION_LINK_PATH,
+                get({
+                    move |ws: WebSocketUpgrade,
+                          connect_info: axum::extract::ConnectInfo<std::net::SocketAddr>| async move {
+                        let peer_addr = connect_info.0;
+                        ws.on_upgrade(move |socket| handle_federation_link(socket, peer_addr))
+                            .into_response()
+                    }
+                }),
+            )
+            .route(
+                "/telemetry",
+                post({
+                    let client_stats = client_stats.clone();
+                    move |body: Json<TelemetryBatch>| {
+                        let client_stats = client_stats.clone();
+                        async move { handle_telemetry(client_stats, body).await }
+                    }
+                }),
+            )
+            .route(
+                "/endorse",
+                post({
+                    let directory = directory.clone();
+                    move |body: axum::body::Bytes| {
+                        let directory = directory.clone();
+                        async move { handle_endorse(directory, body).await }
+                    }
+                }),
+            )
+            .route(
+                "/directory/push",
+                post({
+                    let directory = directory.clone();
+                    let push_rl = push_rate_limiter.clone();
+                    let tp = trusted_proxies.clone();
+                    move |headers: axum::http::HeaderMap,
+                          connect_info: axum::extract::ConnectInfo<std::net::SocketAddr>,
+                          body: axum::body::Bytes| {
+                        let directory = directory.clone();
+                        let push_rl = push_rl.clone();
+                        let client_ip = get_client_ip(connect_info.0.ip(), &headers, &tp);
+                        async move {
+                            handle_directory_push(directory, our_peer_id, push_rl, client_ip, body)
+                                .await
+                        }
+                    }
+                }),
+            )
+            .route(
+                "/tokens/issue",
+                post({
+                    let ta = ta.clone();
+                    let il = issue_limiter.clone();
+                    let tp = trusted_proxies.clone();
+                    move |headers: axum::http::HeaderMap,
+                          connect_info: axum::extract::ConnectInfo<std::net::SocketAddr>,
+                          body: axum::body::Bytes| {
+                        let ta = ta.clone();
+                        let il = il.clone();
+                        let client_ip = get_client_ip(connect_info.0.ip(), &headers, &tp);
+                        async move { handle_tokens_issue(ta, il, client_ip, body).await }
+                    }
+                }),
+            );
+    }
+
+    app = app.layer({
+        let cors_origins = std::env::var("CORS_ORIGINS").unwrap_or_default();
+        if cors_origins.is_empty() {
+            tower_http::cors::CorsLayer::permissive()
+        } else {
+            use tower_http::cors::{AllowOrigin, CorsLayer};
+            let origins: Vec<axum::http::HeaderValue> = cors_origins
+                .split(',')
+                .filter_map(|o| o.trim().parse().ok())
+                .collect();
+            CorsLayer::new()
+                .allow_origin(AllowOrigin::list(origins))
+                .allow_methods(tower_http::cors::Any)
+                .allow_headers(tower_http::cors::Any)
+        }
+    });
 
     // Add /bridge-info endpoint when bridge mode is enabled
     if bridge_mode {
@@ -1610,13 +1717,14 @@ async fn main() {
     }
 
     // Add /stats endpoint only when feature is enabled AND env var is set
+    // (relay profile only).
     #[cfg(feature = "analytics")]
     {
-        if analytics_enabled {
+        if analytics_enabled && let Some(ref pm) = peer_manager {
             let stats_clone = stats.clone();
             let peers_clone = peers.clone();
             let client_stats_clone = client_stats.clone();
-            let pm_clone = peer_manager.clone();
+            let pm_clone = pm.clone();
             app = app.route(
                 "/stats",
                 get(move || {
@@ -1728,19 +1836,29 @@ type CircuitTable = Arc<std::sync::Mutex<HashMap<u32, CircuitState>>>;
 /// Processes CREATE, EXTEND, DATA, and DESTROY cells. In single-relay MVP
 /// mode, EXTEND is handled internally (the relay creates a new sub-circuit
 /// for each hop rather than forwarding to another relay).
+///
+/// Returns `Some((to, json))` when a DATA cell carries a frame for another
+/// peer; the caller routes it (async lock on the peer map). The previous
+/// in-place `blocking_lock()` panicked inside the async runtime and killed
+/// the socket task before its cleanup ran.
+///
+/// A socket may hold at most [`MAX_CIRCUITS_PER_CONN`] circuits; CREATE and
+/// EXTEND beyond that are ignored.
 fn handle_relay_cell(
     cell: parolnet_relay::RelayCell,
     tx: &mpsc::UnboundedSender<Message>,
     circuit_table: &CircuitTable,
-    peers: &PeerMap,
-    _my_peer_id: &Option<String>,
-) {
+) -> Option<(String, String)> {
     use parolnet_relay::CellType;
     use parolnet_relay::handshake::CircuitHandshake;
     use parolnet_relay::onion::HopKeys;
 
     match cell.cell_type {
         CellType::Create => {
+            if circuit_table.lock().unwrap().len() >= MAX_CIRCUITS_PER_CONN {
+                tracing::debug!("CREATE ignored: per-connection circuit cap");
+                return None;
+            }
             // Generate ephemeral X25519 key, do DH, derive keys, respond CREATED
             let relay_secret = x25519_dalek::StaticSecret::random_from_rng(rand::thread_rng());
             match CircuitHandshake::handle_create(&cell, &relay_secret) {
@@ -1768,6 +1886,10 @@ fn handle_relay_cell(
             // Peel the onion layer from the EXTEND payload, then create a new
             // sub-circuit with fresh DH keys.
             let mut table = circuit_table.lock().unwrap();
+            if table.len() >= MAX_CIRCUITS_PER_CONN {
+                tracing::debug!("EXTEND ignored: per-connection circuit cap");
+                return None;
+            }
             if let Some(state) = table.get_mut(&cell.circuit_id) {
                 // Peel the onion layer from the EXTEND payload
                 let payload_data = &cell.payload[..cell.payload_len as usize];
@@ -1852,18 +1974,13 @@ fn handle_relay_cell(
                         // Convert the decrypted payload to a JSON message and route
                         // to the target peer using the existing PeerMap routing.
                         // The plaintext is expected to be a UTF-8 JSON message.
-                        if let Ok(text) = String::from_utf8(plaintext) {
-                            // Try to route via PeerMap
-                            if let Ok(incoming) = serde_json::from_str::<serde_json::Value>(&text)
-                                && let Some(to) = incoming.get("to").and_then(|v| v.as_str())
-                            {
-                                let peers_guard = peers.blocking_lock();
-                                if let Some(recipient_tx) = peers_guard.get(to) {
-                                    let _ = recipient_tx.send(Message::Text(text.into()));
-                                }
-                            }
+                        tracing::debug!(circuit_id = cell.circuit_id, "DATA cell peeled");
+                        if let Ok(text) = String::from_utf8(plaintext)
+                            && let Ok(incoming) = serde_json::from_str::<serde_json::Value>(&text)
+                            && let Some(to) = incoming.get("to").and_then(|v| v.as_str())
+                        {
+                            return Some((to.to_string(), text));
                         }
-                        tracing::debug!(circuit_id = cell.circuit_id, "DATA cell routed");
                     }
                     Err(e) => {
                         tracing::warn!(
@@ -1890,32 +2007,120 @@ fn handle_relay_cell(
             );
         }
     }
+    None
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn handle_socket(
-    socket: WebSocket,
+/// Shared state handed to every client WebSocket task.
+#[derive(Clone)]
+struct WsCtx {
+    policy: Arc<RelayPolicy>,
     peers: PeerMap,
-    store: Arc<Mutex<RelayMessageStore>>,
+    /// Store-and-forward mailbox. `None` on a signaling-only relay: no user
+    /// payload is ever held.
+    store: Option<Arc<Mutex<RelayMessageStore>>>,
     stats: Arc<analytics::Stats>,
-    peer_manager: Arc<PeerManager>,
+    /// Mesh gossip supernode. `None` on a signaling-only relay.
+    peer_manager: Option<Arc<PeerManager>>,
     msg_rate_limiter: MsgRateLimiter,
-    token_authority: Arc<Mutex<TokenAuthority>>,
+    /// Privacy Pass authority. `None` on a signaling-only relay.
+    token_authority: Option<Arc<Mutex<TokenAuthority>>>,
     presence_authority: Arc<Mutex<PresenceAuthority>>,
-) {
+    signal_limiter: Arc<SignalingLimiter>,
+    /// Registered PeerIds per client IP.
+    peer_slots: IpSlots,
+    watches: Arc<Mutex<WatchRegistry>>,
+}
+
+fn send_json(tx: &mpsc::UnboundedSender<Message>, msg: &OutgoingMessage) {
+    let _ = tx.send(Message::Text(msg.to_json().into()));
+}
+
+fn send_error(tx: &mpsc::UnboundedSender<Message>, code: &str, message: &str) {
+    send_json(tx, &OutgoingMessage::error(code, message));
+}
+
+fn presence_frame(peer_id: &str, online: bool) -> OutgoingMessage {
+    OutgoingMessage {
+        msg_type: "presence".into(),
+        peer_id: Some(peer_id.to_string()),
+        online: Some(online),
+        ..Default::default()
+    }
+}
+
+/// Verify a register challenge answer: PeerId = SHA-256(pubkey) and an
+/// Ed25519 signature over the nonce.
+fn verify_register(
+    peer_id: &str,
+    pubkey_hex: &str,
+    sig_hex: &str,
+    nonce_hex: &str,
+) -> Result<(), String> {
+    let pubkey_bytes = hex::decode(pubkey_hex).map_err(|e| format!("invalid pubkey hex: {e}"))?;
+    let sig_bytes = hex::decode(sig_hex).map_err(|e| format!("invalid signature hex: {e}"))?;
+    let nonce_bytes = hex::decode(nonce_hex).map_err(|e| format!("invalid nonce hex: {e}"))?;
+
+    use sha2::{Digest, Sha256};
+    let expected_pid = hex::encode(Sha256::digest(&pubkey_bytes));
+    if expected_pid != peer_id {
+        return Err("peer_id does not match pubkey".into());
+    }
+
+    let vk_bytes: [u8; 32] = pubkey_bytes
+        .try_into()
+        .map_err(|_| "pubkey must be 32 bytes".to_string())?;
+    let verifying_key = ed25519_dalek::VerifyingKey::from_bytes(&vk_bytes)
+        .map_err(|e| format!("invalid Ed25519 key: {e}"))?;
+    let sig_arr: [u8; 64] = sig_bytes
+        .try_into()
+        .map_err(|_| "signature must be 64 bytes".to_string())?;
+    let signature = ed25519_dalek::Signature::from_bytes(&sig_arr);
+
+    use ed25519_dalek::Verifier;
+    verifying_key
+        .verify(&nonce_bytes, &signature)
+        .map_err(|_| "signature verification failed".to_string())
+}
+
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+async fn handle_socket(socket: WebSocket, ctx: WsCtx, client_ip: IpAddr, _conn_slot: SlotGuard) {
+    let WsCtx {
+        policy,
+        peers,
+        store,
+        stats,
+        peer_manager,
+        msg_rate_limiter,
+        token_authority,
+        presence_authority,
+        signal_limiter,
+        peer_slots,
+        watches,
+    } = ctx;
+
     let (mut sender, mut receiver) = socket.split();
     let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
 
     let mut my_peer_id: Option<String> = None;
+    // Released on drop when the socket ends, whatever the reason.
+    let mut _peer_slot: Option<SlotGuard> = None;
+    let mut register_attempts: u32 = 0;
+    let mut frame_budget = FrameBudget::new(policy.frames_per_minute);
 
-    // Circuit routing state for onion relay cells
-    let circuit_table: Arc<std::sync::Mutex<HashMap<u32, CircuitState>>> =
-        Arc::new(std::sync::Mutex::new(HashMap::new()));
+    // Circuit routing state for onion relay cells (relay profile only).
+    let circuit_table: CircuitTable = Arc::new(std::sync::Mutex::new(HashMap::new()));
 
     // Spawn task to forward messages from channel to WebSocket
     let send_task = tokio::spawn(async move {
         while let Some(msg) = rx.recv().await {
-            if sender.send(msg).await.is_err() {
+            let closing = matches!(msg, Message::Close(_));
+            if sender.send(msg).await.is_err() || closing {
                 break;
             }
         }
@@ -1925,6 +2130,10 @@ async fn handle_socket(
     let mut ping_interval = tokio::time::interval(Duration::from_secs(30));
     ping_interval.tick().await; // consume the immediate first tick
 
+    // A socket that has not registered by this deadline is closed. Without
+    // it an anonymous socket could hold a connection slot forever.
+    let register_deadline = tokio::time::Instant::now() + policy.register_timeout;
+
     // PNP-001 §10.3 SHOULD-014 + MUST-067: the relay SHOULD close client
     // WebSockets idle ≥60s and MUST reap presence within 60s of close. We
     // track the wall-clock time of the last inbound frame (any type) and
@@ -1933,6 +2142,13 @@ async fn handle_socket(
     // the loop on idle suffices to honor both clauses.
     let mut last_inbound = std::time::Instant::now();
     const CLIENT_IDLE_CLOSE_SECS: u64 = 60;
+
+    let close = |code: u16, reason: &str| {
+        let _ = tx.send(Message::Close(Some(axum::extract::ws::CloseFrame {
+            code,
+            reason: reason.to_string().into(),
+        })));
+    };
 
     // Read messages from WebSocket, multiplexed with ping keepalive
     loop {
@@ -1944,13 +2160,17 @@ async fn handle_socket(
                     Some(Ok(Message::Pong(_))) => { last_inbound = std::time::Instant::now(); continue; }
                     Some(Ok(Message::Close(_))) | None => break,
                     Some(Ok(_)) => { last_inbound = std::time::Instant::now(); continue; }
+                    // Includes a frame over the message-size cap.
                     Some(Err(_)) => break,
                 }
             }
+            _ = tokio::time::sleep_until(register_deadline), if my_peer_id.is_none() => {
+                tracing::debug!("closing WS that did not register in time");
+                close(CLOSE_POLICY, "register timeout");
+                break;
+            }
             _ = ping_interval.tick() => {
                 // SHOULD-014: close if the client hasn't spoken in ≥60s.
-                // Skip for unregistered connections in the first few seconds
-                // of the handshake — they haven't sent `register` yet.
                 if my_peer_id.is_some()
                     && last_inbound.elapsed() > Duration::from_secs(CLIENT_IDLE_CLOSE_SECS)
                 {
@@ -1968,13 +2188,41 @@ async fn handle_socket(
             }
         };
 
+        // Every frame, registered or not, spends from the socket's budget.
+        match frame_budget.take() {
+            Budget::Ok => {}
+            Budget::LimitedNotify => {
+                send_error(&tx, "rate_limited", "rate limited");
+                continue;
+            }
+            Budget::Limited => continue,
+        }
+
         // Handle binary frames (relay cells)
         if let Message::Binary(ref bin) = ws_msg {
+            match policy.admit_binary(my_peer_id.is_some()) {
+                BinaryAdmission::Accept => {}
+                BinaryAdmission::Refuse(code) => {
+                    send_error(&tx, code, "register first");
+                    continue;
+                }
+                BinaryAdmission::Close => {
+                    // Onion cells carry user content; a signaling-only relay
+                    // refuses them outright.
+                    close(CLOSE_UNSUPPORTED, "binary frames not accepted");
+                    break;
+                }
+            }
             if bin.len() == parolnet_relay::CELL_SIZE {
                 let mut buf = [0u8; parolnet_relay::CELL_SIZE];
                 buf.copy_from_slice(bin);
-                if let Ok(cell) = parolnet_relay::RelayCell::from_bytes(&buf) {
-                    handle_relay_cell(cell, &tx, &circuit_table, &peers, &my_peer_id);
+                if let Ok(cell) = parolnet_relay::RelayCell::from_bytes(&buf)
+                    && let Some((to, text)) = handle_relay_cell(cell, &tx, &circuit_table)
+                {
+                    let peers_guard = peers.lock().await;
+                    if let Some(recipient_tx) = peers_guard.get(&to) {
+                        let _ = recipient_tx.send(Message::Text(text.into()));
+                    }
                 }
             }
             continue;
@@ -1986,209 +2234,192 @@ async fn handle_socket(
         };
 
         let Ok(incoming) = serde_json::from_str::<IncomingMessage>(&text) else {
-            let _ = tx.send(Message::Text(
-                serde_json::to_string(&OutgoingMessage {
-                    msg_type: "error".into(),
-                    message: Some("invalid JSON".into()),
-                    ..Default::default()
-                })
-                .unwrap()
-                .into(),
-            ));
+            send_error(&tx, "invalid_json", "invalid JSON");
             continue;
         };
+
+        if let Err(code) = policy.admit_frame(my_peer_id.is_some(), &incoming.msg_type) {
+            let text = if code == "signaling_only" {
+                "frame type not accepted by a signaling-only relay"
+            } else {
+                "register first"
+            };
+            send_error(&tx, code, text);
+            continue;
+        }
 
         // Per-peer message rate limiting
         if let Some(ref pid) = my_peer_id
             && msg_rate_limiter.is_limited(pid)
         {
-            let _ = tx.send(Message::Text(
-                serde_json::to_string(&OutgoingMessage {
-                    msg_type: "error".into(),
-                    message: Some("rate limited".into()),
-                    ..Default::default()
-                })
-                .unwrap()
-                .into(),
-            ));
+            send_error(&tx, "rate_limited", "rate limited");
             continue;
         }
 
         match incoming.msg_type.as_str() {
             "register" => {
-                if let Some(peer_id) = incoming.peer_id {
-                    // Challenge-response: if peer provides pubkey + signature + nonce,
-                    // verify identity. Otherwise issue a challenge nonce.
-                    if let (Some(pubkey_hex), Some(sig_hex), Some(nonce_hex)) =
-                        (&incoming.pubkey, &incoming.signature, &incoming.nonce)
-                    {
-                        // Verify challenge-response
-                        let valid = (|| -> Result<bool, String> {
-                            let pubkey_bytes = hex::decode(pubkey_hex)
-                                .map_err(|e| format!("invalid pubkey hex: {e}"))?;
-                            let sig_bytes = hex::decode(sig_hex)
-                                .map_err(|e| format!("invalid signature hex: {e}"))?;
-                            let nonce_bytes = hex::decode(nonce_hex)
-                                .map_err(|e| format!("invalid nonce hex: {e}"))?;
-
-                            // Verify PeerId = SHA-256(pubkey)
-                            use sha2::{Digest, Sha256};
-                            let expected_pid = hex::encode(Sha256::digest(&pubkey_bytes));
-                            if expected_pid != peer_id {
-                                return Err("peer_id does not match pubkey".into());
-                            }
-
-                            let vk_bytes: [u8; 32] = pubkey_bytes
-                                .try_into()
-                                .map_err(|_| "pubkey must be 32 bytes".to_string())?;
-                            let verifying_key = ed25519_dalek::VerifyingKey::from_bytes(&vk_bytes)
-                                .map_err(|e| format!("invalid Ed25519 key: {e}"))?;
-
-                            let sig_arr: [u8; 64] = sig_bytes
-                                .try_into()
-                                .map_err(|_| "signature must be 64 bytes".to_string())?;
-                            let signature = ed25519_dalek::Signature::from_bytes(&sig_arr);
-
-                            use ed25519_dalek::Verifier;
-                            verifying_key
-                                .verify(&nonce_bytes, &signature)
-                                .map_err(|_| "signature verification failed".to_string())?;
-
-                            Ok(true)
-                        })();
-
-                        match valid {
-                            Ok(true) => {
-                                // Authenticated — complete registration
-                                peers.lock().await.insert(peer_id.clone(), tx.clone());
-                                my_peer_id = Some(peer_id.clone());
-                                stats.record_connection();
-
-                                if let Some(mesh_pid) = parse_peer_id(&peer_id) {
-                                    let ws_conn = Arc::new(WsConnection { tx: tx.clone() });
-                                    if let Err(e) = peer_manager.add_peer(mesh_pid, ws_conn).await {
-                                        tracing::warn!(
-                                            peer = %peer_id, error = %e,
-                                            "failed to add peer to mesh PeerManager"
-                                        );
-                                    }
-                                }
-
-                                let online = peers.lock().await.len();
-                                let _ = tx.send(Message::Text(
-                                    serde_json::to_string(&OutgoingMessage {
-                                        msg_type: "registered".into(),
-                                        peer_id: Some(peer_id.clone()),
-                                        online_peers: Some(online),
-                                        ..Default::default()
-                                    })
-                                    .unwrap()
-                                    .into(),
-                                ));
-
-                                info!(
-                                    "Peer registered (authenticated): {}...  ({} online)",
-                                    &peer_id[..16.min(peer_id.len())],
-                                    online
-                                );
-
-                                // Publish presence (PNP-008-MUST-063): this
-                                // peer is now authoritatively connected here,
-                                // so `/peers/presence` must advertise it.
-                                if let Some(mesh_pid) = parse_peer_id(&peer_id) {
-                                    let now = std::time::SystemTime::now()
-                                        .duration_since(std::time::UNIX_EPOCH)
-                                        .unwrap_or_default()
-                                        .as_secs();
-                                    presence_authority.lock().await.upsert_local(mesh_pid, now);
-                                }
-
-                                // Deliver stored messages
-                                if let Some(mesh_pid) = parse_peer_id(&peer_id) {
-                                    let pending = store.lock().await.retrieve(&mesh_pid);
-                                    let drained = pending.len();
-                                    if drained > 0 {
-                                        tracing::info!(
-                                            peer = %&peer_id[..peer_id.len().min(16)],
-                                            drained,
-                                            "drained stored messages on reconnect"
-                                        );
-                                    }
-                                    for msg in pending {
-                                        let _ = tx.send(Message::Text(msg.into()));
-                                    }
-
-                                    // Second-pass drain: a message addressed to this peer
-                                    // can land in `store` during the ~50–500 ms register
-                                    // challenge-response window AFTER the synchronous
-                                    // drain above has already run. Without this pass it
-                                    // would sit until the peer reconnects again (which
-                                    // might be never). Schedule a short delayed drain on
-                                    // the same connection — but only if the peer is still
-                                    // registered, so a fast disconnect is a no-op.
-                                    let store_cloned = store.clone();
-                                    let peers_cloned = peers.clone();
-                                    let peer_id_cloned = peer_id.clone();
-                                    tokio::spawn(async move {
-                                        tokio::time::sleep(Duration::from_secs(1)).await;
-                                        let tx_opt = {
-                                            let peers_guard = peers_cloned.lock().await;
-                                            peers_guard.get(&peer_id_cloned).cloned()
-                                        };
-                                        let Some(tx) = tx_opt else {
-                                            return;
-                                        };
-                                        let pending = store_cloned.lock().await.retrieve(&mesh_pid);
-                                        if pending.is_empty() {
-                                            return;
-                                        }
-                                        let delivered = pending.len();
-                                        for msg in pending {
-                                            let _ = tx.send(Message::Text(msg.into()));
-                                        }
-                                        tracing::info!(
-                                            peer = %peer_id_cloned,
-                                            delivered,
-                                            "second-pass drain delivered frames stored during register handshake"
-                                        );
-                                    });
-                                }
-                            }
-                            Ok(false) | Err(_) => {
-                                let err_msg = match valid {
-                                    Err(e) => e,
-                                    _ => "authentication failed".into(),
-                                };
-                                let _ = tx.send(Message::Text(
-                                    serde_json::to_string(&OutgoingMessage {
-                                        msg_type: "error".into(),
-                                        message: Some(format!("register auth failed: {err_msg}")),
-                                        ..Default::default()
-                                    })
-                                    .unwrap()
-                                    .into(),
-                                ));
-                            }
-                        }
-                    } else {
-                        // No auth provided — issue a challenge nonce
-                        let mut nonce = [0u8; 32];
-                        rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut nonce);
-                        let nonce_hex = hex::encode(nonce);
-                        let _ = tx.send(Message::Text(
-                            serde_json::json!({
-                                "type": "challenge",
-                                "nonce": nonce_hex,
-                                "peer_id": peer_id
-                            })
-                            .to_string()
-                            .into(),
-                        ));
+                register_attempts += 1;
+                if register_attempts > MAX_REGISTER_ATTEMPTS {
+                    close(CLOSE_POLICY, "too many register attempts");
+                    break;
+                }
+                let Some(peer_id) = incoming.peer_id else {
+                    continue;
+                };
+                if let Some(ref current) = my_peer_id {
+                    if *current == peer_id {
+                        // Re-register of the same id on the same socket:
+                        // already done, nothing to change.
+                        continue;
                     }
+                    send_error(&tx, "already_registered", "socket already registered");
+                    continue;
+                }
+                // Challenge-response: if peer provides pubkey + signature + nonce,
+                // verify identity. Otherwise issue a challenge nonce.
+                let (Some(pubkey_hex), Some(sig_hex), Some(nonce_hex)) =
+                    (&incoming.pubkey, &incoming.signature, &incoming.nonce)
+                else {
+                    let mut nonce = [0u8; 32];
+                    rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut nonce);
+                    let nonce_hex = hex::encode(nonce);
+                    let _ = tx.send(Message::Text(
+                        serde_json::json!({
+                            "type": "challenge",
+                            "nonce": nonce_hex,
+                            "peer_id": peer_id
+                        })
+                        .to_string()
+                        .into(),
+                    ));
+                    continue;
+                };
+
+                if let Err(err_msg) = verify_register(&peer_id, pubkey_hex, sig_hex, nonce_hex) {
+                    send_error(
+                        &tx,
+                        "register_failed",
+                        &format!("register auth failed: {err_msg}"),
+                    );
+                    continue;
+                }
+
+                let Some(slot) = peer_slots.try_acquire(client_ip) else {
+                    send_error(
+                        &tx,
+                        "too_many_peers",
+                        "too many identities registered from this address",
+                    );
+                    continue;
+                };
+                _peer_slot = Some(slot);
+
+                // Authenticated — complete registration
+                peers.lock().await.insert(peer_id.clone(), tx.clone());
+                my_peer_id = Some(peer_id.clone());
+                stats.record_connection();
+
+                if let Some(ref pm) = peer_manager
+                    && let Some(mesh_pid) = parse_peer_id(&peer_id)
+                {
+                    let ws_conn = Arc::new(WsConnection { tx: tx.clone() });
+                    if let Err(e) = pm.add_peer(mesh_pid, ws_conn).await {
+                        tracing::warn!(error = %e, "failed to add peer to mesh PeerManager");
+                    }
+                }
+
+                let online = peers.lock().await.len();
+                send_json(
+                    &tx,
+                    &OutgoingMessage {
+                        msg_type: "registered".into(),
+                        peer_id: Some(peer_id.clone()),
+                        online_peers: Some(online),
+                        profile: Some(policy.profile().into()),
+                        ..Default::default()
+                    },
+                );
+
+                info!("Peer registered ({} online)", online);
+
+                // Publish presence (PNP-008-MUST-063): this
+                // peer is now authoritatively connected here,
+                // so `/peers/presence` must advertise it.
+                if let Some(mesh_pid) = parse_peer_id(&peer_id) {
+                    presence_authority
+                        .lock()
+                        .await
+                        .upsert_local(mesh_pid, unix_now());
+                }
+
+                // Presence push to mutual watchers (a watch set can survive
+                // from an overlapping earlier socket of the same peer).
+                let mutual = watches.lock().await.mutual_of(&peer_id);
+                if !mutual.is_empty() {
+                    let peers_guard = peers.lock().await;
+                    let frame = presence_frame(&peer_id, true).to_json();
+                    for w in mutual {
+                        if let Some(wtx) = peers_guard.get(&w) {
+                            let _ = wtx.send(Message::Text(frame.clone().into()));
+                        }
+                    }
+                }
+
+                // Deliver stored messages (relay profile only).
+                if let Some(ref store) = store
+                    && let Some(mesh_pid) = parse_peer_id(&peer_id)
+                {
+                    let pending = store.lock().await.retrieve(&mesh_pid);
+                    let drained = pending.len();
+                    if drained > 0 {
+                        tracing::info!(drained, "drained stored messages on reconnect");
+                    }
+                    for msg in pending {
+                        let _ = tx.send(Message::Text(msg.into()));
+                    }
+
+                    // Second-pass drain: a message addressed to this peer
+                    // can land in `store` during the ~50–500 ms register
+                    // challenge-response window AFTER the synchronous
+                    // drain above has already run. Without this pass it
+                    // would sit until the peer reconnects again (which
+                    // might be never). Schedule a short delayed drain on
+                    // the same connection — but only if the peer is still
+                    // registered, so a fast disconnect is a no-op.
+                    let store_cloned = store.clone();
+                    let peers_cloned = peers.clone();
+                    let peer_id_cloned = peer_id.clone();
+                    tokio::spawn(async move {
+                        tokio::time::sleep(Duration::from_secs(1)).await;
+                        let tx_opt = {
+                            let peers_guard = peers_cloned.lock().await;
+                            peers_guard.get(&peer_id_cloned).cloned()
+                        };
+                        let Some(tx) = tx_opt else {
+                            return;
+                        };
+                        let pending = store_cloned.lock().await.retrieve(&mesh_pid);
+                        if pending.is_empty() {
+                            return;
+                        }
+                        let delivered = pending.len();
+                        for msg in pending {
+                            let _ = tx.send(Message::Text(msg.into()));
+                        }
+                        tracing::info!(
+                            delivered,
+                            "second-pass drain delivered frames stored during register handshake"
+                        );
+                    });
                 }
             }
 
             "message" => {
+                // Relay profile only: `frame_type_allowed` refused it above
+                // on a signaling-only relay.
+                let (Some(token_authority), Some(store)) = (&token_authority, &store) else {
+                    continue;
+                };
                 // PNP-001 "Outer Relay Frame" (§ Token Auth): the frame carries
                 // a `token` field *instead of* a `from` field. The relay MUST
                 // VOPRF-verify the token and MUST reject duplicates.
@@ -2201,10 +2432,7 @@ async fn handle_socket(
                 let (Some(to), Some(payload), Some(token_hex)) =
                     (incoming.to, incoming.payload, incoming.token)
                 else {
-                    tracing::warn!(
-                        peer = %my_peer_id.clone().unwrap_or_default(),
-                        "dropping outer message frame missing token / to / payload"
-                    );
+                    tracing::warn!("dropping outer message frame missing token / to / payload");
                     continue;
                 };
 
@@ -2213,10 +2441,7 @@ async fn handle_socket(
                     continue;
                 };
 
-                let now = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs();
+                let now = unix_now();
                 let verified = {
                     let mut a = token_authority.lock().await;
                     a.tick(now);
@@ -2239,46 +2464,54 @@ async fn handle_socket(
                 // Token passed — route the payload to `to`. The outbound frame
                 // does NOT carry a `from` field; the relay is intentionally
                 // blind to sender identity on the wire.
-                let outgoing = serde_json::to_string(&OutgoingMessage {
+                let outgoing = OutgoingMessage {
                     msg_type: "message".into(),
                     payload: Some(payload),
                     ..Default::default()
-                })
-                .unwrap();
+                }
+                .to_json();
 
                 let peers_lock = peers.lock().await;
                 if let Some(recipient_tx) = peers_lock.get(&to) {
                     let _ = recipient_tx.send(Message::Text(outgoing.into()));
                     stats.record_message_routed();
-                    tracing::debug!(to = %&to[..to.len().min(16)], "delivered to online peer");
+                    tracing::debug!("delivered to online peer");
                 } else {
                     drop(peers_lock);
-                    if let Some(dest_pid) = parse_peer_id(&to) {
-                        let size = outgoing.len();
-                        store.lock().await.store(dest_pid, outgoing);
-                        stats.record_message_queued();
-                        tracing::debug!(
-                            to = %&to[..to.len().min(16)],
-                            size,
-                            "queued for offline peer (store-and-forward)"
-                        );
-                    } else {
-                        tracing::warn!(to = %to, "recipient peer_id failed to parse — frame dropped");
+                    let Some(dest_pid) = parse_peer_id(&to) else {
+                        tracing::debug!("recipient peer_id failed to parse — frame dropped");
+                        continue;
+                    };
+                    let size = outgoing.len();
+                    match store.lock().await.store(dest_pid, outgoing) {
+                        StoreOutcome::Stored => {
+                            stats.record_message_queued();
+                            tracing::debug!(size, "queued for offline peer (store-and-forward)");
+                            send_json(
+                                &tx,
+                                &OutgoingMessage {
+                                    msg_type: "queued".into(),
+                                    message: Some("peer offline, message stored".into()),
+                                    ..Default::default()
+                                },
+                            );
+                        }
+                        StoreOutcome::TooLarge => {
+                            send_error(&tx, "payload_too_large", "message too large to store");
+                        }
+                        StoreOutcome::Full => {
+                            send_error(&tx, "mailbox_full", "relay mailbox full");
+                        }
                     }
-                    let _ = tx.send(Message::Text(
-                        serde_json::to_string(&OutgoingMessage {
-                            msg_type: "queued".into(),
-                            message: Some("peer offline, message stored".into()),
-                            ..Default::default()
-                        })
-                        .unwrap()
-                        .into(),
-                    ));
                 }
             }
 
             "gossip" => {
-                // Forward gossip payload to up to 3 random peers (excluding sender + exclude list)
+                // Relay profile only (refused above on a signaling-only
+                // relay); sender is registered.
+                let Some(ref pm) = peer_manager else {
+                    continue;
+                };
                 let from = my_peer_id.clone().unwrap_or_default();
                 if let Some(payload) = incoming.payload {
                     // Forward via existing relay mechanism (JSON, for browser clients)
@@ -2288,7 +2521,7 @@ async fn handle_socket(
                     // Also feed into PeerManager for proper gossip protocol processing
                     // (CBOR-based dedup, bloom filters, PoW validation, score tracking)
                     if let Ok(bytes) = hex::decode(&payload) {
-                        let pm = peer_manager.clone();
+                        let pm = pm.clone();
                         tokio::spawn(async move {
                             match pm.handle_incoming(&bytes).await {
                                 Ok(Some(_delivered)) => {
@@ -2308,20 +2541,62 @@ async fn handle_socket(
             }
 
             "rtc_offer" | "rtc_answer" | "rtc_ice" => {
-                // WebRTC signaling — forward directly to target peer
-                let peer_id_clone = my_peer_id.clone().unwrap_or_default();
-                if let (Some(to), Some(payload)) = (&incoming.to, &incoming.payload) {
-                    let outgoing = OutgoingMessage {
-                        msg_type: incoming.msg_type.clone(),
-                        from: Some(peer_id_clone),
-                        payload: Some(payload.clone()),
-                        ..Default::default()
-                    };
-                    let json = serde_json::to_string(&outgoing).unwrap_or_default();
-                    let peers_lock = peers.lock().await;
-                    if let Some(recipient_tx) = peers_lock.get(to) {
-                        let _ = recipient_tx.send(Message::Text(json.into()));
-                        stats.record_message_routed();
+                // WebRTC signaling — forward to an online registered peer,
+                // never queued (PNP-001 signaling-only profile).
+                let from = my_peer_id.clone().unwrap_or_default();
+                let (Some(to), Some(payload)) = (incoming.to, incoming.payload) else {
+                    continue;
+                };
+                let recipient_tx = peers.lock().await.get(&to).cloned();
+                if let Err(r) = policy.admit_signal(
+                    &signal_limiter,
+                    &from,
+                    &to,
+                    recipient_tx.is_some(),
+                    &incoming.msg_type,
+                    &payload,
+                ) {
+                    let mut e = OutgoingMessage::error(
+                        r.code(),
+                        match r {
+                            SignalReject::PayloadTooLarge => "signaling payload too large",
+                            SignalReject::RateLimited => "signaling rate limited",
+                            SignalReject::PeerOffline => "peer offline",
+                        },
+                    );
+                    if r == SignalReject::PeerOffline {
+                        e.peer_id = Some(to);
+                    }
+                    send_json(&tx, &e);
+                    continue;
+                }
+                let Some(recipient_tx) = recipient_tx else {
+                    continue;
+                };
+                let outgoing = OutgoingMessage {
+                    msg_type: incoming.msg_type.clone(),
+                    from: Some(from),
+                    payload: Some(payload),
+                    ..Default::default()
+                };
+                let _ = recipient_tx.send(Message::Text(outgoing.to_json().into()));
+                stats.record_message_routed();
+            }
+
+            "watch" => {
+                let me = my_peer_id.clone().unwrap_or_default();
+                let mutual = watches.lock().await.set_watch(&me, &incoming.peer_ids);
+                if !mutual.is_empty() {
+                    let peers_guard = peers.lock().await;
+                    let about_me = presence_frame(&me, true).to_json();
+                    for other in mutual {
+                        if let Some(otx) = peers_guard.get(&other) {
+                            // Tell me the contact is online, and the contact
+                            // that I am (they may have watched me before I
+                            // watched them back).
+                            send_json(&tx, &presence_frame(&other, true));
+                            let _ = otx.send(Message::Text(about_me.clone().into()));
+                        }
                     }
                 }
             }
@@ -2334,61 +2609,78 @@ async fn handle_socket(
                 // server-side. Any inbound frame (ping or not) already
                 // refreshed `last_inbound` at the top of the loop, so the
                 // idle-close timer is incidentally reset too.
-                let _ = tx.send(Message::Text(
-                    serde_json::to_string(&OutgoingMessage {
+                send_json(
+                    &tx,
+                    &OutgoingMessage {
                         msg_type: "pong".into(),
                         ts: incoming.ts,
                         ..Default::default()
-                    })
-                    .unwrap()
-                    .into(),
-                ));
+                    },
+                );
                 // Refresh presence liveness on every ping so
                 // /peers/presence stays current even if the user hasn't
                 // sent a real message in a while.
                 if let Some(ref pid_hex) = my_peer_id
                     && let Some(mesh_pid) = parse_peer_id(pid_hex)
                 {
-                    let now = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_secs();
-                    presence_authority.lock().await.upsert_local(mesh_pid, now);
+                    presence_authority
+                        .lock()
+                        .await
+                        .upsert_local(mesh_pid, unix_now());
                 }
             }
 
             _ => {
-                let _ = tx.send(Message::Text(
-                    serde_json::to_string(&OutgoingMessage {
-                        msg_type: "error".into(),
-                        message: Some(format!("unknown type: {}", incoming.msg_type)),
-                        ..Default::default()
-                    })
-                    .unwrap()
-                    .into(),
-                ));
+                send_error(&tx, "unknown_type", "unknown frame type");
             }
         }
     }
 
-    // Cleanup on disconnect
+    // Cleanup on disconnect. A newer socket may have registered the same
+    // PeerId meanwhile; only the socket that owns the map entry removes it.
     if let Some(peer_id) = &my_peer_id {
-        peers.lock().await.remove(peer_id);
+        let owned = {
+            let mut map = peers.lock().await;
+            let owned = map.get(peer_id).is_some_and(|t| t.same_channel(&tx));
+            if owned {
+                map.remove(peer_id);
+            }
+            owned
+        };
         stats.record_disconnection();
 
-        // Remove from mesh PeerManager
-        if let Some(mesh_pid) = parse_peer_id(peer_id) {
-            peer_manager.remove_peer(&mesh_pid).await;
-            // Drop from presence so `/peers/presence` no longer claims this
-            // peer is locally connected.
-            presence_authority.lock().await.remove_local(&mesh_pid);
+        if owned {
+            let mutual = {
+                let mut w = watches.lock().await;
+                let m = w.mutual_of(peer_id);
+                w.remove(peer_id);
+                m
+            };
+            if !mutual.is_empty() {
+                let peers_guard = peers.lock().await;
+                let frame = presence_frame(peer_id, false).to_json();
+                for w in mutual {
+                    if let Some(wtx) = peers_guard.get(&w) {
+                        let _ = wtx.send(Message::Text(frame.clone().into()));
+                    }
+                }
+            }
+            if let Some(mesh_pid) = parse_peer_id(peer_id) {
+                if let Some(ref pm) = peer_manager {
+                    pm.remove_peer(&mesh_pid).await;
+                }
+                // Drop from presence so `/peers/presence` no longer claims this
+                // peer is locally connected.
+                presence_authority.lock().await.remove_local(&mesh_pid);
+            }
         }
 
-        info!(
-            "Peer disconnected: {}...",
-            &peer_id[..16.min(peer_id.len())]
-        );
+        info!("Peer disconnected");
     }
 
+    // Let a queued close frame go out before tearing down the writer.
+    drop(tx);
+    let mut send_task = send_task;
+    let _ = tokio::time::timeout(Duration::from_millis(250), &mut send_task).await;
     send_task.abort();
 }

@@ -2747,3 +2747,221 @@ describe('peer-relay-cache IDB persistence', () => {
         assert.equal(peek && peek.homeRelayUrl, 'https://home.example', 'in-memory cache now holds the fresh entry, not the stale one');
     });
 });
+
+// ── Signaling-only relay profile (relay-profile.js) ──────────────────
+//
+// relay-profile.js has no imports, so these tests exercise the real module.
+// token-pool.js imports the same module instance ('./relay-profile.js'
+// resolves to the same URL), so profile changes here are seen there.
+const rp = await import('../src/relay-profile.js');
+describe('signaling-only relay profile', () => {
+    const A = 'a'.repeat(64);
+    const B = 'b'.repeat(64);
+
+    test('missing / unknown profile field normalizes to relay', () => {
+        assert.equal(rp.normalizeProfile(undefined), 'relay');
+        assert.equal(rp.normalizeProfile('relay'), 'relay');
+        assert.equal(rp.normalizeProfile('something-new'), 'relay');
+        assert.equal(rp.normalizeProfile('signaling-only'), 'signaling-only');
+    });
+
+    test('profile starts unknown; listeners fire on change only', () => {
+        rp._resetProfileForTests();
+        assert.equal(rp.getServerProfile(), 'unknown');
+        assert.equal(rp.relayPathsAllowed(), false, 'unknown profile never uses relay paths');
+        const seen = [];
+        rp.onServerProfileChange((next, prev) => seen.push([prev, next]));
+        rp.setServerProfile('signaling-only');
+        rp.setServerProfile('signaling-only');
+        rp.setServerProfile(undefined); // registered without profile -> relay
+        rp.setServerProfile('unknown');
+        assert.deepEqual(seen, [
+            ['unknown', 'signaling-only'],
+            ['signaling-only', 'relay'],
+            ['relay', 'unknown'],
+        ]);
+        rp._resetProfileForTests();
+    });
+
+    test('chooseSendRoute: content never touches a signaling-only or unknown relay', () => {
+        const r = rp.chooseSendRoute;
+        assert.equal(r({ hasDirect: true, profile: 'signaling-only', onionActive: true }), 'direct');
+        assert.equal(r({ hasDirect: false, profile: 'signaling-only', onionActive: true }), 'queue');
+        assert.equal(r({ hasDirect: false, profile: 'signaling-only', onionActive: false }), 'queue');
+        assert.equal(r({ hasDirect: false, profile: 'unknown', onionActive: false }), 'queue');
+        assert.equal(r({ hasDirect: false, profile: 'relay', onionActive: true }), 'onion');
+        assert.equal(r({ hasDirect: false, profile: 'relay', onionActive: false }), 'relay');
+        assert.equal(r({ hasDirect: true, profile: 'relay', onionActive: false }), 'direct');
+    });
+
+    test('shouldInitiate: exactly one side of a pair initiates', () => {
+        assert.equal(rp.shouldInitiate(A, B), true);
+        assert.equal(rp.shouldInitiate(B, A), false);
+        assert.equal(rp.shouldInitiate(A.toUpperCase(), B), true, 'case-insensitive');
+        assert.equal(rp.shouldInitiate(A, A), false);
+        for (let i = 0; i < 50; i++) {
+            const x = Array.from({ length: 64 }, () => '0123456789abcdef'[Math.floor(Math.random() * 16)]).join('');
+            const y = Array.from({ length: 64 }, () => '0123456789abcdef'[Math.floor(Math.random() * 16)]).join('');
+            if (x === y) continue;
+            assert.notEqual(rp.shouldInitiate(x, y), rp.shouldInitiate(y, x));
+        }
+    });
+
+    test('nextRetryDelayMs: exponential from 5 s, capped at 5 min (+25% jitter)', () => {
+        const zero = () => 0;
+        assert.equal(rp.nextRetryDelayMs(0, zero), 5_000);
+        assert.equal(rp.nextRetryDelayMs(1, zero), 10_000);
+        assert.equal(rp.nextRetryDelayMs(3, zero), 40_000);
+        assert.equal(rp.nextRetryDelayMs(20, zero), 300_000);
+        assert.equal(rp.nextRetryDelayMs(20, () => 1), 375_000);
+        // Never a tight loop: the signaling server allows 64 frames per pair
+        // per 10 minutes.
+        assert.ok(rp.nextRetryDelayMs(0, () => 0.5) >= 5_000);
+    });
+
+    test('rateLimitBackoffMs: 60 s doubling, capped at 10 min', () => {
+        assert.equal(rp.rateLimitBackoffMs(0), 60_000);
+        assert.equal(rp.rateLimitBackoffMs(1), 120_000);
+        assert.equal(rp.rateLimitBackoffMs(10), 600_000);
+    });
+
+    test('takeOfferSlot: at most 3 new offers per 10 s window', () => {
+        const h = [];
+        assert.equal(rp.takeOfferSlot(h, 1000), 0);
+        assert.equal(rp.takeOfferSlot(h, 1100), 0);
+        assert.equal(rp.takeOfferSlot(h, 1200), 0);
+        const wait = rp.takeOfferSlot(h, 1300);
+        assert.equal(wait, 10_000 - 300);
+        assert.equal(h.length, 3, 'a refused slot is not recorded');
+        assert.equal(rp.takeOfferSlot(h, 11_000), 0, 'slot frees once the oldest leaves the window');
+    });
+
+    test('planQueueEviction: per-peer cap drops that peer\'s oldest only', () => {
+        const limits = { maxAgeMs: 1e12, maxEntries: 100, maxPerPeer: 2, maxBytes: 1e9 };
+        const q = [
+            { toPeerId: A, payload: 'a1', timestamp: 1 },
+            { toPeerId: B, payload: 'b1', timestamp: 2 },
+            { toPeerId: A, payload: 'a2', timestamp: 3 },
+        ];
+        const drop = rp.planQueueEviction(q, { toPeerId: A, payload: 'a3', timestamp: 4 }, limits, 10);
+        assert.deepEqual(drop.map(e => e.payload), ['a1']);
+    });
+
+    test('planQueueEviction: total entry and byte caps drop the oldest overall', () => {
+        const limits = { maxAgeMs: 1e12, maxEntries: 3, maxPerPeer: 100, maxBytes: 1e9 };
+        const q = [
+            { toPeerId: A, payload: 'x', timestamp: 1 },
+            { toPeerId: B, payload: 'y', timestamp: 2 },
+            { toPeerId: A, payload: 'z', timestamp: 3 },
+        ];
+        assert.deepEqual(rp.planQueueEviction(q, { toPeerId: B, payload: 'w' }, limits, 10).map(e => e.payload), ['x']);
+
+        const byteLimits = { maxAgeMs: 1e12, maxEntries: 100, maxPerPeer: 100, maxBytes: 10 };
+        const q2 = [
+            { toPeerId: A, payload: '1234', timestamp: 1 },
+            { toPeerId: B, payload: '5678', timestamp: 2 },
+        ];
+        const drop2 = rp.planQueueEviction(q2, { toPeerId: A, payload: 'abcd' }, byteLimits, 10);
+        assert.deepEqual(drop2.map(e => e.payload), ['1234'], '12 bytes > 10: oldest goes, 8 bytes fit');
+    });
+
+    test('planQueueEviction: age-expired entries always drop; defaults are 30 d / 2000 / 50 MiB', () => {
+        const q = [{ toPeerId: A, payload: 'old', timestamp: 0 }, { toPeerId: A, payload: 'new', timestamp: 100 }];
+        const limits = { maxAgeMs: 50, maxEntries: 100, maxPerPeer: 100, maxBytes: 1e9 };
+        assert.deepEqual(rp.planQueueEviction(q, { toPeerId: B, payload: 'n' }, limits, 120).map(e => e.payload), ['old']);
+        assert.equal(rp.QUEUE_LIMITS.maxAgeMs, 30 * 24 * 60 * 60 * 1000);
+        assert.equal(rp.QUEUE_LIMITS.maxEntries, 2000);
+        assert.equal(rp.QUEUE_LIMITS.maxBytes, 50 * 1024 * 1024);
+        assert.ok(rp.QUEUE_LIMITS.maxPerPeer < rp.QUEUE_LIMITS.maxEntries);
+    });
+
+    test('selectWatchList: valid ids only, deduped, most recent first, capped at 256', () => {
+        const ids = [];
+        const activity = new Map();
+        for (let i = 0; i < 300; i++) {
+            const id = i.toString(16).padStart(64, '0');
+            ids.push(id);
+            activity.set(id, i);
+        }
+        ids.push('not-a-peer-id', ids[5].toUpperCase(), null);
+        const list = rp.selectWatchList(ids, activity);
+        assert.equal(list.length, 256);
+        assert.equal(list[0], (299).toString(16).padStart(64, '0'), 'most recently active first');
+        assert.equal(new Set(list).size, 256, 'no duplicates');
+        assert.ok(list.every(x => /^[0-9a-f]{64}$/.test(x)));
+        assert.equal(rp.sameWatchSet([A, B], [B, A]), true);
+        assert.equal(rp.sameWatchSet([A], [B]), false);
+    });
+
+    test('parseTurnCredentials: a signaling-only server never yields TURN', () => {
+        const so = rp.parseTurnCredentials({
+            username: '', credential: '', ttl: 86400, profile: 'signaling-only',
+            uris: ['stun:stun.example:3478', 'turn:sneaky.example:3478'],
+        });
+        assert.equal(so.profile, 'signaling-only');
+        assert.deepEqual(so.stun, [{ urls: 'stun:stun.example:3478' }]);
+        assert.deepEqual(so.turn, []);
+        const relay = rp.parseTurnCredentials({
+            username: 'u', credential: 'c', uris: ['stun:s:3478', 'turns:t:5349'],
+        });
+        assert.equal(relay.profile, null, 'no field: profile unknown from this answer');
+        assert.equal(relay.turn.length, 1);
+        assert.equal(relay.turn[0].username, 'u');
+        assert.equal(rp.iceServersHaveTurn(relay.turn), true);
+        assert.equal(rp.iceServersHaveTurn(so.stun), false);
+        assert.equal(rp.iceServersHaveTurn([{ urls: ['stun:x', 'turn:y'] }]), true);
+    });
+
+    test('token pool is never primed or refilled on a signaling-only relay', async () => {
+        const pool = await import('../src/token-pool.js?t=' + Math.random());
+        rp._resetProfileForTests();
+        rp.setServerProfile('signaling-only');
+        try {
+            const res = await pool.requestBatch('wss://sig.example/ws');
+            assert.deepEqual(res, { ok: false, reason: 'signaling-only' });
+            assert.doesNotThrow(() => pool.maybeRefill('wss://sig.example/ws'));
+        } finally {
+            rp._resetProfileForTests();
+        }
+    });
+});
+
+describe('signaling-only PWA source guards', () => {
+    const read = (f) => readFileSync(join(__dirname, '..', f), 'utf8');
+
+    test('relay-only ICE is no longer the default', () => {
+        const src = read('src/webrtc.js');
+        assert.ok(!/webrtcPrivacyMode\s*=\s*true/.test(src), 'old relay-only default must be gone');
+        assert.match(src, /let relayOnlyPref = false;/);
+        assert.match(src, /'webrtc_relay_only'/);
+        assert.ok(!src.includes("dbGet('settings', 'webrtc_privacy_mode')"), 'old key must be ignored');
+    });
+
+    test('cover traffic defaults off', () => {
+        assert.match(read('src/settings.js'), /let coverTrafficEnabled = false;/);
+    });
+
+    test('sendRawEnvelope routes through chooseSendRoute', () => {
+        const src = read('src/messaging.js');
+        const body = src.slice(src.indexOf('export async function sendRawEnvelope'));
+        const routeAt = body.indexOf('chooseSendRoute(');
+        const relayAt = body.indexOf('acquireToken(');
+        assert.ok(routeAt > 0 && relayAt > routeAt, 'route decision precedes any relay token spend');
+    });
+
+    test('service worker cache bumped and forwards watch frames', () => {
+        const sw = read('sw.source.js');
+        assert.match(sw, /const CACHE_NAME = 'parolnet-v10';/);
+        assert.match(sw, /case 'relay_watch':/);
+    });
+
+    test('en.json carries the signaling-only UI keys', () => {
+        const en = JSON.parse(read('lang/en.json'));
+        for (const k of ['chat.waitingForPeer', 'chat.noDirectPath', 'settings.ipExposureNotice',
+                         'settings.relayOwnTurn', 'notice.ipExposure', 'notice.ipAvoid']) {
+            assert.ok(k in en, `en.json is missing ${k}`);
+        }
+        assert.match(en['chat.noDirectPath'], /\{name\}/);
+        assert.match(en['chat.waitingForPeer'], /\{name\}/);
+    });
+});

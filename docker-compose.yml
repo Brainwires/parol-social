@@ -3,18 +3,28 @@ services:
     build: .
     ports:
       # DO NOT CHANGE 1411:80 — Cloudflare tunnel binds to host:1411.
+      # Only the web port: parol.social is signaling-only (PNP-001 §10.5),
+      # so there is no TURN server and no TURN port range.
       - "1411:80"
-      - "3478:3478/udp"
-      - "3478:3478/tcp"
-      - "5349:5349/tcp"
-      - "49152-49252:49152-49252/udp"
     env_file: .env
     environment:
       - DEV_MODE=false
+      # Signaling-only profile: no message relay, mailbox, tokens, onion
+      # cells, gossip, TURN credentials or federation. Set to 0 only on a
+      # deployment that deliberately offers the relay profile.
+      - SIGNALING_ONLY=1
+      # STUN only (answered by the host's STUN server on UDP 3478; Cloudflare's
+      # tunnel does not carry UDP, so clients reach it directly).
+      - STUN_URIS=stun:biscuits.parol.social:3478
+      # nginx forwards the client address (CF-Connecting-IP) to the relay.
+      - TRUSTED_PROXY_IPS=127.0.0.1
+      - PAROLNET_ANALYTICS=0
     volumes:
-      - /etc/letsencrypt/live/biscuits.parol.social:/etc/turn-certs:ro
-      - /etc/letsencrypt/archive/biscuits.parol.social:/etc/letsencrypt/archive/biscuits.parol.social:ro
-      - /var/log/turnserver:/var/log/turnserver
+      # Abuse access log (no query strings) read by the host's fail2ban jail,
+      # and the ban list its action writes (ops/fail2ban.md). Without
+      # fail2ban, leave /etc/parolnet/banned empty: nothing is banned.
+      - /var/log/parolnet:/var/log/nginx/parolnet
+      - /etc/parolnet/banned:/etc/nginx/banned:ro
       # Persistent relay identity — survives container rebuilds so the
       # Ed25519 pubkey (and therefore the relay's PeerId and authority
       # endorsements) remains stable.
@@ -40,6 +50,8 @@ services:
     env_file: .env
     environment:
       - DEV_MODE=false
+      - SIGNALING_ONLY=1
+      - TRUSTED_PROXY_IPS=127.0.0.1
       # PEER_RELAY_URLS is populated via the runbook so the two relays
       # mutually discover each other over /directory polling.
     volumes:

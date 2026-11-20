@@ -134,6 +134,8 @@ function getKeyField(storeName) {
 export async function updateContactState(peerId, patch) {
     const prior = (await dbGet('contact_state', peerId)) || { peerId };
     const next = { ...prior, ...patch, peerId };
+    // Recency for the presence watch list (most recently active first).
+    if ('lastMessage' in patch) next.lastActivityAt = Date.now();
     return dbPut('contact_state', next);
 }
 
@@ -152,8 +154,16 @@ export async function loadAllContactStates() {
     return map;
 }
 
+// Contacts added / removed: connection.js re-sends the presence watch list.
+function notifyContactsChanged(storeName) {
+    if (storeName !== 'contacts') return;
+    if (typeof window === 'undefined' || typeof CustomEvent === 'undefined') return;
+    try { window.dispatchEvent(new CustomEvent('parolnet:contacts-changed')); } catch (_) {}
+}
+
 // Encrypted wrappers
 export async function dbPut(storeName, item) {
+    notifyContactsChanged(storeName);
     if (cryptoStore.isUnlocked() && ENCRYPTED_STORES.has(storeName)) {
         const keyField = getKeyField(storeName);
         const keyValue = item[keyField];
@@ -203,6 +213,7 @@ export async function dbGetByIndex(storeName, indexName, value) {
 }
 
 export async function dbDelete(storeName, key) {
+    notifyContactsChanged(storeName);
     const db = await openDB();
     return new Promise((resolve, reject) => {
         const tx = db.transaction(storeName, 'readwrite');
@@ -214,6 +225,7 @@ export async function dbDelete(storeName, key) {
 }
 
 export async function dbClear(storeName) {
+    notifyContactsChanged(storeName);
     const db = await openDB();
     return new Promise((resolve, reject) => {
         const tx = db.transaction(storeName, 'readwrite');

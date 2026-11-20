@@ -14,8 +14,9 @@ Minimum:
 
 - 1 vCPU, 512 MB RAM, 5 GB disk
 - Public IPv4 (IPv6 optional but recommended)
-- Open ports `80/tcp`, `443/tcp`, `3478/udp+tcp`, `5349/tcp`,
-  `49152-49252/udp` (TURN relay range). Match the primary.
+- Open ports `80/tcp` and `443/tcp`. The image runs no TURN server (the
+  default relay profile is signaling-only, PNP-001 §10.5); open STUN / TURN
+  ports only if you run your own TURN server for a relay-profile deployment.
 
 SSH in, install Docker and `docker compose`. Nothing ParolNet-specific
 yet.
