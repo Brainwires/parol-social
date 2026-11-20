@@ -47,6 +47,9 @@ jobs:
             pkg-config libvpx-dev libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev \
             libx11-xcb-dev libxcb1-dev libfontconfig-dev libvulkan1 mesa-vulkan-drivers \
             xvfb imagemagick
+          # Ubuntu 24.04 restricts unprivileged user namespaces through AppArmor, which leaves
+          # Chrome for Testing "No usable sandbox!"; allow them rather than run it unsandboxed.
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
       - name: System packages (macOS)
         if: runner.os == 'macOS'
         run: brew install libvpx pkgconf
@@ -61,6 +64,23 @@ jobs:
           node-version: 22
       - name: Chromium for the sender (puppeteer)
         run: npm ci --omit=dev
+      - name: Native Chromium for the sender (Windows arm64)
+        # Chrome for Testing has no Windows arm64 build, and puppeteer's x64 one under emulation
+        # stalls on its first page (Network.enable timed out); use the image's arm64 browser.
+        if: matrix.label == 'windows-arm64'
+        run: |
+          for p in "/c/Program Files (x86)/Microsoft/Edge/Application/msedge.exe" \
+                   "/c/Program Files/Microsoft/Edge/Application/msedge.exe" \
+                   "/c/Program Files/Google/Chrome/Application/chrome.exe"; do
+            if [ -f "$p" ]; then
+              echo "CHROME_PATH=$(cygpath -w "$p")" >> "$GITHUB_ENV"
+              echo "sender browser: $p"
+              file "$p" || true
+              exit 0
+            fi
+          done
+          echo "no native Chromium found on this image" >&2
+          exit 1
 
       - name: Toolchain (apps/desktop/rust-toolchain.toml)
         working-directory: apps/desktop

@@ -325,8 +325,14 @@ fn build_test_tls_transport() -> TlsTransport {
     let cert_der = cert.der().clone();
     let key_der = signing_key.serialize_der();
 
+    // An explicit provider: the workspace builds rustls with both aws-lc-rs (this crate) and ring
+    // (parolnet-rtc's DTLS), so the process-level default can't be picked from features.
+    let provider = std::sync::Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+
     // Server config
-    let server_config = rustls::ServerConfig::builder()
+    let server_config = rustls::ServerConfig::builder_with_provider(provider.clone())
+        .with_safe_default_protocol_versions()
+        .expect("protocol versions")
         .with_no_client_auth()
         .with_single_cert(
             vec![rustls::pki_types::CertificateDer::from(cert_der.to_vec())],
@@ -341,7 +347,9 @@ fn build_test_tls_transport() -> TlsTransport {
     root_store
         .add(cert_der)
         .expect("add self-signed cert to root store");
-    let client_config = rustls::ClientConfig::builder()
+    let client_config = rustls::ClientConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .expect("protocol versions")
         .with_root_certificates(root_store)
         .with_no_client_auth();
 
