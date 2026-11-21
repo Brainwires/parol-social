@@ -2149,10 +2149,12 @@ name = "parolnet-rtc"
 version = "0.1.0"
 dependencies = [
  "bytes",
+ "parolnet-rtc",
  "rtc",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
+ "zeroize",
 ]
 
 [[package]]

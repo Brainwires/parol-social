@@ -12,6 +12,13 @@ bytes = "1.12"
 tokio.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
+zeroize.workspace = true
+
+[features]
+# A minimal in-process TURN server (UDP, long-term credentials) for tests: this crate's and
+# parolnet-app's. Never enabled in a shipped build.
+test-turn = []
 
 [dev-dependencies]
+parolnet-rtc = { path = ".", features = ["test-turn"] }
 tokio = { workspace = true, features = ["full", "test-util"] }
