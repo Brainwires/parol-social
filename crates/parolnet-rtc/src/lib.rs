@@ -26,7 +26,8 @@
 //! - **Media.** It sends VP8 and Opus tracks (encoded frames in, packetized here), delivers
 //!   RTP packets and data-channel messages (binary and text), requests keyframes, and with
 //!   [`RtcConfig::congestion`] runs the engine's congestion controller and reports its target
-//!   bitrate ([`RtcEvent::TargetBitrate`]) for the encoder to follow.
+//!   bitrate ([`RtcEvent::TargetBitrate`]) for the encoder to follow. Video is repaired over
+//!   RTX (RFC 4588); received audio can be de-jittered ([`RtcConfig::jitter_buffer`]).
 //! - **Stats.** The engine's report on request ([`RtcHandle::stats`]) and a digest of it at
 //!   an interval ([`RtcEvent::Quality`]).
 //!
@@ -44,7 +45,9 @@ use std::time::{Duration, Instant};
 
 use bytes::BytesMut;
 use rtc::ice::mdns::MulticastDnsMode;
-use rtc::interceptor::{CongestionControlBuilder, Gcc, PacerBuilder, Registry, Slot};
+use rtc::interceptor::{
+    GccHandle, GccInterceptorBuilder, Interceptor as _, PassThroughInterceptor, Registry, Slot,
+};
 use rtc::mdns::{MDNS_PORT, MulticastSocket};
 use rtc::media_stream::{MediaStreamTrack, MediaStreamTrackId};
 use rtc::peer_connection::configuration::interceptor_registry::{
@@ -53,7 +56,7 @@ use rtc::peer_connection::configuration::interceptor_registry::{
     configure_twcc_receiver_only,
 };
 use rtc::peer_connection::configuration::media_engine::{
-    MIME_TYPE_OPUS, MIME_TYPE_VP8, MediaEngine,
+    MIME_TYPE_OPUS, MIME_TYPE_RTX, MIME_TYPE_VP8, MediaEngine,
 };
 use rtc::peer_connection::configuration::setting_engine::SettingEngineBuilder;
 use rtc::peer_connection::configuration::{RTCConfigurationBuilder, RTCIceTransportPolicy};
@@ -71,7 +74,7 @@ use rtc::rtcp::payload_feedbacks::picture_loss_indication::PictureLossIndication
 use rtc::rtp::packetizer::Packetizer;
 use rtc::rtp_transceiver::rtp_sender::{
     RTCPFeedback, RTCRtpCodec, RTCRtpCodecParameters, RTCRtpCodingParameters,
-    RTCRtpEncodingParameters, RtpCodecKind,
+    RTCRtpEncodingParameters, RTCRtpRtxParameters, RtpCodecKind,
 };
 use rtc::rtp_transceiver::{
     RTCRtpReceiverId, RTCRtpSenderId, RTCRtpTransceiverDirection, RTCRtpTransceiverId,
@@ -87,6 +90,7 @@ use tokio::task::JoinHandle;
 
 pub use rtc;
 
+pub mod jitter;
 pub mod net;
 #[cfg(feature = "test-turn")]
 pub mod test_turn;
@@ -185,25 +189,32 @@ impl MediaKind {
     }
 }
 
-/// Send-side congestion control for a connection that carries media: the engine's GCC
-/// (delay and loss based, on transport-wide feedback) with its pacer. The estimate is
-/// reported as [`RtcEvent::TargetBitrate`]; everything sent (audio, video, retransmissions)
-/// is paced to it, so the encoder has to follow it.
+/// Send-side congestion control for a connection that carries media: the engine's
+/// TWCC-driven GCC (a trendline filter on the delay the peer's transport-wide feedback
+/// reports, and AIMD: about 8% a second up, to 85% on overuse, down on loss above 10%). The
+/// estimate is reported as [`RtcEvent::TargetBitrate`], and nothing here enforces it: the
+/// encoder has to follow it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CongestionConfig {
-    /// Where the estimate starts, in bits per second (and stays, with a peer that sends no
-    /// transport-wide feedback).
-    pub initial_bps: u32,
+    /// The estimate never goes under this, in bits per second. It has to cover the audio and
+    /// a picture that is still one: at the floor the encoder sends that much whatever the
+    /// path does.
     pub min_bps: u32,
     pub max_bps: u32,
 }
 
+impl CongestionConfig {
+    /// Where the estimate starts (the controller's own start, 300 kbit/s, within the
+    /// bounds), and stays with a peer that sends no transport-wide feedback.
+    pub fn initial_bps(&self) -> u32 {
+        300_000.clamp(self.min_bps, self.max_bps.max(self.min_bps))
+    }
+}
+
 impl Default for CongestionConfig {
-    /// 300 kbit/s to start (what libwebrtc starts a call at), never under 100 kbit/s (Opus
-    /// plus a picture that is still one), at most 2.5 Mbit/s.
+    /// Never under 100 kbit/s (Opus plus a small picture), at most 2.5 Mbit/s.
     fn default() -> Self {
         CongestionConfig {
-            initial_bps: 300_000,
             min_bps: 100_000,
             max_bps: 2_500_000,
         }
@@ -255,6 +266,11 @@ pub struct RtcConfig {
     pub media: MediaConfig,
     /// Run congestion control on what this connection sends (see [`CongestionConfig`]).
     pub congestion: Option<CongestionConfig>,
+    /// De-jitter received audio: its RTP packets are delivered in sequence order at an even
+    /// pace, held just long enough to cover how late packets have recently been (see
+    /// [`jitter::AudioJitterBuffer`]). For connections whose audio is played. Video is never
+    /// held: its receiver reassembles frames and has to see late retransmissions.
+    pub jitter_buffer: bool,
     /// When making an offer, open a data channel with this label first.
     pub data_channel: Option<String>,
     /// DTLS role taken when answering (the engine's default when `None`).
@@ -289,6 +305,7 @@ impl Default for RtcConfig {
             ice_policy: IcePolicy::All,
             media: MediaConfig::default(),
             congestion: None,
+            jitter_buffer: false,
             data_channel: None,
             answering_dtls_role: None,
             polite: false,
@@ -765,6 +782,7 @@ pub async fn spawn(config: RtcConfig) -> Result<(RtcHandle, mpsc::Receiver<RtcEv
         events: ev_tx,
         data_channel: config.data_channel,
         tracks: HashMap::new(),
+        audio_jitter: config.jitter_buffer.then(HashMap::new),
         dropped_rtp: 0,
         senders: built
             .senders
@@ -792,6 +810,7 @@ pub async fn spawn(config: RtcConfig) -> Result<(RtcHandle, mpsc::Receiver<RtcEv
         remote_sending: HashMap::new(),
         local_sending: HashMap::new(),
         congestion: config.congestion,
+        estimate: built.estimate,
         last_target: None,
         next_estimate: None,
         quality_interval: config.quality_interval,
@@ -846,6 +865,8 @@ struct Built {
     pc: RTCPeerConnection,
     senders: Senders,
     codecs: Codecs,
+    /// The congestion controller's estimate, when it runs.
+    estimate: Option<GccHandle>,
 }
 
 fn local_track(kind: MediaKind, codec: &RTCRtpCodec) -> MediaStreamTrack {
@@ -861,6 +882,9 @@ fn local_track(kind: MediaKind, codec: &RTCRtpCodec) -> MediaStreamTrack {
         vec![RTCRtpEncodingParameters {
             rtp_coding_parameters: RTCRtpCodingParameters {
                 ssrc: Some(rand_ssrc()),
+                // Video is repaired on a retransmission stream of its own (RFC 4588), when
+                // the peer negotiates it.
+                rtx: (kind == MediaKind::Video).then(|| RTCRtpRtxParameters { ssrc: rand_ssrc() }),
                 ..Default::default()
             },
             codec: codec.clone(),
@@ -909,6 +933,23 @@ fn build_peer_connection(config: &RtcConfig) -> Result<Built, RtcError> {
         },
         RtpCodecKind::Video,
     )?;
+    // RTX for VP8 (RFC 4588), as browsers offer it. A retransmission then travels as a new
+    // packet of its own stream. Without it a lost packet is sent again under its old sequence
+    // number, which the engine's SRTP refuses once the packet's bytes differ from the first
+    // transmission, and with transport-wide sequence numbers they always do.
+    media_engine.register_codec(
+        RTCRtpCodecParameters {
+            rtp_codec: RTCRtpCodec {
+                mime_type: MIME_TYPE_RTX.to_owned(),
+                clock_rate: 90_000,
+                channels: 0,
+                sdp_fmtp_line: "apt=96".to_owned(),
+                rtcp_feedback: vec![],
+            },
+            payload_type: 97,
+        },
+        RtpCodecKind::Video,
+    )?;
     media_engine.register_codec(
         RTCRtpCodecParameters {
             rtp_codec: opus.clone(),
@@ -918,31 +959,29 @@ fn build_peer_connection(config: &RtcConfig) -> Result<Built, RtcError> {
     )?;
     // The engine's default set (`register_default_interceptors`), spelled out so that the
     // transport-wide feedback half can be the receiver alone or, with congestion control,
-    // both halves under the controller and its pacer.
+    // both halves under the congestion controller.
     let registry = configure_nack(Registry::new(), &mut media_engine);
     configure_simulcast_extension_headers(&mut media_engine)?;
     let registry = configure_rtcp_reports(registry);
     configure_receiver_reference_time(&mut media_engine);
     let registry = configure_key_frame_requests(registry);
+    let mut estimate = None;
     let registry = match config.congestion {
         Some(cc) => {
-            let (initial, min, max) = (
-                f64::from(cc.initial_bps),
-                f64::from(cc.min_bps),
-                f64::from(cc.max_bps),
-            );
-            configure_twcc(registry, &mut media_engine)?
-                .with(
-                    Slot::CongestionControl,
-                    CongestionControlBuilder::new(Gcc::new(initial, min, max)).build(),
-                )
-                // The pacer starts where the estimate does; the controller moves both.
-                .with(
-                    Slot::Pacer,
-                    PacerBuilder::new()
-                        .with_target_bitrate(initial.clamp(min, max))
+            // The fork's TWCC-driven GCC (trendline filter and AIMD): it numbers nothing and
+            // paces nothing, it reads the transport-wide feedback and publishes an estimate.
+            let (gcc, handle) = GccInterceptorBuilder::new();
+            estimate = Some(handle);
+            configure_twcc(registry, &mut media_engine)?.with(
+                Slot::CongestionControl,
+                // Around a pass-through: a `NoopInterceptor` there would end the inbound
+                // RTCP of every slot after this one.
+                PassThroughInterceptor::new().with(
+                    gcc.with_min_bitrate(cc.min_bps)
+                        .with_max_bitrate(cc.max_bps)
                         .build(),
-                )
+                ),
+            )
         }
         None => configure_twcc_receiver_only(registry, &mut media_engine)?,
     };
@@ -1000,6 +1039,7 @@ fn build_peer_connection(config: &RtcConfig) -> Result<Built, RtcError> {
         pc,
         senders,
         codecs: Codecs { vp8, opus },
+        estimate,
     })
 }
 
@@ -1076,6 +1116,8 @@ struct Driver {
     data_channel: Option<String>,
     /// track id → (receiver, whether its first packet was reported)
     tracks: HashMap<MediaStreamTrackId, (RTCRtpReceiverId, bool)>,
+    /// Audio tracks whose packets are de-jittered before they are delivered.
+    audio_jitter: Option<HashMap<MediaStreamTrackId, jitter::AudioJitterBuffer>>,
     dropped_rtp: u64,
     /// Local tracks.
     senders: HashMap<MediaKind, LocalSender>,
@@ -1100,6 +1142,7 @@ struct Driver {
     /// Whether our tracks are negotiated to send, as last reported.
     local_sending: HashMap<MediaKind, bool>,
     congestion: Option<CongestionConfig>,
+    estimate: Option<GccHandle>,
     /// The last estimate reported.
     last_target: Option<u32>,
     next_estimate: Option<Instant>,
@@ -1160,6 +1203,7 @@ impl Driver {
                 self.drive_gather(now).await?;
                 continue;
             }
+            self.release_audio(now);
             if self.next_estimate.is_some_and(|t| t <= now) {
                 self.report_estimate(now).await;
                 continue;
@@ -1180,6 +1224,7 @@ impl Driver {
                 self.gather.as_ref().map(StunGather::wake),
                 self.next_estimate,
                 self.next_quality,
+                self.next_audio_release(),
             ]
             .into_iter()
             .flatten()
@@ -1394,12 +1439,10 @@ impl Driver {
                         self.ever_connected = true;
                         let now = now();
                         if let Some(cc) = self.congestion {
-                            self.last_target = Some(cc.initial_bps);
+                            let bps = cc.initial_bps();
+                            self.last_target = Some(bps);
                             self.next_estimate = Some(now + ESTIMATE_INTERVAL);
-                            self.emit(RtcEvent::TargetBitrate {
-                                bps: cc.initial_bps,
-                            })
-                            .await;
+                            self.emit(RtcEvent::TargetBitrate { bps }).await;
                         }
                         self.next_quality = self.quality_interval.map(|every| now + every);
                     }
@@ -1438,7 +1481,17 @@ impl Driver {
         while let Some(TaggedRTCMessage { message, .. }) = self.pc.poll_read() {
             match message {
                 RTCMessage::RtpPacket(track_id, packet) => {
-                    self.report_track(&track_id).await;
+                    let kind = self.report_track(&track_id).await;
+                    if kind == Some(RtpCodecKind::Audio)
+                        && let Some(buffers) = self.audio_jitter.as_mut()
+                    {
+                        let clock_rate = self.codecs.opus.clock_rate;
+                        buffers
+                            .entry(track_id)
+                            .or_insert_with(|| jitter::AudioJitterBuffer::new(clock_rate))
+                            .push(now(), packet);
+                        continue;
+                    }
                     let event = RtcEvent::Rtp { track_id, packet };
                     if self.events.try_send(event).is_err() {
                         self.dropped_rtp += 1;
@@ -1465,20 +1518,42 @@ impl Driver {
         }
     }
 
-    /// Reports a track's kind and codec on its first packet (they are known only once the
-    /// stream's SSRC is bound).
-    async fn report_track(&mut self, track_id: &MediaStreamTrackId) {
-        let Some((receiver_id, reported)) = self.tracks.get(track_id).copied() else {
+    /// Deliver the de-jittered audio packets whose time has come.
+    fn release_audio(&mut self, now: Instant) {
+        let Some(buffers) = self.audio_jitter.as_mut() else {
             return;
         };
-        if reported {
-            return;
+        for (track_id, buffer) in buffers.iter_mut() {
+            while let Some(packet) = buffer.pop(now) {
+                let event = RtcEvent::Rtp {
+                    track_id: track_id.clone(),
+                    packet,
+                };
+                if self.events.try_send(event).is_err() {
+                    self.dropped_rtp += 1;
+                }
+            }
         }
-        let Some(receiver) = self.pc.rtp_receiver(receiver_id) else {
-            return;
-        };
+    }
+
+    fn next_audio_release(&self) -> Option<Instant> {
+        self.audio_jitter
+            .as_ref()?
+            .values()
+            .filter_map(jitter::AudioJitterBuffer::next_release)
+            .min()
+    }
+
+    /// Reports a track's kind and codec on its first packet (they are known only once the
+    /// stream's SSRC is bound). Returns the track's kind.
+    async fn report_track(&mut self, track_id: &MediaStreamTrackId) -> Option<RtpCodecKind> {
+        let (receiver_id, reported) = self.tracks.get(track_id).copied()?;
+        let receiver = self.pc.rtp_receiver(receiver_id)?;
         let track = receiver.track();
         let kind = track.kind();
+        if reported {
+            return Some(kind);
+        }
         let mime_type = track
             .ssrcs()
             .next()
@@ -1492,6 +1567,7 @@ impl Driver {
             mime_type,
         })
         .await;
+        Some(kind)
     }
 
     async fn handle_command(&mut self, command: Command) -> Result<(), RtcError> {
@@ -1921,11 +1997,13 @@ impl Driver {
             let Some(ssrc) = sender.track().ssrcs().last() else {
                 return Ok(());
             };
+            // The media codec, not its retransmission format.
             let Some(codec) = sender
                 .get_parameters()
                 .rtp_parameters
                 .codecs
-                .first()
+                .iter()
+                .find(|c| !c.rtp_codec.mime_type.eq_ignore_ascii_case(MIME_TYPE_RTX))
                 .cloned()
             else {
                 return Ok(());
@@ -2056,14 +2134,13 @@ impl Driver {
 
     // ── Estimate and statistics ───────────────────────────────────
 
-    /// Read the congestion controller's estimate (the engine publishes it as the selected
-    /// pair's `availableOutgoingBitrate`) and report it when it moved.
+    /// Read the congestion controller's estimate and report it when it moved.
     async fn report_estimate(&mut self, now: Instant) {
         self.next_estimate = Some(now + ESTIMATE_INTERVAL);
-        let report = self.pc.get_stats(now, StatsSelector::None);
-        let Some(bps) = selected_pair(&report)
-            .and_then(|pair| pair.available_outgoing_bitrate)
-            .map(|bps| bps.clamp(0.0, f64::from(u32::MAX)) as u32)
+        let Some(bps) = self
+            .estimate
+            .as_ref()
+            .and_then(GccHandle::target_bitrate_bps)
         else {
             return;
         };
@@ -2089,7 +2166,7 @@ impl Driver {
             quality.rtt_ms = pair
                 .current_round_trip_time
                 .map(|s| (s * 1000.0).round().max(0.0) as u32);
-            quality.available_bps = pair.available_outgoing_bitrate.map(|bps| bps as u32);
+
             let kind_of = |id: &str| match report.get(id) {
                 Some(
                     RTCStatsReportEntry::LocalCandidate(c)
@@ -2128,6 +2205,7 @@ impl Driver {
                 _ => {}
             }
         }
+        quality.available_bps = self.last_target;
         quality.loss_sent = worst_reported.map(|f| f.clamp(0.0, 1.0) as f32);
         if quality.rtt_ms.is_none() {
             quality.rtt_ms = media_rtt.map(|s| (s * 1000.0).round().max(0.0) as u32);
