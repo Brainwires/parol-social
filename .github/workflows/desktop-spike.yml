@@ -59,6 +59,17 @@ jobs:
           echo "VCPKG_ROOT=$VCPKG_INSTALLATION_ROOT" >> "$GITHUB_ENV"
           "$VCPKG_INSTALLATION_ROOT/vcpkg" install "libvpx:${{ matrix.triplet }}"
 
+      - name: Perl for the vendored OpenSSL (Windows)
+        # parolnet-store's SQLCipher links an OpenSSL libcrypto that openssl-src builds from
+        # source. Its Configure needs a native Windows perl: Git Bash's own perl (first on PATH
+        # in these steps) lacks the modules it uses.
+        if: runner.os == 'Windows'
+        run: |
+          perl="C:/Strawberry/perl/bin/perl.exe"
+          [ -f "$perl" ] || choco install strawberryperl -y --no-progress
+          "$perl" -v | sed -n 2p
+          echo "OPENSSL_SRC_PERL=$perl" >> "$GITHUB_ENV"
+
       - uses: actions/setup-node@v6
         with:
           node-version: 22

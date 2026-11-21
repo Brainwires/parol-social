@@ -241,7 +241,7 @@ pub(crate) async fn start(
             cfg.relay_url
         )));
     }
-    let store = Store::open(&cfg.data_dir)?;
+    let store = Store::open(&cfg.data_dir, &cfg.key_storage)?;
     let identity = store.load_or_create_identity()?;
     let my_pk = identity.public_key_bytes();
     let me = hex::encode(identity.peer_id());
@@ -415,6 +415,10 @@ impl Engine {
             self.drop_conn(&p);
         }
         self.persist_sessions();
+        // Saves are committed on the store's own thread: wait for the last one.
+        if let Err(e) = self.store.flush() {
+            tracing::error!(%e, "flushing the store failed");
+        }
         self.sig.stop();
     }
 

@@ -4,7 +4,10 @@
 //! shells later) build on: commands in, observable state out, no UI types.
 //!
 //! M1:
-//! - **Identity**: an Ed25519 key in the data directory (`PeerId = SHA-256(pubkey)`).
+//! - **Identity**: an Ed25519 key (`PeerId = SHA-256(pubkey)`).
+//! - **Storage** ([`store`]): the identity, contacts, sessions, history and queue live in an
+//!   encrypted database in the data directory (`parolnet-store`: SQLite with SQLCipher); its
+//!   key is kept where [`AppConfig::key_storage`] says. [`delete_all_data`] removes both.
 //! - **Pairing**: the PWA's QR / code bootstrap (PNP-003 + PNP-001 §5.3.1). The presenter
 //!   shows [`AppHandle::create_pairing_code`]; the scanner calls
 //!   [`AppHandle::pair_with_code`], which establishes the Double Ratchet session and sends
@@ -42,6 +45,7 @@ use tokio::sync::{mpsc, oneshot};
 pub use call::{CallEnd, CallInfo, CallMedia, CallState, FrameSink, MediaEvent};
 pub use ice::IceServer;
 pub use parolnet_rtc::MediaKind;
+pub use store::KeyStorage;
 
 /// Errors surfaced to the client.
 #[derive(Debug, thiserror::Error)]
@@ -75,8 +79,12 @@ pub enum AppError {
 /// How the app starts.
 #[derive(Debug, Clone)]
 pub struct AppConfig {
-    /// Where the identity key and state live.
+    /// Where the encrypted store (identity key and state) lives.
     pub data_dir: PathBuf,
+    /// Where the store's key is kept. [`AppConfig::new`] picks [`KeyStorage::File`] (headless
+    /// peers, tests); a desktop app sets `KeyStorage::Keychain` (cargo feature `keychain`).
+    /// A store keeps the kind it was created with: starting with another is an error.
+    pub key_storage: KeyStorage,
     /// The home relay's WebSocket URL, e.g. `wss://parol.social/ws`.
     pub relay_url: String,
     /// STUN servers. `None` fetches them from the relay's `/turn-credentials`; `Some(vec![])`
@@ -100,6 +108,7 @@ impl AppConfig {
     pub fn new(data_dir: impl Into<PathBuf>, relay_url: impl Into<String>) -> AppConfig {
         AppConfig {
             data_dir: data_dir.into(),
+            key_storage: KeyStorage::File,
             relay_url: relay_url.into(),
             stun_servers: None,
             user_ice_servers: Vec::new(),
@@ -360,6 +369,14 @@ pub async fn start(
     config: AppConfig,
 ) -> Result<(AppHandle, mpsc::UnboundedReceiver<AppEvent>), AppError> {
     engine::start(config).await
+}
+
+/// "Delete all data on this device": remove the encrypted store in `config.data_dir` (the
+/// identity, contacts, sessions, history, queue) and its key from `config.key_storage`.
+/// Shut the core down first ([`AppHandle::shutdown`]); the next [`start`] makes a new
+/// identity.
+pub fn delete_all_data(config: &AppConfig) -> Result<(), AppError> {
+    store::wipe(&config.data_dir, &config.key_storage)
 }
 
 /// Install rustls' ring provider once (the workspace builds rustls without a default one).

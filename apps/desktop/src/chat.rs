@@ -18,6 +18,7 @@ use gpui::{
 use gpui_component::Root;
 use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::input::{Input, InputEvent, InputState};
+use parolnet_app::KeyStorage;
 use parolnet_app::{
     AppConfig, AppEvent, AppHandle, CallEnd, CallInfo, CallMedia, CallState, ChatMessage, Contact,
     DeliveryState, Direction, PathState, RelayState,
@@ -33,13 +34,17 @@ pub const DEFAULT_RELAY: &str = "wss://parol.social/ws";
 pub struct Options {
     pub relay_url: String,
     pub data_dir: PathBuf,
+    /// Where the key of the encrypted store is kept: the OS keychain unless
+    /// `--key-storage file` asks for the (weaker) key file in the data directory.
+    pub key_storage: KeyStorage,
 }
 
-/// `parolnet-desktop [--relay wss://host/ws] [--data-dir DIR]`
+/// `parolnet-desktop [--relay wss://host/ws] [--data-dir DIR] [--key-storage keychain|file]`
 pub fn parse_args(raw: &[String]) -> anyhow::Result<Options> {
     let mut opts = Options {
         relay_url: DEFAULT_RELAY.to_owned(),
         data_dir: default_data_dir(),
+        key_storage: KeyStorage::Keychain,
     };
     let mut it = raw.iter();
     while let Some(arg) = it.next() {
@@ -47,9 +52,17 @@ pub fn parse_args(raw: &[String]) -> anyhow::Result<Options> {
         match arg.as_str() {
             "--relay" => opts.relay_url = value()?.clone(),
             "--data-dir" => opts.data_dir = PathBuf::from(value()?),
+            "--key-storage" => {
+                opts.key_storage = match value()?.as_str() {
+                    "keychain" => KeyStorage::Keychain,
+                    "file" => KeyStorage::File,
+                    other => bail!("--key-storage is keychain or file, not {other}"),
+                }
+            }
             "-h" | "--help" => {
                 println!(
-                    "parolnet-desktop [--relay wss://host/ws] [--data-dir DIR]\n\
+                    "parolnet-desktop [--relay wss://host/ws] [--data-dir DIR] \
+                     [--key-storage keychain|file]\n\
                      parolnet-desktop --spike [spike flags]   (the M0 video spike)"
                 );
                 std::process::exit(0);
@@ -1069,10 +1082,17 @@ pub fn main(raw: &[String]) -> anyhow::Result<()> {
         .worker_threads(2)
         .enable_all()
         .build()?;
-    let config = AppConfig::new(opts.data_dir.clone(), opts.relay_url.clone());
+    let mut config = AppConfig::new(opts.data_dir.clone(), opts.relay_url.clone());
+    config.key_storage = opts.key_storage.clone();
     let (app, events) = runtime
         .block_on(parolnet_app::start(config))
-        .with_context(|| format!("starting with data in {}", opts.data_dir.display()))?;
+        .with_context(|| {
+            format!(
+                "starting with data in {} (the store's key is kept in the OS keychain; on a \
+                 machine without one, a new data directory can use --key-storage file)",
+                opts.data_dir.display()
+            )
+        })?;
     eprintln!(
         "parolnet-desktop: peer {} relay {} data {}",
         app.peer_id(),
@@ -1212,5 +1232,10 @@ mod tests {
         assert_eq!(o.data_dir, PathBuf::from("/tmp/x"));
         assert!(parse_args(&["--bogus".into()]).is_err());
         assert_eq!(parse_args(&[]).unwrap().relay_url, DEFAULT_RELAY);
+        // The keychain unless asked otherwise.
+        assert!(matches!(o.key_storage, KeyStorage::Keychain));
+        let o = parse_args(&["--key-storage".into(), "file".into()]).unwrap();
+        assert!(matches!(o.key_storage, KeyStorage::File));
+        assert!(parse_args(&["--key-storage".into(), "none".into()]).is_err());
     }
 }

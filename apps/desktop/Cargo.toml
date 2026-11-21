@@ -11,7 +11,8 @@ description = "ParolNet desktop client (GPUI): M1 chat UI v0, plus the M0 video 
 
 [dependencies]
 parolnet-rtc = { path = "../../crates/parolnet-rtc" }
-parolnet-app = { path = "../../crates/parolnet-app" }
+# `keychain`: the encrypted store's key lives in the OS keychain (parolnet-store).
+parolnet-app = { path = "../../crates/parolnet-app", features = ["keychain"] }
 
 # GPUI: exact pins, Cargo.lock committed; upgrades are their own train. gpui-pre is the
 # snapshot of zed@main that gpui-component publishes against (docs/m0-spike.md, "GPUI pin").

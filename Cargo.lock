@@ -2291,6 +2291,7 @@ dependencies = [
 name = "parolnet-app"
 version = "0.1.0"
 dependencies = [
+ "ciborium",
  "ed25519-dalek",
  "futures-util",
  "hex",
@@ -2299,6 +2300,7 @@ dependencies = [
  "parolnet-crypto",
  "parolnet-protocol",
  "parolnet-rtc",
+ "parolnet-store",
  "rand 0.8.5",
  "reqwest",
  "rustls",

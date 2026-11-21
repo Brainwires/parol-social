@@ -19,6 +19,7 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
+use parolnet_app::KeyStorage;
 use parolnet_app::{
     AppConfig, AppEvent, AppHandle, CallMedia, CallState, Direction, MediaEvent, MediaKind,
 };
@@ -161,6 +162,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let mut cfg = AppConfig::new(data_dir, relay);
+    // Headless (CI, containers): there is no keychain service, so the store's key is a file
+    // in the data directory.
+    cfg.key_storage = KeyStorage::File;
     if host_only {
         cfg.stun_servers = Some(Vec::new());
     }

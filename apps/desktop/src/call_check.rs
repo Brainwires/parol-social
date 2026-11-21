@@ -16,7 +16,7 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use anyhow::{Context as _, bail};
-use parolnet_app::{AppConfig, AppEvent, CallState, PathState};
+use parolnet_app::{AppConfig, AppEvent, CallState, KeyStorage, PathState};
 
 use crate::call::CallSession;
 
@@ -74,6 +74,8 @@ pub fn main(raw: &[String]) -> anyhow::Result<()> {
 
 async fn run(args: Args, runtime: tokio::runtime::Handle) -> anyhow::Result<()> {
     let mut cfg = AppConfig::new(args.data_dir, args.relay);
+    // A headless check on a throwaway directory: the key file, never the user's keychain.
+    cfg.key_storage = KeyStorage::File;
     cfg.stun_servers = Some(Vec::new());
     cfg.bind_ip = args.bind;
     let (app, mut events) = parolnet_app::start(cfg).await?;

@@ -51,6 +51,14 @@ allow = ["MPL-2.0"]
 crate = "option-ext" # via dirs-sys (zed-font-kit, rust-embed)
 allow = ["MPL-2.0"]
 
+# SQLCipher's source (parolnet-store, through libsqlite3-sys). SQLCipher is BSD-3-Clause; the
+# SQLite code inside it is public domain under SQLite's "blessing"; the crate also ships
+# libtomcrypt (public domain / WTFPL), its crypto provider for wasm, which no native build
+# compiles. Both are permissive with no copyleft, and are allowed for this crate only.
+[[licenses.exceptions]]
+crate = "sqlcipher-src"
+allow = ["blessing", "WTFPL"]
+
 [licenses.private]
 ignore = true
 

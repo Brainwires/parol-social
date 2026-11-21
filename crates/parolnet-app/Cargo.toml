@@ -6,6 +6,11 @@ license.workspace = true
 rust-version.workspace = true
 description = "Headless ParolNet client core: identity, contacts, pairing, signaling, direct data channels, 1:1 chat and calls (native)"
 
+[features]
+# The OS keychain as the home of the store's key (`KeyStorage::Keychain`). The desktop app
+# turns it on; headless builds (the bot, CI) keep the key-file provider and leave it off.
+keychain = ["parolnet-store/keychain"]
+
 [dependencies]
 # Default features off: no mesh, no audio codecs, no transport stack. The app talks to the
 # relay's signaling-only profile and carries content on WebRTC data channels.
@@ -13,6 +18,7 @@ parolnet-core = { workspace = true }
 parolnet-crypto.workspace = true
 parolnet-protocol.workspace = true
 parolnet-rtc.workspace = true
+parolnet-store.workspace = true
 tokio.workspace = true
 tokio-tungstenite = { workspace = true, features = ["rustls-tls-webpki-roots"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
@@ -20,6 +26,7 @@ reqwest = { workspace = true, features = ["rustls-tls-webpki-roots-no-provider"]
 futures-util.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+ciborium.workspace = true
 hex.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
