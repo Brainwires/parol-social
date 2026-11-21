@@ -399,3 +399,41 @@ jobs:
         with:
           name: release-artifacts
           path: dist/
+
+  image:
+    name: Relay image (build + smoke checks)
+    # The image builds the relay and the web app from source (Dockerfile). Build it with BuildKit
+    # (layers cached in the GitHub Actions cache), run it signaling-only on a throwaway volume and
+    # check what nginx serves: the landing page, the web app under /pwa/ with its CSP and cache
+    # rules, application/wasm, and the relay behind it (scripts/image-smoke.sh).
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+      - uses: docker/setup-buildx-action@v4
+      - name: Build the image
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          load: true
+          tags: parolnet-relay:ci
+          cache-from: type=gha,scope=relay-image
+          cache-to: type=gha,scope=relay-image,mode=max
+          build-args: |
+            BUILD_COMMIT=${{ github.sha }}
+      - name: Run it (signaling-only, no STUN)
+        run: |
+          docker run -d --name parolnet-ci -p 127.0.0.1:8080:80 \
+            -e SIGNALING_ONLY=1 -e STUN_URIS= -e PAROLNET_ANALYTICS=0 \
+            -v parolnet-ci-data:/data parolnet-relay:ci
+          for _ in $(seq 1 60); do
+            curl -fsS -o /dev/null http://127.0.0.1:8080/health && exit 0
+            sleep 1
+          done
+          docker logs parolnet-ci
+          exit 1
+      - name: Smoke checks
+        run: scripts/image-smoke.sh http://127.0.0.1:8080
+      - name: Container log
+        if: always()
+        run: docker logs parolnet-ci || true
