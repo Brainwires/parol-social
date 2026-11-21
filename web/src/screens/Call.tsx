@@ -370,7 +370,7 @@ export function CallLayer() {
   const store = useStore();
   const call = store.call.value;
   if (!call) return null;
-  const name = nameOf(store, call.peerId) || t("contact.newName");
+  const name = nameOf(store, call.peerId);
   if (call.state.kind === "Incoming") return <IncomingCall call={call} name={name} />;
   return <CallScreen key={call.callId} call={call} name={name} />;
 }

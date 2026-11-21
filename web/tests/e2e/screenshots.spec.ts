@@ -69,13 +69,28 @@ for (const theme of ["light", "dark"] as const) {
         await page.getByTestId("lab-self-online").click();
         await go(page, "#/add");
         await expect(page.getByTestId("pairing-qr")).toBeVisible();
-        await page.screenshot({ path: join(out, "add.png"), fullPage: true });
+        // The first screen as a person sees it, then with the code as text open.
+        await page.screenshot({ path: join(out, "add.png") });
+        await page.getByTestId("pairing-code-toggle").click();
+        await page.screenshot({ path: join(out, "add-text.png"), fullPage: true });
+        await page.getByTestId("pairing-copy").click();
+        await expect(page.getByTestId("toast")).toBeVisible();
+        await page.screenshot({ path: join(out, "add-copied.png") });
         await page.getByTestId("pairing-paste-open").click();
         await page.screenshot({ path: join(out, "add-paste.png") });
         await page.getByTestId("pairing-code-input").fill("ab12cd34".repeat(10));
         await page.getByTestId("pairing-code-submit").click();
         await expect(page.getByTestId("pairing-name")).toBeVisible();
         await page.screenshot({ path: join(out, "add-name.png") });
+
+        // Left without a name: the conversation asks for one.
+        await go(page, `#/c/${"ab12cd34".repeat(8)}`);
+        await expect(page.getByTestId("name-prompt")).toBeVisible();
+        await page.screenshot({ path: join(out, "conversation-name-prompt.png") });
+        await page.getByTestId("name-prompt-input").fill("Noor");
+        await page.getByTestId("name-prompt-save").click();
+        await expect(page.getByTestId("toast")).toBeVisible();
+        await page.screenshot({ path: join(out, "conversation-toast.png") });
 
         await go(page, `#/c/${"07".repeat(32)}`);
         await expect(page.getByTestId("verify-prompt")).toBeVisible();

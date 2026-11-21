@@ -1,5 +1,6 @@
 import { t } from "../i18n/index.ts";
 import type { ContactView } from "../state/model.ts";
+import { shownName } from "../state/names.ts";
 
 /** The first letter of a name, for an avatar. */
 export function initial(name: string): string {
@@ -50,10 +51,10 @@ export function ConversationRow({ view, preview, href, current }: {
       aria-current={current ? "page" : undefined}
       data-testid={`row-${contact.peerId.slice(0, 8)}`}
     >
-      <Avatar name={contact.name} dot={view.path === "Direct"} />
+      <Avatar name={shownName(contact)} dot={view.path === "Direct"} />
       <span className="row__text">
         <span className="row__name">
-          <bdi>{contact.name}</bdi>
+          <bdi>{shownName(contact)}</bdi>
         </span>
         <span className="row__preview">
           <bdi>{preview}</bdi>

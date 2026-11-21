@@ -107,13 +107,20 @@ Being offline yourself wins over every other state: nothing else can be known th
   no path, blocked, this device offline), where saying they are away would be untrue.
 - **Unread badge**: the number of messages that arrived and were not read, in ink (it is not a
   state). The row's name is bold while there are any.
-- **QR code**: this device's code as a picture, always dark on white with its quiet zone.
+- **QR code**: this device's code as a picture, always dark on white with its quiet zone. At
+  most 17rem wide: a real code (up to about 340 hex characters, with a relay address in it) is
+  at most a version-15 code, 85 modules with the quiet zone, so a module is at least 3.2px.
 - **Switch**: on or off; the thumb's side says which, not colour alone.
 - **CodeBlock**: a pairing code in mono, grouped in fours (set smaller when it is long: a real
-  code is a few hundred characters).
+  code is a few hundred characters). Where it can be copied by hand, focusing or clicking it
+  selects the whole code.
 - **SafetyNumber**: 12 groups of 5 digits, mono.
 - **Sheet / dialog**: focus is trapped inside, Escape closes, focus returns to what opened it.
-- **Toast**: only to confirm something the person just did ("Message taken back").
+- **Toast**: only to confirm something the person just did ("Message taken back"). It sits at
+  the top, centred just under the header (under a conversation's two-row header on a phone;
+  over the screen beside the list at wide widths), clear of the safe-area insets, so it never
+  covers the composer, the call controls or a sheet's actions, which are all at the bottom. It
+  is a polite live region, goes after four seconds, never takes focus and lets clicks through.
 
 ## Screens
 
@@ -159,10 +166,16 @@ created and nothing is contacted before Start.
 
 One screen for both directions.
 
-- **Your code**: as a QR code and as text in mono groups, [Copy code] and, where the browser
-  can, [Share]. "Good for {n} minutes. Works once.", with the code's real lifetime. A new code
-  is made when there is none: on arrival, after a reload, when one expires, and after one was
-  used.
+- **Your code**: as a QR code, "Good for {n} minutes. Works once." (the code's real
+  lifetime), [Copy code] and, where the browser can, [Share]. The text of the code (a few
+  hundred characters) is behind "Show the code as text", a disclosure that opens it in place
+  as mono groups; Copy and Share work with it closed. Then "Keep this screen open while they
+  add you." On a phone (390 by 800) the QR code, the lifetime, Copy, Share and the two ways to
+  take theirs are all on the first screen, without scrolling.
+- **Only while it is on screen.** Leaving "Add a contact" cancels the code being shown, so a
+  code works only while its owner is looking at it. A new code is made when there is none:
+  on arrival (so coming back shows a fresh one), after a reload, when one expires, and after
+  one was used.
 - **Theirs**: [Scan theirs] (the camera; it is released on leaving the screen and as soon as a
   code is read) or [Paste theirs].
 - One sentence, not a dialog: "Contacts you add can see your IP address." with "Hide it",
@@ -170,6 +183,12 @@ One screen for both directions.
 - **Then a name.** Whoever was added, by either side, is given a name ("Only you see this
   name."). A scanned code means the two devices were together: that contact is verified in
   person. A pasted code, or someone using this device's code, is "Not verified yet".
+- **A contact with no name** (someone used this device's code just as the person left the
+  screen, or the person left the naming step) is "New contact" in the list. Its conversation
+  asks once, in a line under the header that blocks nothing and takes no focus: "Someone used
+  your code. Give them a name." (or "Give this contact a name." when this device added them),
+  a name field, [Save] and "Not now", with "Not verified yet" under it as for a pasted code.
+  "Not now" puts it away until the app is next opened.
 
 Mistakes are said where they happen: an incomplete code, an expired one, one's own.
 
@@ -268,4 +287,10 @@ These were not in the brief; each is the smallest reading that keeps the rules.
 - An incoming call takes focus to its words, not to Accept: a key pressed for something else
   must not answer a call.
 - The unread count is in ink. It is a number, not a state.
-- A contact that has no name yet is "New contact".
+- A contact that has no name yet is "New contact". The engine stores an empty name and the
+  screens show "New contact", so the app can tell an unnamed contact from one named that.
+- The text of the code is behind a disclosure on "Add a contact" (decided in review: the
+  open block, eleven rows on a phone, pushed the other direction off the screen).
+- Toasts moved from the bottom to the top (decided in review: one covered the composer).
+- The naming prompt's "Not now" lasts until the app is next opened; nothing about it is
+  stored.

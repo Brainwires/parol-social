@@ -224,6 +224,30 @@
     color: var(--ink-2);
     font-size: var(--text-caption);
   }
+  /* A contact with no name yet: asked for once, in place, without blocking anything. */
+  .conversation__name-prompt {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-2);
+    padding-block: var(--space-3);
+    padding-inline: var(--space-4);
+    border-block-end: var(--border-hairline) solid var(--fog);
+  }
+  .conversation__name-prompt-text {
+    font-weight: var(--weight-medium);
+  }
+  .conversation__name-prompt-row {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: flex-end;
+    gap: var(--space-2) var(--space-3);
+  }
+  .conversation__name-prompt-field {
+    flex: 1 1 12rem;
+  }
+  .conversation__name-prompt .field__problem:empty {
+    display: none;
+  }
   .conversation__problem {
     padding-inline: var(--space-4);
     color: var(--flare);
@@ -424,6 +448,29 @@
   }
   .pairing__theirs .btn {
     flex: 1 1 10rem;
+  }
+  /* The code as text: closed by default, so the QR code, its actions and the other
+     direction all fit on a phone's first screen. */
+  .pairing__text {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-start;
+    gap: var(--space-2);
+    align-self: stretch;
+  }
+  .pairing__disclosure {
+    gap: var(--space-2);
+    font-size: var(--text-caption);
+  }
+  .pairing__disclosure .icon {
+    inline-size: 1.25rem;
+    block-size: 1.25rem;
+  }
+  .pairing__disclosure[aria-expanded="true"] .icon {
+    transform: rotate(180deg);
+  }
+  .pairing__text-region {
+    align-self: stretch;
   }
   .pairing__video {
     inline-size: min(100%, 22rem);

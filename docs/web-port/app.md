@@ -88,10 +88,10 @@ A missing key falls back to English, key by key.
 
 | Locale | Keys | Coverage |
 |---|---|---|
-| `en` | 237 / 237 | 100% |
-| `ar` | 88 / 237 | 37% |
-| `de`, `es`, `fr`, `it` | 32 / 237 | 13% |
-| `fa`, `ja`, `ko` | 26 / 237 | 10% |
+| `en` | 243 / 243 | 100% |
+| `ar` | 88 / 243 | 36% |
+| `de`, `es`, `fr`, `it` | 32 / 243 | 13% |
+| `fa`, `ja`, `ko` | 26 / 243 | 11% |
 
 (`fa`, `ja` and `ko` have six fewer because the old files left those six strings in English.)
 

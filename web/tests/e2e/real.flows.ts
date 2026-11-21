@@ -233,6 +233,59 @@ test("first run, add a contact by pasted code, name them, talk both ways", async
   await allClean(ana, ben);
 });
 
+test("a code works only while its screen is open; someone who used it is asked for a name in the conversation", async ({ browser, live }) => {
+  const ana = await person(browser, live, PHONE);
+  const ben = await person(browser, live, WIDE);
+  await start(ana.page);
+  await start(ben.page);
+
+  // Leaving "Add a contact" closes Ana's code; coming back makes a fresh one.
+  const first = await ownCode(ana.page);
+  expect(first).toMatch(/^[0-9a-f]{200,}$/);
+  await expect(ana.page.getByTestId("pairing-help")).toHaveText(
+    "Keep this screen open while they add you.",
+  );
+  await ana.page.getByTestId("add-screen-back").click();
+  await ana.page.getByTestId("add-contact").click();
+  await expect(ana.page.getByTestId("pairing-own")).toHaveAttribute("data-state", "ready");
+  await expect.poll(() => ownCode(ana.page)).not.toBe(first);
+  const second = await ownCode(ana.page);
+
+  // Ben uses it. Ana is asked for a name, and leaves without giving one.
+  await ben.page.getByTestId("pairing-paste-open").click();
+  await ben.page.getByTestId("pairing-code-input").fill(second);
+  await ben.page.getByTestId("pairing-code-submit").click();
+  await nameContact(ben.page, "Ana");
+  await expect(ana.page.getByTestId("pairing-name-body")).toHaveText(
+    "Someone used your code. Compare safety numbers with them when you can.",
+    CONNECT,
+  );
+  await ana.page.getByTestId("add-screen-back").click();
+
+  // The list says "New contact"; its conversation asks for a name, without taking focus.
+  const row = ana.page.getByTestId("conversation-list").getByRole("link", { name: /New contact/ });
+  await expect(row).toBeVisible();
+  await row.click();
+  await expect(ana.page.getByTestId("conversation-name")).toBeFocused();
+  await expect(ana.page.getByTestId("name-prompt-text")).toHaveText(
+    "Someone used your code. Give them a name.",
+  );
+  await expect(ana.page.getByTestId("verify-prompt")).toContainText("Not verified yet");
+  await ana.page.getByTestId("name-prompt-input").fill("Ben");
+  await ana.page.getByTestId("name-prompt-save").click();
+  await expect(ana.page.getByTestId("conversation-name")).toHaveText("Ben");
+  await expect(ana.page.getByTestId("name-prompt")).toHaveCount(0);
+  // The confirmation stays clear of the composer.
+  const toast = (await ana.page.getByTestId("toast").boundingBox())!;
+  const composer = (await ana.page.getByTestId("composer-input").boundingBox())!;
+  expect(toast.y + toast.height).toBeLessThan(composer.y);
+
+  await openLine(ana.page, ben.page);
+  await send(ben.page, "It is Ben.");
+  await expect(bubble(ana.page, "It is Ben.")).toHaveAttribute("data-kind", "received");
+  await allClean(ana, ben);
+});
+
 test("what is written while they are away waits here, can be changed and taken back, and goes when they return", async ({ browser, live }) => {
   const ana = await person(browser, live);
   const ben = await person(browser, live);

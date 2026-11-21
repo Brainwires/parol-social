@@ -115,7 +115,8 @@
   "otherTab.useHere": "Use it here",
   "add.title": "Add a contact",
   "add.yourCode": "Your code",
-  "add.help": "Show this to the person you are adding, or send them the code.",
+  "add.help": "Keep this screen open while they add you.",
+  "add.showText": "Show the code as text",
   "add.qrLabel": "Your code as a picture to scan",
   "add.making": "Making your code",
   "add.copy": "Copy code",
@@ -150,6 +151,9 @@
   "name.hint": "Only you see this name.",
   "name.done": "Done",
   "name.empty": "The name cannot be empty.",
+  "name.promptTheirs": "Someone used your code. Give them a name.",
+  "name.promptAdded": "Give this contact a name.",
+  "name.later": "Not now",
   "contact.newName": "New contact",
   "verify.prompt": "Not verified yet",
   "verify.open": "Compare safety numbers",
@@ -235,5 +239,5 @@
   "settings.licences": "Licences",
   "settings.about.body": "ParolNet sends messages and calls straight between devices, encrypted end to end. Messages stay on this device and wait here until the other person is online. ParolNet rings and receives only while it is open.",
   "safety.label": "Safety number",
-  "code.label": "Pairing code"
+  "code.label": "Your code as text"
 }

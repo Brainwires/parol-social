@@ -54,6 +54,18 @@ Deno.test("qr: a pairing code survives encoding and the scanner's decoder", asyn
   }
 });
 
+Deno.test("qr: a real-length pairing code, at the size a phone shows it, decodes", async () => {
+  const decode = await jsQr();
+  // About 170 bytes as hex (the longest, with a relay address in it). The screen draws the
+  // code 17rem (272px) wide with its quiet zone.
+  const text = hex(344, 7);
+  const matrix = encodeQr(new TextEncoder().encode(text));
+  const pixelsPerModule = 272 / (matrix.size + 2 * 4);
+  assert(pixelsPerModule >= 3, `${pixelsPerModule.toFixed(2)}px per module`);
+  const image = rasterise(matrix, 3);
+  assertEquals(decode(image.data, image.side, image.side)?.data, text);
+});
+
 Deno.test("qr: every version, filled to capacity, decodes", async () => {
   const decode = await jsQr();
   for (let version = 1; version <= 40; version++) {

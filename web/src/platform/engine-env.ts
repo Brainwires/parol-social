@@ -13,8 +13,6 @@ const TABS_CHANNEL = "parolnet-web-tabs";
 const TAKEOVER_KEY = "parolnet.takeover";
 
 export interface EnvOptions {
-  /** The name a new contact has until the person gives one. */
-  newContactName(): string;
   onEngine?(engine: Engine | null): void;
   onEvent?: StoreEnv["onEvent"];
 }
@@ -46,7 +44,9 @@ export function browserEnv(options: EnvOptions): StoreEnv {
         start: (): Promise<EnginePort> =>
           Engine.start(platform, {
             relayUrl: relayUrl(),
-            defaultContactName: options.newContactName(),
+            // No name until the person gives one: the screens say "New contact" until
+            // then, and ask for a name (src/state/names.ts).
+            defaultContactName: "",
           }),
       };
     },

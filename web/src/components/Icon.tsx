@@ -26,6 +26,7 @@ const PATHS = {
   share: "M12 15V3.5M7.5 8L12 3.5 16.5 8M5 12.5V20h14v-7.5",
   scan: "M4 8.5V4h4.5M15.5 4H20v4.5M20 15.5V20h-4.5M8.5 20H4v-4.5M4 12h16",
   check: "M5 12.5l4.5 4.5L19 7.5",
+  chevron: "M6 9.5l6 6 6-6",
 } as const;
 
 export type IconName = keyof typeof PATHS;

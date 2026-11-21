@@ -19,6 +19,7 @@ import { loadWasm, wasmStatus } from "../platform/wasm.ts";
 import { hrefOf } from "../router.ts";
 import { FAKE_PEERS } from "../state/fake.ts";
 import type { CallEnd, CallInfo, ContactView, LineState, PathState } from "../state/model.ts";
+import { shownName } from "../state/names.ts";
 import type { AppStore, FakeControls } from "../state/store.ts";
 import { Conversation } from "./Conversation.tsx";
 
@@ -214,7 +215,9 @@ export function Lab({ controls: store }: { controls: AppStore & FakeControls }) 
                 onChange={(e) => setPeer(e.currentTarget.value)}
               >
                 {contacts.map((c) => (
-                  <option key={c.contact.peerId} value={c.contact.peerId}>{c.contact.name}</option>
+                  <option key={c.contact.peerId} value={c.contact.peerId}>
+                    {shownName(c.contact)}
+                  </option>
                 ))}
               </select>
             </label>
@@ -287,6 +290,9 @@ export function Lab({ controls: store }: { controls: AppStore & FakeControls }) 
         <div className="lab__choice">
           <Button testId="lab-reset" onClick={() => controls.reset()}>Reset fake data</Button>
           <Button testId="lab-clear" onClick={() => controls.clear()}>Remove all contacts</Button>
+          <Button testId="lab-someone-used-code" onClick={() => controls.someoneUsedCode()}>
+            Someone uses my code
+          </Button>
         </div>
       </section>
 

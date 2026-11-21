@@ -31,7 +31,7 @@ export interface StartOptions {
 function tell(event: AppEvent, store: AppStore): void {
   if (event.kind === "Message" && event.message.direction === "Received") {
     const peerId = event.message.peerId;
-    const name = nameOf(store, peerId) || t("contact.newName");
+    const name = nameOf(store, peerId);
     const current = route.value;
     const reading = current.name === "conversation" && current.peerId === peerId &&
       document.visibilityState === "visible";
@@ -39,7 +39,7 @@ function tell(event: AppEvent, store: AppStore): void {
     announce(reading ? `${name}: ${event.message.text}` : t("notify.message", { name }));
     notify("ParolNet", t("notify.message", { name }), `message-${peerId}`);
   } else if (event.kind === "Call" && event.call.state.kind === "Incoming") {
-    const name = nameOf(store, event.call.peerId) || t("contact.newName");
+    const name = nameOf(store, event.call.peerId);
     announce(t("notify.call", { name }));
     notify("ParolNet", t("notify.call", { name }), "call");
   }
@@ -58,7 +58,6 @@ export async function startApp(options: StartOptions = {}): Promise<void> {
   await setLocale(preferredLocale(navigator.languages ?? [])).catch(() => {});
 
   const real = inLab ? null : createEngineStore(browserEnv({
-    newContactName: () => t("contact.newName"),
     onEngine: options.onEngine,
     onEvent: tell,
   }));
