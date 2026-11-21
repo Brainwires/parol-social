@@ -196,21 +196,38 @@ function connectionReport(page: Page): Promise<string> {
 }
 
 /**
+ * The one failure of these flows that is expected, and only in Linux WebKit: the browser
+ * can block a page's main thread for good when a playing stream is detached from its element
+ * right after its camera track was switched off, which is what "Turn camera off" does to
+ * the self view. It is the browser's defect: repro/README.md ("A second freeze") shows it
+ * with no app code, and docs/web-port/app.md ("Owed") says what is left to try. A step that
+ * names this, fails, and finds a page that no longer answers ends the test as skipped with
+ * this reason, so that the report says what happened; any other failure of the step, in any
+ * browser, is a failure. The freeze at hang-up, which the app does avoid, is not excused.
+ */
+const KNOWN_WEBKIT_FREEZE =
+  'Linux WebKit froze the page at "Turn camera off" (tests/e2e/repro, camera-off)';
+
+/**
  * Run `step`; if it throws, or takes longer than `within`, attach each page's call log,
- * whether it still answers, and its connection report to the failure.
- * `PAROLNET_CONNECTION_REPORT=1` prints them after a success too.
+ * whether it still answers, and its connection report to the failure. With `knownFreeze`,
+ * a failure that left a page frozen in WebKit skips the test with that reason.
+ * `PAROLNET_CONNECTION_REPORT=1` prints the reports after a success too.
  */
 async function withConnectionReport(
   people: Record<string, Page>,
   step: () => Promise<void>,
   within?: number,
+  knownFreeze?: string,
 ): Promise<void> {
+  let frozen = false;
   const report = async () => {
     // All at once, and none waited for longer than a few seconds: the test may be close to
     // its own timeout, and a frozen page never answers.
     const texts = await Promise.all(
       Object.values(people).map(async (page) => {
         const state = await answers(page);
+        if (state !== "the page answers") frozen = true;
         const connections = state === "the page answers"
           ? await Promise.race([
             connectionReport(page),
@@ -244,6 +261,11 @@ async function withConnectionReport(
     ]);
   } catch (error) {
     await report();
+    // The one expected failure: see `KNOWN_WEBKIT_FREEZE`.
+    test.skip(
+      knownFreeze !== undefined && frozen && test.info().project.name === "flows-webkit",
+      knownFreeze,
+    );
     throw error;
   } finally {
     clearTimeout(timer);
@@ -803,19 +825,24 @@ test("a video call: ring, accept, controls, end; and a declined call", async ({ 
   }, 70_000);
 
   // Mute and camera: named for what they will do, and the track really stops flowing.
-  await withConnectionReport({ ana: ana.page, ben: ben.page }, async () => {
-    await ben.page.getByTestId("call-mute").click();
-    await expect(ben.page.getByTestId("call-mute")).toHaveAccessibleName(
-      "Unmute microphone",
-    );
-    await ben.page.getByTestId("call-camera").click();
-    await expect(ben.page.getByTestId("call-camera")).toHaveAccessibleName(
-      "Turn camera on",
-    );
-    await expect(ben.page.getByTestId("call-self")).toHaveCount(0);
-    await ben.page.getByTestId("call-camera").click();
-    await ben.page.getByTestId("call-mute").click();
-  }, 30_000);
+  await withConnectionReport(
+    { ana: ana.page, ben: ben.page },
+    async () => {
+      await ben.page.getByTestId("call-mute").click();
+      await expect(ben.page.getByTestId("call-mute")).toHaveAccessibleName(
+        "Unmute microphone",
+      );
+      await ben.page.getByTestId("call-camera").click();
+      await expect(ben.page.getByTestId("call-camera")).toHaveAccessibleName(
+        "Turn camera on",
+      );
+      await expect(ben.page.getByTestId("call-self")).toHaveCount(0);
+      await ben.page.getByTestId("call-camera").click();
+      await ben.page.getByTestId("call-mute").click();
+    },
+    30_000,
+    KNOWN_WEBKIT_FREEZE,
+  );
 
   // Ana ends it. Ben is told how it ended; both devices let the camera and the connection
   // go. The step has a time limit of its own, so that a page frozen in the browser's media
@@ -885,7 +912,10 @@ test("a video call: ring, accept, controls, end; and a declined call", async ({ 
   await ben.page.getByTestId("call-decline").click();
   await expect(ben.page.getByTestId("incoming-call")).toHaveCount(0);
   await expect(ana.page.getByTestId("call-status")).toHaveText("Ben declined");
-  await ana.page.getByTestId("call-close").click();
+  // It says so for six seconds and goes by itself ("Close" was pressed above).
+  await expect(ana.page.getByTestId("call-screen")).toHaveCount(0, {
+    timeout: 15_000,
+  });
 
   // The conversation is still there, and still open.
   await send(ana.page, "Talk later then.");
