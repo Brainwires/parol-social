@@ -629,24 +629,24 @@ async fn send_attempt(
             });
         }
         if buffered > BUFFER_HIGH {
-            // Backpressure (PNP-010-SHOULD-001): wait for the low mark. The event may have
-            // been missed, so the amount is also looked at.
+            // Backpressure (PNP-010-SHOULD-001): wait for the low mark. The event wakes
+            // the loop (it may be one from an earlier crossing, or be missed altogether);
+            // the amount decides.
             loop {
                 tokio::select! {
                     ev = ch.rx.recv() => match ev {
-                        Some(ChannelEvent::BufferedLow) => break,
+                        Some(ChannelEvent::BufferedLow) => {}
                         Some(ChannelEvent::Message(_)) | None => {
                             return Outcome::Ended { progressed };
                         }
                     },
                     cmd = ctl.recv() => return stop_or_shutdown(cmd),
-                    _ = tokio::time::sleep(Duration::from_millis(50)) => {
-                        match ch.data.buffered_amount(ch.dc).await {
-                            Ok(amount) if amount <= BUFFER_LOW => break,
-                            Ok(_) => {}
-                            Err(_) => return Outcome::Ended { progressed },
-                        }
-                    }
+                    _ = tokio::time::sleep(Duration::from_millis(50)) => {}
+                }
+                match ch.data.buffered_amount(ch.dc).await {
+                    Ok(amount) if amount <= BUFFER_LOW => break,
+                    Ok(_) => {}
+                    Err(_) => return Outcome::Ended { progressed },
                 }
             }
         }

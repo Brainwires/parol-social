@@ -134,18 +134,16 @@ async fn a_second_channel_streams_with_backpressure_and_closes_alone() {
         }
         if buffered > HIGH {
             waits += 1;
-            // Wait for the low mark: the event, or a look at the amount.
+            // Wait for the low mark. The event wakes the loop (one from an earlier crossing
+            // may still be queued), the amount decides.
             loop {
                 match timeout(Duration::from_millis(50), offerer_events.recv()).await {
-                    Ok(Some(RtcEvent::DataChannelBufferedLow { id })) if id == on_offerer => break,
                     Ok(Some(RtcEvent::Closed { error })) => panic!("closed: {error:?}"),
-                    Ok(Some(_)) => {}
                     Ok(None) => panic!("events ended"),
-                    Err(_) => {
-                        if sender.buffered_amount(on_offerer).await.unwrap() <= LOW as usize {
-                            break;
-                        }
-                    }
+                    Ok(Some(_)) | Err(_) => {}
+                }
+                if sender.buffered_amount(on_offerer).await.unwrap() <= LOW as usize {
+                    break;
                 }
             }
         }
