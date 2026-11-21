@@ -559,8 +559,7 @@ fn trial_decrypt_in(
 
     // A session that cannot authenticate the envelope is left exactly as it was
     // (PNP-002-MUST-041), so trying every session is safe.
-    for (pid_bytes, _) in client.sessions().export_all() {
-        let pid = parolnet_protocol::address::PeerId(pid_bytes);
+    for pid in client.sessions().peer_ids() {
         if let Ok(decoded) =
             parolnet_core::envelope::decrypt_for_peer(client.sessions(), &pid, envelope_bytes)
         {

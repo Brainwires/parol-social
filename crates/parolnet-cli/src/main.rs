@@ -579,8 +579,7 @@ fn try_decrypt_as_presenter(
     pending_bootstrap: &mut Option<([u8; 32], [u8; 32])>,
 ) -> Result<(PeerId, DecryptedEnvelope, bool)> {
     // 1. Try every committed session.
-    for (pid_bytes, _) in sessions.export_all() {
-        let pid = PeerId(pid_bytes);
+    for pid in sessions.peer_ids() {
         if let Ok(d) = decrypt_for_peer(sessions, &pid, envelope_bytes) {
             return Ok((pid, d, false));
         }

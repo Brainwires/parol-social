@@ -121,7 +121,22 @@ impl SessionManager {
         }
     }
 
+    /// The peers a session is held for, in no particular order.
+    ///
+    /// For callers that only need to know who the sessions are with: unlike
+    /// [`Self::export_all`] it serializes no key material.
+    pub fn peer_ids(&self) -> Vec<PeerId> {
+        self.sessions
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .keys()
+            .copied()
+            .collect()
+    }
+
     /// Export all sessions as (peer_id_bytes, session_bytes) pairs.
+    ///
+    /// The bytes are secret key material.
     pub fn export_all(&self) -> Vec<([u8; 32], Vec<u8>)> {
         let sessions = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
         sessions
@@ -172,5 +187,27 @@ impl SessionManager {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .len()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn peer_ids_lists_every_session_and_nothing_else() {
+        let sessions = SessionManager::new();
+        assert!(sessions.peer_ids().is_empty());
+        for n in [3u8, 1, 2] {
+            let ratchet = DoubleRatchetSession::initialize_initiator([n; 32], &[0x09; 32]).unwrap();
+            sessions.add_session(PeerId([n; 32]), ratchet);
+        }
+        let mut ids = sessions.peer_ids();
+        ids.sort_by_key(|p| p.0);
+        assert_eq!(ids, [PeerId([1; 32]), PeerId([2; 32]), PeerId([3; 32])]);
+
+        sessions.remove_session(&PeerId([2; 32]));
+        assert_eq!(sessions.peer_ids().len(), 2);
+        assert!(!sessions.peer_ids().contains(&PeerId([2; 32])));
     }
 }
