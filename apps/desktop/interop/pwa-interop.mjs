@@ -1,42 +1,63 @@
 // Desktop <-> PWA interop test: pairing, chat, the sender queue, the channel binding, calls.
 //
 //   node apps/desktop/interop/pwa-interop.mjs
+//   INTEROP_BROWSER=firefox node apps/desktop/interop/pwa-interop.mjs
 //
 // Peers
 //   - "desktop": the headless `parolnet-app` bot (examples/bot.rs), the same core the GPUI app
 //     runs, speaking JSON lines on stdout / commands on stdin.
-//   - "pwa": the real PWA (pwa/, built with `npm run build:wasm && npm run build`) in headless
-//     Chromium through puppeteer, a fresh profile per case.
+//   - "pwa": the real PWA (pwa/, built with `npm run build:wasm && npm run build`) in a headless
+//     browser through Playwright (`npx playwright install chromium firefox webkit`), a fresh
+//     profile per case. INTEROP_BROWSER: chromium (default), firefox, webkit.
 //   - one local relay: the `parolnet-relay` binary in its default signaling-only profile.
 //
 // A small HTTP server serves pwa/ and proxies the relay's endpoints (`/ws` upgrade included),
 // so the PWA finds its relay at `location.host + '/ws'` with no settings.
 //
-// ICE (INTEROP_ICE):
-//   mdns     (default on Linux) Chromium as shipped: its host candidates are mDNS `<uuid>.local`
-//            names; the bot binds the default-route interface and resolves them with an mDNS
-//            query (parolnet-rtc). The test fails unless the bot saw mDNS answers.
-//   loopback (default elsewhere) --allow-loopback-in-peer-connection and
-//            --disable-features=WebRtcHideLocalIpsWithMdns, the bot on 127.0.0.1: no multicast
-//            and no LAN address (no macOS Local Network prompt on a developer's machine).
+// Browsers
+//   chromium  The full browser in its headless mode (Playwright's `chromium` channel), with
+//             Chromium's fake camera and microphone in the cases that need media.
+//   firefox   Fake streams (`media.navigator.streams.fake`) and no permission prompt
+//             (`media.navigator.permission.disabled`) in the cases that need media.
+//   webkit    Playwright's WebKit build; meant for Linux (WPE with libwebrtc: mock capture
+//             devices, VP8, Opus, data channels), which is what CI runs. Not run on macOS.
+// No request leaves the machine: Chromium by a resolver rule, Firefox and WebKit by an HTTP
+// proxy (for every host but 127.0.0.1) that refuses everything. The relay here announces no
+// STUN server and the PWA's fallback (parol.social) is unreachable, so ICE uses host candidates
+// only; the run fails if a page reports ICE servers.
 //
-// Cases
+// ICE (INTEROP_ICE)
+//   mdns     (Chromium and Firefox; default on Linux) the browser as shipped: its host
+//            candidates are mDNS `<uuid>.local` names (while the page holds no media
+//            permission); the bot binds the default-route interface and resolves them with an
+//            mDNS query (parolnet-rtc). The test fails unless the bot saw mDNS answers.
+//   loopback (Chromium and Firefox; default elsewhere) the bot on 127.0.0.1, no multicast and
+//            no LAN address (no macOS Local Network prompt on a developer's machine). Chromium:
+//            --allow-loopback-in-peer-connection and
+//            --disable-features=WebRtcHideLocalIpsWithMdns. Firefox:
+//            media.peerconnection.ice.loopback, and
+//            media.peerconnection.ice.obfuscate_host_addresses off.
+//   host     (WebKit, its only mode) Playwright's Linux WebKit gathers the default-route address
+//            as a plain host candidate: no mDNS name (so the mDNS path is not exercised in
+//            WebKit) and no loopback candidate. The bot binds the default-route interface.
+//
+// Cases (the same in every browser; none is skipped anywhere)
 //   1. PWA presents its code, the desktop enters it (bot `pair`): bootstrap over the data
 //      channel, messages both ways.
 //   2. The desktop presents its code, the PWA pastes it ("Paste Code" tab): the paste path
 //      pairs like a camera scan, messages both ways.
-//   3. Sender queue: with case 2's pair, the PWA tab closes; the bot's message waits in its
-//      queue and is delivered when the PWA comes back (same browser profile).
+//   3. Sender queue: with case 2's pair, the PWA's browser closes; the bot's message waits in
+//      its queue and is delivered when the PWA comes back (same browser profile).
 //   4. Channel binding (PNP-001 §10.5.1): every case above requires both sides to verify the
 //      other's binding before the path is direct; here the PWA binds a fingerprint it did not
 //      see (as if a relay had swapped the desktop's), and the desktop must refuse the channel.
-//   5. The desktop video-calls the PWA (Chromium's fake camera and microphone); the PWA
+//   5. The desktop video-calls the PWA (the browser's fake camera and microphone); the PWA
 //      accepts; the desktop sends its test pattern (VP8) and a tone (Opus): RTP flows both
-//      ways and Chromium decodes the desktop's video and audio; the desktop hangs up.
-//   6. The PWA video-calls the desktop; the same checks; the PWA hangs up. Chromium is then
-//      the ICE controlling side (it offers) and, holding media permission, gathers on every
-//      interface and may move its nomination to another pair a moment after connecting; the
-//      desktop (controlled) must follow the later nomination (webrtc-rs-rtc
+//      ways and the browser decodes the desktop's video and audio; the desktop hangs up.
+//   6. The PWA video-calls the desktop; the same checks; the PWA hangs up. The browser is then
+//      the ICE controlling side (it offers). Chromium, holding media permission, gathers on
+//      every interface and may move its nomination to another pair a moment after connecting;
+//      the desktop (controlled) must follow the later nomination (webrtc-rs-rtc
 //      v0.22.0+brainwires.5). INTEROP_PWA_CALLS=0 skips it.
 //   7. A data channel the PWA offers while it holds camera and microphone permission (a live
 //      getUserMedia stream): the same renomination as case 6 on a chat connection. The PWA
@@ -44,13 +65,14 @@
 //      ways, and again after the connection has settled.
 //
 // Every PWA connection records its selected ICE candidate pair changes (`window.__pcs[i]
-// .__pairChanges`); a failure report prints them with the bot's stderr.
+// .__pairChanges`); a failure report prints them with the page console and the bot's stderr.
 //
 // Environment: PAROLNET_RELAY_BIN, PAROLNET_BOT_BIN (default: $CARGO_TARGET_DIR or target/,
-// debug profile), CHROME_PATH, INTEROP_ICE, INTEROP_KEEP=1 (keep temp dirs), INTEROP_VERBOSE=1
+// debug profile), INTEROP_BROWSER, INTEROP_ICE, CHROME_PATH / FIREFOX_PATH / WEBKIT_PATH (a
+// browser binary instead of Playwright's), INTEROP_KEEP=1 (keep temp dirs), INTEROP_VERBOSE=1
 // (page console and bot stderr on stdout).
 
-import puppeteer from "puppeteer";
+import { chromium, firefox, webkit } from "playwright";
 import { spawn } from "node:child_process";
 import { createServer, request as httpRequest } from "node:http";
 import { connect as netConnect, createServer as netCreateServer } from "node:net";
@@ -67,7 +89,21 @@ const exe = process.platform === "win32" ? ".exe" : "";
 const targetDir = process.env.CARGO_TARGET_DIR || join(root, "target");
 const relayBin = process.env.PAROLNET_RELAY_BIN || join(targetDir, "debug", `parolnet-relay${exe}`);
 const botBin = process.env.PAROLNET_BOT_BIN || join(targetDir, "debug", "examples", `bot${exe}`);
-const mode = process.env.INTEROP_ICE || (process.platform === "linux" ? "mdns" : "loopback");
+const browserName = process.env.INTEROP_BROWSER || "chromium";
+const engines = { chromium, firefox, webkit };
+if (!engines[browserName]) {
+  console.error(`INTEROP_BROWSER must be chromium, firefox or webkit (got ${browserName})`);
+  process.exit(2);
+}
+// See "ICE" in the header.
+const modes = browserName === "webkit" ? ["host"] : ["mdns", "loopback"];
+const mode = process.env.INTEROP_ICE || (browserName === "webkit" ? "host" : process.platform === "linux" ? "mdns" : "loopback");
+if (!modes.includes(mode)) {
+  console.error(`INTEROP_ICE for ${browserName} must be ${modes.join(" or ")} (got ${mode})`);
+  process.exit(2);
+}
+/// The browser's name in log lines.
+const Browser = { chromium: "Chromium", firefox: "Firefox", webkit: "WebKit" }[browserName];
 const verbose = process.env.INTEROP_VERBOSE === "1";
 const keep = process.env.INTEROP_KEEP === "1";
 
@@ -111,14 +147,14 @@ function freePort() {
   });
 }
 
-/// The address host candidates use in mDNS mode: the default-route IPv4 interface.
+/// The address host candidates use in mdns and host mode: the default-route IPv4 interface.
 function lanIPv4() {
   for (const list of Object.values(networkInterfaces())) {
     for (const a of list ?? []) {
       if (a.family === "IPv4" && !a.internal) return a.address;
     }
   }
-  throw new Error("no non-loopback IPv4 interface for mDNS mode");
+  throw new Error(`no non-loopback IPv4 interface for ${mode} mode`);
 }
 
 // ── Relay ────────────────────────────────────────────────────
@@ -273,40 +309,106 @@ class Bot {
   }
 }
 
-// ── PWA in Chromium ──────────────────────────────────────────
+// ── PWA in the browser ───────────────────────────────────────
 
+/// Firefox and WebKit get this as their HTTP proxy for every host but 127.0.0.1: it refuses
+/// everything, so no request leaves the machine, the service worker's included (Chromium has a
+/// resolver rule for that). Refused requests are counted per host for the log.
+const refusedHosts = new Map();
+let deadProxyPort = null;
+async function deadProxy() {
+  if (deadProxyPort) return deadProxyPort;
+  const note = (target) => {
+    let host = target;
+    try {
+      host = new URL(target.includes("://") ? target : `http://${target}`).hostname;
+    } catch {}
+    refusedHosts.set(host, (refusedHosts.get(host) ?? 0) + 1);
+  };
+  const server = createServer((req, res) => {
+    note(req.url);
+    res.writeHead(502);
+    res.end();
+  });
+  server.on("connect", (req, socket) => {
+    note(req.url);
+    socket.end("HTTP/1.1 502 Bad Gateway\r\n\r\n");
+  });
+  server.on("clientError", (_e, socket) => socket.destroy());
+  await new Promise((r) => server.listen(0, "127.0.0.1", r));
+  cleanups.push(() => server.close());
+  deadProxyPort = server.address().port;
+  return deadProxyPort;
+}
+
+/// A browser with its profile in `profileDir` (a persistent context: IndexedDB and the service
+/// worker survive a relaunch, as case 3 needs).
+///
 /// `media`: a synthetic camera and microphone with the permission granted. That also makes
 /// Chromium gather host candidates on every interface (it does so once a page holds media
-/// permission), so only the call cases use it.
+/// permission) and Firefox stop hiding its addresses behind mDNS names, so only the call cases
+/// use it.
 async function launchBrowser(profileDir, { media = false } = {}) {
-  const args = [
-    "--no-first-run",
-    "--no-default-browser-check",
-    // Nothing leaves the machine: the PWA's STUN fallback (parol.social) and any other remote
-    // host fail to resolve, so ICE uses host candidates only.
-    "--host-resolver-rules=MAP * ~NOTFOUND, EXCLUDE 127.0.0.1, EXCLUDE localhost",
-    "--autoplay-policy=no-user-gesture-required",
-  ];
-  if (media) args.push("--use-fake-device-for-media-stream", "--use-fake-ui-for-media-stream");
-  if (mode === "loopback") {
-    args.push("--allow-loopback-in-peer-connection", "--disable-features=WebRtcHideLocalIpsWithMdns");
+  if (browserName === "chromium") {
+    const args = [
+      "--no-first-run",
+      "--no-default-browser-check",
+      // Nothing leaves the machine: the PWA's STUN fallback (parol.social) and any other remote
+      // host fail to resolve, so ICE uses host candidates only.
+      "--host-resolver-rules=MAP * ~NOTFOUND, EXCLUDE 127.0.0.1, EXCLUDE localhost",
+      "--autoplay-policy=no-user-gesture-required",
+    ];
+    if (media) args.push("--use-fake-device-for-media-stream", "--use-fake-ui-for-media-stream");
+    if (mode === "loopback") {
+      args.push("--allow-loopback-in-peer-connection", "--disable-features=WebRtcHideLocalIpsWithMdns");
+    }
+    return chromium.launchPersistentContext(profileDir, {
+      headless: true,
+      // The full browser in its headless mode (as a user's Chromium), not the headless shell.
+      channel: process.env.CHROME_PATH ? undefined : "chromium",
+      executablePath: process.env.CHROME_PATH || undefined,
+      // Playwright's default is no sandbox; keep Chromium's own wherever it can run.
+      chromiumSandbox: !(process.platform === "linux" && process.env.CI),
+      args,
+    });
   }
-  if (process.platform === "linux" && process.env.CI) args.push("--no-sandbox");
-  return puppeteer.launch({
+  // Nothing leaves the machine (the PWA's fallback fetch to parol.social among them).
+  const proxy = { server: `http://127.0.0.1:${await deadProxy()}`, bypass: "127.0.0.1" };
+  if (browserName === "firefox") {
+    const prefs = {
+      "media.autoplay.default": 0,
+      "media.autoplay.blocking_policy": 0,
+      // mdns: Firefox as shipped (host candidates are `<uuid>.local` names while the page holds
+      // no media permission). loopback: addresses as they are, 127.0.0.1 included.
+      "media.peerconnection.ice.obfuscate_host_addresses": mode === "mdns",
+      "media.peerconnection.ice.loopback": mode === "loopback",
+    };
+    if (media) {
+      prefs["media.navigator.streams.fake"] = true;
+      prefs["media.navigator.permission.disabled"] = true;
+    }
+    return firefox.launchPersistentContext(profileDir, {
+      headless: true,
+      executablePath: process.env.FIREFOX_PATH || undefined,
+      firefoxUserPrefs: prefs,
+      proxy,
+    });
+  }
+  return webkit.launchPersistentContext(profileDir, {
     headless: true,
-    executablePath: process.env.CHROME_PATH || undefined,
-    userDataDir: profileDir,
-    args,
+    executablePath: process.env.WEBKIT_PATH || undefined,
+    permissions: media ? ["camera", "microphone"] : [],
+    proxy,
   });
 }
 
 class Pwa {
-  static async open(browser, port, name, { tamperBinding = false } = {}) {
-    const page = await browser.newPage();
+  static async open(context, port, name, { tamperBinding = false } = {}) {
+    const page = context.pages()[0] ?? (await context.newPage());
     if (tamperBinding) {
       // Once connected, the local description the PWA binds names a fingerprint that is not
       // its certificate's: the binding then disagrees with what the desktop saw.
-      await page.evaluateOnNewDocument(() => {
+      await page.addInitScript(() => {
         const desc = Object.getOwnPropertyDescriptor(RTCPeerConnection.prototype, "localDescription");
         Object.defineProperty(RTCPeerConnection.prototype, "localDescription", {
           configurable: true,
@@ -321,7 +423,7 @@ class Pwa {
     }
     const p = new Pwa(page, name);
     // Keep every RTCPeerConnection the PWA makes, for call stats.
-    await page.evaluateOnNewDocument(() => {
+    await page.addInitScript(() => {
       const Orig = window.RTCPeerConnection;
       window.__pcs = [];
       const t0 = performance.now();
@@ -360,7 +462,12 @@ class Pwa {
       p.consoleAt.push(new Date().toISOString().slice(11, 23));
       if (verbose) log(`[pwa ${name}]`, text);
     });
-    page.on("pageerror", (e) => log(`[pwa ${name}] PAGE ERROR`, e.message));
+    page.on("pageerror", (e) => {
+      p.console.push(`PAGE ERROR ${e.message}`);
+      p.consoleAt.push(new Date().toISOString().slice(11, 23));
+      // WebKit reports the refused fallback fetch (see deadProxy) as a page error.
+      if (verbose || !e.message.includes("/turn-credentials due to access control checks")) log(`[pwa ${name}] PAGE ERROR`, e.message);
+    });
     await page.goto(`http://127.0.0.1:${port}/index.html`, { waitUntil: "domcontentloaded" });
     p.peerId = await until(`pwa ${name}: identity`, 30_000, () =>
       page.evaluate(() => (typeof window._peerId === "string" && window._peerId.length === 64 ? window._peerId : null)),
@@ -453,14 +560,13 @@ class Pwa {
 
   async sendText(to, text) {
     await this.page.evaluate(
-      async (to, text) => {
+      async ({ to, text }) => {
         window.openChat(to);
         await new Promise((r) => setTimeout(r, 100));
         document.getElementById("message-input").value = text;
         await window.sendMessage();
       },
-      to,
-      text,
+      { to, text },
     );
   }
 
@@ -520,7 +626,7 @@ async function chatBothWays(bot, pwa, tag) {
 
 async function caseDesktopEntersPwaCode(ctx) {
   const tag = "case 1 (PWA code -> desktop)";
-  const profile = mkdtempSync(join(work, "chrome-1-"));
+  const profile = mkdtempSync(join(work, `${browserName}-1-`));
   const browser = await launchBrowser(profile);
   cleanups.push(() => browser.close().catch(() => {}));
   const bot = new Bot("one", ctx.relayPort, ctx.bindIp);
@@ -545,7 +651,7 @@ async function caseDesktopEntersPwaCode(ctx) {
 
 async function casePwaPastesDesktopCode(ctx) {
   const tag = "case 2 (desktop code -> PWA paste)";
-  const profile = mkdtempSync(join(work, "chrome-2-"));
+  const profile = mkdtempSync(join(work, `${browserName}-2-`));
   let browser = await launchBrowser(profile);
   cleanups.push(() => browser.close().catch(() => {}));
   const bot = new Bot("two", ctx.relayPort, ctx.bindIp);
@@ -586,7 +692,7 @@ async function casePwaPastesDesktopCode(ctx) {
 
 async function caseTamperedBindingIsRefused(ctx) {
   const tag = "case 4 (tampered channel binding)";
-  const profile = mkdtempSync(join(work, "chrome-4-"));
+  const profile = mkdtempSync(join(work, `${browserName}-4-`));
   const browser = await launchBrowser(profile);
   cleanups.push(() => browser.close().catch(() => {}));
   const bot = new Bot("four", ctx.relayPort, ctx.bindIp);
@@ -631,7 +737,7 @@ async function pwaDecodes(pwa, what) {
 }
 
 async function caseCalls(ctx) {
-  const profile = mkdtempSync(join(work, "chrome-5-"));
+  const profile = mkdtempSync(join(work, `${browserName}-5-`));
   const browser = await launchBrowser(profile, { media: true });
   cleanups.push(() => browser.close().catch(() => {}));
   const bot = new Bot("calls", ctx.relayPort, ctx.bindIp);
@@ -654,8 +760,8 @@ async function caseCalls(ctx) {
   );
   await pwa.page.evaluate(() => window.acceptIncomingCall());
   await bot.wait("active", (e) => e.event === "call" && e.call_id === out.call_id && e.state === "Active", 30_000, mark);
-  const m6 = await botMedia(bot, out.call_id, 50, `${tag}: the desktop receives Chromium's VP8 and Opus`);
-  const s6 = await pwaDecodes(pwa, `${tag}: Chromium decodes the desktop's VP8 and Opus`);
+  const m6 = await botMedia(bot, out.call_id, 50, `${tag}: the desktop receives ${Browser}'s VP8 and Opus`);
+  const s6 = await pwaDecodes(pwa, `${tag}: ${Browser} decodes the desktop's VP8 and Opus`);
   log(`${tag}: desktop got audio ${m6.audio_rx} / video ${m6.video_rx} packets; PWA decoded ${s6.videoFrames} frames, ${s6.audioSamples} audio samples`);
   bot.send(`hangup ${out.call_id}`);
   await bot.wait("ended", (e) => e.event === "call" && e.call_id === out.call_id && e.state === "Ended(HungUp)", 10_000, mark);
@@ -672,8 +778,8 @@ async function caseCalls(ctx) {
     if (!ring.video) throw new Error(`${tag}: the PWA's offer should carry video`);
     bot.send(`accept ${ring.call_id}`);
     await bot.wait("active", (e) => e.event === "call" && e.call_id === ring.call_id && e.state === "Active", 30_000);
-    const m5 = await botMedia(bot, ring.call_id, 50, `${tag}: the desktop receives Chromium's VP8 and Opus`);
-    const s5 = await pwaDecodes(pwa, `${tag}: Chromium decodes the desktop's VP8 and Opus`);
+    const m5 = await botMedia(bot, ring.call_id, 50, `${tag}: the desktop receives ${Browser}'s VP8 and Opus`);
+    const s5 = await pwaDecodes(pwa, `${tag}: ${Browser} decodes the desktop's VP8 and Opus`);
     log(`${tag}: desktop got audio ${m5.audio_rx} / video ${m5.video_rx} packets; PWA decoded ${s5.videoFrames} frames, ${s5.audioSamples} audio samples`);
     log(`${tag}: selected-pair changes on the PWA's connections: ${JSON.stringify(await pairChanges(pwa))}`);
     await pwa.page.evaluate(() => window.hangupCall());
@@ -694,7 +800,7 @@ async function pairChanges(pwa) {
 
 async function casePwaOffersWithMedia(ctx) {
   const tag = "case 7 (PWA-offered data channel with media permission)";
-  const profile = mkdtempSync(join(work, "chrome-7-"));
+  const profile = mkdtempSync(join(work, `${browserName}-7-`));
   const browser = await launchBrowser(profile, { media: true });
   cleanups.push(() => browser.close().catch(() => {}));
   const bot = new Bot("seven", ctx.relayPort, ctx.bindIp);
@@ -738,8 +844,8 @@ async function casePwaOffersWithMedia(ctx) {
 
 async function main() {
   if (!existsSync(botBin)) throw new Error(`bot binary not found: ${botBin} (cargo build -p parolnet-app --example bot)`);
-  const bindIp = mode === "mdns" ? lanIPv4() : "127.0.0.1";
-  log(`ICE mode ${mode}, desktop host candidate ${bindIp}`);
+  const bindIp = mode === "loopback" ? "127.0.0.1" : lanIPv4();
+  log(`${Browser}, ICE mode ${mode}, desktop host candidate ${bindIp}`);
   const relayPort = await startRelay();
   const pwaPort = await startPwaServer(relayPort);
   const ctx = { relayPort, pwaPort, bindIp };
@@ -751,13 +857,20 @@ async function main() {
   if (process.env.INTEROP_CALLS !== "0") bots.push(await caseCalls(ctx));
   bots.push(await casePwaOffersWithMedia(ctx));
 
+  // Host candidates only: no page may have learned a STUN / TURN server (that would mean a
+  // request left the machine).
+  for (const p of openPwas) {
+    const line = p.console.find((t) => t.includes("[WebRTC] ICE servers from"));
+    if (line) throw new Error(`pwa ${p.name} learned ICE servers, so a request left the machine: ${line}`);
+  }
+  if (refusedHosts.size) log(`requests refused by the proxy: ${[...refusedHosts].map(([h, n]) => `${h} x${n}`).join(", ")}`);
   if (mode === "mdns") {
     const resolved = bots.some((b) => b.stderr.some((l) => l.includes("mDNS traffic received")));
-    if (!resolved) throw new Error("mDNS mode: the desktop never received an mDNS answer for Chromium's .local candidates");
-    log("mDNS: the desktop resolved Chromium's .local candidates");
+    if (!resolved) throw new Error(`mDNS mode: the desktop never received an mDNS answer for ${Browser}'s .local candidates`);
+    log(`mDNS: the desktop resolved ${Browser}'s .local candidates`);
   }
   const cases = 5 + (process.env.INTEROP_CALLS === "0" ? 0 : process.env.INTEROP_PWA_CALLS === "0" ? 1 : 2);
-  log(`PASS: desktop <-> PWA interop (${cases} cases)`);
+  log(`PASS: desktop <-> PWA interop, ${Browser}, ${mode} candidates (${cases} cases)`);
 }
 
 let status = 0;

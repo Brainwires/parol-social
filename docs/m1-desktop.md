@@ -14,23 +14,40 @@ signaling-only relay). What runs, how it is tested, what it does not do yet.
   the first side restarts from its data directory, the relay's presence push tells the other side,
   the queue flushes. An offer from a stranger is ignored. A video call: ring, accept, VP8 and Opus
   RTP both ways, hang up; a declined call.
-- **Desktop ↔ PWA** (`apps/desktop/interop/pwa-interop.mjs`, CI job `pwa-interop` on
-  ubuntu-latest): the bot (`parolnet-app`'s headless peer, the same core the GPUI app runs)
-  against the real PWA in headless Chromium through the relay binary.
+- **Desktop ↔ PWA in Chromium, Firefox and WebKit** (`apps/desktop/interop/pwa-interop.mjs`,
+  CI job `pwa-interop` on ubuntu-latest): the bot (`parolnet-app`'s headless peer, the same core
+  the GPUI app runs) against the real PWA in a headless browser (Playwright;
+  `INTEROP_BROWSER=chromium|firefox|webkit`) through the relay binary. The same seven cases in
+  every browser, none skipped; the PWA and the desktop core needed no per-browser change.
   1. PWA code → desktop: bootstrap over the data channel, messages both ways.
   2. Desktop code → the PWA's "Paste Code" tab (which now pairs like a camera scan), messages
      both ways.
   3. Sender queue across a PWA restart.
   4. A PWA that binds a fingerprint it did not see is refused by the desktop ("failed its
      end-to-end check"), and nothing queued goes out on that channel.
-  5. The desktop video-calls the PWA (Chromium's fake camera and microphone): the desktop receives
-     Chromium's VP8 and Opus, Chromium decodes the desktop's VP8 test pattern and Opus tone; the
-     desktop hangs up and the PWA closes its call connection.
+  5. The desktop video-calls the PWA (the browser's fake camera and microphone): the desktop
+     receives the browser's VP8 and Opus, the browser decodes the desktop's VP8 test pattern and
+     Opus tone (decoded frames and received audio samples from `getStats`); the desktop hangs up
+     and the PWA closes its call connection.
+  6. The PWA video-calls the desktop: the same checks; the PWA hangs up.
+  7. A data channel the PWA offers while it holds a live camera and microphone stream: bindings
+     verified, messages both ways, and again after the connection has settled.
 
-  It runs twice in CI: as Chromium ships (host candidates are mDNS `<uuid>.local` names; the
-  desktop resolves them, and the test requires mDNS answers to have arrived) and with loopback
-  candidates (`--allow-loopback-in-peer-connection`, the default on a developer's Mac, where no
-  multicast and no LAN address is used).
+  | Browser (headless, Playwright) | Candidates | Cases 1-7 |
+  |---|---|---|
+  | Chromium (full browser, `chromium` channel) | mDNS names; loopback | pass; pass |
+  | Firefox | mDNS names; loopback | pass; pass |
+  | WebKit (Playwright's Linux build, WPE + libwebrtc) | plain host address | pass |
+
+  Chromium and Firefox run twice in CI: as shipped (host candidates are mDNS `<uuid>.local`
+  names; the desktop resolves them, and the test requires mDNS answers to have arrived) and with
+  loopback candidates (Chromium `--allow-loopback-in-peer-connection`, Firefox
+  `media.peerconnection.ice.loopback`; the default on a developer's Mac, where no multicast and
+  no LAN address is used). WebKit runs once: Playwright's Linux build gathers the default-route
+  address as a plain host candidate. Fake media: Chromium's fake device flags, Firefox's
+  `media.navigator.streams.fake`, WebKit's mock capture devices. No request leaves the machine
+  (Chromium: resolver rule; Firefox and WebKit: a proxy that refuses every host but 127.0.0.1),
+  and a run fails if a page learned a STUN or TURN server.
 - **The desktop app's call media** (`parolnet-desktop --call-check`, `apps/desktop/interop/
   desktop-call.mjs`, in the `desktop-spike` workflow): the window's call session without a window
   video-calls the bot with synthetic media (the test pattern as a 720p YUYV camera through
@@ -205,6 +222,10 @@ secret, contacts, ratchet sessions, history, the sender queue, settings. Beside 
   pair, so media stopped after about a second. `webrtc-rs-rtc` `v0.22.0+brainwires.5` follows the
   later nomination; interop case 6 (the PWA video-calls the desktop) and case 7 (a data channel
   the PWA offers while it holds camera and microphone permission) run by default.
+- Browser interop is headless with fake devices on Linux (CI) only: no real Safari (macOS / iOS)
+  and no WebKit run on macOS; WebKit's mDNS host candidates are not exercised (Playwright's Linux
+  WebKit exposes plain addresses), so mDNS resolution is covered by Chromium and Firefox; no
+  browser run goes through STUN or TURN (host candidates only).
 - Camera, microphone and speaker paths are unverified on real devices (the checklist above);
   the call panel's new controls are unverified on screen.
 - Adding or removing a track mid-call (an audio call that becomes a video call): camera off /
@@ -237,4 +258,3 @@ secret, contacts, ratchet sessions, history, the sender queue, settings. Beside 
 1. The manual media checklist on the three OSes; device choices in the settings screen; an
    adaptive jitter buffer and Opus FEC / DTX; audio-to-video upgrade by renegotiation.
 2. Settings: "Delete all data on this device" over `parolnet-store`.
-3. Interop in Firefox and WebKit.

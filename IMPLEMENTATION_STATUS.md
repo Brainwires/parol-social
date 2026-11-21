@@ -89,6 +89,18 @@ See [docs/m1-desktop.md](docs/m1-desktop.md) for what runs end to end, the tests
   with no presence push behind it is offered to again with backoff under a probe budget.
 - **Desktop**: chat UI v0 (contact list with path badges, pairing screen with QR code and code
   entry, chat view with delivery state, rename, retry, the no-path message).
+- **Desktop ↔ PWA browser matrix** (`apps/desktop/interop/pwa-interop.mjs`, CI job `pwa-interop`,
+  headless on ubuntu-latest with fake media devices; the seven cases are listed in
+  [docs/m1-desktop.md](docs/m1-desktop.md)):
+
+  | | Chromium | Firefox | WebKit (Playwright, Linux) |
+  |---|---|---|---|
+  | Pairing both ways, chat, sender queue, refused tampered binding (cases 1-4) | pass | pass | pass |
+  | Video calls both ways, VP8 + Opus decoded on both sides (cases 5-6) | pass | pass | pass |
+  | PWA-offered data channel while holding media (case 7) | pass | pass | pass |
+  | Host candidates covered | mDNS names, loopback | mDNS names, loopback | plain address only |
+
+  Not covered: real Safari (macOS / iOS), WebKit's mDNS candidates, STUN / TURN paths in a browser.
 
 ## M0
 
