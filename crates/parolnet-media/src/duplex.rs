@@ -29,8 +29,10 @@ use crate::{FRAME_10MS, FRAME_20MS, MediaError, SAMPLE_RATE};
 /// buffer. The receive path pushes decoded packets; the audio thread pops 10 ms frames.
 ///
 /// After running empty it holds playback back until [`PlayoutBuffer::PREBUFFER`] is there
-/// again (a late packet then costs one gap instead of a stutter), and it never holds more
-/// than [`PlayoutBuffer::MAX`]: the oldest audio is dropped first (latency over completeness).
+/// again (a late packet then costs one gap instead of a stutter). When more than
+/// [`PlayoutBuffer::MAX`] has piled up (a burst after a network stall, or the contact's clock
+/// running ahead of the sound card's), the oldest audio is dropped down to
+/// [`PlayoutBuffer::TRIM`]: one skip, instead of a call that stays 300 ms behind.
 #[derive(Clone, Default)]
 pub struct PlayoutBuffer(Arc<Mutex<PlayoutState>>);
 
@@ -47,8 +49,10 @@ struct PlayoutState {
 impl PlayoutBuffer {
     /// What must be buffered before playback (re)starts: 40 ms.
     pub const PREBUFFER: usize = SAMPLE_RATE as usize * 40 / 1000;
-    /// The most that is kept: 300 ms.
+    /// The most that may wait: 300 ms.
     pub const MAX: usize = SAMPLE_RATE as usize * 300 / 1000;
+    /// What is kept when the buffer overflowed: 80 ms.
+    pub const TRIM: usize = SAMPLE_RATE as usize * 80 / 1000;
 
     pub fn new() -> Self {
         Self::default()
@@ -62,8 +66,8 @@ impl PlayoutBuffer {
     pub fn push(&self, samples: &[f32]) {
         let mut s = self.lock();
         s.samples.extend(samples);
-        let excess = s.samples.len().saturating_sub(Self::MAX);
-        if excess > 0 {
+        if s.samples.len() > Self::MAX {
+            let excess = s.samples.len() - Self::TRIM;
             s.samples.drain(..excess);
             s.dropped += excess as u64;
         }
@@ -298,12 +302,16 @@ mod tests {
         buf.push(&[0.5; FRAME_10MS]);
         assert!(!buf.pop(&mut frame));
         assert_eq!(buf.stats().0, 1);
-        // Never more than the cap; the oldest goes first.
-        buf.push(&vec![0.1; PlayoutBuffer::MAX]);
+        // Past the cap it trims to the newest 80 ms; the oldest goes first.
+        buf.push(&vec![0.1; PlayoutBuffer::MAX - buf.len()]);
+        assert_eq!((buf.len(), buf.stats().1), (PlayoutBuffer::MAX, 0));
         buf.push(&[0.9; FRAME_10MS]);
-        assert_eq!(buf.len(), PlayoutBuffer::MAX);
+        assert_eq!(buf.len(), PlayoutBuffer::TRIM);
         assert!(buf.stats().1 > 0);
         assert!(!buf.is_empty());
+        let mut newest = vec![0f32; PlayoutBuffer::TRIM];
+        assert!(buf.pop(&mut newest));
+        assert_eq!(newest[newest.len() - 1], 0.9);
     }
 
     /// Run a duplex against a simulated room for `ms` milliseconds in 5 ms steps.

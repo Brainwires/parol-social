@@ -42,6 +42,8 @@ use crate::receiver::{Stats, decode_loop};
 const AUDIO_TICK: Duration = Duration::from_millis(5);
 /// How often a failed audio device is tried again (on the system default).
 const AUDIO_RETRY: Duration = Duration::from_secs(2);
+/// What a muted microphone sends.
+static SILENCE: [f32; FRAME_20MS] = [0.0; FRAME_20MS];
 /// With the camera off: one black frame per second.
 const BLACK_INTERVAL: Duration = Duration::from_secs(1);
 
@@ -269,6 +271,11 @@ impl Drop for CallSession {
     }
 }
 
+/// A frame interval in the 90 kHz RTP clock, kept between 1 ms and 2 s.
+fn rtp_ticks(interval: Duration) -> u32 {
+    (interval.as_micros() * 9 / 100).clamp(90, 180_000) as u32
+}
+
 fn spawn(name: &str, f: impl FnOnce() + Send + 'static) {
     if let Err(e) = std::thread::Builder::new().name(name.into()).spawn(f) {
         tracing::warn!("could not start the {name} thread: {e}");
@@ -309,6 +316,7 @@ impl VideoSender {
         let black = I420Frame::black(format.width, format.height);
         let mut input = VideoInput::Closed;
         let mut last_black: Option<Instant> = None;
+        let mut last_sent: Option<Instant> = None;
         let mut frame_no = 0u64;
         while !self.shared.stop.load(Ordering::Relaxed) {
             loop {
@@ -370,10 +378,12 @@ impl VideoSender {
             let key = self.shared.force_keyframe.swap(false, Ordering::Relaxed);
             match encoder.encode(&picture, key) {
                 Ok(Some(e)) => {
-                    if !self
-                        .frames
-                        .send(MediaKind::Video, e.data, 90_000 / format.fps)
-                    {
+                    // The RTP clock follows the real frame times (a camera in low light
+                    // slows down; black frames come once a second), not a nominal 30 fps.
+                    let now = Instant::now();
+                    let ticks = last_sent.map_or(90_000 / format.fps, |t| rtp_ticks(now - t));
+                    last_sent = Some(now);
+                    if !self.frames.send(MediaKind::Video, e.data, ticks) {
                         break;
                     }
                     self.stats.video_sent.fetch_add(1, Ordering::Relaxed);
@@ -573,12 +583,15 @@ impl AudioWorker {
                 &self.playout,
                 &mut |frame: &[f32]| {
                     debug_assert_eq!(frame.len(), FRAME_20MS);
-                    // Muted: the microphone still runs through the processor (the echo
-                    // canceller stays converged), nothing is sent.
-                    if muted || call_over {
+                    if call_over {
                         return;
                     }
                     let Some(enc) = encoder.as_mut() else { return };
+                    // Muted: silence is sent instead of the microphone (what a browser does
+                    // for a disabled track), so the contact's jitter buffer sees a steady
+                    // stream; the microphone still runs through the processor, which keeps
+                    // the echo canceller converged.
+                    let frame = if muted { &SILENCE[..] } else { frame };
                     match enc.encode(frame) {
                         Ok(packet) => {
                             if self.frames.send(
@@ -698,6 +711,15 @@ async fn receive(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rtp_ticks_follow_the_frame_interval() {
+        assert_eq!(rtp_ticks(Duration::from_micros(33_333)), 2999);
+        assert_eq!(rtp_ticks(Duration::from_secs(1)), 90_000);
+        // Bounded both ways.
+        assert_eq!(rtp_ticks(Duration::ZERO), 90);
+        assert_eq!(rtp_ticks(Duration::from_secs(60)), 180_000);
+    }
 
     #[test]
     fn the_send_format_defaults_to_360p() {

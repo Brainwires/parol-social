@@ -102,13 +102,15 @@ fn find(id: Option<&str>, input: bool) -> Result<cpal::Device, MediaError> {
 }
 
 /// Build the stream on a thread of its own and keep it there until `shared.stop`: a `cpal`
-/// stream is not `Send` on every host, and this way its owner need not be either.
-fn own_stream<F>(name: &str, shared: Arc<Shared>, build: F) -> Result<(), MediaError>
+/// stream need not be `Send`, and this way [`Microphone`] and [`Speaker`] are whatever the
+/// host does.
+fn own_stream<F>(name: &str, shared: Arc<Shared>, build: F) -> Result<StreamOwner, MediaError>
 where
     F: FnOnce() -> Result<cpal::Stream, MediaError> + Send + 'static,
 {
     let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel::<Result<(), MediaError>>(1);
-    std::thread::Builder::new()
+    let stop = shared.clone();
+    let thread = std::thread::Builder::new()
         .name(name.to_owned())
         .spawn(move || {
             let stream = match build().and_then(|s| s.play().map(|()| s).map_err(device_error)) {
@@ -127,11 +129,38 @@ where
             drop(stream);
         })
         .map_err(|e| MediaError::Device(format!("audio thread: {e}")))?;
+    let owner = StreamOwner {
+        shared: stop,
+        thread: Some(thread),
+    };
     match ready_rx.recv_timeout(OPEN_TIMEOUT) {
-        Ok(result) => result,
-        Err(_) => Err(MediaError::Device(
-            "the audio device did not open in time".into(),
-        )),
+        Ok(Ok(())) => Ok(owner),
+        Ok(Err(e)) => Err(e),
+        Err(_) => {
+            // Still opening: do not wait for it when the owner drops.
+            let mut owner = owner;
+            owner.thread = None;
+            Err(MediaError::Device(
+                "the audio device did not open in time".into(),
+            ))
+        }
+    }
+}
+
+/// The thread that holds a stream. Dropping it closes the stream and waits for that, so the
+/// same device can be opened again right away.
+struct StreamOwner {
+    shared: Arc<Shared>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Drop for StreamOwner {
+    fn drop(&mut self) {
+        self.shared.stop.store(true, Ordering::Relaxed);
+        if let Some(thread) = self.thread.take() {
+            thread.thread().unpark();
+            let _ = thread.join();
+        }
     }
 }
 
@@ -141,6 +170,7 @@ pub struct Microphone {
     rate: u32,
     name: String,
     shared: Arc<Shared>,
+    _owner: StreamOwner,
 }
 
 impl Microphone {
@@ -161,7 +191,7 @@ impl Microphone {
         let (tx, rx) = rtrb::RingBuffer::<f32>::new(rate as usize / 2);
         let shared = Arc::new(Shared::default());
         let cb_shared = shared.clone();
-        own_stream("mic-stream", shared.clone(), move || match format {
+        let owner = own_stream("mic-stream", shared.clone(), move || match format {
             SampleFormat::F32 => input_stream::<f32>(&device, config, channels, tx, cb_shared),
             SampleFormat::I16 => input_stream::<i16>(&device, config, channels, tx, cb_shared),
             SampleFormat::U16 => input_stream::<u16>(&device, config, channels, tx, cb_shared),
@@ -175,6 +205,7 @@ impl Microphone {
             rate,
             name,
             shared,
+            _owner: owner,
         })
     }
 
@@ -259,12 +290,6 @@ impl AudioSource for Microphone {
     }
 }
 
-impl Drop for Microphone {
-    fn drop(&mut self) {
-        self.shared.stop.store(true, Ordering::Relaxed);
-    }
-}
-
 /// Speakers: mono samples at the device's rate, copied to every output channel.
 pub struct Speaker {
     tx: rtrb::Producer<f32>,
@@ -272,6 +297,7 @@ pub struct Speaker {
     rate: u32,
     name: String,
     shared: Arc<Shared>,
+    _owner: StreamOwner,
 }
 
 impl Speaker {
@@ -291,7 +317,7 @@ impl Speaker {
         let (tx, rx) = rtrb::RingBuffer::<f32>::new(capacity);
         let shared = Arc::new(Shared::default());
         let cb_shared = shared.clone();
-        own_stream("speaker-stream", shared.clone(), move || match format {
+        let owner = own_stream("speaker-stream", shared.clone(), move || match format {
             SampleFormat::F32 => output_stream::<f32>(&device, config, channels, rx, cb_shared),
             SampleFormat::I16 => output_stream::<i16>(&device, config, channels, rx, cb_shared),
             SampleFormat::U16 => output_stream::<u16>(&device, config, channels, rx, cb_shared),
@@ -306,6 +332,7 @@ impl Speaker {
             rate,
             name,
             shared,
+            _owner: owner,
         })
     }
 
@@ -402,11 +429,5 @@ impl AudioSink for Speaker {
 
     fn latency(&self) -> Duration {
         Duration::from_micros(u64::from(self.shared.latency_us.load(Ordering::Relaxed)))
-    }
-}
-
-impl Drop for Speaker {
-    fn drop(&mut self) {
-        self.shared.stop.store(true, Ordering::Relaxed);
     }
 }

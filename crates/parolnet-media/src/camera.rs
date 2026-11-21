@@ -239,6 +239,8 @@ pub struct Camera {
     label: String,
     stop: Arc<AtomicBool>,
     idle: Duration,
+    /// Disconnects when the capture thread has closed the device.
+    closed: std::sync::mpsc::Receiver<()>,
 }
 
 impl Camera {
@@ -257,11 +259,15 @@ impl Camera {
         let stop = Arc::new(AtomicBool::new(false));
         let (ready_tx, ready_rx) =
             std::sync::mpsc::sync_channel::<Result<(VideoFormat, String), MediaError>>(1);
+        let (closed_tx, closed) = std::sync::mpsc::channel::<()>();
         {
             let (slot, stop) = (slot.clone(), stop.clone());
             std::thread::Builder::new()
                 .name("camera".into())
-                .spawn(move || capture(index, want, slot, stop, ready_tx))
+                .spawn(move || {
+                    capture(index, want, slot, stop, ready_tx);
+                    drop(closed_tx);
+                })
                 .map_err(|e| MediaError::Device(format!("camera thread: {e}")))?;
         }
         match ready_rx.recv_timeout(ACCESS_TIMEOUT + OPEN_TIMEOUT) {
@@ -271,6 +277,7 @@ impl Camera {
                 label,
                 stop,
                 idle: Duration::ZERO,
+                closed,
             }),
             Ok(Err(e)) => Err(e),
             Err(_) => {
@@ -430,8 +437,11 @@ impl VideoSource for Camera {
 impl Drop for Camera {
     fn drop(&mut self) {
         // The capture thread stops after the picture it is waiting for and closes the
-        // device (the camera's light goes out).
+        // device (the camera's light goes out). Wait for that, briefly, so the same camera
+        // can be opened again right away; a thread stuck on a device that went away is
+        // left behind rather than waited for.
         self.stop.store(true, Ordering::Relaxed);
+        let _ = self.closed.recv_timeout(Duration::from_millis(500));
     }
 }
 
