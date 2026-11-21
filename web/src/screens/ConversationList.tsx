@@ -96,7 +96,7 @@ export function ConversationList({ current }: { current: Route }) {
   return (
     <div className="list" data-testid="conversation-list">
       <header className="list__header">
-        <h1 className="list__title">{t("list.title")}</h1>
+        <h1 className="list__title" tabIndex={-1} data-testid="list-title">{t("list.title")}</h1>
         <div className="list__actions">
           {contacts.length > 0 && (
             <a

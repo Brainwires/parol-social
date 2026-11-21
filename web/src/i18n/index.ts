@@ -106,9 +106,15 @@ export function setDirectionOverride(dir: "ltr" | "rtl" | null): void {
   applyToDocument();
 }
 
-/** The message for `key` in the current locale (English when the locale lacks it). */
+/**
+ * The message for `key` in the current locale (English when the locale lacks it). An English
+ * fallback inside a right-to-left locale is isolated as left-to-right text, so its
+ * punctuation stays at the end of its own sentence.
+ */
 export function t(key: MessageKey, params: MessageParams = {}): string {
   const code = current.value;
-  const message = catalogues.get(code)?.[key] ?? en[key];
-  return formatMessage(message, params, code);
+  const own = catalogues.get(code)?.[key];
+  if (own !== undefined) return formatMessage(own, params, code);
+  const english = formatMessage(en[key], params, "en");
+  return code !== "en" && RTL.has(code) ? `\u2066${english}\u2069` : english;
 }

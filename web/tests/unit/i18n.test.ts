@@ -81,6 +81,15 @@ Deno.test("catalogue: a missing key falls back to English, key by key", async ()
   await setLocale("en");
 });
 
+Deno.test("catalogue: an English fallback in a right-to-left locale is isolated", async () => {
+  await setLocale("ar");
+  assertEquals("firstRun.start" in ar, false);
+  // LRI … PDI: the sentence keeps its own direction (and its full stop at its own end).
+  assertEquals(t("firstRun.start"), "\u2066Start\u2069");
+  assertEquals(t("composer.send"), ar["composer.send" as keyof typeof ar]);
+  await setLocale("en");
+});
+
 Deno.test("catalogue: the language to start in", () => {
   assertEquals(preferredLocale(["fr-CA", "en"]), "fr");
   assertEquals(preferredLocale(["pt-BR", "ko"]), "ko");

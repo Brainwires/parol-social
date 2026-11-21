@@ -1,4 +1,4 @@
-import type { ReactNode } from "denext";
+import { type ReactNode, useEffect } from "denext";
 import { Announcer } from "./components/Announcer.tsx";
 import { ToastHost } from "./components/Toast.tsx";
 import { route } from "./router.ts";
@@ -15,6 +15,14 @@ function Frame() {
   const current = route.value;
   // A phone shows one column: the list, or whatever was opened from it.
   const view = current.name === "list" || current.name === "lab" ? "list" : "main";
+
+  // Back on the list with focus left on something that is gone (the conversation that was
+  // closed, the contact that was removed): put it on the list's title.
+  useEffect(() => {
+    if (view !== "list" || document.activeElement !== document.body) return;
+    document.querySelector<HTMLElement>('[data-testid="list-title"]')?.focus();
+  }, [view]);
+
   return (
     <div className="app" data-view={view} data-route={current.name} data-testid="app">
       <div className="app__list">

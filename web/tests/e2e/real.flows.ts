@@ -18,6 +18,96 @@ interface Person {
   problems: Problems;
 }
 
+/**
+ * WebKit only. Until a page captures media, WebKit offers its host addresses as mDNS names,
+ * and a test machine (a container, a CI runner) has nothing to resolve them, so two WebKit
+ * pages could not reach each other. A page that holds a microphone, as a page in a call does,
+ * offers its real addresses. The project grants the permission; this holds the capture on
+ * every load. It is the test's surroundings, not the app: in Chromium and Firefox the flows
+ * run without it.
+ */
+async function exposeHostAddresses(context: BrowserContext): Promise<void> {
+  await context.addInitScript(() => {
+    void navigator.mediaDevices?.getUserMedia({ audio: true }).then(
+      (stream) => ((window as unknown as { __held: MediaStream }).__held = stream),
+      () => {},
+    );
+  });
+}
+
+/** The QR code a page is showing, as a picture (a data URL) another page's camera can see. */
+function shownCode(page: Page): Promise<string> {
+  return page.getByTestId("pairing-qr").evaluate((shown) => {
+    // A copy with its colours as attributes: an image has no stylesheet.
+    const svg = shown.cloneNode(true) as SVGSVGElement;
+    svg.setAttribute("xmlns", "http://www.w3.org/2000/svg");
+    svg.setAttribute("width", "400");
+    svg.setAttribute("height", "400");
+    svg.querySelector("rect")!.setAttribute("fill", "#ffffff");
+    svg.querySelector("path")!.setAttribute("fill", "#000000");
+    return `data:image/svg+xml;base64,${btoa(new XMLSerializer().serializeToString(svg))}`;
+  });
+}
+
+/**
+ * Give a page a camera that sees `picture`. `window.__camera` is then the stream the app got,
+ * so a test can tell whether the camera was let go.
+ *
+ * Chromium and Firefox: the camera is a canvas showing the picture (`captureStream`).
+ * WebKit (Playwright's Linux build): a canvas stream delivers no frames there, so the camera
+ * is the browser's own mock device, and the picture is put in where the scanner copies the
+ * video frame to its canvas. Everything after that copy (decoding, pairing) is the app's.
+ */
+async function pointCameraAt(page: Page, picture: string, webkit: boolean): Promise<void> {
+  await page.evaluate(async ({ picture, webkit }) => {
+    const image = new Image();
+    image.src = picture;
+    await image.decode();
+    const paint = (context: CanvasRenderingContext2D, width: number, height: number) => {
+      context.fillStyle = "#8a8f8c";
+      context.fillRect(0, 0, width, height);
+      const side = Math.min(width, height) * 0.8;
+      context.drawImage(image, (width - side) / 2, (height - side) / 2, side, side);
+    };
+    const hold = window as unknown as { __camera?: MediaStream };
+    const media = navigator.mediaDevices;
+    if (webkit) {
+      const real = media.getUserMedia.bind(media);
+      media.getUserMedia = async (constraints) => {
+        const stream = await real(constraints);
+        if (constraints?.video) hold.__camera = stream;
+        return stream;
+      };
+      const draw = CanvasRenderingContext2D.prototype.drawImage;
+      CanvasRenderingContext2D.prototype.drawImage = function (
+        this: CanvasRenderingContext2D,
+        source: CanvasImageSource,
+        ...rest: number[]
+      ) {
+        if (source instanceof HTMLVideoElement) paint(this, this.canvas.width, this.canvas.height);
+        else (draw as (...args: unknown[]) => void).call(this, source, ...rest);
+      } as typeof draw;
+      return;
+    }
+    const canvas = document.createElement("canvas");
+    canvas.width = 640;
+    canvas.height = 480;
+    const context = canvas.getContext("2d")!;
+    paint(context, canvas.width, canvas.height);
+    setInterval(() => paint(context, canvas.width, canvas.height), 100);
+    const stream = canvas.captureStream(10);
+    hold.__camera = stream;
+    media.getUserMedia = () => Promise.resolve(stream);
+  }, { picture, webkit });
+}
+
+const cameraTracks = (page: Page) =>
+  page.evaluate(() =>
+    (window as unknown as { __camera?: MediaStream }).__camera?.getTracks().map((t) =>
+      t.readyState
+    ) ?? []
+  );
+
 async function person(
   browser: Browser,
   live: Server,
@@ -25,6 +115,7 @@ async function person(
   init?: (context: BrowserContext) => Promise<void>,
 ): Promise<Person> {
   const context = await browser.newContext({ viewport });
+  if (browser.browserType().name() === "webkit") await exposeHostAddresses(context);
   await init?.(context);
   const page = await context.newPage();
   const problems = await watch(page, live);
@@ -209,7 +300,7 @@ test("what is written while they are away waits here, can be changed and taken b
 });
 
 for (const decoder of ["the browser's decoder if it has one", "the bundled decoder"] as const) {
-  test(`scanning their code with the camera (${decoder}) verifies in person and lets the camera go`, async ({ browser, live }) => {
+  test(`scanning their code with the camera (${decoder}) verifies in person and lets the camera go`, async ({ browser, browserName, live }) => {
     const ana = await person(browser, live);
     const ben = await person(browser, live, WIDE, async (context) => {
       if (decoder === "the bundled decoder") {
@@ -221,27 +312,8 @@ for (const decoder of ["the browser's decoder if it has one", "the bundled decod
     await start(ana.page);
     await start(ben.page);
 
-    // Ben's "camera" looks at Ana's screen: a canvas showing a picture of her code.
-    const picture = await ana.page.getByTestId("pairing-qr").screenshot();
-    await ben.page.evaluate(async (dataUrl) => {
-      const image = new Image();
-      image.src = dataUrl;
-      await image.decode();
-      const canvas = document.createElement("canvas");
-      canvas.width = 640;
-      canvas.height = 480;
-      const context = canvas.getContext("2d")!;
-      const draw = () => {
-        context.fillStyle = "#8a8f8c";
-        context.fillRect(0, 0, canvas.width, canvas.height);
-        context.drawImage(image, 130, 50, 380, 380);
-      };
-      draw();
-      setInterval(draw, 100);
-      const stream = canvas.captureStream(10);
-      (window as unknown as { __camera: MediaStream }).__camera = stream;
-      navigator.mediaDevices.getUserMedia = () => Promise.resolve(stream);
-    }, `data:image/png;base64,${picture.toString("base64")}`);
+    // Ben's camera looks at Ana's screen.
+    await pointCameraAt(ben.page, await shownCode(ana.page), browserName === "webkit");
 
     await ben.page.getByTestId("pairing-scan-open").click();
     await expect(ben.page.getByTestId("pairing-name-body")).toHaveText(
@@ -249,13 +321,7 @@ for (const decoder of ["the browser's decoder if it has one", "the bundled decod
       CONNECT,
     );
     // The camera is released as soon as the code is read.
-    expect(
-      await ben.page.evaluate(() =>
-        (window as unknown as { __camera: MediaStream }).__camera.getTracks().map((t) =>
-          t.readyState
-        )
-      ),
-    ).toEqual(["ended"]);
+    expect(await cameraTracks(ben.page)).toEqual(["ended"]);
     await nameContact(ben.page, "Ana");
     await nameContact(ana.page, "Ben");
     await openLine(ana.page, ben.page);
@@ -271,44 +337,20 @@ for (const decoder of ["the browser's decoder if it has one", "the bundled decod
   });
 }
 
-test("leaving the scanner releases the camera; a picture that is not a code says so", async ({ browser, live }) => {
+test("leaving the scanner releases the camera; a picture that is not a code says so", async ({ browser, browserName, live }) => {
   const ben = await person(browser, live);
   await start(ben.page);
-  // A camera that sees a QR code which is not a ParolNet code (the lab's sample would do;
-  // here: this device's own code, which the engine refuses).
-  const own = await ben.page.getByTestId("pairing-qr").screenshot();
-  await ben.page.evaluate(async (dataUrl) => {
-    const image = new Image();
-    image.src = dataUrl;
-    await image.decode();
-    const canvas = document.createElement("canvas");
-    canvas.width = 480;
-    canvas.height = 480;
-    const context = canvas.getContext("2d")!;
-    const draw = () => {
-      context.fillStyle = "#ffffff";
-      context.fillRect(0, 0, 480, 480);
-      context.drawImage(image, 40, 40, 400, 400);
-    };
-    draw();
-    setInterval(draw, 100);
-    const stream = canvas.captureStream(10);
-    (window as unknown as { __camera: MediaStream }).__camera = stream;
-    navigator.mediaDevices.getUserMedia = () => Promise.resolve(stream);
-  }, `data:image/png;base64,${own.toString("base64")}`);
+  // A camera that sees a code the engine refuses: this device's own.
+  await pointCameraAt(ben.page, await shownCode(ben.page), browserName === "webkit");
 
   await ben.page.getByTestId("pairing-scan-open").click();
   await expect(ben.page.getByTestId("pairing-scan")).toHaveAttribute("data-state", "scanning");
   await expect(ben.page.getByTestId("pairing-scan-problem")).toHaveText("That is your own code.");
-  const states = () =>
-    ben.page.evaluate(() =>
-      (window as unknown as { __camera: MediaStream }).__camera.getTracks().map((t) => t.readyState)
-    );
-  expect(await states()).toEqual(["live"]);
+  expect(await cameraTracks(ben.page)).toEqual(["live"]);
   // Leaving the screen (not just pressing Stop) lets the camera go.
   await ben.page.getByTestId("open-settings").click();
   await expect(ben.page.getByTestId("settings-screen")).toBeVisible();
-  expect(await states()).toEqual(["ended"]);
+  expect(await cameraTracks(ben.page)).toEqual(["ended"]);
   await expectClean(ben.problems);
 });
 
