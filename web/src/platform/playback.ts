@@ -34,9 +34,8 @@ export function play(
 export function detach(element: HTMLMediaElement): void {
   playing.delete(element);
   try {
-    // Not paused first: on the browser this is for, a paused pipeline made the freeze that
-    // comes with attaching the stream again more likely, and made this one no rarer
-    // (tests/e2e/repro).
+    // Not paused first: pausing made the freeze at the end of a call no rarer
+    // (tests/e2e/repro), and this is what the call screen always did with an element.
     if (element.srcObject !== null) element.srcObject = null;
   } catch {
     // An element the browser already tore down.
