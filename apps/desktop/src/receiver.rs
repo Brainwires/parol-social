@@ -20,7 +20,8 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
 use crate::frame::{FrameSlot, I420Frame, Presentable};
-use crate::vp8::Vp8Decoder;
+use parolnet_media::opus::OpusDecoder;
+use parolnet_media::vp8::{Vp8Decoder, is_keyframe};
 
 /// Counters the headless mode and the status line read.
 #[derive(Default)]
@@ -197,9 +198,8 @@ async fn run_session(
     let mut video_track = None;
     let mut audio: Option<(
         parolnet_rtc::rtc::media_stream::MediaStreamTrackId,
-        opus_rs::OpusDecoder,
+        OpusDecoder,
     )> = None;
-    let mut pcm = vec![0f32; 5760];
     let mut builder = SampleBuilder::new(256, Vp8Packet::default(), 90_000);
     let mut last_keyframe_request = Instant::now() - Duration::from_secs(10);
     loop {
@@ -218,8 +218,7 @@ async fn run_session(
                 Some(RtcEvent::Track { track_id, kind: RtpCodecKind::Audio, mime_type }) => {
                     tracing::info!(%track_id, %mime_type, "audio track");
                     if mime_type.eq_ignore_ascii_case("audio/opus") && options.audio_sink.is_some() {
-                        let decoder = opus_rs::OpusDecoder::new(48_000, 1)
-                            .map_err(|e| anyhow::anyhow!("opus-rs decoder: {e}"))?;
+                        let decoder = OpusDecoder::new()?;
                         audio = Some((track_id, decoder));
                     }
                 }
@@ -228,11 +227,11 @@ async fn run_session(
                         && *audio_track == track_id
                     {
                         stats.audio_packets.fetch_add(1, Ordering::Relaxed);
-                        match decoder.decode(&packet.payload, 5760, &mut pcm) {
-                            Ok(n) => {
+                        match decoder.decode(&packet.payload) {
+                            Ok(pcm) => {
                                 if let Some(sink) = &options.audio_sink {
                                     let mut sink = sink.lock().unwrap();
-                                    sink.extend_from_slice(&pcm[..n]);
+                                    sink.extend_from_slice(pcm);
                                     let excess = sink.len().saturating_sub(AUDIO_KEEP);
                                     sink.drain(..excess);
                                 }
@@ -280,11 +279,6 @@ async fn run_session(
     Ok(())
 }
 
-/// VP8 key frames have bit 0 of the first byte clear (RFC 6386 section 9.1).
-pub(crate) fn is_keyframe(frame: &[u8]) -> bool {
-    frame.first().is_some_and(|b| b & 1 == 0)
-}
-
 pub(crate) fn decode_loop(
     samples: std::sync::mpsc::Receiver<Vec<u8>>,
     want_keyframe: tokio::sync::mpsc::UnboundedSender<()>,
@@ -296,7 +290,7 @@ pub(crate) fn decode_loop(
     let mut decoder = match Vp8Decoder::new(2) {
         Ok(decoder) => decoder,
         Err(err) => {
-            slot.set_status(format!("decoder: {err:#}"));
+            slot.set_status(format!("decoder: {err}"));
             return;
         }
     };
@@ -322,7 +316,7 @@ pub(crate) fn decode_loop(
             }
             Err(err) => {
                 stats.decode_errors.fetch_add(1, Ordering::Relaxed);
-                tracing::debug!("{err:#}");
+                tracing::debug!("{err}");
                 synced = false;
                 let _ = want_keyframe.send(());
             }

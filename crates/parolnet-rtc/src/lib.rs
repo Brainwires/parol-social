@@ -6,18 +6,20 @@
 //! talks to it through a command channel ([`RtcHandle`]) and an event channel
 //! ([`RtcEvent`]).
 //!
-//! Status (M1): it gathers the host candidate of the socket it binds and, when STUN servers
-//! are given, one server-reflexive candidate per server (a binding request on the same socket
-//! before the loop starts); it answers or makes a non-trickle offer, delivers RTP packets and
+//! Status (M1): it gathers the host candidate of the socket it binds, when STUN servers
+//! are given one server-reflexive candidate per server (a binding request on the same socket
+//! before the loop starts), and when the user configured a TURN server a relay candidate from
+//! it ([`RtcConfig::turn`], over UDP; see [`IcePolicy::Relay`] to use nothing else); it
+//! answers or makes a non-trickle offer, delivers RTP packets and
 //! data-channel messages (binary and text), sends VP8 and Opus tracks (encoded frames in,
 //! packetized here), requests keyframes and reports stats. Remote mDNS
 //! host candidates (`<uuid>.local`, what Chromium and Safari announce instead of a private
 //! address) are resolved with an mDNS query: the engine asks, and this driver opens the
 //! multicast socket (`224.0.0.251:5353`) the first time a remote description or candidate
 //! names a `.local` host, so a connection that never sees one never touches multicast.
-//! Still to come in M1 (see `docs/m0-spike.md`): TURN candidates for a user-supplied TURN
-//! server (`rtc-turn`), IPv6 and several sockets per connection, interface-change restarts,
-//! and the virtual-time mode that runs the same loop over `parolnet-simnet`.
+//! Still to come (see `docs/m0-spike.md`): TURN over TCP and TLS, IPv6 and several sockets
+//! per connection, interface-change restarts, and the virtual-time mode that runs the same
+//! loop over `parolnet-simnet`.
 
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
@@ -28,19 +30,19 @@ use rtc::ice::mdns::MulticastDnsMode;
 use rtc::interceptor::Registry;
 use rtc::mdns::{MDNS_PORT, MulticastSocket};
 use rtc::media_stream::{MediaStreamTrack, MediaStreamTrackId};
-use rtc::peer_connection::configuration::RTCConfigurationBuilder;
 use rtc::peer_connection::configuration::interceptor_registry::register_default_interceptors;
 use rtc::peer_connection::configuration::media_engine::{
     MIME_TYPE_OPUS, MIME_TYPE_VP8, MediaEngine,
 };
 use rtc::peer_connection::configuration::setting_engine::SettingEngineBuilder;
+use rtc::peer_connection::configuration::{RTCConfigurationBuilder, RTCIceTransportPolicy};
 use rtc::peer_connection::event::{RTCDataChannelEvent, RTCPeerConnectionEvent, RTCTrackEvent};
 use rtc::peer_connection::message::{RTCMessage, TaggedRTCMessage};
 use rtc::peer_connection::sdp::RTCSessionDescription;
 use rtc::peer_connection::state::{RTCIceConnectionState, RTCPeerConnectionState};
 use rtc::peer_connection::transport::{
-    CandidateConfig, CandidateHostConfig, CandidateServerReflexiveConfig, RTCDtlsRole,
-    RTCIceCandidate, RTCIceCandidateInit, RTCIceServer,
+    CandidateConfig, CandidateHostConfig, CandidateRelayConfig, CandidateServerReflexiveConfig,
+    RTCDtlsRole, RTCIceCandidate, RTCIceCandidateInit, RTCIceServer,
 };
 use rtc::peer_connection::{RTCPeerConnection, RTCPeerConnectionBuilder};
 use rtc::rtcp::payload_feedbacks::full_intra_request::FullIntraRequest;
@@ -63,6 +65,12 @@ use tokio::task::JoinHandle;
 
 pub use rtc;
 
+#[cfg(feature = "test-turn")]
+pub mod test_turn;
+mod turn;
+
+pub use turn::{TurnServer, parse_turn_uri};
+
 /// Errors from the driver.
 #[derive(Debug, thiserror::Error)]
 pub enum RtcError {
@@ -74,6 +82,23 @@ pub enum RtcError {
     UnspecifiedBind(SocketAddr),
     #[error("the connection task has stopped")]
     Stopped,
+    #[error("TURN server address: {0}")]
+    TurnUri(String),
+    /// No relay candidate could be gathered although [`IcePolicy::Relay`] needs one.
+    #[error("TURN: {0}")]
+    Turn(String),
+}
+
+/// Which local candidates a connection uses (W3C `iceTransportPolicy`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum IcePolicy {
+    /// Host, server-reflexive and (with [`RtcConfig::turn`]) relay candidates.
+    #[default]
+    All,
+    /// Relay candidates only: every datagram goes through the configured TURN server, so the
+    /// peer sees that server's address, never ours. Needs [`RtcConfig::turn`]; a connection
+    /// whose allocation fails does not start.
+    Relay,
 }
 
 /// Media this connection sends and receives.
@@ -114,8 +139,8 @@ pub struct RtcConfig {
     /// The UDP socket to bind. Its address is the host candidate, so it must name an
     /// interface (`127.0.0.1:0` for loopback tests).
     pub bind: SocketAddr,
-    /// STUN / TURN servers handed to the engine's configuration (TURN gathering is not
-    /// implemented yet; see [`RtcConfig::stun_servers`] for server-reflexive candidates).
+    /// ICE servers recorded in the engine's configuration. The engine gathers nothing itself:
+    /// candidates come from [`RtcConfig::stun_servers`] and [`RtcConfig::turn`].
     pub ice_servers: Vec<RTCIceServer>,
     /// STUN servers (`host:port`, or `stun:host:port` URIs) to learn a server-reflexive
     /// candidate from before the connection starts. Unreachable servers are skipped after
@@ -123,6 +148,18 @@ pub struct RtcConfig {
     pub stun_servers: Vec<String>,
     /// How long STUN gathering may take in total.
     pub stun_timeout: Duration,
+    /// The user's own TURN server: a relay candidate is allocated on it before the connection
+    /// starts and released when it closes. With [`IcePolicy::All`] an unreachable server only
+    /// costs that candidate.
+    pub turn: Option<TurnServer>,
+    /// How long the TURN allocation may take.
+    pub turn_timeout: Duration,
+    /// The allocation is refreshed at least this often (and at half its lifetime). Short
+    /// enough to keep a NAT mapping towards the server alive while the relay carries no
+    /// traffic because a direct pair is selected.
+    pub turn_keepalive: Duration,
+    /// Which candidates are gathered and used.
+    pub ice_policy: IcePolicy,
     /// Receive transceivers.
     pub media: MediaConfig,
     /// When making an offer, open a data channel with this label first.
@@ -145,6 +182,10 @@ impl Default for RtcConfig {
             ice_servers: Vec::new(),
             stun_servers: Vec::new(),
             stun_timeout: Duration::from_millis(1500),
+            turn: None,
+            turn_timeout: Duration::from_secs(5),
+            turn_keepalive: Duration::from_secs(25),
+            ice_policy: IcePolicy::All,
             media: MediaConfig::default(),
             data_channel: None,
             answering_dtls_role: None,
@@ -246,6 +287,7 @@ impl FrameSender {
 pub struct RtcHandle {
     commands: mpsc::UnboundedSender<Command>,
     local_addr: SocketAddr,
+    relayed_addr: Option<SocketAddr>,
     task: JoinHandle<()>,
 }
 
@@ -253,6 +295,11 @@ impl RtcHandle {
     /// The address of the connection's UDP socket.
     pub fn local_addr(&self) -> SocketAddr {
         self.local_addr
+    }
+
+    /// The address allocated on the TURN server (the relay candidate), when there is one.
+    pub fn relayed_addr(&self) -> Option<SocketAddr> {
+        self.relayed_addr
     }
 
     fn send(&self, command: Command) -> Result<(), RtcError> {
@@ -341,9 +388,35 @@ pub async fn spawn(config: RtcConfig) -> Result<(RtcHandle, mpsc::Receiver<RtcEv
     if config.bind.ip().is_unspecified() {
         return Err(RtcError::UnspecifiedBind(config.bind));
     }
+    let relay_only = config.ice_policy == IcePolicy::Relay;
+    if relay_only && config.turn.is_none() {
+        return Err(RtcError::Turn(
+            "relay-only connections need a TURN server".into(),
+        ));
+    }
     let socket = UdpSocket::bind(config.bind).await?;
     let local_addr = socket.local_addr()?;
-    let srflx = gather_srflx(&socket, &config.stun_servers, config.stun_timeout).await;
+    // Relay-only talks to nobody but the TURN server: no STUN either.
+    let srflx = if relay_only {
+        Vec::new()
+    } else {
+        gather_srflx(&socket, &config.stun_servers, config.stun_timeout).await
+    };
+    let relay = match &config.turn {
+        Some(server) => {
+            match turn::allocate(&socket, server, config.turn_timeout, config.turn_keepalive).await
+            {
+                Ok(relay) => Some(relay),
+                Err(err) if relay_only => return Err(err),
+                Err(err) => {
+                    tracing::warn!(%err, "no relay candidate; continuing with direct candidates");
+                    None
+                }
+            }
+        }
+        None => None,
+    };
+    let relayed_addr = relay.as_ref().map(turn::Relay::relayed);
     let (pc, senders) = build_peer_connection(&config)?;
 
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
@@ -362,15 +435,18 @@ pub async fn spawn(config: RtcConfig) -> Result<(RtcHandle, mpsc::Receiver<RtcEv
             .map(|(kind, id)| (kind, (id, None)))
             .collect(),
         connected: false,
-        mdns_enabled: config.mdns,
+        mdns_enabled: config.mdns && !relay_only,
         mdns: None,
         mdns_answers: 0,
+        relay,
+        relay_only,
     };
     let task = tokio::spawn(driver.run(cmd_rx));
     Ok((
         RtcHandle {
             commands: cmd_tx,
             local_addr,
+            relayed_addr,
             task,
         },
         ev_rx,
@@ -464,16 +540,24 @@ fn build_peer_connection(config: &RtcConfig) -> Result<(RTCPeerConnection, Sende
     )?;
     let registry = register_default_interceptors(Registry::new(), &mut media_engine)?;
 
-    let mut settings = SettingEngineBuilder::new().with_multicast_dns_mode(if config.mdns {
-        MulticastDnsMode::QueryOnly
-    } else {
-        MulticastDnsMode::Disabled
-    });
+    let relay_only = config.ice_policy == IcePolicy::Relay;
+    // A relay cannot reach a `.local` host on the peer's network: no mDNS when relay-only.
+    let mut settings =
+        SettingEngineBuilder::new().with_multicast_dns_mode(if config.mdns && !relay_only {
+            MulticastDnsMode::QueryOnly
+        } else {
+            MulticastDnsMode::Disabled
+        });
     if let Some(role) = config.answering_dtls_role {
         settings = settings.with_answering_dtls_role(role);
     }
     let rtc_config = RTCConfigurationBuilder::new()
         .with_ice_servers(config.ice_servers.clone())
+        .with_ice_transport_policy(if relay_only {
+            RTCIceTransportPolicy::Relay
+        } else {
+            RTCIceTransportPolicy::All
+        })
         .build();
 
     let mut pc = RTCPeerConnectionBuilder::new()
@@ -527,6 +611,10 @@ struct Driver {
     mdns: Option<UdpSocket>,
     /// mDNS datagrams received (answers to our queries, and other hosts' traffic).
     mdns_answers: u64,
+    /// The allocation on the user's TURN server, when there is one.
+    relay: Option<turn::Relay>,
+    /// [`IcePolicy::Relay`]: nothing is sent to, or accepted from, anyone but the TURN server.
+    relay_only: bool,
 }
 
 /// The longest the loop sleeps when the engine names no deadline.
@@ -540,6 +628,9 @@ impl Driver {
             .err()
             .map(|e| e.to_string());
         let _ = self.pc.close();
+        if let Some(relay) = self.relay.take() {
+            relay.release(&self.socket).await;
+        }
         let _ = self.events.send(RtcEvent::Closed { error }).await;
     }
 
@@ -557,11 +648,19 @@ impl Driver {
             self.drain_reads().await;
 
             let now = Instant::now();
+            let relay_deadline = self.relay.as_mut().and_then(turn::Relay::poll_timeout);
+            if let Some(relay) = self.relay.as_mut()
+                && relay_deadline.is_some_and(|t| t <= now)
+            {
+                relay.handle_timeout(now);
+                continue;
+            }
             let deadline = self.pc.poll_timeout().unwrap_or(now + IDLE_WAKE);
             if deadline <= now {
                 self.pc.handle_timeout(now)?;
                 continue;
             }
+            let deadline = relay_deadline.map_or(deadline, |t| t.min(deadline));
 
             tokio::select! {
                 biased;
@@ -570,10 +669,20 @@ impl Driver {
                     Some(command) => self.handle_command(command).await?,
                 },
                 _ = tokio::time::sleep_until(deadline.into()) => {
-                    self.pc.handle_timeout(Instant::now())?;
+                    // The loop's next pass runs whichever timer is due.
                 }
                 received = self.socket.recv_from(&mut buf) => {
                     let (n, peer_addr) = received?;
+                    if let Some(relay) = self.relay.as_mut()
+                        && relay.server() == peer_addr
+                    {
+                        relay.handle_datagram(&buf[..n]);
+                        continue;
+                    }
+                    if self.relay_only {
+                        // Answering would show the sender our address.
+                        continue;
+                    }
                     // A malformed or unexpected datagram is the peer's problem, not ours.
                     if let Err(err) = self.pc.handle_read(TaggedBytesMut {
                         now: Instant::now(),
@@ -618,7 +727,17 @@ impl Driver {
     }
 
     async fn flush_writes(&mut self) {
+        self.deliver_relayed();
         while let Some(msg) = self.pc.poll_write() {
+            if let Some(relay) = self.relay.as_mut()
+                && msg.transport.local_addr == relay.relayed()
+            {
+                relay.send(Instant::now(), msg.message, msg.transport.peer_addr);
+                continue;
+            }
+            if self.relay_only {
+                continue;
+            }
             if msg.transport.peer_addr.port() == MDNS_PORT
                 && msg.transport.peer_addr.ip().is_multicast()
             {
@@ -636,6 +755,37 @@ impl Driver {
                 .await
             {
                 tracing::debug!(peer = %msg.transport.peer_addr, %err, "send failed");
+            }
+        }
+        if let Some(relay) = self.relay.as_mut() {
+            while let Some((data, to)) = relay.poll_write() {
+                if let Err(err) = self.socket.send_to(&data, to).await {
+                    tracing::debug!(%err, "send to the TURN server failed");
+                }
+            }
+        }
+    }
+
+    /// Hand the engine what peers sent to the relayed address (it arrives there as if on a
+    /// socket bound to that address).
+    fn deliver_relayed(&mut self) {
+        let Some(relay) = self.relay.as_mut() else {
+            return;
+        };
+        let now = Instant::now();
+        let local_addr = relay.relayed();
+        for (peer_addr, message) in relay.poll_inbound(now) {
+            if let Err(err) = self.pc.handle_read(TaggedBytesMut {
+                now,
+                transport: TransportContext {
+                    local_addr,
+                    peer_addr,
+                    ecn: None,
+                    transport_protocol: TransportProtocol::UDP,
+                },
+                message,
+            }) {
+                tracing::debug!(%peer_addr, %err, "relayed datagram rejected");
             }
         }
     }
@@ -904,8 +1054,30 @@ impl Driver {
         }
     }
 
-    /// The host candidate (the bound socket) and the server-reflexive ones learned from STUN.
+    /// The host candidate (the bound socket), the server-reflexive ones learned from STUN
+    /// and the relay candidate; the relay candidate alone when relay-only.
     fn add_local_candidates(&mut self) -> Result<(), RtcError> {
+        if let Some(relayed) = self.relay.as_ref().map(turn::Relay::relayed) {
+            // No related address: it would name the address the relay exists to hide.
+            let candidate = CandidateRelayConfig {
+                base_config: CandidateConfig {
+                    network: "udp".to_owned(),
+                    address: relayed.ip().to_string(),
+                    port: relayed.port(),
+                    component: 1,
+                    ..Default::default()
+                },
+                rel_addr: if relayed.is_ipv4() { "0.0.0.0" } else { "::" }.to_owned(),
+                rel_port: 0,
+                ..Default::default()
+            }
+            .new_candidate_relay()?;
+            let init = RTCIceCandidate::from(&candidate).to_json()?;
+            self.pc.add_local_candidate(init)?;
+        }
+        if self.relay_only {
+            return Ok(());
+        }
         self.add_host_candidate()?;
         for addr in self.srflx.clone() {
             let candidate = CandidateServerReflexiveConfig {

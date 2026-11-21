@@ -4,7 +4,9 @@
 //! direct data channels, `parolnet-desktop [--relay wss://host/ws] [--data-dir DIR]`.
 //!
 //! `--call-check` places a call from a headless core with the window's call media and reports
-//! what was decoded (`call_check.rs`).
+//! what was decoded (`call_check.rs`). `--media-check` runs the media checks that need no
+//! network and no device: echo cancellation (ERLE) and a synthetic camera through the VP8
+//! encoder and decoder (`media_check.rs`).
 //!
 //! With `--spike` (or any of the spike's flags below) it is the M0 spike: a GPUI window that
 //! shows a VP8 stream received from a peer (Chromium in the tests) through `webrtc-rs-rtc`,
@@ -29,11 +31,10 @@ mod chat;
 mod frame;
 #[cfg(target_os = "macos")]
 mod macos;
+mod media_check;
 mod receiver;
-mod testpattern;
+mod settings;
 mod ui;
-mod vp8;
-mod vp8enc;
 
 use std::net::SocketAddr;
 use std::sync::atomic::Ordering;
@@ -117,7 +118,9 @@ fn main() -> anyhow::Result<()> {
         .with_writer(std::io::stderr)
         .init();
     let raw: Vec<String> = std::env::args().skip(1).collect();
-    if raw.iter().any(|a| a == "--call-check") {
+    if raw.iter().any(|a| a == "--media-check") {
+        media_check::main()
+    } else if raw.iter().any(|a| a == "--call-check") {
         call_check::main(&raw)
     } else if raw.iter().any(|a| SPIKE_FLAGS.contains(&a.as_str())) {
         spike_main()
@@ -128,7 +131,7 @@ fn main() -> anyhow::Result<()> {
 
 fn spike_main() -> anyhow::Result<()> {
     let args = parse_args()?;
-    eprintln!("libvpx {}", vp8::libvpx_version());
+    eprintln!("libvpx {}", parolnet_media::vp8::libvpx_version());
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)

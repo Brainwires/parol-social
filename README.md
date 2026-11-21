@@ -38,7 +38,8 @@ relying on it.
   (registration, WebRTC offer / answer / ICE between two online contacts, presence, STUN URIs); no
   message, file, group, call or decoy traffic transits or is stored on it
   ([PNP-001 §10.5](specs/PNP-001-wire-protocol.md)). Content travels peer to peer, so a contact you
-  connect to sees your IP address unless you add your own TURN server; messages to an offline
+  connect to sees your IP address unless you relay through your own TURN server (Settings; the
+  relay never offers one and the apps have none built in); messages to an offline
   contact wait on your device. Operators who want store-and-forward, tokens, TURN credentials or
   federation run the relay profile (`SIGNALING_ONLY=0`).
 - **Metadata, honestly stated.** Your home relay learns your `PeerId`, your IP address, when you are
@@ -71,9 +72,11 @@ apps/desktop (GPUI)      pwa/ (JS + wasm)        later: iOS / Android shells (Un
 | `parolnet-wasm` | Browser bindings for the PWA | exists |
 | `parolnet-relay-server` | Axum relay: signaling-only by default (register, SDP / ICE, presence, STUN URIs); opt-in relay profile with store-and-forward, federation, TURN credentials | exists |
 | `parolnet-rtc` | Async driver for the sans-I/O [`webrtc-rs-rtc`](https://github.com/Brainwires/webrtc-rs-rtc) engine (native): host + STUN candidates, data channels, RTP | M1 in progress |
+| `parolnet-store` | Encrypted native persistence: SQLite with SQLCipher (bundled), database key in the OS keychain (`keyring`) or an owner-only key file on machines without one; identity, contacts, sessions, messages, sender queue, settings; schema migrations, incremental transactional writes, import of the earlier plaintext data directory, wipe | M1 |
 | `parolnet-app` | Headless client core: identity, PWA-compatible pairing, signaling-only relay client, a direct data channel per contact bound to the E2EE session (DTLS fingerprints, PNP-001 §10.5.1), 1:1 encrypted chat, sender-side queue, 1:1 voice / video calls | M1 |
-| `apps/desktop` | GPUI desktop client: contacts, pairing, chat (UI v0); the M0 video spike behind `--spike` | M1 first slice |
-| `parolnet-media`, `-call`, `-transfer`, `-store`, `-simnet` | Media, calls, PNP-010 transfer, storage, app core, network simulator | M1 |
+| `apps/desktop` | GPUI desktop client: contacts, pairing, chat (UI v0), 1:1 calls with camera, echo cancellation and device menus; the M0 video spike behind `--spike` | M1 |
+| `parolnet-media` | Call media for native clients (no dependency on the rest of the workspace): frames, the capture traits and synthetic sources, resampling, Opus, echo cancellation / noise suppression / gain (AEC3, pure Rust), the audio duplex path; behind opt-in features, VP8 through libvpx, microphone and speakers (cpal), camera capture (nokhwa) | M1 |
+| `parolnet-call`, `-transfer`, `-simnet` | Calls, PNP-010 transfer, network simulator | M1 |
 | `parolnet-mls`, `-sframe`, `-sfu` | MLS groups and devices, SFrame, the SFU | M2 |
 
 Media: Opus audio with echo cancellation (AEC3), VP8 video (VP9 / AV1 later), DTLS-SRTP end to end

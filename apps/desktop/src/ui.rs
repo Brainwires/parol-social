@@ -32,6 +32,8 @@ pub struct VideoView {
     first_frame_at: Option<Instant>,
     exit_after: Option<Duration>,
     path: &'static str,
+    /// A bare tile (the self-view): no status line, nothing printed.
+    preview: bool,
 }
 
 impl VideoView {
@@ -63,7 +65,15 @@ impl VideoView {
             first_frame_at: None,
             exit_after,
             path: "none yet",
+            preview: false,
         }
+    }
+
+    /// A bare tile for the self-view: the picture only.
+    pub(crate) fn preview(slot: FrameSlot, cx: &mut Context<Self>) -> Self {
+        let mut view = Self::new(slot, Arc::default(), None, cx);
+        view.preview = true;
+        view
     }
 
     fn tick(&mut self, cx: &mut Context<Self>) {
@@ -113,7 +123,9 @@ impl VideoView {
         self.presented += 1;
         if self.first_frame_at.is_none() {
             self.first_frame_at = Some(Instant::now());
-            println!("spike-window first-frame path={}", self.path);
+            if !self.preview {
+                println!("spike-window first-frame path={}", self.path);
+            }
         }
     }
 }
@@ -138,9 +150,12 @@ impl Render for VideoView {
                 .items_center()
                 .justify_center()
                 .text_color(rgb(0x9a9a9a))
-                .child("no video yet")
+                .child(if self.preview { "" } else { "no video yet" })
                 .into_any_element(),
         };
+        if self.preview {
+            return div().size_full().bg(rgb(0x101010)).child(tile);
+        }
         let line = format!(
             "{status} | {width}x{height} | decoded {} | presented {} | {}",
             self.stats.decoded.load(Ordering::Relaxed),

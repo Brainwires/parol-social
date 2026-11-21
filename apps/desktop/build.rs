@@ -1,58 +1,15 @@
-//! Links libvpx (BSD-3-Clause): the VP8 decoder (hand-written binding, `src/vp8.rs`) and the
-//! encoder shim `src/vp8enc.c`, compiled here against the same libvpx's headers.
-//!
-//! `VPX_LIB_DIR` (+ optional `VPX_STATIC=1`, and `VPX_INCLUDE_DIR` for the shim) overrides
-//! discovery. Otherwise pkg-config on macOS / Linux (Homebrew `libvpx`, apt `libvpx-dev`) and
-//! vcpkg on Windows (`vcpkg install libvpx:x64-windows-static-md`, or `arm64-windows-static-md`).
-
-use std::path::PathBuf;
+//! macOS: embed `macos/Info.plist` in the executable (the `__TEXT,__info_plist` section), so
+//! that the unbundled binary carries the camera and microphone usage strings. macOS ends a
+//! process that asks for the camera or the microphone without them. An app bundle's own
+//! `Info.plist` (packaging) takes the same keys from the same file.
 
 fn main() {
-    println!("cargo:rerun-if-env-changed=VPX_LIB_DIR");
-    println!("cargo:rerun-if-env-changed=VPX_STATIC");
-    println!("cargo:rerun-if-env-changed=VPX_INCLUDE_DIR");
-    println!("cargo:rerun-if-changed=src/vp8enc.c");
-
-    let includes = link_libvpx();
-    let mut shim = cc::Build::new();
-    shim.file("src/vp8enc.c").warnings(true);
-    for dir in includes {
-        shim.include(dir);
-    }
-    shim.compile("pn_vp8enc");
-}
-
-/// Emit the link flags for libvpx; returns the include directories for the shim.
-fn link_libvpx() -> Vec<PathBuf> {
-    if let Ok(dir) = std::env::var("VPX_LIB_DIR") {
-        println!("cargo:rustc-link-search=native={dir}");
-        let kind = if std::env::var("VPX_STATIC").is_ok_and(|v| v == "1") {
-            "static"
-        } else {
-            "dylib"
-        };
-        println!("cargo:rustc-link-lib={kind}=vpx");
-        return std::env::var("VPX_INCLUDE_DIR")
-            .map(|d| vec![PathBuf::from(d)])
-            .unwrap_or_default();
-    }
-
-    // The target's OS, not the build host's (they differ when cross-checking).
-    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
-        return match vcpkg::Config::new().find_package("libvpx") {
-            Ok(lib) => lib.include_paths,
-            Err(err) => panic!(
-                "libvpx not found ({err}): `vcpkg install libvpx:<triplet>-static-md` or set \
-                 VPX_LIB_DIR"
-            ),
-        };
-    }
-
-    match pkg_config::Config::new().probe("vpx") {
-        Ok(lib) => lib.include_paths,
-        Err(err) => panic!(
-            "libvpx not found ({err}): install it (brew install libvpx / apt install libvpx-dev) \
-             or set VPX_LIB_DIR"
-        ),
+    println!("cargo:rerun-if-changed=build.rs");
+    println!("cargo:rerun-if-changed=macos/Info.plist");
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("macos") {
+        let dir = std::env::var("CARGO_MANIFEST_DIR").unwrap_or_else(|_| ".".into());
+        println!(
+            "cargo:rustc-link-arg-bins=-Wl,-sectcreate,__TEXT,__info_plist,{dir}/macos/Info.plist"
+        );
     }
 }
