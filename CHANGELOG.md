@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed — Double Ratchet: the send counter cannot wrap and `encrypt` zeroizes its message key (`parolnet-crypto`)
+- `DoubleRatchetSession::encrypt` returns an error when `send_n` is `u32::MAX` in place of overflowing (a panic in debug builds; in release message number 0 again in the same chain, so two messages with one `(ratchet_key, message_number)`). The check comes before the chain key moves: a refused encrypt changes nothing, and the chain is usable again after the peer's next ratchet key. `decrypt` refuses a header with message number `u32::MAX` before it does anything else, where `recv_n + 1` overflowed ahead of the AEAD check. No spec text changes; the limit is not yet a clause of PNP-002.
+- `encrypt` held its message key in a plain array that was never erased, on success and on every error path. It is zeroized on drop now, as `decrypt`'s already was (security invariant 2).
+
 ### Fixed — the sender-key chain index cannot wrap (`parolnet-crypto`)
 - `SenderKeyState::encrypt` returns an error when the chain index is `u32::MAX` in place of overflowing (a panic in debug builds, a wrapped index in release), and `decrypt` refuses a message claiming index `u32::MAX`, which would have wrapped the receiver's index the same way. A failed encrypt at the limit changes nothing; the sender has to rotate.
 

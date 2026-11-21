@@ -528,6 +528,17 @@ impl RatchetSession for DoubleRatchetSession {
         plaintext: &[u8],
         extra_aad: &[u8],
     ) -> Result<(RatchetHeader, Vec<u8>), CryptoError> {
+        // The message number after this one must exist: `send_n` is the low four bytes of
+        // the nonce and must not wrap within a sending chain. A chain at u32::MAX is used up
+        // until the peer's next ratchet key starts a new one. Checked before the chain moves,
+        // so a refused encrypt changes nothing.
+        let next_send_n = self
+            .send_n
+            .checked_add(1)
+            .ok_or(CryptoError::RatchetError {
+                reason: "sending chain exhausted".into(),
+            })?;
+
         let send_ck = self
             .send_chain_key
             .as_mut()
@@ -535,7 +546,7 @@ impl RatchetSession for DoubleRatchetSession {
                 reason: "no sending chain key established".into(),
             })?;
 
-        let message_key = Self::chain_ratchet(send_ck)?;
+        let message_key = Zeroizing::new(Self::chain_ratchet(send_ck)?);
 
         let ratchet_pub = self
             .our_ratchet_public_key()
@@ -550,12 +561,12 @@ impl RatchetSession for DoubleRatchetSession {
         };
 
         // Encrypt with ChaCha20-Poly1305
-        let cipher = ChaCha20Poly1305Cipher::new(&message_key)?;
+        let cipher = ChaCha20Poly1305Cipher::new(&message_key[..])?;
         let nonce = Self::build_nonce(&ratchet_pub, self.send_n);
         let aad = build_aad(&header, extra_aad);
         let ciphertext = cipher.encrypt(&nonce, plaintext, &aad)?;
 
-        self.send_n += 1;
+        self.send_n = next_send_n;
 
         Ok((header, ciphertext))
     }
@@ -581,6 +592,16 @@ impl RatchetSession for DoubleRatchetSession {
             self.erase_skipped(index);
             return Ok(plaintext);
         }
+
+        // No sender emits message number u32::MAX (`encrypt` refuses at that point), and
+        // accepting it would wrap `recv_n`. The header is not authenticated yet.
+        let next_recv_n =
+            header
+                .message_number
+                .checked_add(1)
+                .ok_or(CryptoError::RatchetError {
+                    reason: "message number out of range".into(),
+                })?;
 
         // Everything below runs on a copy; `self` changes only in `commit`.
         let mut attempt = ReceiveAttempt::begin(self);
@@ -613,7 +634,7 @@ impl RatchetSession for DoubleRatchetSession {
                 reason: "no receiving chain key".into(),
             })?;
         let message_key = Zeroizing::new(Self::chain_ratchet(recv_ck)?);
-        attempt.recv_n += 1;
+        attempt.recv_n = next_recv_n;
 
         // Decrypt, and only then commit
         let plaintext =
@@ -1426,5 +1447,78 @@ mod tests {
         bob.erase_skipped(0);
         assert_eq!(unsafe { std::ptr::read_volatile(slot) }, [0u8; SIZE]);
         assert_eq!(stored_numbers(&bob), [2, 3, 4]);
+    }
+
+    // ── Counter limits ──────────────────────────────────────────────────
+    //
+    // `send_n` is a `u32` and the low four bytes of the nonce. At its limit the session
+    // refuses, in place of wrapping (a panic in debug builds, message number 0 again in
+    // release).
+
+    /// A pair whose Alice-to-Bob chain is established and has one message number left.
+    fn pair_near_the_counter_limit() -> (DoubleRatchetSession, DoubleRatchetSession) {
+        let (mut alice, mut bob) = setup_session_pair();
+        let (h, c) = alice.encrypt(b"first", &[]).unwrap();
+        assert_eq!(bob.decrypt(&h, &c, &[]).unwrap(), b"first");
+        alice.send_n = u32::MAX - 1;
+        bob.recv_n = u32::MAX - 1;
+        (alice, bob)
+    }
+
+    #[test]
+    fn encrypt_refuses_at_the_send_counter_limit() {
+        let (mut alice, mut bob) = pair_near_the_counter_limit();
+
+        // The last message number a chain may use.
+        let (header, ct) = alice.encrypt(b"last", &[]).unwrap();
+        assert_eq!(header.message_number, u32::MAX - 1);
+        assert_eq!(alice.send_n, u32::MAX);
+
+        // At the limit: an error, and the session is exactly what it was.
+        let before = snapshot(&alice);
+        assert!(alice.encrypt(b"one too many", &[]).is_err());
+        assert!(alice.encrypt(b"still", &[]).is_err());
+        assert_eq!(snapshot(&alice), before);
+
+        // The last message decrypts, and a reply (a DH ratchet step, which starts a new
+        // sending chain at 0) puts the sender back in business.
+        assert_eq!(bob.decrypt(&header, &ct, &[]).unwrap(), b"last");
+        assert_eq!(bob.recv_n, u32::MAX);
+        let (h, c) = bob.encrypt(b"reply", &[]).unwrap();
+        assert_eq!(alice.decrypt(&h, &c, &[]).unwrap(), b"reply");
+        assert_eq!(alice.previous_send_n, u32::MAX);
+        let (h, c) = alice.encrypt(b"again", &[]).unwrap();
+        assert_eq!(h.message_number, 0);
+        assert_eq!(bob.decrypt(&h, &c, &[]).unwrap(), b"again");
+    }
+
+    #[test]
+    fn decrypt_refuses_a_message_number_at_the_limit() {
+        let (mut alice, mut bob) = pair_near_the_counter_limit();
+        let (last, last_ct) = alice.encrypt(b"last", &[]).unwrap();
+
+        // What a sender that ignores the limit would emit next: message number u32::MAX
+        // under the next key of the same chain.
+        let ratchet_pub = alice.our_ratchet_public_key().unwrap();
+        let message_key =
+            DoubleRatchetSession::chain_ratchet(alice.send_chain_key.as_mut().unwrap()).unwrap();
+        let header = RatchetHeader {
+            ratchet_key: ratchet_pub,
+            previous_chain_length: 0,
+            message_number: u32::MAX,
+        };
+        let ct = ChaCha20Poly1305Cipher::new(&message_key)
+            .unwrap()
+            .encrypt(
+                &DoubleRatchetSession::build_nonce(&ratchet_pub, u32::MAX),
+                b"wrapped",
+                &build_aad(&header, &[]),
+            )
+            .unwrap();
+
+        let before = snapshot(&bob);
+        assert!(bob.decrypt(&header, &ct, &[]).is_err());
+        assert_eq!(snapshot(&bob), before);
+        assert_eq!(bob.decrypt(&last, &last_ct, &[]).unwrap(), b"last");
     }
 }
