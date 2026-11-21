@@ -30,6 +30,7 @@ mod frame;
 #[cfg(target_os = "macos")]
 mod macos;
 mod receiver;
+mod settings;
 mod testpattern;
 mod ui;
 mod vp8;
