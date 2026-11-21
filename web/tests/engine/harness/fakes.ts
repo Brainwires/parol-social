@@ -9,6 +9,7 @@ import type {
   MediaTrack,
   PeerConfig,
   PeerConnection,
+  RtpSender,
   SessionDescription,
   Socket,
 } from "../../../src/engine/platform.ts";
@@ -464,6 +465,18 @@ export class FakePc implements PeerConnection {
   addTrack(track: MediaTrack, stream: MediaStreamLike): unknown {
     this.senders.push({ track, stream });
     return {};
+  }
+
+  getSenders(): RtpSender[] {
+    return this.senders.map((sender) => ({
+      get track() {
+        return sender.track;
+      },
+      replaceTrack: (track: MediaTrack | null) => {
+        if (track) sender.track = track;
+        return Promise.resolve();
+      },
+    }));
   }
 
   setState(state: string): void {

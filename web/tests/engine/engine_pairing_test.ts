@@ -327,3 +327,81 @@ Deno.test(
     assertEquals((await b.engine.messages(a.id))[0].state, "Queued");
   }),
 );
+
+Deno.test(
+  "contacts: removing one deletes its history, queue and session, and leaves the others",
+  withWorld(async (w) => {
+    const a = await w.device("a");
+    const b = await w.device("b");
+    const c = await w.device("c");
+    await w.pair(a, b);
+    await w.pair(a, c);
+    await a.engine.sendText(b.id, "to b");
+    await b.engine.sendText(a.id, "from b");
+    await a.engine.sendText(c.id, "to c");
+    await w.settle();
+    // Something still waiting for b.
+    w.relay.socketOf(b.id)?.drop();
+    for (const pc of b.pcs) pc.close();
+    await w.settle();
+    assertEquals((await a.engine.sendText(b.id, "waits")).state, "Queued");
+    // A code on screen while the contact is removed.
+    await a.engine.createPairingCode();
+
+    await a.engine.removeContact(b.id);
+    await w.settle();
+
+    assertEquals(a.eventsOf("ContactRemoved"), [{ kind: "ContactRemoved", peerId: b.id }]);
+    assertEquals(a.engine.snapshot().contacts.map((v) => v.contact.peerId), [c.id]);
+    assertEquals(await a.engine.messages(b.id), []);
+    assertEquals(a.wasm.has_session(b.id), false);
+    assertEquals(a.wasm.has_session(c.id), true);
+    assertEquals(a.wasm.get_peer_id(), a.id, "the identity is the same");
+    assertEquals(await a.storage.get("contacts", b.id), undefined);
+    assertEquals(await a.storage.get("contactState", b.id), undefined);
+    assertEquals(await a.storage.getAllByPeer("messages", b.id), []);
+    assertEquals(await a.storage.getAllByPeer("outbox", b.id), []);
+    const saved = await a.storage.get<{ json: string }>("sessions", "blob");
+    assertEquals(Object.keys(JSON.parse(saved!.json)), [c.id]);
+    // Without `remove_session` in the core the identity was reloaded: the shown code is gone.
+    assertEquals(a.engine.snapshot().pairing, null);
+
+    // The other contact still works, both ways.
+    await a.engine.sendText(c.id, "still here");
+    await c.engine.sendText(a.id, "so am I");
+    await w.settle();
+    assertEquals((await a.engine.messages(c.id)).map((m) => m.text), [
+      "to c",
+      "still here",
+      "so am I",
+    ]);
+    assertEquals((await c.engine.messages(a.id)).at(-2)?.text, "still here");
+
+    // The removed contact is a stranger again: nothing it sends is accepted.
+    const err = await assertRejects(() => a.engine.sendText(b.id, "x"), EngineError);
+    assertEquals(err.code, "UnknownContact");
+    const again = await assertRejects(() => a.engine.removeContact(b.id), EngineError);
+    assertEquals(again.code, "UnknownContact");
+
+    // And survives a restart.
+    const a2 = await w.restart(a);
+    assertEquals(a2.engine.snapshot().contacts.map((v) => v.contact.peerId), [c.id]);
+    assertEquals(a2.wasm.has_session(b.id), false);
+  }),
+);
+
+Deno.test(
+  "contacts: a removed contact can be added again with a new code",
+  withWorld(async (w) => {
+    const a = await w.device("a");
+    const b = await w.device("b");
+    await w.pair(a, b);
+    await a.engine.removeContact(b.id);
+    await b.engine.removeContact(a.id);
+    await w.settle();
+    await w.pair(a, b);
+    await a.engine.sendText(b.id, "hello again");
+    await w.settle();
+    assertEquals((await b.engine.messages(a.id)).map((m) => m.text), ["hello again"]);
+  }),
+);

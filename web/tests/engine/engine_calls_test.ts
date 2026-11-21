@@ -4,7 +4,7 @@ import { assert, assertEquals, assertRejects } from "@std/assert";
 import { CALL_CONNECT_TIMEOUT_MS, CALL_RING_TIMEOUT_MS } from "../../src/engine/calls.ts";
 import { type CallInfo, EngineError } from "../../src/engine/types.ts";
 import { type CallSignal, callSignalJson, chatFrame } from "../../src/engine/wire.ts";
-import type { FakeTrack } from "./harness/fakes.ts";
+import { FakeStream, FakeTrack } from "./harness/fakes.ts";
 import { type Device, withWorld, type World } from "./harness/world.ts";
 
 async function pairWithMedia(w: World): Promise<[Device, Device]> {
@@ -271,5 +271,52 @@ Deno.test(
     assertEquals(callStates(a).at(-1), "Ended(HungUp)");
     assert(a.streams[0].tracks.every((t) => t.stopped));
     assert(callStates(b).at(-1)!.startsWith("Ended("));
+  }),
+);
+
+Deno.test(
+  "call: the camera can be replaced without renegotiation; the engine owns the new capture",
+  withWorld(async (w) => {
+    const [a, b] = await pairWithMedia(w);
+    const started = await a.engine.startCall(b.id, true);
+    await w.settle();
+    await b.engine.acceptCall(call(b).callId);
+    await w.settle();
+    assertEquals(call(a).state.kind, "Active");
+    const pc = callPcs(a)[0];
+    const before = pc.senders.find((s) => s.track.kind === "video")!.track as FakeTrack;
+    const signals = w.relay.signals.length;
+    const mediaEvents = a.eventsOf("CallMedia").length;
+
+    const back = new FakeStream([new FakeTrack("video")]);
+    await a.engine.replaceCamera(started.callId, back);
+    await w.settle();
+    assert(before.stopped, "the first camera is released");
+    assertEquals(pc.senders.find((s) => s.track.kind === "video")!.track, back.tracks[0]);
+    const local = a.engine.callMedia(started.callId)!.local!;
+    assertEquals(local.getVideoTracks(), [back.tracks[0]]);
+    assertEquals(local.getAudioTracks().length, 1, "the microphone stays");
+    assertEquals(a.eventsOf("CallMedia").length, mediaEvents + 1);
+    assertEquals(w.relay.signals.length, signals, "no signalling");
+
+    // A camera that is off stays off on the new track.
+    a.engine.setCameraOff(started.callId, true);
+    const third = new FakeStream([new FakeTrack("video")]);
+    await a.engine.replaceCamera(started.callId, third);
+    await w.settle();
+    assertEquals(third.tracks[0].enabled, false);
+
+    await a.engine.hangup(started.callId);
+    await w.settle();
+    assert(third.tracks[0].stopped, "released when the call ends");
+
+    // After the call: refused, and the offered capture is stopped.
+    const late = new FakeStream([new FakeTrack("video")]);
+    const err = await assertRejects(
+      () => a.engine.replaceCamera(started.callId, late),
+      EngineError,
+    );
+    assertEquals(err.code, "UnknownCall");
+    assert(late.tracks[0].stopped);
   }),
 );

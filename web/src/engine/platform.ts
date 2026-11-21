@@ -76,6 +76,8 @@ export interface WasmApi {
   version(): string;
   /** Clears the identity, sessions and pending bootstrap from wasm memory. */
   panic_wipe?(): void;
+  /** Not in the core yet (engine.md, "wasm API gaps"): drops one peer's session. */
+  remove_session?(peerIdHex: string): void;
 }
 
 // ── storage ──────────────────────────────────────────────────────
@@ -174,6 +176,12 @@ export interface MediaStreamLike {
   getVideoTracks(): MediaTrack[];
 }
 
+/** The part of `RTCRtpSender` the engine uses. */
+export interface RtpSender {
+  readonly track: MediaTrack | null;
+  replaceTrack(track: MediaTrack | null): Promise<void>;
+}
+
 /** The part of `RTCPeerConnection` the engine uses. */
 export interface PeerConnection {
   /** Read live at binding time (the interop driver overrides this getter). */
@@ -204,6 +212,8 @@ export interface PeerConnection {
   setRemoteDescription(desc: SessionDescription): Promise<void>;
   addIceCandidate(candidate: IceCandidateInit): Promise<void>;
   addTrack(track: MediaTrack, stream: MediaStreamLike): unknown;
+  /** Optional: switching cameras during a call needs it. */
+  getSenders?(): RtpSender[];
   close(): void;
 }
 

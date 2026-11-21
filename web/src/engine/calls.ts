@@ -15,6 +15,7 @@ import { hasCandidates } from "./ice.ts";
 import type {
   IceCandidateInit,
   MediaStreamLike,
+  MediaTrack,
   PeerConfig,
   PeerConnection,
   Platform,
@@ -36,6 +37,14 @@ export const CALL_CONNECT_TIMEOUT_MS = 30_000;
 const CALL_PENDING_ICE_MAX = 64;
 const CALL_GATHER_CAP_MS = 3_000;
 const CALL_LATE_ICE_MAX = 16;
+
+/**
+ * The `reason` of a call that failed because the microphone or camera could not be used
+ * (no permission, no device), so a UI can say that instead of "could not connect".
+ */
+export const CALL_FAILED_MEDIA = "the microphone or camera could not be used";
+
+class NoCapture extends Error {}
 
 export interface CallHost {
   platform: Platform;
@@ -74,6 +83,21 @@ interface Call {
   remote: MediaStreamLike | null;
   ringTimer: unknown;
   connectTimer: unknown;
+}
+
+/** The call's capture after a camera switch: the old audio tracks, the new video. */
+function mergedStream(audio: MediaTrack[], video: MediaStreamLike): MediaStreamLike {
+  const withTracks = video as MediaStreamLike & { addTrack?(track: MediaTrack): void };
+  if (typeof withTracks.addTrack === "function") {
+    for (const t of audio) withTracks.addTrack(t);
+    return video;
+  }
+  const tracks = [...audio, ...video.getVideoTracks()];
+  return {
+    getTracks: () => tracks,
+    getAudioTracks: () => audio,
+    getVideoTracks: () => video.getVideoTracks(),
+  };
 }
 
 export class CallManager {
@@ -298,6 +322,44 @@ export class CallManager {
     this.emit(c);
   }
 
+  async replaceCamera(callId: string, stream: MediaStreamLike): Promise<void> {
+    const stop = () => {
+      for (const t of stream.getTracks()) {
+        try {
+          t.stop();
+        } catch { /* already stopped */ }
+      }
+    };
+    const c = this.call;
+    const next = stream.getVideoTracks()[0];
+    const sender = c?.pc?.getSenders?.().find((s) => s.track?.kind === "video");
+    if (!c || c.callId !== callId || !c.video || !c.local || !next || !sender) {
+      stop();
+      throw new EngineError("UnknownCall", "that call has no camera to switch");
+    }
+    try {
+      await sender.replaceTrack(next);
+    } catch {
+      stop();
+      throw new EngineError("Media", "the camera could not be switched");
+    }
+    await this.inMailbox(() => {
+      if (!this.alive(c) || !c.local) {
+        stop();
+        return;
+      }
+      for (const t of c.local.getVideoTracks()) {
+        try {
+          t.stop();
+        } catch { /* already stopped */ }
+      }
+      // Our audio keeps flowing from the capture the call started with.
+      c.local = mergedStream(c.local.getAudioTracks(), stream);
+      this.applyToggles(c);
+      this.host.emit({ kind: "CallMedia", callId: c.callId });
+    });
+  }
+
   private applyToggles(c: Call): void {
     for (const t of c.local?.getAudioTracks() ?? []) t.enabled = !c.muted;
     for (const t of c.local?.getVideoTracks() ?? []) t.enabled = !c.cameraOff;
@@ -318,7 +380,7 @@ export class CallManager {
   // ── Media and SDP (outside the mailbox) ──────────────────────────
 
   private negotiate(c: Call): void {
-    this.setup(c).catch(() =>
+    this.setup(c).catch((e) =>
       this.host.internal(async () => {
         if (!this.alive(c)) return;
         if (c.descriptionSent || c.incoming) {
@@ -327,7 +389,10 @@ export class CallManager {
             callId: c.callId,
           });
         }
-        this.end(c, { kind: "Failed", reason: "the call could not be set up" });
+        this.end(c, {
+          kind: "Failed",
+          reason: e instanceof NoCapture ? CALL_FAILED_MEDIA : "the call could not be set up",
+        });
       })
     );
   }
@@ -347,7 +412,12 @@ export class CallManager {
   private async setup(c: Call): Promise<void> {
     const { host } = this;
     const media = host.platform.media!;
-    const stream = await media.getUserMedia({ audio: true, video: c.video });
+    let stream: MediaStreamLike;
+    try {
+      stream = await media.getUserMedia({ audio: true, video: c.video });
+    } catch {
+      throw new NoCapture();
+    }
     const pc = await this.inMailbox(() => {
       if (!this.alive(c)) {
         for (const t of stream.getTracks()) t.stop();

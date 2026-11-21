@@ -155,11 +155,24 @@ export type AppEvent =
     unread: number;
     lastActivityMs: number;
   }
-  /** Something the user should know (a failed pairing, a refused connection). */
-  | { kind: "Notice"; text: string }
+  /** Web-only: a contact and everything kept about it was removed (`removeContact`). */
+  | { kind: "ContactRemoved"; peerId: string }
+  /**
+   * Something the user should know. `code` says which, so a UI can use its own words;
+   * `text` is the English sentence. `peerId` is set when it is about one contact.
+   */
+  | { kind: "Notice"; code: NoticeCode; text: string; peerId?: string }
   | { kind: "Call"; call: CallInfo }
   /** Web-only: the local or remote stream of a call changed (see `Engine.callMedia`). */
   | { kind: "CallMedia"; callId: string };
+
+/**
+ * What a `Notice` is about:
+ * - `Storage`: a write to this device's storage failed;
+ * - `BindingFailed`: a direct connection failed its end-to-end check and was closed;
+ * - `TurnUnusable`: relay-only is on and the user's TURN server gave no path.
+ */
+export type NoticeCode = "Storage" | "BindingFailed" | "TurnUnusable";
 
 /** The user's own TURN server. The only TURN server the engine ever uses. */
 export interface TurnSettings {

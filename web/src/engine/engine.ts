@@ -384,6 +384,7 @@ export class Engine {
       if (e instanceof EngineError && e.code === "Storage") {
         this.emit({
           kind: "Notice",
+          code: "Storage",
           text: "Could not save to this device's storage.",
         });
       }
@@ -663,6 +664,83 @@ export class Engine {
       this.emit({ kind: "ContactUpdated", contact });
       return contact;
     });
+  }
+
+  /**
+   * Remove a contact and everything this device keeps about it: the history, what was
+   * waiting to be sent, and the session. Ends a call with it first. The contact is not
+   * told; to talk again both sides pair again.
+   */
+  removeContact(peerId: string): Promise<void> {
+    return this.post(async () => {
+      this.contactOrThrow(peerId);
+      const { wasm, storage } = this.p;
+      const call = this.calls.current();
+      if (call && call.peerId === peerId) await this.calls.hangup(call.callId);
+      this.dropConn(peerId);
+
+      // The saved sessions without this contact's.
+      let sessions: Record<string, string> = {};
+      try {
+        const json = wasm.export_sessions();
+        if (json) sessions = JSON.parse(json) as Record<string, string>;
+      } catch {
+        throw new EngineError("Crypto", "could not read the sessions");
+      }
+      delete sessions[peerId];
+      const sessionsJson = Object.keys(sessions).length > 0 ? JSON.stringify(sessions) : "";
+
+      const ops: WriteOp[] = [
+        { op: "delete", store: "contacts", key: peerId },
+        { op: "delete", store: "contactState", key: peerId },
+        {
+          op: "put",
+          store: "sessions",
+          value: { id: "blob", json: sessionsJson } satisfies SessionsRow,
+        },
+      ];
+      for (const m of await storage.getAllByPeer<MessageRow>("messages", peerId)) {
+        ops.push({ op: "delete", store: "messages", key: m.id });
+      }
+      for (const e of this.outbox) {
+        if (e.peerId === peerId) ops.push({ op: "delete", store: "outbox", key: e.id });
+      }
+      await this.save(ops);
+
+      this.sessionsJson = sessionsJson;
+      this.outbox = this.outbox.filter((e) => e.peerId !== peerId);
+      this.contacts.delete(peerId);
+      this.contactState.delete(peerId);
+      this.peers.delete(peerId);
+      this.probes.clear(peerId);
+      this.forgetSession(peerId, sessionsJson);
+      this.sendWatch();
+      this.emit({ kind: "ContactRemoved", peerId });
+    });
+  }
+
+  /**
+   * Take one session out of wasm memory. The core has no call for that yet, so without
+   * `remove_session` the identity is reloaded with the remaining sessions; that also drops
+   * a pairing code being shown, which is then closed. Storage no longer holds the session
+   * either way.
+   */
+  private forgetSession(peerId: string, remainingJson: string): void {
+    const { wasm } = this.p;
+    try {
+      if (typeof wasm.remove_session === "function") {
+        wasm.remove_session(peerId);
+        return;
+      }
+      if (typeof wasm.panic_wipe !== "function") return;
+      const secret = wasm.export_secret_key();
+      wasm.panic_wipe();
+      wasm.initialize_from_key(secret);
+      if (remainingJson) wasm.import_sessions(remainingJson);
+      this.closePairing(true);
+    } catch {
+      this.p.log.warn("[Engine] could not clear a removed contact's session from memory");
+    }
   }
 
   private activityOp(peer: string, unreadDelta: number | "reset"): WriteOp {
@@ -1247,6 +1325,8 @@ export class Engine {
       const name = this.contacts.get(peer)?.name ?? shortId(peer);
       this.emit({
         kind: "Notice",
+        code: "BindingFailed",
+        peerId: peer,
         text: `The direct connection to ${name} failed its end-to-end check. ` +
           "Someone between you, such as the relay, may be interfering; it was closed.",
       });
@@ -1855,6 +1935,7 @@ export class Engine {
     this.turnNoticeAt = now;
     this.emit({
       kind: "Notice",
+      code: "TurnUnusable",
       text: "Your TURN server cannot be used. Relay-only is on, so no connection is made " +
         "without it; check the server in Settings.",
     });
@@ -2176,6 +2257,16 @@ export class Engine {
   /** Switch our camera off or on (the track stays). */
   setCameraOff(callId: string, off: boolean): void {
     this.calls.setCameraOff(callId, off);
+  }
+
+  /**
+   * Send the video of `stream` instead of the camera the call started with (another
+   * camera, chosen by the UI). No renegotiation. The engine takes the stream over: it stops
+   * the old video track now and this one when the call ends. Rejects with `UnknownCall`
+   * when the call is over or has no video (the stream is stopped then).
+   */
+  replaceCamera(callId: string, stream: MediaStreamLike): Promise<void> {
+    return this.calls.replaceCamera(callId, stream);
   }
 
   // ── Settings ─────────────────────────────────────────────────────
