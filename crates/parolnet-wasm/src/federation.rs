@@ -116,15 +116,79 @@ impl AuthorityEndorsement {
     }
 }
 
+/// PNP-008-MUST-027 item 3: a descriptor older than this is rejected.
+pub const MAX_ENDORSED_DESCRIPTOR_AGE_SECS: u64 = 7 * 86400;
+
+impl RelayDescriptor {
+    /// The bytes the relay signs (mirror of
+    /// `parolnet_relay::directory::RelayDescriptor::signable_bytes`).
+    pub fn signable_bytes(&self) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(128);
+        buf.extend_from_slice(&self.peer_id.0);
+        buf.extend_from_slice(&self.identity_key);
+        buf.extend_from_slice(&self.x25519_key);
+        match self.addr {
+            std::net::SocketAddr::V4(a) => {
+                buf.push(4);
+                buf.extend_from_slice(&a.ip().octets());
+            }
+            std::net::SocketAddr::V6(a) => {
+                buf.push(6);
+                buf.extend_from_slice(&a.ip().octets());
+            }
+        }
+        buf.extend_from_slice(&self.addr.port().to_be_bytes());
+        buf.push(self.bandwidth_class);
+        buf.extend_from_slice(&self.uptime_secs.to_be_bytes());
+        buf.extend_from_slice(&self.timestamp.to_be_bytes());
+        buf.extend_from_slice(&self.bandwidth_estimate.to_be_bytes());
+        if let Some(ref next_key) = self.next_pubkey {
+            buf.push(1);
+            buf.extend_from_slice(next_key);
+        } else {
+            buf.push(0);
+        }
+        buf
+    }
+
+    /// Whether this descriptor is its relay's own statement (PNP-008-MUST-027
+    /// item 1): `peer_id` is the hash of `identity_key`, and `signature` is that
+    /// key's over [`Self::signable_bytes`].
+    pub fn verify_self_signature(&self) -> bool {
+        if PeerId::from_public_key(&self.identity_key) != self.peer_id {
+            return false;
+        }
+        let Ok(verifying_key) = VerifyingKey::from_bytes(&self.identity_key) else {
+            return false;
+        };
+        verifying_key
+            .verify(
+                &self.signable_bytes(),
+                &Signature::from_bytes(&self.signature),
+            )
+            .is_ok()
+    }
+}
+
 impl EndorsedDescriptor {
-    /// Check that at least `threshold` valid, non-expired endorsements exist
-    /// from distinct authorities in the trusted set.
+    /// Validate the descriptor (PNP-008-MUST-027: its relay's signature by the
+    /// key its PeerId is the hash of, and its age) and check that at least
+    /// `threshold` valid, non-expired endorsements of it exist from distinct
+    /// authorities in the trusted set. An endorsement names a PeerId only, so
+    /// the descriptor checks are what tie it to these keys and this address.
     pub fn verify_threshold(
         &self,
         authority_pubkeys: &[[u8; 32]],
         threshold: usize,
         now_secs: u64,
     ) -> Result<bool, String> {
+        if now_secs.saturating_sub(self.descriptor.timestamp) >= MAX_ENDORSED_DESCRIPTOR_AGE_SECS {
+            return Ok(false);
+        }
+        if !self.descriptor.verify_self_signature() {
+            return Ok(false);
+        }
+
         let mut valid_authorities: Vec<[u8; 32]> = Vec::new();
 
         for endorsement in &self.endorsements {
@@ -175,5 +239,72 @@ impl SignedDirectory {
         let signature = Signature::from_bytes(&self.signature);
         let signable = self.signable_bytes();
         Ok(verifying_key.verify(&signable, &signature).is_ok())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ed25519_dalek::{Signer, SigningKey};
+
+    fn descriptor(relay: &SigningKey, addr: &str, timestamp: u64) -> RelayDescriptor {
+        let identity_key = relay.verifying_key().to_bytes();
+        let mut d = RelayDescriptor {
+            peer_id: PeerId::from_public_key(&identity_key),
+            identity_key,
+            x25519_key: [0xBB; 32],
+            addr: addr.parse().unwrap(),
+            bandwidth_class: 1,
+            uptime_secs: 3600,
+            timestamp,
+            signature: [0u8; 64],
+            bandwidth_estimate: 1000,
+            next_pubkey: None,
+        };
+        d.signature = relay.sign(&d.signable_bytes()).to_bytes();
+        d
+    }
+
+    /// An endorsement names a PeerId; it must not carry over to a descriptor that
+    /// claims that PeerId with other keys or another address (PNP-008-MUST-027).
+    #[test]
+    fn endorsement_does_not_carry_to_a_forged_descriptor() {
+        let authority = SigningKey::from_bytes(&[1; 32]);
+        let trusted = [authority.verifying_key().to_bytes()];
+        let relay = SigningKey::from_bytes(&[7; 32]);
+        let attacker = SigningKey::from_bytes(&[66; 32]);
+        let now = 1_800_000_000;
+
+        let genuine = descriptor(&relay, "198.51.100.7:443", now);
+        let mut endorsement = AuthorityEndorsement {
+            authority_pubkey: trusted[0],
+            relay_peer_id: genuine.peer_id,
+            endorsed_at: now,
+            expires_at: now + 86400,
+            signature: [0u8; 64],
+        };
+        endorsement.signature = authority.sign(&endorsement.signable_bytes()).to_bytes();
+        let accepted = |descriptor: RelayDescriptor, at: u64| {
+            EndorsedDescriptor {
+                descriptor,
+                endorsements: vec![endorsement.clone()],
+            }
+            .verify_threshold(&trusted, 1, at)
+            .unwrap()
+        };
+        assert!(accepted(genuine.clone(), now));
+
+        let mut forged = descriptor(&attacker, "203.0.113.66:443", now);
+        forged.peer_id = genuine.peer_id;
+        forged.signature = attacker.sign(&forged.signable_bytes()).to_bytes();
+        assert!(!accepted(forged, now));
+
+        let mut moved = genuine.clone();
+        moved.addr = "203.0.113.66:443".parse().unwrap();
+        assert!(!accepted(moved, now));
+
+        // MUST-027 item 3: older than seven days.
+        let old = descriptor(&relay, "198.51.100.7:443", now - 7 * 86400);
+        assert!(!accepted(old, now));
     }
 }

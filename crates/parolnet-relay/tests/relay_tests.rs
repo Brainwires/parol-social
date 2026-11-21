@@ -492,8 +492,8 @@ fn test_directory_select_path_insufficient_relays() {
 // ── Descriptor Signing Tests ──────────────────────────────────
 
 fn make_signed_descriptor(id: u8, uptime_days: u64, signing_key: &SigningKey) -> RelayDescriptor {
-    let peer_id = PeerId([id; 32]);
     let identity_key = signing_key.verifying_key().to_bytes();
+    let peer_id = PeerId::from_public_key(&identity_key);
     RelayDirectory::create_descriptor(
         peer_id,
         identity_key,
@@ -662,4 +662,33 @@ async fn test_destroy_unknown_circuit_discards() {
         "DESTROY for unknown circuit should discard"
     );
     assert_eq!(node.circuit_count(), 0);
+}
+
+/// A descriptor signed by one key cannot claim the PeerId of another relay
+/// (PNP-008-MUST-027: the signature is checked against the relay's own key,
+/// the one its PeerId is the hash of).
+#[test]
+fn test_gossip_rejects_descriptor_claiming_another_relays_peer_id() {
+    let relay = SigningKey::generate(&mut rand::thread_rng());
+    let attacker = SigningKey::generate(&mut rand::thread_rng());
+    let genuine = make_signed_descriptor(1, 10, &relay);
+
+    let mut dir = RelayDirectory::new();
+    assert!(dir.handle_gossip_descriptor(genuine.clone(), 1700000000 + 60));
+
+    // Newer, self-consistent (signed by the key it carries), under the victim's PeerId.
+    let mut forged = RelayDirectory::create_descriptor(
+        genuine.peer_id,
+        attacker.verifying_key().to_bytes(),
+        [0xEE; 32],
+        "203.0.113.66:443".parse().unwrap(),
+        1,
+        0,
+        1700000000 + 30,
+        &attacker,
+    );
+    assert!(!dir.handle_gossip_descriptor(forged.clone(), 1700000000 + 60));
+    forged.timestamp += 1;
+    assert!(!dir.handle_gossip_descriptor(forged, 1700000000 + 60));
+    assert_eq!(dir.lookup_addr(&genuine.peer_id), Some(genuine.addr));
 }
