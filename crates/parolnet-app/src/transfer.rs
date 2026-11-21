@@ -735,7 +735,11 @@ pub(crate) async fn run_receiver(
             let outcome =
                 receive_attempt(&mut receiver, &mut file, attachment, &mut ctl, &report).await;
             receiver.end_attempt();
-            let _ = data.close_channel(dc);
+            // After the last record the channel stays open until the core has sent
+            // `complete`: the sender hears that before it sees the channel close.
+            if !matches!(outcome, Outcome::AllStored) {
+                let _ = data.close_channel(dc);
+            }
             outcome
         };
         match outcome {

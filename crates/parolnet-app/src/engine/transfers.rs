@@ -814,7 +814,7 @@ impl Engine {
                 }
             }
             WorkerEvent::Received { path } => {
-                self.xfer.workers.remove(id);
+                let chan = self.xfer.workers.remove(id).and_then(|w| w.chan);
                 self.xfer.progress.remove(id);
                 if let Some(t) = self.transfer_mut(id) {
                     t.path = Some(path);
@@ -824,6 +824,15 @@ impl Engine {
                     t.pending = Some(PendingControl::Complete);
                 }
                 self.flush_transfer_controls(&peer);
+                // `complete` first, then the channel (the worker left it open for this).
+                if let Some(Chan {
+                    epoch,
+                    dc: Some(dc),
+                }) = chan
+                    && let Some(h) = self.conn_mut(&peer, epoch).and_then(|c| c.handle.as_ref())
+                {
+                    let _ = h.close_data_channel(dc);
+                }
                 self.save();
                 self.emit_transfer(id);
                 self.pump_transfers(&peer);
