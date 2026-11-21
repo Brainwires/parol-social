@@ -133,24 +133,15 @@ impl SenderKeyState {
                 reason: "receiver-only state cannot encrypt".into(),
             })?;
 
-        // Derive message key from chain_key
-        let mk_bytes = hkdf_sha256(&self.chain_key, &[0x01], b"ParolNet_sender_key_v1", 32)?;
-        let mut message_key = [0u8; 32];
-        message_key.copy_from_slice(&mk_bytes);
-
-        // Derive next chain key
-        let ck_bytes = hkdf_sha256(&self.chain_key, &[0x02], b"ParolNet_sender_chain_v1", 32)?;
-        self.chain_key.copy_from_slice(&ck_bytes);
+        // Derive the message key and advance the chain.
+        let message_key = Zeroizing::new(Self::chain_step(&mut self.chain_key)?);
 
         // Build nonce: SHA-256(signing_public_key)[0..8] || chain_index.to_be_bytes()
         let nonce = Self::build_nonce(&self.signing_public_key, self.chain_index);
 
         // Encrypt with ChaCha20-Poly1305
-        let cipher = ChaCha20Poly1305Cipher::new(&message_key)?;
+        let cipher = ChaCha20Poly1305Cipher::new(&message_key[..])?;
         let ciphertext = cipher.encrypt(&nonce, plaintext, &[])?;
-
-        // Zeroize message key after use
-        message_key.zeroize();
 
         // Sign (chain_index || ciphertext)
         let mut signed_data = Vec::with_capacity(4 + ciphertext.len());
@@ -200,9 +191,8 @@ impl SenderKeyState {
         let nonce = Self::build_nonce(&self.signing_public_key, msg.chain_index);
 
         // All-or-nothing from here: the signature proves who sent the message, not that it
-        // belongs to the chain this state holds (the same signing key signs every chain of a
-        // sender, before and after `rotate`). Nothing below is written back before the AEAD
-        // tag has verified.
+        // decrypts under the chain this state holds (a sender can sign anything). Nothing
+        // below is written back before the AEAD tag has verified.
         if msg.chain_index < self.chain_index {
             // A stored key is consumed only by a message that authenticates under it.
             let mk = self
@@ -260,14 +250,22 @@ impl SenderKeyState {
         Ok(message_key)
     }
 
-    /// Rotate the sender key chain. Generates a new random chain key and resets the index.
+    /// Rotate the sender key (PNP-009 §7.2): a new random chain key (MUST-028), a new
+    /// Ed25519 signing key pair (MUST-029) and the index back at 0 (MUST-030).
     ///
-    /// Used for periodic rotation (e.g., every 1000 messages or 24 hours).
-    /// After rotation, a new distribution message must be sent to all group members.
+    /// Used on member removal, suspected compromise and periodically. After rotation a new
+    /// distribution message (`create_distribution`, which carries the new verification key)
+    /// must be sent to all group members. The old signing key zeroizes as it is dropped
+    /// here; a receiver-only state has none and gains none.
     pub fn rotate(&mut self) {
         use rand::RngCore;
         OsRng.fill_bytes(&mut self.chain_key);
         self.chain_index = 0;
+        if self.signing_key.is_some() {
+            let signing_key = SigningKey::generate(&mut OsRng);
+            self.signing_public_key = signing_key.verifying_key().to_bytes();
+            self.signing_key = Some(signing_key);
+        }
         // Clear skipped keys from old chain — they are no longer valid
         for value in self.skipped_keys.values_mut() {
             value.zeroize();
@@ -419,6 +417,51 @@ mod tests {
         }
     }
 
+    /// PNP-009-MUST-029: rotation replaces the signing key pair, and the new distribution
+    /// carries the new verification key.
+    #[test]
+    fn rotation_replaces_the_signing_key() {
+        let mut sender = SenderKeyState::new();
+        let old_dist = sender.create_distribution([0x42; 32]);
+        let old_secret = sender.signing_key.as_ref().unwrap().to_bytes();
+        let mut old_receiver = SenderKeyState::from_distribution(&old_dist).unwrap();
+
+        sender.rotate();
+
+        let new_dist = sender.create_distribution([0x42; 32]);
+        assert_ne!(new_dist.signing_public_key, old_dist.signing_public_key);
+        assert_ne!(sender.signing_key.as_ref().unwrap().to_bytes(), old_secret);
+        assert_eq!(
+            sender
+                .signing_key
+                .as_ref()
+                .unwrap()
+                .verifying_key()
+                .to_bytes(),
+            new_dist.signing_public_key
+        );
+
+        // The new chain verifies under the new key, and not under the old one.
+        let msg = sender.encrypt(b"after").unwrap();
+        assert!(matches!(
+            old_receiver.decrypt(&msg),
+            Err(CryptoError::SignatureVerificationFailed)
+        ));
+        let mut new_receiver = SenderKeyState::from_distribution(&new_dist).unwrap();
+        assert_eq!(new_receiver.decrypt(&msg).unwrap(), b"after");
+
+        // Whoever holds the old signing key cannot sign for the new chain.
+        let old_key = SigningKey::from_bytes(&old_secret);
+        let mut forged = sender.encrypt(b"next").unwrap();
+        let mut signed = forged.chain_index.to_be_bytes().to_vec();
+        signed.extend_from_slice(&forged.ciphertext);
+        forged.signature = old_key.sign(&signed).to_bytes().to_vec();
+        assert!(matches!(
+            new_receiver.decrypt(&forged),
+            Err(CryptoError::SignatureVerificationFailed)
+        ));
+    }
+
     // ── Atomic decrypt ──────────────────────────────────────────────────
     //
     // A message that passes the signature check but not the AEAD check (signed by the same
@@ -442,14 +485,21 @@ mod tests {
     }
 
     /// A receiver of the sender's first chain, six messages of that chain, and eight
-    /// validly signed messages of the chain the sender rotated to afterwards.
+    /// validly signed messages of another chain under the same signing key.
     fn receiver_with_messages_of_two_chains()
     -> (SenderKeyState, Vec<SenderKeyMessage>, Vec<SenderKeyMessage>) {
         let mut sender = SenderKeyState::new();
         let receiver =
             SenderKeyState::from_distribution(&sender.create_distribution([0x42; 32])).unwrap();
         let genuine = (0..6u8).map(|i| sender.encrypt(&[i]).unwrap()).collect();
-        sender.rotate();
+        // Another chain under the same signing key: `rotate` replaces the key, so build it.
+        let mut sender = SenderKeyState {
+            chain_key: [0x77; 32],
+            signing_key: sender.signing_key.clone(),
+            signing_public_key: sender.signing_public_key,
+            chain_index: 0,
+            skipped_keys: HashMap::new(),
+        };
         let other = (0..8u8).map(|i| sender.encrypt(&[i]).unwrap()).collect();
         (receiver, genuine, other)
     }

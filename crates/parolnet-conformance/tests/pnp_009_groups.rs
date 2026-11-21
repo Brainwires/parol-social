@@ -507,12 +507,43 @@ fn member_removal_triggers_sender_key_rotation() {
 #[test]
 fn rotation_generates_fresh_signing_pair_and_zeroizes_old() {
     use parolnet_crypto::sender_key::SenderKeyState;
-    let old = SenderKeyState::new();
-    let old_sig = old.create_distribution([0u8; 32]).signing_public_key;
-    drop(old); // Zeroize on drop (manual Drop).
-    let new = SenderKeyState::new();
-    let new_sig = new.create_distribution([0u8; 32]).signing_public_key;
-    assert_ne!(old_sig, new_sig, "MUST-029: fresh Ed25519 keypair");
+    let mut sender = SenderKeyState::new();
+    let old = sender.create_distribution([0u8; 32]);
+    let mut old_receiver = SenderKeyState::from_distribution(&old).unwrap();
+
+    sender.rotate();
+
+    // MUST-029 / MUST-031: the distribution after rotation carries a new key pair.
+    let new = sender.create_distribution([0u8; 32]);
+    assert_ne!(
+        old.signing_public_key, new.signing_public_key,
+        "MUST-029: fresh Ed25519 keypair"
+    );
+    assert_ne!(old.chain_key, new.chain_key, "MUST-028");
+    assert_eq!(new.chain_index, 0, "MUST-030");
+
+    // MUST-032: a receiver that replaced its state reads the new chain; one that did not
+    // cannot even verify it, because the old verification key no longer signs.
+    let msg = sender.encrypt(b"after rotation").unwrap();
+    assert!(old_receiver.decrypt(&msg).is_err());
+    let mut new_receiver = SenderKeyState::from_distribution(&new).unwrap();
+    assert_eq!(new_receiver.decrypt(&msg).unwrap(), b"after rotation");
+}
+
+/// MUST-026 through the group manager: removing a member rotates our sender key, signing
+/// key pair included, and returns the distribution that carries it.
+#[clause("PNP-009-MUST-026", "PNP-009-MUST-029")]
+#[test]
+fn removing_a_member_rotates_chain_and_signing_key() {
+    use parolnet_core::group::GroupManager;
+    let mgr = GroupManager::new();
+    let (admin, member) = (PeerId([1u8; 32]), PeerId([2u8; 32]));
+    let (gid, before) = mgr.create_group("g".into(), admin, 1000).unwrap();
+    mgr.add_member(&gid, &admin, member, 1001).unwrap();
+    let (_op, after) = mgr.remove_member(&gid, &admin, &member, 1002).unwrap();
+    assert_ne!(before.chain_key, after.chain_key);
+    assert_ne!(before.signing_public_key, after.signing_public_key);
+    assert_eq!(after.chain_index, 0);
 }
 
 // -- §7.3 Adding members ------------------------------------------------------

@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security — sender-key rotation replaces the signing key pair (PNP-009 §7.2, MUST-029)
+- `SenderKeyState::rotate` replaced the chain key and reset the index but kept the Ed25519 signing key, against PNP-009-MUST-029. Every member holds a sender's chain key, so the signature is all that stops one member writing as another: a signing key that had leaked stayed good for forging after the rotation that was supposed to answer the leak (MUST-027). Rotation now generates a new pair; the distribution built afterwards carries the new verification key, as it always carried the current one, and the old private key zeroizes when dropped. Nothing changes on the wire. A receiver still holding the pre-rotation state now fails the signature check on the new chain, where it used to fail the AEAD check.
+
 ### Security — comparisons of authenticators are constant-time (security invariant 5; PNP-007-MUST-062, PNP-009-MUST-069)
 - `FileTransferReceiver::assemble` and `GroupFileReceiver::assemble` compared the SHA-256 of a received file with `!=`; they use `subtle` now. The conformance tests for the two clauses did their own `subtle` comparison and passed either way; new ones pin the implementation.
 - The relay's `ADMIN_TOKEN` check (`/peers`, every profile) compared the bearer token with `==`. It compares SHA-256 digests of the two in constant time, which also hides the configured token's length.
