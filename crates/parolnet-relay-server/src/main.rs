@@ -147,8 +147,20 @@ fn check_admin_token(headers: &axum::http::HeaderMap) -> bool {
         .get(axum::http::header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Bearer "))
-        .map(|token| token == expected)
+        .map(|token| admin_token_matches(token, &expected))
         .unwrap_or(false)
+}
+
+/// Compare a presented admin token with the configured one in constant time.
+/// Both are hashed first, so neither the position of the first differing
+/// byte nor the configured token's length shows in the timing.
+fn admin_token_matches(presented: &str, expected: &str) -> bool {
+    use sha2::{Digest, Sha256};
+    use subtle::ConstantTimeEq;
+    Sha256::digest(presented.as_bytes())
+        .as_slice()
+        .ct_eq(Sha256::digest(expected.as_bytes()).as_slice())
+        .into()
 }
 
 /// Extract the real client IP, respecting X-Forwarded-For when the connecting

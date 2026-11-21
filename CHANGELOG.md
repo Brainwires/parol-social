@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security — comparisons of authenticators are constant-time (security invariant 5; PNP-007-MUST-062, PNP-009-MUST-069)
+- `FileTransferReceiver::assemble` and `GroupFileReceiver::assemble` compared the SHA-256 of a received file with `!=`; they use `subtle` now. The conformance tests for the two clauses did their own `subtle` comparison and passed either way; new ones pin the implementation.
+- The relay's `ADMIN_TOKEN` check (`/peers`, every profile) compared the bearer token with `==`. It compares SHA-256 digests of the two in constant time, which also hides the configured token's length.
+- LAN discovery's 8-byte HMAC tag (`parolnet-mesh`) and the channel-binding fingerprint lists (`ChannelBinding::verify`) are compared with `subtle` too. Neither is known to have been exploitable: the tag check is not reachable from a shipped binary, and DTLS fingerprints are not secret.
+
 ### Fixed — forwarded gossip verifies after the first hop (PNP-005 §3.1, §5.2; `parolnet-mesh`, relay profile only)
 - The originator's signature covers `ttl` (PNP-005-MUST-003) and every hop decrements it (PNP-005-MUST-020), so `StandardGossip::process_gossip` refused every message at its second hop with "invalid Ed25519 signature". A receiver now verifies over the originator's `ttl`, which is `ttl + hops` (`GossipEnvelope::origin_signable_bytes`); a sum above the maximum `ttl` is refused. What an originator signs is unchanged, so nothing changes on the wire. A forwarder can no longer hand a message more hops than its originator signed for.
 

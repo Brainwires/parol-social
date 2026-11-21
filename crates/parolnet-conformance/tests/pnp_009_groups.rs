@@ -698,6 +698,21 @@ fn file_hash_comparison_is_constant_time() {
     _asserts_ct_eq::<[u8]>();
 }
 
+/// MUST-069 on the implementation: `GroupFileReceiver::assemble` compares with
+/// `subtle`, not `==` / `!=`.
+#[clause("PNP-009-MUST-069")]
+#[test]
+fn group_file_receiver_compares_the_hash_in_constant_time() {
+    let src = include_str!("../../parolnet-core/src/group_file.rs");
+    let start = src
+        .find("pub fn assemble(&self)")
+        .expect("GroupFileReceiver::assemble present");
+    let rest = &src[start..];
+    let body = &rest[..rest.find("\n    }\n").expect("function end")];
+    assert!(body.contains("ct_eq"), "assemble must compare with subtle");
+    assert!(!body.contains("computed !=") && !body.contains("computed =="));
+}
+
 // -- §11.9 Zeroize on rotation + panic_wipe -----------------------------------
 
 #[clause("PNP-009-MUST-073")]

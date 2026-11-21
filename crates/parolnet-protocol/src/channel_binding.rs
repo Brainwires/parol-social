@@ -15,6 +15,7 @@
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use subtle::{Choice, ConstantTimeEq};
 
 /// The binding's format version.
 pub const CHANNEL_BINDING_VERSION: u8 = 1;
@@ -101,6 +102,17 @@ fn canonical(list: &[String]) -> Result<Vec<String>, BindingError> {
     Ok(out)
 }
 
+/// Whether two canonical fingerprint lists are equal, in time that depends on their shapes
+/// (how many fingerprints, how long each) and not on where they first differ.
+fn lists_ct_eq(a: &[String], b: &[String]) -> Choice {
+    if a.len() != b.len() {
+        return Choice::from(0);
+    }
+    a.iter().zip(b).fold(Choice::from(1), |acc, (x, y)| {
+        acc & x.as_bytes().ct_eq(y.as_bytes())
+    })
+}
+
 impl ChannelBinding {
     /// The binding this side sends, from its local description and the remote description it
     /// applied to the data channel's connection.
@@ -152,7 +164,9 @@ impl ChannelBinding {
         }
         let theirs_local = canonical(&self.local)?;
         let theirs_remote = canonical(&self.remote)?;
-        if theirs_local == ours.remote && theirs_remote == ours.local {
+        if bool::from(
+            lists_ct_eq(&theirs_local, &ours.remote) & lists_ct_eq(&theirs_remote, &ours.local),
+        ) {
             Ok(())
         } else {
             Err(BindingError::Mismatch)
