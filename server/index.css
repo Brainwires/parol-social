@@ -1,0 +1,139 @@
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+body {
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
+  background: #f5f5f7;
+  color: #1d1d1f;
+  line-height: 1.5;
+  -webkit-font-smoothing: antialiased;
+}
+
+.container {
+  max-width: 480px;
+  margin: 0 auto;
+  padding: 24px 20px 40px;
+}
+
+.header {
+  text-align: center;
+  padding: 32px 0 8px;
+}
+.header h1 { font-size: 22px; font-weight: 600; }
+.header p { font-size: 14px; color: #86868b; margin-top: 4px; }
+
+.app-card {
+  background: #fff;
+  border-radius: 16px;
+  padding: 24px;
+  margin-top: 24px;
+  box-shadow: 0 1px 3px rgba(0,0,0,0.06), 0 1px 2px rgba(0,0,0,0.04);
+}
+.app-info { display: flex; align-items: center; gap: 16px; }
+.app-icon { width: 80px; height: 80px; border-radius: 18px; flex-shrink: 0; overflow: hidden; }
+.app-icon svg { width: 100%; height: 100%; display: block; }
+.app-details h2 { font-size: 20px; font-weight: 600; }
+.app-meta { font-size: 13px; color: #86868b; margin-top: 4px; }
+.app-meta span + span::before { content: "\00b7"; margin: 0 6px; }
+.app-stars { color: #ff9500; font-size: 14px; margin-top: 4px; letter-spacing: 1px; }
+
+.app-stats {
+  display: flex;
+  justify-content: space-around;
+  margin-top: 20px;
+  padding-top: 16px;
+  border-top: 1px solid #f0f0f0;
+  text-align: center;
+}
+.stat-label { font-size: 11px; color: #86868b; text-transform: uppercase; letter-spacing: 0.5px; }
+.stat-value { font-size: 15px; font-weight: 600; margin-top: 2px; }
+
+/* Open button — always a plain link to the PWA */
+.open-section { text-align: center; margin-top: 28px; }
+.open-btn {
+  display: inline-block;
+  background: #007aff;
+  color: #fff;
+  font-size: 17px;
+  font-weight: 600;
+  padding: 14px 48px;
+  border-radius: 12px;
+  text-decoration: none;
+  width: 100%;
+  max-width: 320px;
+  transition: background 0.15s;
+}
+.open-btn:hover { background: #0066d6; }
+.open-btn:active { background: #0055b3; }
+.open-note { font-size: 13px; color: #86868b; margin-top: 12px; }
+
+/* Install steps card */
+.steps-card {
+  background: #fff;
+  border-radius: 16px;
+  padding: 24px;
+  margin-top: 24px;
+  box-shadow: 0 1px 3px rgba(0,0,0,0.06), 0 1px 2px rgba(0,0,0,0.04);
+}
+.steps-card h3 { font-size: 16px; font-weight: 600; margin-bottom: 16px; }
+.steps-card ol { padding-left: 22px; }
+.steps-card li { font-size: 14px; color: #3a3a3c; margin-bottom: 12px; line-height: 1.7; }
+.steps-card li:last-child { margin-bottom: 0; }
+.step-key {
+  background: #f0f0f5;
+  border-radius: 6px;
+  padding: 2px 8px;
+  font-weight: 600;
+  font-size: 13px;
+  white-space: nowrap;
+}
+.platform-steps { display: none; }
+.platform-steps.active { display: block; }
+
+/* Other platforms (collapsed) */
+.other-platforms {
+  background: #fff;
+  border-radius: 16px;
+  padding: 24px;
+  margin-top: 16px;
+  box-shadow: 0 1px 3px rgba(0,0,0,0.06), 0 1px 2px rgba(0,0,0,0.04);
+}
+.other-platforms summary {
+  font-size: 14px;
+  font-weight: 600;
+  cursor: pointer;
+  color: #007aff;
+  list-style: none;
+}
+.other-platforms summary::-webkit-details-marker { display: none; }
+.other-platforms .all-steps { margin-top: 16px; }
+.other-platforms h4 { font-size: 14px; font-weight: 600; margin-top: 14px; margin-bottom: 6px; color: #1d1d1f; }
+.other-platforms h4:first-child { margin-top: 0; }
+.other-platforms p { font-size: 13px; color: #3a3a3c; line-height: 1.6; margin-bottom: 4px; }
+
+.footer {
+  text-align: center;
+  margin-top: 40px;
+  padding-top: 20px;
+  border-top: 1px solid #e5e5ea;
+}
+.footer p { font-size: 12px; color: #aeaeb2; }
+.footer a { color: #86868b; text-decoration: none; }
+.footer a:hover { text-decoration: underline; }
+
+.privacy-overlay {
+  display: none; position: fixed; inset: 0;
+  background: rgba(0,0,0,0.4); z-index: 100;
+  justify-content: center; align-items: center;
+}
+.privacy-overlay.visible { display: flex; }
+.privacy-box {
+  background: #fff; border-radius: 16px; padding: 24px;
+  max-width: 340px; margin: 20px; text-align: center;
+}
+.privacy-box h3 { font-size: 17px; font-weight: 600; margin-bottom: 8px; }
+.privacy-box p { font-size: 14px; color: #3a3a3c; line-height: 1.6; }
+.privacy-close {
+  display: inline-block; margin-top: 16px; background: #007aff;
+  color: #fff; border: none; padding: 8px 24px; border-radius: 8px;
+  font-size: 14px; font-weight: 600; cursor: pointer;
+}
