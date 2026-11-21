@@ -1,12 +1,16 @@
 # PNP-002: ParolNet Handshake Protocol
 
 ### Status: CANDIDATE
-### Version: 0.4
-### Date: 2026-11-20
+### Version: 0.5
+### Date: 2026-11-21
 
 ---
 
 ## Changelog
+
+**v0.5 (2026-11-21) — Atomic receive**
+
+- Added §5.7 "Receiving Double Ratchet Messages": a receiver changes no session state for a message that fails authentication. Allocated **PNP-002-MUST-041**. MUST count: 41.
 
 **v0.4 (2026-11-20) — Safety numbers**
 
@@ -302,6 +306,14 @@ The leading 32 bytes of 0xFF serve as a domain separator (consistent with the Si
 2. Upon sending or receiving a CloseMessage, the peer MUST securely erase all session state: root key, chain keys, message keys, ratchet keypairs. **PNP-002-MUST-028**
 3. A peer MUST NOT reuse any key material from a closed session. **PNP-002-MUST-029**
 4. After closure, a new handshake (starting from INIT) is REQUIRED to re-establish communication. **PNP-002-MUST-030**
+
+### 5.7 Receiving Double Ratchet Messages
+
+Processing a received Double Ratchet message is all-or-nothing. To find the message key the receiver may have to take a stored skipped message key, perform a DH ratchet step for the ratchet key in the message header, derive and store skipped message keys up to the header's counters, and advance the receiving chain. All of these depend on header fields that are not authenticated until the AEAD tag of the message has been verified under the resulting message key.
+
+1. A receiver MUST NOT change session state for a message that fails authentication. **PNP-002-MUST-041** If AEAD verification fails, or processing stops before it for any other reason (for example the skipped-message-key limit), the root key, both chain keys, the DH ratchet keypair, the remote ratchet public key, every counter and the stored skipped message keys are exactly what they were before the message was processed. In particular a skipped message key is deleted only by a message that authenticates under it, and no skipped message key is stored for a message that does not authenticate. The new state is committed only after successful AEAD verification.
+
+Without this rule any party able to deliver one message to a session (a relay, a peer connected under another PeerId before the channel binding of PNP-001 §10.5.1 is verified, or a corrupted frame) could desynchronize it permanently. The same rule covers session creation: a session derived for a first message (PNP-001 §5.3.1) is kept only if that message authenticates, and does not replace an existing session otherwise.
 
 ## 6. Security Considerations
 
