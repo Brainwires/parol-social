@@ -1464,9 +1464,9 @@ fn backpressure_thresholds_stay_below_the_channel_limit() {
     assert_eq!(BUFFER_HIGH, 4 << 20);
     assert_eq!(BUFFER_LOW, 1 << 20);
     assert_eq!(BUFFER_MAX, 16 << 20);
-    assert!(BUFFER_LOW < BUFFER_HIGH);
+    const { assert!(BUFFER_LOW < BUFFER_HIGH) };
     // Pausing once the buffer is above the high mark can overshoot by one message.
-    assert!(BUFFER_HIGH + MESSAGE_MAX <= BUFFER_MAX);
+    const { assert!(BUFFER_HIGH + MESSAGE_MAX <= BUFFER_MAX) };
 }
 
 #[clause("PNP-010-SHOULD-003")]
