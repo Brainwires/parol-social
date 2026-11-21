@@ -84,6 +84,8 @@ Deno.test(
     await w.settle();
     assertEquals(callStates(a).at(-1), "Ended(HungUp)");
     assertEquals(callStates(b).at(-1), "Ended(RemoteHungUp)");
+    // The media is let go in tasks of its own, after the end was published.
+    await w.advance(0);
     for (const d of [a, b]) {
       assertEquals(d.engine.snapshot().call, null);
       assertEquals(callPcs(d)[0].connectionState, "closed");
@@ -92,6 +94,114 @@ Deno.test(
     }
     // The data channel is untouched.
     assertEquals(a.path(b), "Direct");
+  }),
+);
+
+Deno.test(
+  "call: the end is published before any media is released, and the release runs in later tasks",
+  withWorld(async (w) => {
+    const [a, b] = await pairWithMedia(w);
+    const started = await a.engine.startCall(b.id, true);
+    await w.settle();
+    await b.engine.acceptCall(started.callId);
+    await w.settle();
+    assertEquals(call(a).state.kind, "Active");
+
+    // What each device's media looked like at the moment its listeners heard "Ended".
+    const atEnd = new Map<Device, { closed: boolean; stopped: boolean[]; media: unknown }>();
+    for (const d of [a, b]) {
+      d.engine.subscribe((ev) => {
+        if (ev.kind !== "Call" || ev.call.state.kind !== "Ended") return;
+        atEnd.set(d, {
+          closed: callPcs(d)[0].connectionState === "closed",
+          stopped: d.streams[0].tracks.map((t) => t.stopped),
+          media: d.engine.callMedia(started.callId),
+        });
+      });
+    }
+
+    await a.engine.hangup(started.callId);
+    await w.settle();
+    for (const d of [a, b]) {
+      // Published: the call is over and the engine no longer hands out its streams...
+      assertEquals(d.engine.snapshot().call, null);
+      assertEquals(atEnd.get(d), { closed: false, stopped: [false, false], media: null });
+      // ...and still nothing was released: that waits for a task of its own.
+      assertEquals(callPcs(d)[0].connectionState, "connected");
+      assert(d.streams[0].tracks.every((t) => !t.stopped));
+    }
+
+    await w.advance(0);
+    for (const d of [a, b]) {
+      assertEquals(callPcs(d)[0].connectionState, "closed");
+      assert(d.streams[0].tracks.every((t) => t.stopped));
+      // A line before each browser call, the capture before the connection.
+      const id = started.callId.slice(0, 8);
+      const lines = d.logs.filter((l) => l.startsWith(`[Call] ${id}`)).map((l) =>
+        l.slice(`[Call] ${id} `.length)
+      );
+      assertEquals(lines.slice(-4), [
+        `over (${d === a ? "HungUp" : "RemoteHungUp"})`,
+        "releasing the capture",
+        "closing the media connection",
+        "released",
+      ]);
+    }
+  }),
+);
+
+Deno.test(
+  "call: a release that fails or has not run yet blocks neither the end nor the next call",
+  withWorld(async (w) => {
+    const [a, b] = await pairWithMedia(w);
+    const first = await a.engine.startCall(b.id, true);
+    await w.settle();
+    await b.engine.acceptCall(first.callId);
+    await w.settle();
+    assertEquals(call(a).state.kind, "Active");
+
+    // A browser whose teardown fails: stopping the microphone throws, closing throws.
+    const [microphone, camera] = a.streams[0].tracks;
+    microphone.stop = () => {
+      throw new Error("stop failed");
+    };
+    const firstPc = callPcs(a)[0];
+    firstPc.close = () => {
+      throw new Error("close failed");
+    };
+
+    await a.engine.hangup(first.callId);
+    await w.settle();
+    assertEquals(callStates(a).at(-1), "Ended(HungUp)");
+    assertEquals(callStates(b).at(-1), "Ended(RemoteHungUp)");
+
+    // The next call starts while the first one's media has not been released at all (a
+    // release that never comes back looks the same from here).
+    const second = await a.engine.startCall(b.id, false);
+    await w.settle();
+    assertEquals(call(b).state.kind, "Incoming");
+    await b.engine.acceptCall(second.callId);
+    await w.settle();
+    assertEquals(call(a).state.kind, "Active");
+    assertEquals(call(b).state.kind, "Active");
+    assert(!camera.stopped, "the first call's release has not run");
+
+    // Now it runs, and fails where it fails: the rest is still released, nothing surfaces,
+    // and the call under way is not touched.
+    await w.advance(0);
+    assert(camera.stopped, "the camera is released though the microphone could not be");
+    assert(a.logs.includes(`[Call] ${first.callId.slice(0, 8)} released`));
+    assertEquals(a.eventsOf("Notice").length, 0);
+    assertEquals(call(a).state.kind, "Active");
+    assertEquals(callPcs(a)[1].connectionState, "connected");
+    assert(a.streams[1].tracks.every((t) => !t.stopped));
+    assertEquals(callPcs(b)[0].connectionState, "closed");
+
+    await b.engine.hangup(second.callId);
+    await w.advance(0);
+    assertEquals(callStates(a).at(-1), "Ended(RemoteHungUp)");
+    assertEquals(callPcs(a)[1].connectionState, "closed");
+    assert(a.streams[1].tracks.every((t) => t.stopped));
   }),
 );
 
@@ -105,6 +215,7 @@ Deno.test(
     await w.settle();
     assertEquals(callStates(b), ["Incoming", "Ended(Declined)"]);
     assertEquals(callStates(a), ["Outgoing", "Ended(Rejected)"]);
+    await w.advance(0);
     assertEquals(callPcs(a)[0].connectionState, "closed");
     assert(a.streams[0].tracks.every((t) => t.stopped));
     assertEquals(a.streams[0].getVideoTracks().length, 0);
@@ -297,7 +408,10 @@ Deno.test(
     w.devices = w.devices.filter((d) => d !== a);
     await w.settle();
     assertEquals(callStates(a).at(-1), "Ended(HungUp)");
+    // The release does not need the engine: it runs after the engine has stopped.
+    await w.advance(0);
     assert(a.streams[0].tracks.every((t) => t.stopped));
+    assertEquals(callPcs(a)[0].connectionState, "closed");
     assert(callStates(b).at(-1)!.startsWith("Ended("));
   }),
 );
@@ -319,6 +433,11 @@ Deno.test(
     const back = new FakeStream([new FakeTrack("video")]);
     await a.engine.replaceCamera(started.callId, back);
     await w.settle();
+    // The new capture is published first; the old camera is stopped in a later task, once
+    // whoever showed it has let go of it.
+    assertEquals(a.eventsOf("CallMedia").length, mediaEvents + 1);
+    assert(!before.stopped, "the first camera is still live when the new one is published");
+    await w.advance(0);
     assert(before.stopped, "the first camera is released");
     assertEquals(pc.senders.find((s) => s.track.kind === "video")!.track, back.tracks[0]);
     const local = a.engine.callMedia(started.callId)!.local!;
@@ -335,7 +454,7 @@ Deno.test(
     assertEquals(third.tracks[0].enabled, false);
 
     await a.engine.hangup(started.callId);
-    await w.settle();
+    await w.advance(0);
     assert(third.tracks[0].stopped, "released when the call ends");
 
     // After the call: refused, and the offered capture is stopped.

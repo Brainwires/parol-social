@@ -211,37 +211,85 @@ export class CallManager {
     });
   }
 
-  /** Tear the call down: timers, connection, our capture. */
+  /**
+   * The call is over. What the person sees comes first: the ended state is published before
+   * any media is let go, and the browser's own teardown (stopping the capture, closing the
+   * connection) runs afterwards in tasks of its own, where nothing waits on it.
+   *
+   * The order matters in WebKit on Linux (GStreamer): a track that ends while a media
+   * element is still playing its stream can block the main thread for good, inside
+   * `RTCPeerConnection.close()` or `MediaStreamTrack.stop()` (tests/e2e/repro). A listener
+   * of the `Ended` event must therefore detach its media elements before it returns; the
+   * release below starts in a later task.
+   */
   private end(c: Call, why: CallEnd): void {
     if (!this.alive(c)) return;
     this.call = null;
     this.host.cancel(c.ringTimer);
     this.host.cancel(c.connectTimer);
     const pc = c.pc;
+    const local = c.local;
     c.pc = null;
+    c.local = null;
+    c.remote = null;
     if (pc) {
       pc.onconnectionstatechange =
         pc.onicecandidate =
         pc.ontrack =
         pc.onicegatheringstatechange =
           null;
-      try {
-        pc.close();
-      } catch { /* already closed */ }
     }
-    // The engine asked for the capture, so the engine stops it.
-    for (const t of c.local?.getTracks() ?? []) {
-      try {
-        t.stop();
-      } catch { /* already stopped */ }
-    }
-    c.local = null;
-    c.remote = null;
     c.state = { kind: "Ended", end: why };
     this.host.platform.log.info(
       `[Call] ${shortId(c.callId)} over (${why.kind})`,
     );
     this.emit(c);
+    this.release(c.callId, local?.getTracks() ?? [], pc);
+  }
+
+  /**
+   * Let a call's media go, after whoever showed it had a turn to stop showing it: first the
+   * capture the engine asked for, then the connection, each in a task of its own and each
+   * guarded, so one that fails does not keep the next from running. A line is logged before
+   * each browser call: if one never returns, the last line names it.
+   */
+  private release(callId: string, tracks: MediaTrack[], pc: PeerConnection | null): void {
+    const { clock, log } = this.host.platform;
+    const id = shortId(callId);
+    const steps: Array<() => void> = [];
+    if (tracks.length > 0) {
+      steps.push(() => {
+        log.info(`[Call] ${id} releasing the capture`);
+        for (const t of tracks) {
+          try {
+            t.stop();
+          } catch { /* already stopped */ }
+        }
+      });
+    }
+    if (pc) {
+      steps.push(() => {
+        log.info(`[Call] ${id} closing the media connection`);
+        try {
+          pc.close();
+        } catch { /* already closed */ }
+      });
+    }
+    if (steps.length === 0) return;
+    const next = () => {
+      const step = steps.shift();
+      if (!step) {
+        log.info(`[Call] ${id} released`);
+        return;
+      }
+      try {
+        step();
+      } finally {
+        // The platform's clock, not the engine's timers: this also runs after `stop()`.
+        clock.setTimeout(next, 0);
+      }
+    };
+    clock.setTimeout(next, 0);
   }
 
   // ── Commands ─────────────────────────────────────────────────────
@@ -349,15 +397,13 @@ export class CallManager {
         stop();
         return;
       }
-      for (const t of c.local.getVideoTracks()) {
-        try {
-          t.stop();
-        } catch { /* already stopped */ }
-      }
+      const replaced = c.local.getVideoTracks();
       // Our audio keeps flowing from the capture the call started with.
       c.local = mergedStream(c.local.getAudioTracks(), stream);
       this.applyToggles(c);
       this.host.emit({ kind: "CallMedia", callId: c.callId });
+      // As at the end of a call: whoever shows the old camera lets go of it first.
+      this.release(c.callId, replaced, null);
     });
   }
 
