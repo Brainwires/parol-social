@@ -17,6 +17,7 @@ members = [
     "crates/parolnet-store",
     "crates/parolnet-app",
     "crates/parolnet-media",
+    "crates/parolnet-simnet",
     "xtask",
 ]
 # The GPUI desktop app is its own workspace: it needs a newer toolchain than the MSRV here and

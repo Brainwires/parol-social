@@ -3312,6 +3312,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "parolnet-simnet"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "parolnet-media",
+ "parolnet-rtc",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "parolnet-store"
 version = "0.1.0"
 dependencies = [
