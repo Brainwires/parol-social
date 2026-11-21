@@ -4,8 +4,10 @@ The GPUI desktop client. By default it is the M1 client (UI v0 over `parolnet-ap
 pairing by QR code or code (compatible with the PWA), safety numbers, 1:1 end-to-end encrypted
 chat over a direct data channel per contact (bound to the session by both DTLS fingerprints),
 the direct-path state, and 1:1 voice / video calls: camera capture (a test pattern without a
-camera), echo cancellation (AEC3), camera / microphone / speaker menus, camera off, a self-view.
-The media code is `crates/parolnet-media`. Status and limits:
+camera), echo cancellation (AEC3), camera / microphone / speaker menus, camera off, a self-view,
+and files (PNP-010): attach or drop a file onto a conversation, accept / decline / cancel, progress
+in the timeline; files travel only over the direct connection and received ones go to
+`Downloads/ParolNet`. The media code is `crates/parolnet-media`. Status and limits:
 [docs/m1-desktop.md](../../docs/m1-desktop.md).
 
 With `--spike` (or any spike flag) it is the M0 spike: a window that shows a VP8 stream received
