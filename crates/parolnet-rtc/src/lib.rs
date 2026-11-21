@@ -363,6 +363,9 @@ pub struct ConnectionQuality {
     /// The selected pair's two ends.
     pub local_candidate: Option<CandidateKind>,
     pub remote_candidate: Option<CandidateKind>,
+    /// How often the transport moved to another candidate pair (1 once connected; an ICE
+    /// restart that selects a pair adds one).
+    pub path_changes: u32,
 }
 
 impl ConnectionQuality {
@@ -1607,6 +1610,7 @@ impl Driver {
                 if self.negotiation.established && self.negotiation.in_flight.take().is_some() {
                     self.pc
                         .set_local_description(now, RTCSessionDescription::rollback(None)?)?;
+                    self.forget_unnegotiated_tracks();
                     self.report_local_media().await;
                 }
             }
@@ -1936,6 +1940,29 @@ impl Driver {
         Ok(true)
     }
 
+    /// After our offer was taken back: every local track is wanted as it is negotiated, so
+    /// that asking for the change again offers it again.
+    fn forget_unnegotiated_tracks(&mut self) {
+        let ids: Vec<(MediaKind, RTCRtpTransceiverId)> = self
+            .senders
+            .iter()
+            .map(|(kind, sender)| (*kind, sender.id.into()))
+            .collect();
+        for (kind, id) in ids {
+            let Some(mut transceiver) = self.pc.rtp_transceiver(id) else {
+                continue;
+            };
+            let negotiated = transceiver.current_direction().has_send();
+            let receive = transceiver.direction().has_recv();
+            transceiver.set_direction(RTCRtpTransceiverDirection::from_send_recv(
+                negotiated, receive,
+            ));
+            if let Some(sender) = self.senders.get_mut(&kind) {
+                sender.enabled = negotiated;
+            }
+        }
+    }
+
     /// Report which kinds the peer's description sends, when that changed.
     async fn report_remote_media(&mut self, sdp: &str) {
         for (kind, sending) in media_directions(sdp) {
@@ -2160,7 +2187,12 @@ impl Driver {
             return base.last.clone();
         }
 
-        let mut quality = ConnectionQuality::default();
+        let mut quality = ConnectionQuality {
+            path_changes: report
+                .transport()
+                .map_or(0, |t| t.selected_candidate_pair_changes),
+            ..Default::default()
+        };
         let pair = selected_pair(&report);
         if let Some(pair) = pair {
             quality.rtt_ms = pair

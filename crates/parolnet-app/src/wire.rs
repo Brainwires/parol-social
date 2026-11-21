@@ -9,7 +9,10 @@
 //! - **Data-channel frames** on the `parolnet` channel: JSON text, `{"type":"identity",
 //!   "peerId"}` once on open and `{"type":"chat","payload":<envelope hex>}` for every PNP-001
 //!   envelope (chat, bootstrap, and later file and call signals). This is what
-//!   `pwa/src/webrtc.js` sends and accepts.
+//!   `pwa/src/webrtc.js` sends and accepts. Our identity frame also lists `"features"`:
+//!   [`FEATURE_ICE_RESTART`] says that a later `rtc_offer` for this connection is applied to
+//!   it (an ICE restart) instead of replacing it. A peer that lists nothing is never sent
+//!   one.
 
 use serde::{Deserialize, Serialize};
 
@@ -183,7 +186,11 @@ pub struct SdpJson {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DcFrame {
     /// Sent once by each side when the channel opens.
-    Identity { peer_id: String },
+    Identity {
+        peer_id: String,
+        /// What the peer's app supports on this connection (empty from the PWA).
+        features: Vec<String>,
+    },
     /// A hex-encoded PNP-001 envelope.
     Envelope { hex: String },
     /// Anything else (the PWA's mesh `gossip` frames, future types).
@@ -198,11 +205,28 @@ struct RawDcFrame {
     peer_id: Option<String>,
     #[serde(default)]
     payload: Option<serde_json::Value>,
+    #[serde(default)]
+    features: Option<serde_json::Value>,
 }
 
+/// The identity-frame feature of a peer that takes an ICE restart of the data connection: a
+/// second `rtc_offer` with the connection's DTLS fingerprint and new ICE credentials.
+pub const FEATURE_ICE_RESTART: &str = "ice-restart";
+
 impl DcFrame {
-    pub fn identity(peer_id: &str) -> String {
-        serde_json::json!({ "type": "identity", "peerId": peer_id }).to_string()
+    /// The identity frame; with `ice_restart` it lists that feature, without it is exactly
+    /// the PWA's.
+    pub fn identity(peer_id: &str, ice_restart: bool) -> String {
+        if ice_restart {
+            serde_json::json!({
+                "type": "identity",
+                "peerId": peer_id,
+                "features": [FEATURE_ICE_RESTART],
+            })
+        } else {
+            serde_json::json!({ "type": "identity", "peerId": peer_id })
+        }
+        .to_string()
     }
 
     pub fn chat(envelope_hex: &str) -> String {
@@ -218,7 +242,23 @@ impl DcFrame {
         match serde_json::from_str::<RawDcFrame>(text) {
             Ok(raw) => match raw.msg_type.as_str() {
                 "identity" => match raw.peer_id {
-                    Some(peer_id) => DcFrame::Identity { peer_id },
+                    Some(peer_id) => DcFrame::Identity {
+                        peer_id,
+                        // A list of strings; anything else is no feature.
+                        features: raw
+                            .features
+                            .as_ref()
+                            .and_then(serde_json::Value::as_array)
+                            .map(|list| {
+                                list.iter()
+                                    .filter_map(serde_json::Value::as_str)
+                                    .filter(|f| !f.is_empty() && f.len() <= 32)
+                                    .take(16)
+                                    .map(str::to_owned)
+                                    .collect()
+                            })
+                            .unwrap_or_default(),
+                    },
                     None => DcFrame::Other,
                 },
                 "chat" => match raw.payload {
@@ -335,10 +375,15 @@ mod tests {
     #[test]
     fn data_channel_frames_match_the_pwa() {
         assert_eq!(
-            DcFrame::parse(DcFrame::identity("abc").as_bytes()),
+            DcFrame::parse(DcFrame::identity("abc", true).as_bytes()),
             DcFrame::Identity {
-                peer_id: "abc".into()
+                peer_id: "abc".into(),
+                features: vec![FEATURE_ICE_RESTART.into()],
             }
+        );
+        assert_eq!(
+            DcFrame::identity("abc", false),
+            r#"{"peerId":"abc","type":"identity"}"#
         );
         assert_eq!(
             DcFrame::parse(DcFrame::chat("00ff").as_bytes()),
@@ -348,7 +393,23 @@ mod tests {
         assert_eq!(
             DcFrame::parse(br#"{"type":"identity","peerId":"p"}"#),
             DcFrame::Identity {
-                peer_id: "p".into()
+                peer_id: "p".into(),
+                features: vec![],
+            }
+        );
+        // Features that are not a list of strings are no features.
+        assert_eq!(
+            DcFrame::parse(br#"{"type":"identity","peerId":"p","features":"ice-restart"}"#),
+            DcFrame::Identity {
+                peer_id: "p".into(),
+                features: vec![],
+            }
+        );
+        assert_eq!(
+            DcFrame::parse(br#"{"type":"identity","peerId":"p","features":["x",1,"ice-restart"]}"#),
+            DcFrame::Identity {
+                peer_id: "p".into(),
+                features: vec!["x".into(), "ice-restart".into()],
             }
         );
         assert_eq!(

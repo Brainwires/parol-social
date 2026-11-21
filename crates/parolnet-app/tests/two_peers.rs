@@ -808,3 +808,455 @@ async fn relay_only_without_a_reachable_turn_server_shows_no_path() {
     bob.shutdown().await;
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+// ── Network changes, renegotiation, bitrate and quality ─────────────────────────────────
+
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+
+/// A call's media driven by the test: opaque audio and video frames go out all the time
+/// (the core drops what is not negotiated), and what comes back is counted.
+#[derive(Clone, Default)]
+struct MediaProbe {
+    audio: Arc<AtomicUsize>,
+    video: Arc<AtomicUsize>,
+    bitrates: Arc<Mutex<Vec<u32>>>,
+    remote_video: Arc<Mutex<Vec<bool>>>,
+    local_video: Arc<Mutex<Vec<bool>>>,
+}
+
+impl MediaProbe {
+    fn start(media: parolnet_app::CallMedia) -> MediaProbe {
+        use parolnet_app::{MediaEvent, MediaKind};
+        let probe = MediaProbe::default();
+        let parolnet_app::CallMedia { frames, mut events } = media;
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(Duration::from_millis(20));
+            loop {
+                tick.tick().await;
+                if !frames.send(MediaKind::Audio, vec![0xf8; 60], 960)
+                    || !frames.send(MediaKind::Video, vec![0x10; 2000], 1800)
+                {
+                    break;
+                }
+            }
+        });
+        let seen = probe.clone();
+        tokio::spawn(async move {
+            while let Some(event) = events.recv().await {
+                match event {
+                    MediaEvent::Rtp {
+                        kind: MediaKind::Audio,
+                        ..
+                    } => {
+                        seen.audio.fetch_add(1, Ordering::Relaxed);
+                    }
+                    MediaEvent::Rtp {
+                        kind: MediaKind::Video,
+                        ..
+                    } => {
+                        seen.video.fetch_add(1, Ordering::Relaxed);
+                    }
+                    MediaEvent::TargetBitrate { bps } => seen.bitrates.lock().unwrap().push(bps),
+                    MediaEvent::RemoteVideo { sending } => {
+                        seen.remote_video.lock().unwrap().push(sending)
+                    }
+                    MediaEvent::LocalVideo { sending } => {
+                        seen.local_video.lock().unwrap().push(sending)
+                    }
+                    _ => {}
+                }
+            }
+        });
+        probe
+    }
+
+    fn audio(&self) -> usize {
+        self.audio.load(Ordering::Relaxed)
+    }
+
+    fn video(&self) -> usize {
+        self.video.load(Ordering::Relaxed)
+    }
+
+    /// Wait until `more` further packets of each asked kind have arrived.
+    async fn more(&self, what: &str, audio: usize, video: usize) {
+        let (a0, v0) = (self.audio(), self.video());
+        for _ in 0..600 {
+            if self.audio() >= a0 + audio && self.video() >= v0 + video {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        panic!(
+            "{what}: audio {} (+{audio} wanted from {a0}), video {} (+{video} from {v0})",
+            self.audio(),
+            self.video()
+        );
+    }
+}
+
+/// Start a call from `caller` to `callee` and wait until it is active on both sides.
+async fn active_call(
+    caller: (&AppHandle, &mut UnboundedReceiver<AppEvent>),
+    callee: (&AppHandle, &mut UnboundedReceiver<AppEvent>),
+    video: bool,
+) -> (String, MediaProbe, MediaProbe) {
+    let call = caller
+        .0
+        .start_call(callee.0.peer_id(), video)
+        .await
+        .unwrap();
+    let caller_media = MediaProbe::start(caller.0.take_call_media(&call.call_id).await.unwrap());
+    let ring = call_state(callee.1, "incoming call", |c| {
+        c.state == parolnet_app::CallState::Incoming
+    })
+    .await;
+    assert_eq!(ring.video, video);
+    callee.0.accept_call(&ring.call_id).await.unwrap();
+    let callee_media = MediaProbe::start(callee.0.take_call_media(&ring.call_id).await.unwrap());
+    for rx in [caller.1, callee.1] {
+        call_state(rx, "active call", |c| {
+            c.state == parolnet_app::CallState::Active
+        })
+        .await;
+    }
+    (call.call_id, caller_media, callee_media)
+}
+
+/// Wait until the contact's connection has completed `want` ICE restarts.
+async fn ice_restarts(app: &AppHandle, want: u32, what: &str) {
+    for _ in 0..400 {
+        if app.snapshot().await.unwrap().contacts[0].ice_restarts >= want {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    panic!(
+        "{what}: {} ICE restarts, expected {want}",
+        app.snapshot().await.unwrap().contacts[0].ice_restarts
+    );
+}
+
+/// Everything waiting in the event channel.
+fn drain(rx: &mut UnboundedReceiver<AppEvent>) -> Vec<AppEvent> {
+    let mut events = Vec::new();
+    while let Ok(event) = rx.try_recv() {
+        events.push(event);
+    }
+    events
+}
+
+/// A network change restarts ICE on the data connection through the relay (`rtc_offer` /
+/// `rtc_answer` again) and on the call through `reoffer` / `reanswer` inside the session:
+/// neither is torn down, the path never stops being direct, and chat and media go on.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_network_change_restarts_ice_instead_of_rebuilding() {
+    let relay = start_relay().await;
+    let dir = unique_dir("restart");
+    let ((alice, mut alice_rx), (bob, mut bob_rx)) = paired_pair(&relay, &dir).await;
+    bob.send_text(alice.peer_id(), "before").await.unwrap();
+    received(&mut alice_rx, bob.peer_id(), "before").await;
+    assert_eq!(alice.snapshot().await.unwrap().contacts[0].ice_restarts, 0);
+    drain(&mut alice_rx);
+    drain(&mut bob_rx);
+
+    // Alice's interfaces changed.
+    alice.network_changed();
+    ice_restarts(&alice, 1, "alice's restart").await;
+    ice_restarts(&bob, 1, "the restart bob answered").await;
+    let sent = alice
+        .send_text(bob.peer_id(), "after the restart")
+        .await
+        .unwrap();
+    assert_eq!(sent.state, DeliveryState::Sent);
+    received(&mut bob_rx, alice.peer_id(), "after the restart").await;
+    bob.send_text(alice.peer_id(), "and back").await.unwrap();
+    received(&mut alice_rx, bob.peer_id(), "and back").await;
+    // And from the other side, the one that answered the first offer of the connection.
+    bob.network_changed();
+    ice_restarts(&bob, 2, "bob's restart").await;
+    ice_restarts(&alice, 2, "the restart alice answered").await;
+    // Both at once: the crossing offers are settled, and one restart is counted.
+    alice.network_changed();
+    bob.network_changed();
+    ice_restarts(&alice, 3, "the crossed restarts (alice)").await;
+    ice_restarts(&bob, 3, "the crossed restarts (bob)").await;
+    alice.send_text(bob.peer_id(), "still here").await.unwrap();
+    received(&mut bob_rx, alice.peer_id(), "still here").await;
+
+    // The connection was never rebuilt: no path change was reported on either side.
+    for events in [drain(&mut alice_rx), drain(&mut bob_rx)] {
+        for event in events {
+            assert!(
+                !matches!(event, AppEvent::Path { .. } | AppEvent::Notice(_)),
+                "{event:?}"
+            );
+        }
+    }
+    assert_eq!(
+        alice.snapshot().await.unwrap().contacts[0].path,
+        PathState::Direct
+    );
+
+    // The same during a call: the call's own connection restarts too and media goes on.
+    let (call_id, alice_media, bob_media) =
+        active_call((&alice, &mut alice_rx), (&bob, &mut bob_rx), true).await;
+    alice_media
+        .more("media before the change (alice)", 25, 25)
+        .await;
+    bob_media
+        .more("media before the change (bob)", 25, 25)
+        .await;
+    let changes = |rx: &mut UnboundedReceiver<AppEvent>| {
+        drain(rx)
+            .into_iter()
+            .filter_map(|e| match e {
+                AppEvent::CallQuality { quality, .. } => Some(quality.stats.path_changes),
+                AppEvent::Call(c) => {
+                    assert!(!c.is_over(), "{c:?}");
+                    None
+                }
+                _ => None,
+            })
+            .max()
+    };
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+    let before = changes(&mut alice_rx).expect("a quality report").max(1);
+    alice.network_changed();
+    let mut moved = false;
+    for _ in 0..200 {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        if changes(&mut alice_rx).is_some_and(|n| n > before) {
+            moved = true;
+            break;
+        }
+    }
+    assert!(
+        moved,
+        "the call's transport selected a pair again after its ICE restart"
+    );
+    alice_media
+        .more("media after the change (alice)", 50, 50)
+        .await;
+    bob_media.more("media after the change (bob)", 50, 50).await;
+    ice_restarts(&alice, 4, "the data connection restarted with the call").await;
+    alice.hangup(&call_id);
+    call_state(&mut bob_rx, "hang-up", |c| c.is_over()).await;
+
+    alice.shutdown().await;
+    bob.shutdown().await;
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A contact whose app knows no ICE restart (the PWA, the web app today) is never sent one:
+/// its connection is left as it is, and a call with it stays as it was set up.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_contact_that_does_not_renegotiate_keeps_working_as_before() {
+    let relay = start_relay().await;
+    let dir = unique_dir("norestart");
+    let (alice, mut alice_rx) = start(config(&dir, &relay, "alice")).await;
+    let mut old = config(&dir, &relay, "bob");
+    old.renegotiation = false;
+    let (bob, mut bob_rx) = start(old).await;
+    registered(&mut alice_rx).await;
+    registered(&mut bob_rx).await;
+    let code = alice.create_pairing_code().await.unwrap();
+    bob.pair_with_code(&code).await.unwrap();
+    path(&mut alice_rx, "paired (alice)", 30, PathState::Direct).await;
+    path(&mut bob_rx, "paired (bob)", 30, PathState::Direct).await;
+    drain(&mut alice_rx);
+    drain(&mut bob_rx);
+
+    alice.network_changed();
+    bob.network_changed();
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    for app in [&alice, &bob] {
+        let contact = &app.snapshot().await.unwrap().contacts[0];
+        assert_eq!((contact.ice_restarts, contact.path), (0, PathState::Direct));
+    }
+    alice.send_text(bob.peer_id(), "as before").await.unwrap();
+    received(&mut bob_rx, alice.peer_id(), "as before").await;
+    assert!(
+        drain(&mut alice_rx)
+            .iter()
+            .all(|e| !matches!(e, AppEvent::Path { .. })),
+        "nothing happened to the connection"
+    );
+
+    // A video call: the camera toggle does not renegotiate (black is sent instead), and the
+    // call is not told to change.
+    let (call_id, alice_media, bob_media) =
+        active_call((&alice, &mut alice_rx), (&bob, &mut bob_rx), true).await;
+    alice_media.more("video from bob", 10, 10).await;
+    bob_media.more("video from alice", 10, 10).await;
+    assert_eq!(
+        alice.set_call_video(&call_id, false).await.unwrap(),
+        parolnet_app::VideoChange::Unchanged
+    );
+    assert_eq!(
+        bob.set_call_video(&call_id, false).await.unwrap(),
+        parolnet_app::VideoChange::Unchanged
+    );
+    alice.network_changed();
+    // The stream is still there both ways (what the client sends on it is its business).
+    bob_media
+        .more("video from alice after 'camera off'", 25, 25)
+        .await;
+    alice_media
+        .more("video from bob after 'camera off'", 25, 25)
+        .await;
+    let calls: Vec<parolnet_app::CallInfo> = drain(&mut alice_rx)
+        .into_iter()
+        .filter_map(|e| match e {
+            AppEvent::Call(c) => Some(c),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        calls.iter().all(|c| !c.renegotiable && c.local_video),
+        "{calls:?}"
+    );
+    alice.hangup(&call_id);
+    call_state(&mut bob_rx, "hang-up", |c| c.is_over()).await;
+
+    // An audio call cannot gain video.
+    let (call_id, alice_media, _bob_media) =
+        active_call((&alice, &mut alice_rx), (&bob, &mut bob_rx), false).await;
+    alice_media.more("audio", 10, 0).await;
+    assert!(matches!(
+        alice.set_call_video(&call_id, true).await,
+        Err(parolnet_app::AppError::CannotRenegotiate)
+    ));
+    assert_eq!(
+        alice.set_call_video(&call_id, false).await.unwrap(),
+        parolnet_app::VideoChange::Unchanged
+    );
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(alice_media.video(), 0);
+    alice.hangup(&call_id);
+    call_state(&mut bob_rx, "hang-up", |c| c.is_over()).await;
+
+    alice.shutdown().await;
+    bob.shutdown().await;
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// An audio call gains video by renegotiation, in both directions, and a camera that is
+/// turned off stops its stream; the encoder is told what the path carries and the UI how
+/// good the connection is.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_call_gains_and_loses_video_by_renegotiation() {
+    use parolnet_app::VideoChange;
+    let relay = start_relay().await;
+    let dir = unique_dir("upgrade");
+    let ((alice, mut alice_rx), (bob, mut bob_rx)) = paired_pair(&relay, &dir).await;
+    let (call_id, alice_media, bob_media) =
+        active_call((&alice, &mut alice_rx), (&bob, &mut bob_rx), false).await;
+    alice_media.more("audio (alice)", 25, 0).await;
+    bob_media.more("audio (bob)", 25, 0).await;
+    assert_eq!((alice_media.video(), bob_media.video()), (0, 0));
+
+    // The congestion controller's estimate reached the client's media end at once.
+    assert_eq!(alice_media.bitrates.lock().unwrap().first(), Some(&300_000));
+    assert_eq!(bob_media.bitrates.lock().unwrap().first(), Some(&300_000));
+
+    // Alice turns her camera on.
+    assert_eq!(
+        alice.set_call_video(&call_id, true).await.unwrap(),
+        VideoChange::Renegotiating
+    );
+    let info = call_state(&mut bob_rx, "bob sees alice's video", |c| c.remote_video).await;
+    assert!(info.video && !info.local_video && info.renegotiable);
+    let info = call_state(&mut alice_rx, "alice's video is sent", |c| c.local_video).await;
+    assert!(info.video && !info.remote_video && info.renegotiable);
+    bob_media.more("alice's video", 25, 25).await;
+    assert_eq!(alice_media.video(), 0, "bob's camera is off");
+    assert_eq!(*bob_media.remote_video.lock().unwrap(), [true]);
+    assert_eq!(alice_media.local_video.lock().unwrap().last(), Some(&true));
+
+    // Bob turns his on.
+    assert_eq!(
+        bob.set_call_video(&call_id, true).await.unwrap(),
+        VideoChange::Renegotiating
+    );
+    call_state(&mut alice_rx, "alice sees bob's video", |c| c.remote_video).await;
+    alice_media.more("bob's video", 25, 25).await;
+
+    // Alice turns hers off: bob is told and her stream stops; his goes on.
+    assert_eq!(
+        alice.set_call_video(&call_id, false).await.unwrap(),
+        VideoChange::Renegotiating
+    );
+    let info = call_state(&mut bob_rx, "bob sees alice's video end", |c| {
+        !c.remote_video
+    })
+    .await;
+    assert!(info.video && info.local_video, "{info:?}");
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let stopped = bob_media.video();
+    alice_media.more("bob's video continues", 25, 25).await;
+    assert_eq!(bob_media.video(), stopped, "no video from alice any more");
+    assert_eq!(*bob_media.remote_video.lock().unwrap(), [true, false]);
+
+    // Both at once: alice on again, bob off. The crossing offers are settled.
+    let (a, b) = tokio::join!(
+        alice.set_call_video(&call_id, true),
+        bob.set_call_video(&call_id, false)
+    );
+    assert_eq!(
+        (a.unwrap(), b.unwrap()),
+        (VideoChange::Renegotiating, VideoChange::Renegotiating)
+    );
+    call_state(&mut bob_rx, "alice's video is back and bob's is off", |c| {
+        c.remote_video && !c.local_video
+    })
+    .await;
+    call_state(&mut alice_rx, "the same seen by alice", |c| {
+        c.local_video && !c.remote_video
+    })
+    .await;
+    bob_media.more("alice's video again", 25, 25).await;
+
+    // The quality of the connection is reported about once a second while the call is
+    // active: a host pair on loopback, nothing lost, nothing weak.
+    let quality = wait_for(
+        &mut alice_rx,
+        "a quality report",
+        10,
+        |e| matches!(e, AppEvent::CallQuality { quality, .. } if quality.stats.send_bps > 0),
+    )
+    .await;
+    let AppEvent::CallQuality {
+        call_id: id,
+        quality,
+    } = quality
+    else {
+        unreachable!()
+    };
+    assert_eq!(id, call_id);
+    assert_eq!(
+        quality.stats.local_candidate,
+        Some(parolnet_app::CandidateKind::Host)
+    );
+    assert!(
+        quality.stats.rtt_ms.is_some_and(|rtt| rtt < 200),
+        "{quality:?}"
+    );
+    assert!(quality.stats.available_bps.is_some());
+    assert_eq!(quality.summary(), None, "{quality:?}");
+    assert!(
+        alice_media.bitrates.lock().unwrap().len() > 1,
+        "the estimate moved"
+    );
+
+    alice.hangup(&call_id);
+    call_state(&mut bob_rx, "hang-up", |c| c.is_over()).await;
+    assert!(matches!(
+        alice.set_call_video(&call_id, true).await,
+        Err(parolnet_app::AppError::UnknownCall(_))
+    ));
+    alice.shutdown().await;
+    bob.shutdown().await;
+    let _ = std::fs::remove_dir_all(&dir);
+}
