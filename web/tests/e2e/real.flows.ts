@@ -103,6 +103,34 @@ async function recordPeerConnections(context: BrowserContext): Promise<void> {
   });
 }
 
+/**
+ * What each page's engine logged about its calls (`[Call] …`: how a call ended, and a line
+ * before each step of letting its media go), with the time. Diagnostics only: if a page
+ * freezes while a call is torn down, the last line names the browser call that did not
+ * return (see repro/README.md).
+ */
+const callLogs = new WeakMap<Page, string[]>();
+
+function recordCallLog(page: Page): void {
+  const lines: string[] = [];
+  const t0 = Date.now();
+  callLogs.set(page, lines);
+  page.on("console", (message) => {
+    const text = message.text();
+    if (text.startsWith("[Call]")) lines.push(`+${Date.now() - t0}ms ${text}`);
+  });
+}
+
+/** Whether the page still runs script: a blocked main thread does not answer. */
+function answers(page: Page): Promise<string> {
+  return Promise.race([
+    page.evaluate(() => "the page answers"),
+    new Promise<string>((done) =>
+      setTimeout(() => done("the page does not answer: its main thread is blocked"), 5_000)
+    ),
+  ]).catch((e) => `the page does not answer: ${e}`);
+}
+
 /** Every connection a page made: states, the timed ICE log, SDP candidates, candidate pairs. */
 function connectionReport(page: Page): Promise<string> {
   return page.evaluate(async () => {
@@ -158,17 +186,30 @@ function connectionReport(page: Page): Promise<string> {
 }
 
 /**
- * Run `step`; if it throws, attach both pages' connection reports to the failure.
+ * Run `step`; if it throws, or takes longer than `within`, attach each page's call log,
+ * whether it still answers, and its connection report to the failure.
  * `PAROLNET_CONNECTION_REPORT=1` prints them after a success too.
  */
 async function withConnectionReport(
   people: Record<string, Page>,
   step: () => Promise<void>,
+  within?: number,
 ): Promise<void> {
   const report = async () => {
-    // Both at once: the test may be close to its own timeout.
+    // All at once, and none waited for longer than a few seconds: the test may be close to
+    // its own timeout, and a frozen page never answers.
     const texts = await Promise.all(
-      Object.values(people).map((page) => connectionReport(page).catch((e) => `no report: ${e}`)),
+      Object.values(people).map(async (page) => {
+        const state = await answers(page);
+        const connections = state === "the page answers"
+          ? await Promise.race([
+            connectionReport(page),
+            new Promise<string>((done) => setTimeout(() => done("no report in 10 s"), 10_000)),
+          ]).catch((e) => `no report: ${e}`)
+          : "no report";
+        const calls = (callLogs.get(page) ?? []).map((l) => `  ${l}`).join("\n");
+        return `${state}\ncall log:\n${calls || "  (nothing)"}\n${connections}`;
+      }),
     );
     for (const [i, name] of Object.keys(people).entries()) {
       await test.info().attach(`connections-${name}.txt`, {
@@ -178,11 +219,24 @@ async function withConnectionReport(
       console.log(`--- ${name}'s connections ---\n${texts[i]}`);
     }
   };
+  let timer: ReturnType<typeof setTimeout> | undefined;
   try {
-    await step();
+    await Promise.race([
+      step(),
+      new Promise<void>((_done, fail) => {
+        if (within !== undefined) {
+          timer = setTimeout(
+            () => fail(new Error(`this step did not finish in ${within / 1000} s`)),
+            within,
+          );
+        }
+      }),
+    ]);
   } catch (error) {
     await report();
     throw error;
+  } finally {
+    clearTimeout(timer);
   }
   if (process.env.PAROLNET_CONNECTION_REPORT === "1") await report();
 }
@@ -292,6 +346,7 @@ async function person(
   }
   await init?.(context);
   const page = await context.newPage();
+  recordCallLog(page);
   const problems = await watch(page, live);
   await page.goto(live.url);
   return { context, page, problems };
@@ -666,8 +721,23 @@ test("leaving the scanner releases the camera; a picture that is not a code says
 });
 
 test("a video call: ring, accept, controls, end; and a declined call", async ({ browser, live }) => {
-  const ana = await person(browser, live, PHONE);
-  const ben = await person(browser, live, WIDE);
+  // Every camera capture a page makes is kept (`window.__captures`), to see it let go.
+  // Patched on the prototype: WebKit's `navigator.mediaDevices` is not yet the page's own
+  // object when an init script runs.
+  const keepCaptures = (context: BrowserContext) =>
+    context.addInitScript(() => {
+      const kept: MediaStream[] = [];
+      (window as unknown as { __captures: MediaStream[] }).__captures = kept;
+      if (typeof MediaDevices === "undefined") return;
+      const real = MediaDevices.prototype.getUserMedia;
+      MediaDevices.prototype.getUserMedia = async function (constraints) {
+        const stream = await real.call(this, constraints);
+        if (constraints?.video) kept.push(stream);
+        return stream;
+      };
+    });
+  const ana = await person(browser, live, PHONE, keepCaptures);
+  const ben = await person(browser, live, WIDE, keepCaptures);
   await start(ana.page);
   await start(ben.page);
   await pairByPaste(ana.page, ben.page, { presenter: "Ana", scanner: "Ben" });
@@ -730,17 +800,61 @@ test("a video call: ring, accept, controls, end; and a declined call", async ({ 
   await ben.page.getByTestId("call-camera").click();
   await ben.page.getByTestId("call-mute").click();
 
-  // Ana ends it. Ben is told how it ended; both devices let the camera go.
-  await withConnectionReport({ ana: ana.page, ben: ben.page }, async () => {
-    await ana.page.getByTestId("call-hangup").click();
-    await expect(ana.page.getByTestId("call-status")).toHaveText("Call ended");
-    await expect(ben.page.getByTestId("call-status")).toHaveText(
-      "Ana ended the call",
+  // Ana ends it. Ben is told how it ended; both devices let the camera and the connection
+  // go. The step has a time limit of its own, so that a page frozen in the browser's media
+  // teardown is reported as such, with the engine's last line.
+  const captures = (page: Page) =>
+    page.evaluate(() =>
+      (window as unknown as { __captures: MediaStream[] }).__captures.flatMap((stream) =>
+        stream.getTracks().map((track) => track.readyState)
+      )
     );
-  });
-  await ben.page.getByTestId("call-close").click();
-  await expect(ben.page.getByTestId("call-screen")).toHaveCount(0);
-  await ana.page.getByTestId("call-close").click();
+  type Kept = { pc: RTCPeerConnection };
+  // The call's connection is the one that carries media.
+  const callConnections = (page: Page) =>
+    page.evaluate(() =>
+      (window as unknown as { __pcs: Kept[] }).__pcs.flatMap(({ pc }, i) =>
+        pc.getTransceivers().length > 0 ? [i] : []
+      )
+    );
+  const signaling = (page: Page, which: number[]) =>
+    page.evaluate(
+      (which) =>
+        which.map((i) => (window as unknown as { __pcs: Kept[] }).__pcs[i].pc.signalingState),
+      which,
+    );
+  await withConnectionReport({ ana: ana.page, ben: ben.page }, async () => {
+    const connections = new Map<Page, number[]>();
+    for (const page of [ana.page, ben.page]) {
+      connections.set(page, await callConnections(page));
+      expect(connections.get(page)).toHaveLength(1);
+    }
+    await ana.page.getByTestId("call-hangup").click();
+    // The screen says how the call ended for six seconds, so the two pages are read at the
+    // same time. Ben closes his; Ana's goes away by itself.
+    await Promise.all([
+      (async () => {
+        await expect(ana.page.getByTestId("call-status")).toHaveText("Call ended");
+        await expect(ana.page.getByTestId("call-remote")).toHaveCount(0);
+      })(),
+      (async () => {
+        await expect(ben.page.getByTestId("call-status")).toHaveText(
+          "Ana ended the call",
+        );
+        await expect(ben.page.getByTestId("call-remote")).toHaveCount(0);
+        await ben.page.getByTestId("call-close").click();
+        await expect(ben.page.getByTestId("call-screen")).toHaveCount(0);
+      })(),
+    ]);
+    await expect(ana.page.getByTestId("call-screen")).toHaveCount(0, {
+      timeout: 15_000,
+    });
+    for (const page of [ana.page, ben.page]) {
+      // The capture is stopped and the call's connection closed.
+      await expect.poll(() => captures(page)).toEqual(["ended", "ended"]);
+      await expect.poll(() => signaling(page, connections.get(page)!)).toEqual(["closed"]);
+    }
+  }, 60_000);
 
   // A voice call the other way, declined.
   await ana.page.getByTestId("call-voice").click();
