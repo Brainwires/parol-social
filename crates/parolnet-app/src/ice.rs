@@ -1,22 +1,13 @@
 //! ICE servers: STUN from the home relay's `/turn-credentials`, TURN only from the user.
 //!
 //! A signaling-only relay answers `/turn-credentials` with STUN URIs only. The app never
-//! takes a TURN URI from a relay (even a relay-profile one): TURN is user-supplied
-//! (plan section 2.3).
+//! takes a TURN URI or credential from a relay (even a relay-profile one): the only TURN
+//! server it ever uses is the one the user configured ([`crate::TurnSettings`],
+//! PNP-001-MUST-082), so a relay cannot put itself on the media path by announcing one.
 
 use std::time::Duration;
 
 use serde::Deserialize;
-
-/// A user-configured ICE server (their own TURN server, or extra STUN).
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, Deserialize)]
-pub struct IceServer {
-    pub urls: Vec<String>,
-    #[serde(default)]
-    pub username: String,
-    #[serde(default)]
-    pub credential: String,
-}
 
 #[derive(Deserialize)]
 struct TurnCredentials {
@@ -121,6 +112,34 @@ mod tests {
         let (stun, _) = stun_uris_from_answer("{}");
         assert!(stun.is_empty());
         let (stun, _) = stun_uris_from_answer("garbage");
+        assert!(stun.is_empty());
+    }
+
+    #[test]
+    fn a_relay_cannot_offer_turn_in_any_spelling() {
+        // A relay-profile answer with working TURN credentials, and hostile spellings.
+        let (stun, _) = stun_uris_from_answer(
+            r#"{"username":"1700000000:u","credential":"c2VjcmV0","ttl":86400,
+                "uris":["TURN:relay.example:3478","Turn:relay.example:3478?transport=udp",
+                        "turns:relay.example:443?transport=tcp"," turn:relay.example:3478",
+                        "stun:relay.example:3478","STUN:relay.example:3479",
+                        "stuns:relay.example:5349","http://relay.example/","",
+                        "stun:x turn:relay.example:3478"],
+                "iceServers":[{"urls":"turn:relay.example:3478","username":"u","credential":"c"}]}"#,
+        );
+        for uri in &stun {
+            assert!(uri.to_ascii_lowercase().starts_with("stun:"), "{uri}");
+        }
+        assert_eq!(stun.len(), 3);
+        // What is kept is only ever used as a STUN server address: the one entry that
+        // smuggles a second URI does not parse as one.
+        let usable: Vec<_> = stun
+            .iter()
+            .filter_map(|u| parolnet_rtc::stun_host_port(u))
+            .collect();
+        assert_eq!(usable, vec!["relay.example:3478", "relay.example:3479"]);
+        // Credentials in the answer are not even parsed.
+        let (stun, _) = stun_uris_from_answer(r#"{"username":"u","credential":"c","uris":[]}"#);
         assert!(stun.is_empty());
     }
 }

@@ -13,7 +13,10 @@
 //!   `presence`, non-trickle `rtc_offer` / `rtc_answer`, `rtc_ice` for late candidates).
 //! - **Transport**: one direct WebRTC connection per contact through `parolnet-rtc`, with
 //!   the `parolnet` data channel and the PWA's JSON frames on it. ICE is host + STUN (from
-//!   the relay's `/turn-credentials`); TURN is user-supplied only.
+//!   the relay's `/turn-credentials`). TURN is never taken from a relay: only the server the
+//!   user configured ([`TurnSettings`], [`AppHandle::set_turn_settings`]) is used, as one
+//!   more candidate or, with `relay_only`, as the only path (the contact then sees that
+//!   server's address instead of ours).
 //! - **Channel binding** (PNP-001 §10.5.1): both DTLS fingerprints are bound into the session
 //!   by a CHANNEL_BINDING envelope on the channel; content and call signals wait for it.
 //! - **Chat**: 1:1 text as PNP-001 TEXT envelopes, interoperable with the PWA; a sender-side
@@ -27,6 +30,7 @@
 pub mod call;
 mod engine;
 pub mod ice;
+pub mod reconnect;
 mod signaling;
 pub mod store;
 pub mod wire;
@@ -40,8 +44,8 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, oneshot};
 
 pub use call::{CallEnd, CallInfo, CallMedia, CallState, FrameSink, MediaEvent};
-pub use ice::IceServer;
 pub use parolnet_rtc::MediaKind;
+pub use reconnect::ReconnectConfig;
 
 /// Errors surfaced to the client.
 #[derive(Debug, thiserror::Error)]
@@ -82,10 +86,6 @@ pub struct AppConfig {
     /// STUN servers. `None` fetches them from the relay's `/turn-credentials`; `Some(vec![])`
     /// uses host candidates only (tests, one network).
     pub stun_servers: Option<Vec<String>>,
-    /// The user's own ICE servers ("Relay through my own TURN server"). Passed to the engine;
-    /// TURN candidate gathering in `parolnet-rtc` is still to come, so a TURN entry does not
-    /// yet create relay candidates.
-    pub user_ice_servers: Vec<IceServer>,
     /// The interface address for host candidates. `None` picks the default-route interface
     /// (loopback when there is none).
     pub bind_ip: Option<IpAddr>,
@@ -94,6 +94,8 @@ pub struct AppConfig {
     pub pairing_window: Duration,
     /// Optional name to give contacts by default (`None`: the first 8 hex digits).
     pub default_contact_name: Option<String>,
+    /// How contacts the relay called offline are re-probed.
+    pub reconnect: ReconnectConfig,
 }
 
 impl AppConfig {
@@ -102,10 +104,10 @@ impl AppConfig {
             data_dir: data_dir.into(),
             relay_url: relay_url.into(),
             stun_servers: None,
-            user_ice_servers: Vec::new(),
             bind_ip: None,
             pairing_window: Duration::from_secs(30 * 60),
             default_contact_name: None,
+            reconnect: ReconnectConfig::default(),
         }
     }
 }
@@ -160,8 +162,9 @@ pub enum PathState {
     Connecting,
     /// The data channel is open.
     Direct,
-    /// The contact is online but no direct path could be built: either side can add a TURN
-    /// server of their own.
+    /// The contact is online but no path could be built: either side can add a TURN server
+    /// of their own. Also the state when relay-only is on and the user's TURN server gives
+    /// no relay candidate (unreachable, wrong credential): no direct attempt is made then.
     NoDirectPath,
     /// The last direct connection failed its end-to-end check (the DTLS fingerprints the
     /// contact saw differ from ours, PNP-001 §10.5.1): something on the signaling path may
@@ -219,6 +222,61 @@ pub struct Snapshot {
     pub relay: RelayState,
     pub contacts: Vec<ContactView>,
     pub pairing_open: bool,
+    /// The user configured their own TURN server (its credential is never in a snapshot).
+    pub turn_configured: bool,
+    /// Connections use that TURN server only.
+    pub relay_only: bool,
+}
+
+/// The user's own TURN server ("Relay through my own TURN server"). The only TURN server
+/// the app ever uses: none is built in and none is taken from a relay.
+///
+/// The password is wiped when the value is dropped and never shown by `Debug`.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TurnSettings {
+    /// `turn:host[:port]` (UDP; `?transport=udp` is accepted, TCP and `turns:` are not yet).
+    pub uri: String,
+    /// The long-term credential.
+    pub username: String,
+    pub password: String,
+    /// Use the TURN server for every connection and nothing else: contacts see its address
+    /// instead of this device's. Off: the relay candidate is one more option next to the
+    /// direct ones, for pairs with no direct path.
+    #[serde(default)]
+    pub relay_only: bool,
+}
+
+impl TurnSettings {
+    /// Trimmed and checked: a usable `turn:` URI, a username and a password.
+    pub fn validated(mut self) -> Result<TurnSettings, AppError> {
+        self.uri = self.uri.trim().to_owned();
+        self.username = self.username.trim().to_owned();
+        parolnet_rtc::parse_turn_uri(&self.uri).map_err(|e| AppError::Config(e.to_string()))?;
+        if self.username.is_empty() {
+            return Err(AppError::Config("the TURN server needs a username".into()));
+        }
+        if self.password.is_empty() {
+            return Err(AppError::Config("the TURN server needs a password".into()));
+        }
+        Ok(self)
+    }
+}
+
+impl std::fmt::Debug for TurnSettings {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TurnSettings")
+            .field("uri", &self.uri)
+            .field("username", &self.username)
+            .field("password", &"<redacted>")
+            .field("relay_only", &self.relay_only)
+            .finish()
+    }
+}
+
+impl Drop for TurnSettings {
+    fn drop(&mut self) {
+        zeroize::Zeroize::zeroize(&mut self.password);
+    }
 }
 
 pub(crate) enum Command {
@@ -238,6 +296,8 @@ pub(crate) enum Command {
     RejectCall(String),
     Hangup(String),
     TakeCallMedia(String, oneshot::Sender<Result<CallMedia, AppError>>),
+    TurnSettings(oneshot::Sender<Option<TurnSettings>>),
+    SetTurnSettings(Option<TurnSettings>, oneshot::Sender<Result<(), AppError>>),
     Shutdown(oneshot::Sender<()>),
 }
 
@@ -347,6 +407,25 @@ impl AppHandle {
     pub async fn take_call_media(&self, call_id: &str) -> Result<CallMedia, AppError> {
         let c = call_id.to_owned();
         self.ask(|tx| Command::TakeCallMedia(c, tx)).await?
+    }
+
+    /// The user's TURN server, if they configured one (for the settings view; snapshots
+    /// only say whether one is set).
+    pub async fn turn_settings(&self) -> Result<Option<TurnSettings>, AppError> {
+        self.ask(Command::TurnSettings).await
+    }
+
+    /// Use the user's own TURN server from now on, and remember it. Refused when the URI is
+    /// not `turn:host[:port]` over UDP or the credential is incomplete. New connections use
+    /// it at once and existing data connections are rebuilt, without a restart.
+    pub async fn set_turn_settings(&self, settings: TurnSettings) -> Result<(), AppError> {
+        self.ask(|tx| Command::SetTurnSettings(Some(settings), tx))
+            .await?
+    }
+
+    /// Forget the TURN server: connections are direct again.
+    pub async fn clear_turn_settings(&self) -> Result<(), AppError> {
+        self.ask(|tx| Command::SetTurnSettings(None, tx)).await?
     }
 
     /// Close every connection, save state and stop the core.

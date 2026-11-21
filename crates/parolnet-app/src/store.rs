@@ -50,6 +50,9 @@ pub struct State {
     pub messages: BTreeMap<String, Vec<ChatMessage>>,
     #[serde(default)]
     pub next_message_id: u64,
+    /// The user's own TURN server ("Relay through my own TURN server"), if they set one.
+    #[serde(default)]
+    pub turn: Option<crate::TurnSettings>,
 }
 
 fn one() -> u32 {
