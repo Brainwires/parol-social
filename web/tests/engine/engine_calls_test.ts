@@ -198,6 +198,34 @@ Deno.test(
   }),
 );
 
+for (const exposed of [true, false]) {
+  Deno.test(
+    `call: a caller whose connectionState sticks at "connecting" ${
+      exposed ? "is Active once its DTLS transport connects" : "fails without transports to read"
+    }`,
+    withWorld(async (w) => {
+      const [a, b] = await pairWithMedia(w);
+      w.rtc.exposeTransports = exposed;
+      w.rtc.offererStateStuck = true;
+      const started = await a.engine.startCall(b.id, true);
+      await w.settle();
+      await b.engine.acceptCall(started.callId);
+      await w.settle();
+      assertEquals(callPcs(a)[0].connectionState, "connecting");
+      if (exposed) {
+        assertEquals(call(a).state.kind, "Active");
+        assertEquals(call(b).state.kind, "Active");
+        assertEquals(callStates(a).filter((s) => s === "Active").length, 1);
+      } else {
+        // As before the fix: only connectionState can say, and it never does.
+        assertEquals(call(a).state.kind, "Connecting");
+        await w.advance(CALL_CONNECT_TIMEOUT_MS + 1_000);
+        assertEquals(callStates(a).at(-1), "Ended(Failed)");
+      }
+    }),
+  );
+}
+
 Deno.test(
   "call: media that never connects fails the call on both sides after 30 s",
   withWorld(async (w) => {

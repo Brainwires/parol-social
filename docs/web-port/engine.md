@@ -244,7 +244,12 @@ stream.
 **Calls.** Per-call `RTCPeerConnection`; `offer` / `answer` carry the SDP with its candidates;
 incoming `ice` is accepted, also before the user accepts; every signal is matched by `callId` and
 by peer; a second call gets `reject`; `reject` and `hangup` tear down both sides; ring 60 s,
-connect 30 s. Capture goes through the injected `MediaDevices` when the call starts or is
+connect 30 s. A call is Active when `connectionState` is "connected" or, where senders
+expose their `RTCDtlsTransport`, when every transport still in use is connected (the spec's
+rule, applied by the engine): Linux WebKit (GStreamer) leaves the offerer's `connectionState`
+at "connecting" after the answer bundles the media lines and the extra transport closes.
+`bundlePolicy: "max-bundle"` would avoid the extra transport, but Firefox then offers
+bundle-only lines, which the desktop engine rejects. Capture goes through the injected `MediaDevices` when the call starts or is
 accepted; the engine stops the tracks it obtained when the call ends.
 
 **Timers and limits.** As the native core: answer 20 s, connect 45 s, offer fallback 10 s + up to
