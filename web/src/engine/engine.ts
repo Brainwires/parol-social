@@ -1486,6 +1486,8 @@ export class Engine {
    */
   connect(peerId: string): void {
     void this.internal(() => {
+      // Offering shows our address to whoever receives it: contacts only.
+      if (!this.contacts.has(peerId)) return;
       const st = this.peer(peerId);
       st.attempt = 0;
       st.quietProbe = false;

@@ -53,6 +53,8 @@ cleanups.push(() => rmSync(work, { recursive: true, force: true }));
 /** Every URL a page asked for, and every host the dead proxy was asked for. */
 const requested = [];
 const refusedHosts = new Set();
+/** Pages that are open, for the report when something fails. */
+const openWebs = new Set();
 
 function log(...args) {
   console.log(`[${new Date().toISOString().slice(11, 23)}]`, ...args);
@@ -259,10 +261,27 @@ async function launchBrowser(profileDir) {
       proxy,
     });
   }
-  return webkit.launchPersistentContext(profileDir, { headless: true, proxy });
+  // See `holdMedia`.
+  return webkit.launchPersistentContext(profileDir, {
+    headless: true,
+    proxy,
+    permissions: ["camera", "microphone"],
+  });
 }
 
-/** The engine harness in a page, driven through `window.__parolnetTest`. */
+/**
+ * WebKit only. Without media permission WebKit hides its host addresses behind mDNS names,
+ * and a container has no mDNS responder, so two WebKit pages could never reach each other
+ * here. A page that captures media gets real host candidates (as a page in a call would).
+ */
+async function holdMedia(page) {
+  if (browserName !== "webkit") return;
+  await page.evaluate(async () => {
+    globalThis.__held = await navigator.mediaDevices.getUserMedia({ audio: true });
+  });
+}
+
+/** The engine harness in a page, driven through `globalThis.__parolnetTest`. */
 class Web {
   static async open(name, port, { profile, tamperBinding = false } = {}) {
     const dir = profile ?? mkdtempSync(join(work, `${browserName}-${name}-`));
@@ -270,6 +289,7 @@ class Web {
     cleanups.push(() => context.close().catch(() => {}));
     const page = context.pages()[0] ?? (await context.newPage());
     const web = new Web(name, dir, context, page, port);
+    openWebs.add(web);
     page.on("request", (r) => requested.push(r.url()));
     page.on("websocket", (ws) => requested.push(ws.url()));
     page.on("console", (m) => {
@@ -301,26 +321,27 @@ class Web {
     }
     // Proof that connections are made through the global constructor at call time.
     await page.addInitScript(() => {
-      const Real = window.RTCPeerConnection;
-      window.__pcs = [];
-      window.RTCPeerConnection = function (...args) {
+      const Real = globalThis.RTCPeerConnection;
+      globalThis.__pcs = [];
+      globalThis.RTCPeerConnection = function (...args) {
         const pc = new Real(...args);
-        window.__pcs.push({ pc, config: args[0] });
+        globalThis.__pcs.push({ pc, config: args[0] });
         return pc;
       };
-      window.RTCPeerConnection.prototype = Real.prototype;
+      globalThis.RTCPeerConnection.prototype = Real.prototype;
     });
     await page.goto(`http://127.0.0.1:${port}/index.html`);
     await until(`${name}: the engine to start`, 30_000, async () => {
-      const h = await page.evaluate(() => window.__harness);
+      const h = await page.evaluate(() => globalThis.__harness);
       if (h?.state === "failed") throw new Error(`engine failed to start: ${h.error}`);
       return h?.state === "ready";
     });
-    web.peerId = (await page.evaluate(() => window.__parolnetTest.ready())).peerId;
+    web.peerId = (await page.evaluate(() => globalThis.__parolnetTest.ready())).peerId;
+    await holdMedia(page);
     await until(
       `${name}: relay registration`,
       20_000,
-      () => page.evaluate(() => window.__parolnetTest.relayRegistered()),
+      () => page.evaluate(() => globalThis.__parolnetTest.relayRegistered()),
     );
     return web;
   }
@@ -337,11 +358,11 @@ class Web {
   }
 
   hook(method, ...args) {
-    return this.page.evaluate(([m, a]) => window.__parolnetTest[m](...a), [method, args]);
+    return this.page.evaluate(([m, a]) => globalThis.__parolnetTest[m](...a), [method, args]);
   }
 
   engine(method, ...args) {
-    return this.page.evaluate(([m, a]) => window.__engine[m](...a), [method, args]);
+    return this.page.evaluate(([m, a]) => globalThis.__engine[m](...a), [method, args]);
   }
 
   async waitPath(peer, state, ms = 45_000) {
@@ -364,7 +385,24 @@ class Web {
   }
 
   async close() {
+    openWebs.delete(this);
     await this.context.close();
+  }
+
+  /** What the page knows, for a failure report: console, path events, ICE candidates. */
+  async report() {
+    const state = await this.page.evaluate(() => ({
+      events: (globalThis.__events ?? []).filter((e) => e.kind !== "Message").map((e) =>
+        `${e.kind}:${e.state?.kind ?? e.state ?? e.text ?? ""}`
+      ),
+      candidates: (globalThis.__pcs ?? []).map((p) =>
+        `${p.pc.connectionState}/${p.pc.iceConnectionState} ` +
+        (p.pc.localDescription?.sdp.match(/a=candidate:.*/g) ?? []).map((c) =>
+          c.split(" ").slice(4, 8).join(" ")
+        ).join(" | ")
+      ),
+    })).catch((e) => ({ error: String(e) }));
+    return { console: this.console.slice(-20), errors: this.errors, ...state };
   }
 }
 
@@ -482,7 +520,10 @@ async function webToWeb(port) {
   for (
     const text of ["while you were away 1", "typo mesage", "regretted", "while you were away 4"]
   ) {
-    const r = await a.page.evaluate(([p, t]) => window.__engine.sendText(p, t), [b.peerId, text]);
+    const r = await a.page.evaluate(([p, t]) => globalThis.__engine.sendText(p, t), [
+      b.peerId,
+      text,
+    ]);
     assert(r.state === "Queued", `"${text}" is queued, not ${r.state}`);
     queued.push(r);
   }
@@ -498,7 +539,7 @@ async function webToWeb(port) {
   );
   assert(
     (await a.page.evaluate(
-      (p) => window.__engine.snapshot().contacts.find((c) => c.contact.peerId === p).queued,
+      (p) => globalThis.__engine.snapshot().contacts.find((c) => c.contact.peerId === p).queued,
       b.peerId,
     )) ===
       3,
@@ -546,7 +587,7 @@ async function webToWeb(port) {
       servers.length === 0,
       `${w.name}: no ICE servers in the harness, got ${JSON.stringify(servers)}`,
     );
-    const pcs = await w.page.evaluate(() => window.__pcs.map((p) => p.config));
+    const pcs = await w.page.evaluate(() => globalThis.__pcs.map((p) => p.config));
     assert(pcs.length >= 1, `${w.name}: connections were made through the global constructor`);
     assert(
       pcs.every((c) => c.iceServers.length === 0 && c.iceTransportPolicy === "all"),
@@ -561,7 +602,7 @@ async function webToWeb(port) {
 
   // "Delete all data on this device".
   const old = b.peerId;
-  await b.page.evaluate(() => window.__engine.wipe());
+  await b.page.evaluate(() => globalThis.__engine.wipe());
   const dbs = await b.page.evaluate(
     async () => (indexedDB.databases ? (await indexedDB.databases()).map((d) => d.name) : []),
   );
@@ -569,7 +610,7 @@ async function webToWeb(port) {
   await b.page.reload();
   await until("a new identity after the wipe", 30_000, async () => {
     const id = await b.page.evaluate(() =>
-      window.__harness?.state === "ready" && window.__engine?.peerId
+      globalThis.__harness?.state === "ready" && globalThis.__engine?.peerId
     );
     return id && id !== old;
   });
@@ -618,7 +659,8 @@ async function webPresentsToDesktop(port, relayPort, bindIp) {
   // The presenter learned the desktop's identity key from the bootstrap envelope.
   const key = await web.page.evaluate(
     (p) =>
-      window.__engine.snapshot().contacts.find((c) => c.contact.peerId === p).contact.identityKey,
+      globalThis.__engine.snapshot().contacts.find((c) => c.contact.peerId === p).contact
+        .identityKey,
     bot.peerId,
   );
   const ready = bot.events.find((e) => e.event === "ready");
@@ -650,7 +692,7 @@ async function desktopPresentsToWeb(port, relayPort, bindIp) {
   await web.waitPath(bot.peerId, "direct");
   // The web client scanned, so it offered: its data connection is the offer side.
   const offered = await web.page.evaluate(() =>
-    window.__pcs.some((p) =>
+    globalThis.__pcs.some((p) =>
       p.pc.connectionState === "connected" && p.pc.localDescription?.type === "offer"
     )
   );
@@ -756,6 +798,7 @@ try {
 } catch (e) {
   failed = true;
   console.error(`FAIL (${browserName}): ${e.stack ?? e}`);
+  for (const w of openWebs) console.error(`[${w.name}]`, JSON.stringify(await w.report(), null, 1));
 } finally {
   for (const c of cleanups.reverse()) {
     try {
