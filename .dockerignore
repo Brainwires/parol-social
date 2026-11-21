@@ -2,4 +2,24 @@ target/
 .git/
 coverage/
 node_modules/
+**/node_modules/
 apps/desktop/target/
+# Secrets and local state never enter the build context.
+.env
+relay-data/
+relay-data-secondary/
+dist/
+dist-verify/
+# The web app's build outputs: the image builds them itself.
+web/out/
+web/out-test/
+web/.denext/
+web/.wasm-pkg/
+web/public/wasm/
+web/tests/e2e/artifacts/
+web/tests/e2e/test-results/
+web/tests/e2e/playwright-report/
+web/tests/engine/e2e/dist/
+# The legacy PWA's build outputs (pwa/ itself is not copied into the image).
+pwa/pkg/
+pwa/build-info.js

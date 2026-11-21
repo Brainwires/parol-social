@@ -112,7 +112,8 @@ docker compose logs parolnet | grep 'Relay Ed25519 public key'
 ## 7. Authority endorsement
 
 For clients to accept the secondary's descriptors, the authority set
-(baked into `pwa/network-config.js` at build time) must have endorsed
+(baked into the wasm core when the image is built: the `AUTHORITY_PUBKEYS` and
+`AUTHORITY_THRESHOLD` build arguments, see section 8) must have endorsed
 it. Use `parolnet-authority-cli` (see `crates/parolnet-authority-cli/`)
 on the offline authority machine to produce an `AuthorityEndorsement`
 CBOR blob for the secondary's descriptor, then upload it to the
@@ -121,26 +122,28 @@ secondary.
 This runbook does not cover the authority signing ceremony itself —
 that is operator-specific and should run on an airgapped machine.
 
-## 8. Rebuild the PWA with both relays
+## 8. Rebuild the image with the authority keys
 
-On the dev machine:
+The image builds the web app (`web/`) from source; there is no separate PWA build to run or
+copy. The authority keys reach the wasm core as build arguments (empty means the dev
+placeholder keys). On each relay host:
 
 ```
-cd pwa
-./build.sh \
-    --pubkeys AUTH1_HEX,AUTH2_HEX,AUTH3_HEX \
-    --threshold 2 \
-    --network-name "ParolNet" \
-    --bootstrap-relays https://biscuits.parol.social,https://biscuits-two.parol.social
+docker compose build \
+    --build-arg AUTHORITY_PUBKEYS=AUTH1_HEX,AUTH2_HEX,AUTH3_HEX \
+    --build-arg AUTHORITY_THRESHOLD=2 \
+    --build-arg BUILD_COMMIT="$(git rev-parse --short HEAD)"
+docker compose up -d
 ```
 
-That populates `BOOTSTRAP_RELAYS` in the generated `network-config.js`
-with both entries. The PWA will iterate through them on connect — first
-successful register wins — and fetch `/directory` from the chosen relay
-with authority-threshold verification of each descriptor.
+(or set them under `build: args:` in a `docker-compose.override.yml` so that a plain
+`git pull && docker compose up -d --build` keeps them.)
 
-Redeploy the PWA bundle to both relays (nginx serves it from
-`/usr/share/nginx/html/pwa/`).
+The legacy PWA's `pwa/build.sh --network-name … --bootstrap-relays …` generated a
+`network-config.js` with a bootstrap relay list. The web app has no such list: it uses the
+relay at the origin it was served from, and a person can name another under Settings,
+Advanced. Each relay therefore serves the app for its own users; steps 9 and 9a describe the
+legacy PWA's multi-relay behaviour and do not apply to the web app as it stands.
 
 ## 9. Verify
 

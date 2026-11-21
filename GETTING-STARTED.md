@@ -238,11 +238,13 @@ After building the PWA, you need to serve it over HTTP. The Service Worker requi
 #### Using Docker (Recommended)
 
 ```bash
-docker compose up -d
+docker compose up -d --build
 # Open http://localhost:1411
 ```
 
-This serves the distribution landing page at `/` and the PWA at `/pwa/`. To stop:
+The image builds the relay and the web app (`web/`) from source, so no host-side build step is
+needed first. It serves the distribution landing page at `/` and the web app at `/pwa/` (the
+legacy `pwa/` client is no longer in the image). To stop:
 
 ```bash
 docker compose down
