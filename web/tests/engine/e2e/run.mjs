@@ -2,7 +2,7 @@
 // signaling-only profile) and the native headless bot. Everything runs on this machine and
 // no request may leave it: that is asserted.
 //
-//   deno task wasm && deno task e2e:build        (the harness page into e2e/dist)
+//   denext task build-wasm && denext task engine:e2e:build   (in web/)        (the harness page into e2e/dist)
 //   cargo build -p parolnet-relay-server --bin parolnet-relay -p parolnet-app --example bot
 //   npm ci && npx playwright install chromium firefox     (at the repository root)
 //   E2E_BROWSER=chromium|firefox|webkit node web/tests/engine/e2e/run.mjs
