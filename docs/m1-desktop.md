@@ -71,15 +71,12 @@ and shows its video in the call panel.
 
 ## Known gaps
 
-- **The PWA calling the desktop is unreliable** (interop case 6, off by default,
-  `INTEROP_PWA_CALLS=1`): when Chromium offers it is the ICE controlling side, and once it holds
-  media permission it gathers on every interface and moves its nomination to a better pair a moment
-  after connecting. `webrtc-rs-rtc`'s controlled agent keeps its first selected pair
-  (`rtc-ice/src/agent/agent_selector.rs`, the binding-request handler only selects a pair while
-  none is selected), so media stops after about a second. The same applies to a data channel the
-  PWA offers while it holds media permission (seen on the dev Mac in loopback mode; the chat cases
-  run without media permission). Needs an engine release where the controlled agent follows the
-  latest nomination (libwebrtc does).
+- **Fixed: the PWA calling the desktop.** When Chromium offers it is the ICE controlling side,
+  and once it holds media permission it gathers on every interface and moves its nomination to
+  another pair a moment after connecting; the engine's controlled agent kept its first selected
+  pair, so media stopped after about a second. `webrtc-rs-rtc` `v0.22.0+brainwires.5` follows the
+  later nomination; interop case 6 (the PWA video-calls the desktop) and case 7 (a data channel
+  the PWA offers while it holds camera and microphone permission) run by default.
 - Camera capture (nokhwa / platform capture), echo cancellation (AEC3), device menus, camera on /
   off mid-call (renegotiation, E1), call stats in the UI.
 - TURN candidates for a user-supplied TURN server (`rtc-turn`); IPv6 host candidates and several
@@ -89,10 +86,8 @@ and shows its video in the call panel.
 
 ## Next slice
 
-1. The engine fix above (controlled agent follows renomination) as a `webrtc-rs-rtc` release,
-   then turn on interop case 6 and a data channel offered by a PWA with media permission.
-2. Camera capture and AEC3 in a `parolnet-media` crate (the libvpx encoder / decoder and the test
+1. Camera capture and AEC3 in a `parolnet-media` crate (the libvpx encoder / decoder and the test
    pattern move there), camera toggle mid-call.
-3. `parolnet-store` behind the same `Store` interface; settings screen with the user's TURN server
+2. `parolnet-store` behind the same `Store` interface; settings screen with the user's TURN server
    once `parolnet-rtc` gathers TURN candidates.
-4. Interop in Firefox and WebKit.
+3. Interop in Firefox and WebKit.

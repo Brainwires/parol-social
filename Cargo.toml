@@ -40,7 +40,7 @@ parolnet-app = { path = "crates/parolnet-app" }
 
 # Realtime engine: Brainwires' fork of webrtc-rs/rtc (sans-I/O), pinned by tag, never a branch.
 # Its DTLS / SRTP provider is ring (C and assembly); the E2EE layer stays pure Rust.
-rtc = { git = "https://github.com/Brainwires/webrtc-rs-rtc", tag = "v0.22.0+brainwires.3" }
+rtc = { git = "https://github.com/Brainwires/webrtc-rs-rtc", tag = "v0.22.0+brainwires.5" }
 
 # Crypto
 x25519-dalek = { version = "2", features = ["static_secrets"] }

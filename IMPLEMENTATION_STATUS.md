@@ -52,7 +52,7 @@ See [docs/m1-desktop.md](docs/m1-desktop.md) for what runs end to end, the tests
   rest** (`parolnet-store` replaces it).
 - **`parolnet-rtc`**: server-reflexive candidates from STUN (binding request on the connection's
   socket before its loop starts), text data-channel messages, the channel label on open,
-  `default_local_ip`. Engine pin `v0.22.0+brainwires.3`.
+  `default_local_ip`. Engine pin `v0.22.0+brainwires.5` (was `.3`; `.5` follows ICE renomination).
 - **Desktop**: chat UI v0 (contact list with path badges, pairing screen with QR code and code
   entry, chat view with delivery state, rename, retry, the no-path message).
 

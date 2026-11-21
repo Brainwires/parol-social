@@ -33,13 +33,18 @@
 //   5. The desktop video-calls the PWA (Chromium's fake camera and microphone); the PWA
 //      accepts; the desktop sends its test pattern (VP8) and a tone (Opus): RTP flows both
 //      ways and Chromium decodes the desktop's video and audio; the desktop hangs up.
-//   6. The PWA video-calls the desktop; the same checks; the PWA hangs up. Off by default
-//      (INTEROP_PWA_CALLS=1 runs it): when Chromium is the ICE controlling side (it offers)
-//      and holds media permission it gathers on every interface and later moves the
-//      nomination to another pair; webrtc-rs-rtc's controlled agent keeps its first selected
-//      pair (rtc-ice agent_selector.rs, handle_binding_request: `if get_selected_pair()
-//      .is_none()`), so media stops after a second. Needs the engine fix (follow the latest
-//      nomination) in a webrtc-rs-rtc release.
+//   6. The PWA video-calls the desktop; the same checks; the PWA hangs up. Chromium is then
+//      the ICE controlling side (it offers) and, holding media permission, gathers on every
+//      interface and may move its nomination to another pair a moment after connecting; the
+//      desktop (controlled) must follow the later nomination (webrtc-rs-rtc
+//      v0.22.0+brainwires.5). INTEROP_PWA_CALLS=0 skips it.
+//   7. A data channel the PWA offers while it holds camera and microphone permission (a live
+//      getUserMedia stream): the same renomination as case 6 on a chat connection. The PWA
+//      pastes the desktop's code and must be the offerer; bindings verified, messages both
+//      ways, and again after the connection has settled.
+//
+// Every PWA connection records its selected ICE candidate pair changes (`window.__pcs[i]
+// .__pairChanges`); a failure report prints them with the bot's stderr.
 //
 // Environment: PAROLNET_RELAY_BIN, PAROLNET_BOT_BIN (default: $CARGO_TARGET_DIR or target/,
 // debug profile), CHROME_PATH, INTEROP_ICE, INTEROP_KEEP=1 (keep temp dirs), INTEROP_VERBOSE=1
@@ -318,10 +323,33 @@ class Pwa {
     await page.evaluateOnNewDocument(() => {
       const Orig = window.RTCPeerConnection;
       window.__pcs = [];
+      const t0 = performance.now();
       window.RTCPeerConnection = class extends Orig {
         constructor(...args) {
           super(...args);
           window.__pcs.push(this);
+          // Selected candidate pair changes, for failure reports (renomination).
+          this.__pairChanges = [];
+          const watched = new Set();
+          const record = (ice) => {
+            const p = ice.getSelectedCandidatePair?.();
+            const at = Math.round(performance.now() - t0);
+            this.__pairChanges.push(
+              p ? `${at} ms ${p.local.address}:${p.local.port}(${p.local.type}) -> ${p.remote.address}:${p.remote.port}(${p.remote.type})` : `${at} ms none`,
+            );
+          };
+          const watch = () => {
+            const transports = [this.sctp?.transport, ...this.getTransceivers().map((t) => t.sender.transport)];
+            for (const dtls of transports) {
+              const ice = dtls?.iceTransport;
+              if (!ice || watched.has(ice)) continue;
+              watched.add(ice);
+              ice.addEventListener("selectedcandidatepairchange", () => record(ice));
+              if (ice.getSelectedCandidatePair?.()) record(ice);
+            }
+          };
+          this.addEventListener("connectionstatechange", watch);
+          this.addEventListener("iceconnectionstatechange", watch);
         }
       };
     });
@@ -355,7 +383,7 @@ class Pwa {
       .evaluate(async () => {
         const out = [];
         for (const pc of window.__pcs || []) {
-          const r = { state: pc.connectionState, ice: pc.iceConnectionState, pairs: [], transports: [] };
+          const r = { state: pc.connectionState, ice: pc.iceConnectionState, role: pc.localDescription?.type, pairChanges: pc.__pairChanges, pairs: [], transports: [] };
           const stats = await pc.getStats();
           const byId = new Map();
           stats.forEach((s) => byId.set(s.id, s));
@@ -628,7 +656,7 @@ async function caseCalls(ctx) {
   await bot.wait("ended", (e) => e.event === "call" && e.call_id === out.call_id && e.state === "Ended(HungUp)", 10_000, mark);
   await until(`${tag}: the PWA closes its call connection`, 15_000, async () => (await pwa.openCallPcs()) === 0);
   log(`${tag}: hung up by the desktop`);
-  if (process.env.INTEROP_PWA_CALLS === "1") {
+  if (process.env.INTEROP_PWA_CALLS !== "0") {
     // Case 6: the PWA calls (see the header).
     tag = "case 6 (PWA video-calls the desktop)";
     await pwa.page.evaluate((peer) => {
@@ -642,12 +670,60 @@ async function caseCalls(ctx) {
     const m5 = await botMedia(bot, ring.call_id, 50, `${tag}: the desktop receives Chromium's VP8 and Opus`);
     const s5 = await pwaDecodes(pwa, `${tag}: Chromium decodes the desktop's VP8 and Opus`);
     log(`${tag}: desktop got audio ${m5.audio_rx} / video ${m5.video_rx} packets; PWA decoded ${s5.videoFrames} frames, ${s5.audioSamples} audio samples`);
+    log(`${tag}: selected-pair changes on the PWA's connections: ${JSON.stringify(await pairChanges(pwa))}`);
     await pwa.page.evaluate(() => window.hangupCall());
     await bot.wait("remote hang-up", (e) => e.event === "call" && e.call_id === ring.call_id && e.state === "Ended(RemoteHungUp)", 15_000);
     log(`${tag}: hung up by the PWA`);
   } else {
-    log("case 6 (PWA video-calls the desktop): skipped (INTEROP_PWA_CALLS=1; needs the engine's renomination fix)");
+    log("case 6 (PWA video-calls the desktop): skipped (INTEROP_PWA_CALLS=0)");
   }
+  await bot.quit();
+  await browser.close();
+  return bot;
+}
+
+/// Selected-pair changes of the PWA's open connections, for a log line.
+async function pairChanges(pwa) {
+  return pwa.page.evaluate(() => (window.__pcs || []).filter((pc) => pc.connectionState !== "closed").map((pc) => pc.__pairChanges.length));
+}
+
+async function casePwaOffersWithMedia(ctx) {
+  const tag = "case 7 (PWA-offered data channel with media permission)";
+  const profile = mkdtempSync(join(work, "chrome-7-"));
+  const browser = await launchBrowser(profile, { media: true });
+  cleanups.push(() => browser.close().catch(() => {}));
+  const bot = new Bot("seven", ctx.relayPort, ctx.bindIp);
+  const ready = await bot.wait("ready", (e) => e.event === "ready");
+  bot.peerId = ready.peer_id;
+  await bot.wait("registered", (e) => e.event === "relay" && e.state.includes("Registered"));
+  const pwa = await Pwa.open(browser, ctx.pwaPort, "seven");
+  // Hold the camera and microphone for the whole case, as a page in a call does.
+  const tracks = await pwa.page.evaluate(async () => {
+    window.__held = await navigator.mediaDevices.getUserMedia({ audio: true, video: true });
+    return window.__held.getTracks().map((t) => `${t.kind}:${t.readyState}`);
+  });
+  log(`${tag}: the PWA holds ${tracks.join(", ")}`);
+
+  const mark = bot.events.length;
+  bot.send("code");
+  const { code } = await bot.wait("code", (e) => e.event === "code", 10_000, mark);
+  await pwa.pasteCode(code);
+  await bot.wait("contact (presenter side)", (e) => e.event === "contact" && e.peer_id === pwa.peerId, 45_000);
+  await bot.wait("direct path", (e) => e.event === "path" && e.peer_id === pwa.peerId && e.state === "Direct", 45_000);
+  await bothVerified(bot, pwa, tag);
+  const roles = await pwa.page.evaluate(() =>
+    (window.__pcs || []).filter((pc) => pc.connectionState === "connected" && pc.sctp).map((pc) => pc.localDescription?.type),
+  );
+  if (!roles.includes("offer")) throw new Error(`${tag}: expected the PWA to offer the data channel, its connected roles are ${JSON.stringify(roles)}`);
+  log(`${tag}: the PWA offered; paired, direct data channel, bindings verified`);
+  await chatBothWays(bot, pwa, tag);
+  // Past the moment Chromium renominates (about a second after connecting).
+  await sleep(5000);
+  await chatBothWays(bot, pwa, `${tag}, settled`);
+  if (bot.events.slice(mark).some((e) => e.event === "path" && e.peer_id === pwa.peerId && e.state !== "Direct" && e.state !== "Connecting")) {
+    log(`${tag}: note: path states ${bot.events.slice(mark).filter((e) => e.event === "path").map((e) => e.state).join(" -> ")}`);
+  }
+  log(`${tag}: selected-pair changes on the PWA's connections: ${JSON.stringify(await pairChanges(pwa))}`);
   await bot.quit();
   await browser.close();
   return bot;
@@ -668,13 +744,14 @@ async function main() {
   bots.push(await casePwaPastesDesktopCode(ctx));
   bots.push(await caseTamperedBindingIsRefused(ctx));
   if (process.env.INTEROP_CALLS !== "0") bots.push(await caseCalls(ctx));
+  bots.push(await casePwaOffersWithMedia(ctx));
 
   if (mode === "mdns") {
     const resolved = bots.some((b) => b.stderr.some((l) => l.includes("mDNS traffic received")));
     if (!resolved) throw new Error("mDNS mode: the desktop never received an mDNS answer for Chromium's .local candidates");
     log("mDNS: the desktop resolved Chromium's .local candidates");
   }
-  const cases = 4 + (process.env.INTEROP_CALLS === "0" ? 0 : process.env.INTEROP_PWA_CALLS === "1" ? 2 : 1);
+  const cases = 5 + (process.env.INTEROP_CALLS === "0" ? 0 : process.env.INTEROP_PWA_CALLS === "0" ? 1 : 2);
   log(`PASS: desktop <-> PWA interop (${cases} cases)`);
 }
 
