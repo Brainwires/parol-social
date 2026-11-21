@@ -12,7 +12,7 @@
 # only for the named crates in `exceptions` below (three, all pulled in by GPUI), never
 # for our own code.
 #
-# C libraries linked from the system (libvpx, libopus, webrtc-audio-processing) are not crates
+# C libraries linked from the system (libvpx) are not crates
 # and are not seen here: their licences are recorded in docs/m0-spike.md and THIRD_PARTY.md
 # lands with packaging in M1.
 
@@ -50,6 +50,14 @@ allow = ["MPL-2.0"]
 [[licenses.exceptions]]
 crate = "option-ext" # via dirs-sys (zed-font-kit, rust-embed)
 allow = ["MPL-2.0"]
+
+# SQLCipher's source (parolnet-store, through libsqlite3-sys). SQLCipher is BSD-3-Clause; the
+# SQLite code inside it is public domain under SQLite's "blessing"; the crate also ships
+# libtomcrypt (public domain / WTFPL), its crypto provider for wasm, which no native build
+# compiles. Both are permissive with no copyleft, and are allowed for this crate only.
+[[licenses.exceptions]]
+crate = "sqlcipher-src"
+allow = ["blessing", "WTFPL"]
 
 [licenses.private]
 ignore = true

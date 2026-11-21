@@ -33,6 +33,9 @@ parolnet-mesh = { workspace = true }
 parolnet-relay = { workspace = true }
 parolnet-relay-server = { path = "../parolnet-relay-server" }
 parolnet-core = { workspace = true, features = ["native", "mesh"] }
+# The native client's ICE policy and re-probing (PNP-001 §10.5, MUST-082 / SHOULD-019).
+parolnet-app = { workspace = true }
+parolnet-rtc = { workspace = true }
 zeroize = { workspace = true }
 proptest = { workspace = true }
 serde = { workspace = true }

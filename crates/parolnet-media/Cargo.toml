@@ -1,0 +1,43 @@
+[package]
+name = "parolnet-media"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Device-independent call media: frames, VP8 and Opus, capture and playback, echo cancellation (native only)"
+build = "build.rs"
+
+# The default features are pure Rust and need no system library, so the workspace's CI jobs
+# build and test them as they are. `vpx` links the system's libvpx, `audio-io` and `camera`
+# open devices (ALSA / V4L2 headers on Linux): the desktop app turns those on.
+[features]
+default = ["opus", "aec3", "convert"]
+# Opus encode / decode (opus-rs, pure Rust).
+opus = ["dep:opus-rs"]
+# Echo cancellation, noise suppression and gain control: WebRTC's audio processing module
+# (AEC3, NS, AGC2) in its pure-Rust port, sonora.
+aec3 = ["dep:sonora"]
+# Pixel-format conversion (NV12 / YUYV / RGB / MJPEG to I420, I420 to BGRA / RGBA).
+convert = ["dep:yuv", "dep:zune-jpeg"]
+# VP8 encode / decode through the system's libvpx (BSD-3-Clause).
+vpx = ["dep:cc", "dep:pkg-config", "dep:vcpkg"]
+# Microphone and speakers (cpal).
+audio-io = ["dep:cpal", "dep:rtrb"]
+# Camera capture (nokhwa: AVFoundation, Media Foundation, V4L2).
+camera = ["dep:nokhwa", "convert"]
+
+[dependencies]
+thiserror.workspace = true
+tracing.workspace = true
+opus-rs = { workspace = true, optional = true }
+sonora = { version = "0.3", optional = true }
+yuv = { version = "0.8", optional = true }
+zune-jpeg = { version = "0.5", optional = true }
+cpal = { version = "0.18", optional = true }
+rtrb = { version = "0.4", optional = true }
+nokhwa = { version = "0.10.11", default-features = false, features = ["input-native"], optional = true }
+
+[build-dependencies]
+cc = { version = "1", optional = true }
+pkg-config = { version = "0.3", optional = true }
+vcpkg = { version = "0.2", optional = true }

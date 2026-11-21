@@ -1,111 +1,9 @@
-//! Decoded pictures and the latest-frame slot between the media thread and the UI.
+//! Pictures in the form the platform draws, and the latest-frame slot between the media
+//! threads and the UI. The frames themselves ([`I420Frame`]) live in `parolnet-media`.
 
 use std::sync::{Arc, Mutex};
 
-use yuv::{YuvPlanarImage, YuvRange, YuvStandardMatrix};
-
-/// One decoded picture, I420 (planar Y, U, V; chroma halved both ways), tightly packed.
-#[derive(Clone)]
-pub struct I420Frame {
-    pub width: u32,
-    pub height: u32,
-    data: Vec<u8>,
-}
-
-impl I420Frame {
-    pub fn new(width: u32, height: u32) -> Self {
-        let (w, h) = (width as usize, height as usize);
-        let chroma = w.div_ceil(2) * h.div_ceil(2);
-        Self {
-            width,
-            height,
-            data: vec![0; w * h + 2 * chroma],
-        }
-    }
-
-    fn chroma_dims(&self) -> (usize, usize) {
-        (
-            (self.width as usize).div_ceil(2),
-            (self.height as usize).div_ceil(2),
-        )
-    }
-
-    fn plane_range(&self, plane: usize) -> std::ops::Range<usize> {
-        let luma = self.width as usize * self.height as usize;
-        let (cw, ch) = self.chroma_dims();
-        let chroma = cw * ch;
-        match plane {
-            0 => 0..luma,
-            1 => luma..luma + chroma,
-            _ => luma + chroma..luma + 2 * chroma,
-        }
-    }
-
-    /// Y, U and V planes back to back (what the VP8 encoder takes).
-    pub fn data(&self) -> &[u8] {
-        &self.data
-    }
-
-    pub fn plane(&self, plane: usize) -> &[u8] {
-        &self.data[self.plane_range(plane)]
-    }
-
-    pub fn plane_mut(&mut self, plane: usize) -> &mut [u8] {
-        let range = self.plane_range(plane);
-        &mut self.data[range]
-    }
-
-    fn planar(&self) -> YuvPlanarImage<'_, u8> {
-        let (cw, _) = self.chroma_dims();
-        YuvPlanarImage {
-            y_plane: self.plane(0),
-            y_stride: self.width,
-            u_plane: self.plane(1),
-            u_stride: cw as u32,
-            v_plane: self.plane(2),
-            v_stride: cw as u32,
-            width: self.width,
-            height: self.height,
-        }
-    }
-
-    /// BGRA, 4 bytes per pixel, BT.601 limited range (what browsers' VP8 encoders send).
-    pub fn to_bgra(&self) -> Vec<u8> {
-        let mut out = vec![0; self.width as usize * self.height as usize * 4];
-        yuv::yuv420_to_bgra(
-            &self.planar(),
-            &mut out,
-            self.width * 4,
-            YuvRange::Limited,
-            YuvStandardMatrix::Bt601,
-        )
-        .expect("buffer sizes match the frame");
-        out
-    }
-
-    /// RGBA, for writing PNGs.
-    pub fn to_rgba(&self) -> Vec<u8> {
-        let mut out = vec![0; self.width as usize * self.height as usize * 4];
-        yuv::yuv420_to_rgba(
-            &self.planar(),
-            &mut out,
-            self.width * 4,
-            YuvRange::Limited,
-            YuvStandardMatrix::Bt601,
-        )
-        .expect("buffer sizes match the frame");
-        out
-    }
-
-    /// The luma plane's mean and spread: a cheap "this is a picture, not a flat fill" check.
-    pub fn luma_stats(&self) -> (f64, f64) {
-        let y = self.plane(0);
-        let n = y.len().max(1) as f64;
-        let mean = y.iter().map(|&v| v as f64).sum::<f64>() / n;
-        let var = y.iter().map(|&v| (v as f64 - mean).powi(2)).sum::<f64>() / n;
-        (mean, var.sqrt())
-    }
-}
+pub use parolnet_media::I420Frame;
 
 /// What the UI shows: the newest picture, already in the form the platform draws.
 pub enum Presentable {
@@ -183,36 +81,6 @@ impl FrameSlot {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn odd_sizes_round_chroma_up() {
-        let frame = I420Frame::new(5, 3);
-        assert_eq!(frame.plane(0).len(), 15);
-        assert_eq!(frame.plane(1).len(), 6);
-        assert_eq!(frame.plane(2).len(), 6);
-    }
-
-    #[test]
-    fn limited_range_white_and_black_convert_to_bgra() {
-        let mut frame = I420Frame::new(2, 2);
-        frame.plane_mut(0).copy_from_slice(&[235, 235, 16, 16]);
-        frame.plane_mut(1).fill(128);
-        frame.plane_mut(2).fill(128);
-        let bgra = frame.to_bgra();
-        assert!(
-            bgra[..3].iter().all(|&c| c >= 250),
-            "white: {:?}",
-            &bgra[..4]
-        );
-        assert!(
-            bgra[8..11].iter().all(|&c| c <= 5),
-            "black: {:?}",
-            &bgra[8..12]
-        );
-        assert_eq!(bgra[3], 255);
-        let (_, spread) = frame.luma_stats();
-        assert!(spread > 100.0);
-    }
 
     #[test]
     fn the_slot_keeps_only_the_newest_picture() {

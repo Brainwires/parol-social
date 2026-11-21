@@ -19,7 +19,7 @@ WebSocket and WebRTC data channels; native clients do not exist yet beyond the M
 
 ## Workspace
 
-The root Cargo workspace has 14 members; the desktop app is a separate workspace.
+The root Cargo workspace has 15 members; the desktop app is a separate workspace.
 
 | Crate | Current role |
 |------|--------------|
@@ -35,9 +35,25 @@ The root Cargo workspace has 14 members; the desktop app is a separate workspace
 | `parolnet-cli` | Headless test client (QR bootstrap, messaging over the relay) |
 | `parolnet-clause`, `parolnet-conformance` | Spec-clause attribute and the conformance suite |
 | `parolnet-rtc` | **New (M0, extended in M1).** Async driver for the sans-I/O `webrtc-rs-rtc` engine |
+| `parolnet-store` | **New (M1).** Encrypted native persistence: SQLite with SQLCipher, key in the OS keychain or a key file; identity, contacts, sessions, messages, queue, settings |
 | `parolnet-app` | **New (M1).** Headless client core: identity, pairing, signaling, direct data channels, 1:1 chat |
+| `parolnet-media` | **New (M1).** Call media for native clients: frames, capture traits and synthetic sources, resampler, Opus, AEC3 / noise suppression / gain (sonora, pure Rust), the audio duplex path; opt-in features for libvpx VP8, cpal, nokhwa |
 | `xtask` | Clause and test-vector tooling |
 | `apps/desktop` (own workspace) | **New (M0/M1).** GPUI client: contacts, pairing, chat (UI v0); the M0 video spike behind `--spike` |
+
+## M1 (in progress): third slice, media
+
+- **`parolnet-media`** (new, root workspace; default features pure Rust, so the workspace's CI
+  jobs need no system library): see the crate's `lib.rs` for the module table. The libvpx VP8
+  encoder / decoder and the test pattern moved here from `apps/desktop`.
+- **Echo cancellation**: WebRTC's AEC3, noise suppression and AGC2 through `sonora`, the
+  pure-Rust port, behind `AudioProcessor`; a deterministic ERLE test (67 dB far end alone, 7 to
+  9 dB in double talk, near-end tone within 2 dB) runs in `cargo test --workspace`.
+- **Desktop**: camera capture with a test-pattern fallback, one audio thread with the render
+  stream as AEC3's reverse stream, device menus, camera off / on, self-view, `--media-check`.
+  **Not verified on real devices or on screen**: the dev machine opens no window, camera or
+  microphone; the camera and device paths compile on macOS arm64 and run with synthetic sources.
+  See the manual checklist in [docs/m1-desktop.md](docs/m1-desktop.md).
 
 ## M1 (in progress): first slice
 
@@ -48,13 +64,43 @@ See [docs/m1-desktop.md](docs/m1-desktop.md) for what runs end to end, the tests
   `presence`, non-trickle `rtc_offer` / `rtc_answer`, `rtc_ice`), one direct WebRTC connection per
   contact with the PWA's `parolnet` data channel and JSON frames, 1:1 chat as PNP-001 TEXT
   envelopes, a sender-side queue (PWA limits) flushed when the channel opens, and the
-  "no direct path" state. State is a JSON file in the data directory, **not yet encrypted at
-  rest** (`parolnet-store` replaces it).
+  "no direct path" state. State lives in `parolnet-store` (below); the first slices' plaintext
+  JSON file and identity file are imported and removed on first start.
+- **`parolnet-store`** (new, third slice): one SQLCipher-encrypted SQLite database per data
+  directory for the identity secret, contacts, ratchet sessions, history, the sender queue and
+  settings. Random 256-bit key held by a key provider: the OS keychain (`keyring`; what the
+  desktop app uses), an owner-only key file (headless peers; weaker, it sits next to the
+  database) or memory (tests); the provider kind is fixed when the store is created. Version
+  table and forward migrations, incremental transactional writes on a writer thread (WAL,
+  synced commits), import of the plaintext layout, `wipe`. SQLCipher's cipher is C
+  (CommonCrypto on Apple systems, vendored OpenSSL libcrypto elsewhere): storage encryption,
+  not part of the pure-Rust E2EE layer. Not exercised yet: the keychain path on a real
+  keychain (an opt-in test exists, `tests/keychain.rs`), Windows builds of the vendored
+  OpenSSL, key rotation, and a UI for "delete all data" / a lost key.
 - **`parolnet-rtc`**: server-reflexive candidates from STUN (binding request on the connection's
   socket before its loop starts), text data-channel messages, the channel label on open,
   `default_local_ip`. Engine pin `v0.22.0+brainwires.5` (was `.3`; `.5` follows ICE renomination).
+- **TURN, user-supplied only** (PNP-001-MUST-082): `parolnet-rtc` gathers a relay candidate from
+  the TURN server the user configured (UDP, long-term credentials, `rtc-turn` driven on the
+  connection's socket) and has a relay-only ICE policy; `parolnet-app` stores `TurnSettings` and
+  applies it to data and call connections; the desktop has the Settings pane. Nothing but STUN
+  URIs is taken from a relay. TURN over TCP / TLS is M4.
+- **Re-probing after `peer_offline`** (PNP-001-SHOULD-019): a contact the relay called offline
+  with no presence push behind it is offered to again with backoff under a probe budget.
 - **Desktop**: chat UI v0 (contact list with path badges, pairing screen with QR code and code
   entry, chat view with delivery state, rename, retry, the no-path message).
+- **Desktop ↔ PWA browser matrix** (`apps/desktop/interop/pwa-interop.mjs`, CI job `pwa-interop`,
+  headless on ubuntu-latest with fake media devices; the seven cases are listed in
+  [docs/m1-desktop.md](docs/m1-desktop.md)):
+
+  | | Chromium | Firefox | WebKit (Playwright, Linux) |
+  |---|---|---|---|
+  | Pairing both ways, chat, sender queue, refused tampered binding (cases 1-4) | pass | pass | pass |
+  | Video calls both ways, VP8 + Opus decoded on both sides (cases 5-6) | pass | pass | pass |
+  | PWA-offered data channel while holding media (case 7) | pass | pass | pass |
+  | Host candidates covered | mDNS names, loopback | mDNS names, loopback | plain address only |
+
+  Not covered: real Safari (macOS / iOS), WebKit's mDNS candidates, STUN / TURN paths in a browser.
 
 ## M0
 

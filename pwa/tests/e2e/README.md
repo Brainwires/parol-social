@@ -56,3 +56,11 @@ spawning the three contexts, driving the UI via `evaluate()`) lands in a
 follow-up once the `npm install puppeteer` dependency is approved locally. The
 scaffolding itself is runnable and will skip cleanly when puppeteer is not
 installed.
+
+## Cross-browser coverage lives elsewhere
+
+This family is Chromium-only scaffolding. The suite that runs the real PWA in headless
+Chromium, Firefox and WebKit (Playwright) is the desktop interop,
+`apps/desktop/interop/pwa-interop.mjs` (CI job `pwa-interop`): the headless desktop peer against
+the PWA through the relay binary, covering pairing, chat, the sender queue, the channel binding
+and 1:1 video calls. See `docs/m1-desktop.md`.

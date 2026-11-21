@@ -75,12 +75,22 @@ parolnet-core (depends on all above)
 parolnet-wasm (depends on crypto + protocol, WASM target only)
 
 parolnet-rtc (native only; drives the sans-I/O `rtc` engine; no workspace deps)
+parolnet-store (native only; encrypted persistence: SQLite + SQLCipher, key in the OS keychain; no workspace deps)
   |
   v
-parolnet-app (native; headless client core: crypto + protocol + core (no default features) + rtc)
+parolnet-app (native; headless client core: crypto + protocol + core (no default features) + rtc + store)
 
-apps/desktop (own workspace; GPUI; depends on parolnet-app and parolnet-rtc)
+parolnet-media (native only; call media; no workspace deps. Default features are pure Rust
+  (Opus, AEC3, conversion); `vpx` (system libvpx), `audio-io` (cpal) and `camera` (nokhwa) are
+  opt-in and must stay out of the default set: the workspace's CI installs no system libraries)
+
+apps/desktop (own workspace; GPUI; depends on parolnet-app, parolnet-rtc and parolnet-media
+  with `vpx`, `audio-io`, `camera`)
 ```
+
+`parolnet-store` encrypts local storage with SQLCipher, whose cipher is C (CommonCrypto on Apple
+systems, a vendored OpenSSL libcrypto elsewhere). Security invariant 6 covers the E2EE layer
+(`parolnet-crypto`, `parolnet-protocol`); at-rest storage encryption is outside it.
 
 `parolnet-core` features: `native` (default), `mesh` (default; store-forward and LAN discovery),
 `codec2` (opt-in, LGPL-2.1, being removed), `wasm`.
