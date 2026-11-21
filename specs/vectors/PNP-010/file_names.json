@@ -1,0 +1,55 @@
+{
+  "clause": "PNP-010-MUST-034",
+  "description": "The local file name a receiver makes from the offered name (§7.3).",
+  "input": {},
+  "expected": [
+    {
+      "offered": "report.pdf",
+      "local": "report.pdf"
+    },
+    {
+      "offered": "../../etc/passwd",
+      "local": "passwd"
+    },
+    {
+      "offered": "C:\\Users\\me\\x.txt",
+      "local": "x.txt"
+    },
+    {
+      "offered": "..",
+      "local": "file"
+    },
+    {
+      "offered": "",
+      "local": "file"
+    },
+    {
+      "offered": ".bashrc",
+      "local": "bashrc"
+    },
+    {
+      "offered": "name. . .",
+      "local": "name"
+    },
+    {
+      "offered": "a\u0000b\nc",
+      "local": "abc"
+    },
+    {
+      "offered": "what?<really>*.txt",
+      "local": "whatreally.txt"
+    },
+    {
+      "offered": "photo‮gpj.exe",
+      "local": "photogpj.exe"
+    },
+    {
+      "offered": "CON",
+      "local": "_CON"
+    },
+    {
+      "offered": "nul.txt",
+      "local": "_nul.txt"
+    }
+  ]
+}

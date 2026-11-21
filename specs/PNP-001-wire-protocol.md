@@ -1,12 +1,16 @@
 # PNP-001: ParolNet Wire Protocol
 
 ### Status: CANDIDATE
-### Version: 0.14
+### Version: 0.15
 ### Date: 2026-11-21
 
 ---
 
 ## Changelog
+
+**v0.15 (2026-11-21) — Message type 0x15 FILE_TRANSFER**
+
+- §3.4: code `0x15 FILE_TRANSFER` is allocated to PNP-010 (File Transfer): the offer and the accept / decline / cancel / complete messages of a transfer whose records flow on a data channel of their own. The reserved range is now `0x16–0xFF`. Codes 0x02, 0x09 and 0x0A stay allocated; the file transfer they belonged to (PNP-007 §7) is superseded by PNP-010. No clause changes.
 
 **v0.14 (2026-11-21) — The whole ratchet header is associated data (wire-incompatible)**
 
@@ -233,7 +237,7 @@ This construction makes the AEAD tag tamper-evident with respect to (a) every re
 
 ### 3.4 Message Types
 
-Codes 0x01–0x06 and 0x14 are allocated by this specification. Codes 0x07–0x0B are allocated by PNP-007 (Media & File Transfer). Codes 0x0C–0x12 are allocated by PNP-009 (Group Communication). Code 0x13 is allocated by PNP-002 (Handshake Protocol) for identity rotation. PNP-001 is the canonical registry — new message types MUST be assigned here in future revisions.
+Codes 0x01–0x06 and 0x14 are allocated by this specification. Codes 0x07–0x0B are allocated by PNP-007 (Media & File Transfer). Codes 0x0C–0x12 are allocated by PNP-009 (Group Communication). Code 0x13 is allocated by PNP-002 (Handshake Protocol) for identity rotation. Code 0x15 is allocated by PNP-010 (File Transfer). PNP-001 is the canonical registry — new message types MUST be assigned here in future revisions.
 
 | Code | Name | Allocated By | Description |
 |------|------|-------------|-------------|
@@ -257,8 +261,9 @@ Codes 0x01–0x06 and 0x14 are allocated by this specification. Codes 0x07–0x0
 | 0x12 | GROUP_ADMIN | PNP-009 | Group admin operation (invite, member add/remove; see PNP-009 §6.2) |
 | 0x13 | IDENTITY_ROTATE | PNP-002 | Signed identity rotation notification (see PNP-002 §7) |
 | 0x14 | CHANNEL_BINDING | PNP-001 | DTLS fingerprints of a direct data channel (§10.5.1) |
+| 0x15 | FILE_TRANSFER | PNP-010 | File transfer offer and control (accept, decline, cancel, complete); the records flow on the transfer's own data channel |
 
-Codes 0x15–0xFF are reserved for future assignment.
+Codes 0x16–0xFF are reserved for future assignment.
 
 Implementations MUST treat unrecognized message type codes as DECOY and silently discard them after decryption. **PNP-001-MUST-008**
 
@@ -485,6 +490,7 @@ QR-code freshness (30 minutes) is defined in PNP-003 §5.1.6 and is unrelated to
 | PNP-008 (Relay Federation) | Directory-sync messages are PNP-001 envelopes with RELAY_CONTROL (0x06). |
 | PNP-009 (Group Communication) | Allocates message-type codes 0x0C–0x12 (§3.4). |
 | PNP-002 (Handshake Protocol) | Allocates message-type code 0x13 IDENTITY_ROTATE (§3.4) for H5 identity rotation. |
+| PNP-010 (File Transfer) | Allocates message-type code 0x15 FILE_TRANSFER (§3.4); reserves data-channel labels under `pn-` on the direct connection of §10.5. |
 
 ## 9. Nonce Construction Catalog
 
