@@ -4,14 +4,28 @@ import { useEffect, useLayoutEffect, useRef, useState } from "denext";
 import { t } from "../i18n/index.ts";
 import { Button, IconButton } from "./Button.tsx";
 
-export function Composer({ name, away, editingText = null, onSend, onSaveEdit, onCancelEdit }: {
+export type ComposerState =
+  /** The line is open: what is written goes at once. */
+  | "open"
+  /** The contact is away (or this device is offline): what is written waits here. */
+  | "away"
+  /** The contact is online but there is no path to them: it waits for one. */
+  | "no-path";
+
+const PLACEHOLDER = {
+  "open": "composer.placeholder",
+  "away": "composer.placeholderAway",
+  "no-path": "composer.placeholderNoPath",
+} as const;
+
+export function Composer({ name, state, editingText = null, onSend, onSaveEdit, onCancelEdit }: {
   name: string;
-  /** The line is not open: a message written now waits here. */
-  away: boolean;
+  state: ComposerState;
   /** The text of the waiting message being edited, or null when writing a new one. */
   editingText?: string | null;
-  onSend: (text: string) => void;
-  onSaveEdit?: (text: string) => void;
+  /** May reject: the text then stays in the field and the caller says why. */
+  onSend: (text: string) => Promise<void> | void;
+  onSaveEdit?: (text: string) => Promise<void> | void;
   onCancelEdit?: () => void;
 }) {
   const [text, setText] = useState("");
@@ -40,14 +54,19 @@ export function Composer({ name, away, editingText = null, onSend, onSaveEdit, o
     fit();
     addEventListener("resize", fit);
     return () => removeEventListener("resize", fit);
-  }, [text, name, away]);
+  }, [text, name, state]);
 
-  const submit = () => {
+  // The field empties at once, so what is typed next is a new message. If the message could
+  // not be sent it comes back, unless something else has been written meanwhile.
+  const submit = async () => {
     const value = text.trim();
     if (!value) return;
-    if (editing) onSaveEdit?.(value);
-    else onSend(value);
     setText("");
+    try {
+      await (editing ? onSaveEdit?.(value) : onSend(value));
+    } catch {
+      setText((now) => (now === "" ? value : now));
+    }
   };
 
   const cancel = () => {
@@ -61,7 +80,7 @@ export function Composer({ name, away, editingText = null, onSend, onSaveEdit, o
       data-testid="composer"
       onSubmit={(event) => {
         event.preventDefault();
-        submit();
+        void submit();
       }}
     >
       {editing && (
@@ -80,13 +99,13 @@ export function Composer({ name, away, editingText = null, onSend, onSaveEdit, o
           dir={text ? "auto" : undefined}
           value={text}
           aria-label={t("composer.label", { name })}
-          placeholder={t(away ? "composer.placeholderAway" : "composer.placeholder", { name })}
-          data-testid="composer-field"
+          placeholder={t(PLACEHOLDER[state], { name })}
+          data-testid="composer-input"
           onInput={(event) => setText(event.currentTarget.value)}
           onKeyDown={(event) => {
             if (event.key === "Enter" && !event.shiftKey && !event.nativeEvent.isComposing) {
               event.preventDefault();
-              submit();
+              void submit();
             } else if (event.key === "Escape" && editing) {
               cancel();
             }

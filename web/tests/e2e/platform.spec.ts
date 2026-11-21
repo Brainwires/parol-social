@@ -16,11 +16,29 @@ test("renders under /pwa/ with the CSP header, no errors, nothing leaves localho
     "script-src 'self' 'wasm-unsafe-eval'",
   );
 
-  await expect(page.getByTestId("conversation-list")).toBeVisible();
-  await expect(page.getByTestId("section-online")).toContainText("Mira");
-  // The wasm core loaded: the device status says so, with the crate's version.
-  await expect(page.getByTestId("device-status")).toHaveAttribute("data-state", "ready");
-  await expect(page.getByTestId("device-status")).toContainText(/Encryption ready · \d+\.\d+\.\d+/);
+  // Nothing on this device yet: the first-run screen, which only appears once the wasm core
+  // has loaded and the device's storage has been opened.
+  const firstRun = page.getByTestId("first-run");
+  await expect(firstRun).toBeVisible();
+  await expect(firstRun).toContainText(
+    "Private calls and messages, straight from your device to theirs.",
+  );
+  await expect(firstRun).toContainText(
+    "No account, no phone number, no email. Nothing is stored on a server.",
+  );
+  await expect(page.getByTestId("first-run-start")).toHaveText("Start");
+  // No identity is made, and nothing is contacted, before the person presses Start.
+  expect(
+    await page.evaluate(() =>
+      new Promise((resolve) => {
+        const open = indexedDB.open("parolnet-web");
+        open.onsuccess = () => {
+          const rows = open.result.transaction("identity").objectStore("identity").count();
+          rows.onsuccess = () => resolve(rows.result);
+        };
+      })
+    ),
+  ).toBe(0);
 
   // Fonts are the self-hosted ones.
   await page.evaluate(() => document.fonts.ready);
@@ -31,16 +49,11 @@ test("renders under /pwa/ with the CSP header, no errors, nothing leaves localho
   await expectClean(problems);
 });
 
-test("calls a real wasm export: a safety number from the Rust core", async ({ page, server }) => {
-  const problems = await watch(page, server);
+test("the production export has no state lab and no test hooks", async ({ page, server }) => {
   await page.goto(server.url + "#/lab");
-  const result = page.getByTestId("wasm-result");
-  await expect(result).toBeVisible();
-  const digits = (await result.innerText()).replace(/\s+/g, "");
-  expect(digits).toMatch(/^\d{60}$/);
-  expect(digits).not.toBe("0".repeat(60));
-  await expect(page.getByTestId("wasm-status")).toContainText(/parolnet-wasm \d+\.\d+\.\d+/);
-  await expectClean(problems);
+  await expect(page.getByTestId("first-run")).toBeVisible();
+  await expect(page.getByTestId("lab")).toHaveCount(0);
+  expect(await page.evaluate(() => "__parolnetTest" in window)).toBe(false);
 });
 
 test("no layout shift while wasm loads", async ({ page, server, browserName }) => {
@@ -55,10 +68,8 @@ test("no layout shift while wasm loads", async ({ page, server, browserName }) =
       }
     }).observe({ type: "layout-shift", buffered: true });
   });
-  await page.goto(server.url + "#/lab");
-  await expect(page.getByTestId("wasm-result")).toBeVisible();
-  await page.goto(server.url + "#/");
-  await expect(page.getByTestId("device-status")).toHaveAttribute("data-state", "ready");
+  await page.goto(server.url);
+  await expect(page.getByTestId("first-run")).toBeVisible();
   await page.waitForTimeout(300);
   const shift = await page.evaluate(() =>
     (window as unknown as { __cls: { shift: number } }).__cls.shift
@@ -76,21 +87,24 @@ test("the service worker controls the page and the app starts offline", async ({
   expect(await page.evaluate(() => navigator.serviceWorker.ready.then((r) => r.scope))).toBe(
     server.url,
   );
-  await expect(page.getByTestId("device-status")).toHaveAttribute("data-state", "ready");
+  await expect(page.getByTestId("first-run")).toBeVisible();
   await expectClean(problems);
 
-  // Stop the server: the next load has no network at all.
+  // Stop the server: the next load has no network at all. The first-run screen needs the
+  // shell, the bundle, the wasm core and the fonts, all from the worker's cache.
   await server.close();
   await page.reload();
-  await expect(page.getByTestId("conversation-list")).toBeVisible();
-  await expect(page.getByTestId("device-status")).toHaveAttribute("data-state", "ready");
-  await page.goto(server.url + "#/lab");
-  await page.reload();
-  await expect(page.getByTestId("wasm-result")).toBeVisible();
+  await expect(page.getByTestId("first-run")).toBeVisible();
   await page.evaluate(() => document.fonts.ready);
   expect(await page.evaluate(() => document.fonts.check('16px "Atkinson Hyperlegible Next"'))).toBe(
     true,
   );
+  // The scanner's decoder is cached too: scanning works offline.
+  expect(
+    await page.evaluate(() =>
+      caches.match(new URL("vendor/jsqr.js", document.baseURI).href).then((hit) => hit?.ok)
+    ),
+  ).toBe(true);
   expect(await problems.csp(), "CSP violations offline").toEqual([]);
   expect(problems.external, "requests that left localhost").toEqual([]);
 });
@@ -123,7 +137,7 @@ test("a new build is offered and applied on reload", async ({ page, server }) =>
 
     await Promise.all([page.waitForEvent("load"), page.getByTestId("update-reload").click()]);
     await controlled(page);
-    await expect(page.getByTestId("conversation-list")).toBeVisible();
+    await expect(page.getByTestId("first-run")).toBeVisible();
     expect(await workerVersion(page)).toBe("next-build");
     await expect(page.getByTestId("update-ready")).toHaveCount(0);
     const caches = await page.evaluate(() => caches.keys());
@@ -147,7 +161,7 @@ test("replaces the previous PWA's worker and caches without the person doing any
   await page.evaluate(() => navigator.serviceWorker.ready.then((r) => r.update()));
 
   // The new worker takes over, clears the old caches and reloads the window into the app.
-  await expect(page.getByTestId("conversation-list")).toBeVisible({ timeout: 30_000 });
+  await expect(page.getByTestId("first-run")).toBeVisible({ timeout: 30_000 });
   await controlled(page);
   const caches = await page.evaluate(() => caches.keys());
   expect(caches).toHaveLength(1);
@@ -155,5 +169,4 @@ test("replaces the previous PWA's worker and caches without the person doing any
   expect(
     await page.evaluate(() => navigator.serviceWorker.getRegistrations().then((r) => r.length)),
   ).toBe(1);
-  await expect(page.getByTestId("device-status")).toHaveAttribute("data-state", "ready");
 });

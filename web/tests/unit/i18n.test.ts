@@ -1,7 +1,15 @@
 import { assertEquals } from "@std/assert";
 import { formatMessage } from "../../src/i18n/format.ts";
+import { LANGUAGES, preferredLocale, setLocale, t } from "../../src/i18n/index.ts";
 import ar from "../../src/i18n/locales/ar.json" with { type: "json" };
+import de from "../../src/i18n/locales/de.json" with { type: "json" };
 import en from "../../src/i18n/locales/en.json" with { type: "json" };
+import es from "../../src/i18n/locales/es.json" with { type: "json" };
+import fa from "../../src/i18n/locales/fa.json" with { type: "json" };
+import fr from "../../src/i18n/locales/fr.json" with { type: "json" };
+import it from "../../src/i18n/locales/it.json" with { type: "json" };
+import ja from "../../src/i18n/locales/ja.json" with { type: "json" };
+import ko from "../../src/i18n/locales/ko.json" with { type: "json" };
 
 Deno.test("format: named arguments", () => {
   assertEquals(formatMessage("Message {name}", { name: "Mira" }, "en"), "Message Mira");
@@ -40,31 +48,72 @@ function argumentsOf(message: string): string[] {
   return [...names].sort();
 }
 
-Deno.test("catalogue: ar has exactly en's keys and the same arguments", () => {
-  assertEquals(Object.keys(ar).sort(), Object.keys(en).sort());
-  for (const key of Object.keys(en) as Array<keyof typeof en>) {
-    assertEquals(argumentsOf(ar[key]), argumentsOf(en[key]), key);
-  }
-});
+const LOCALES = { ar, de, es, fa, fr, it, ja, ko } as Record<string, Record<string, string>>;
 
-Deno.test("catalogue: plain words in the primary interface", () => {
-  // Rule 5 of docs/ux/web-app.md. "relay" appears only where the person chooses a relay
-  // server of their own.
-  const banned = /\b(peer|bootstrap|ICE|STUN|TURN|NAT|SDP)\b/;
-  for (const [key, message] of Object.entries(en)) {
-    assertEquals(banned.test(message), false, `${key}: ${message}`);
-    if (/relay/i.test(message)) {
-      assertEquals(/^(action\.useOwnRelay|sheet\.relay\.)/.test(key), true, key);
+Deno.test("catalogue: a locale only has keys English has, with the same arguments", () => {
+  // A locale may lack keys (each falls back to English), but never invents or misuses one.
+  for (const [code, catalogue] of Object.entries(LOCALES)) {
+    for (const [key, message] of Object.entries(catalogue)) {
+      assertEquals(key in en, true, `${code}: unknown key ${key}`);
+      assertEquals(
+        argumentsOf(message),
+        argumentsOf(en[key as keyof typeof en]),
+        `${code}: ${key}`,
+      );
     }
   }
 });
 
-Deno.test("catalogue: sentence case, no all-caps labels", () => {
+Deno.test("catalogue: every language the settings offer has a catalogue, and the reverse", () => {
+  assertEquals(
+    LANGUAGES.map((language) => language.code).sort(),
+    ["en", ...Object.keys(LOCALES)].sort(),
+  );
+});
+
+Deno.test("catalogue: a missing key falls back to English, key by key", async () => {
+  await setLocale("de");
+  // Ported from the old PWA.
+  assertEquals(t("composer.send"), de["composer.send" as keyof typeof de]);
+  // Not translated yet.
+  assertEquals("firstRun.start" in de, false);
+  assertEquals(t("firstRun.start"), "Start");
+  await setLocale("en");
+});
+
+Deno.test("catalogue: the language to start in", () => {
+  assertEquals(preferredLocale(["fr-CA", "en"]), "fr");
+  assertEquals(preferredLocale(["pt-BR", "ko"]), "ko");
+  assertEquals(preferredLocale(["zz"]), "en");
+  assertEquals(preferredLocale([]), "en");
+});
+
+Deno.test("catalogue: plain words in the primary interface", () => {
+  // Rule 5 of docs/ux/web-app.md. The settings may name things: "relay server" where a
+  // person sets up their own, "TURN" in that setting's title.
+  const banned = /\b(peer|bootstrap|ICE|STUN|TURN|NAT|SDP|WebRTC)\b/;
+  const mayNameRelay = /^(action\.useOwnRelay|settings\.|notice\.turn\.|toast\.turn)/;
   for (const [key, message] of Object.entries(en)) {
-    const words = message.replace(/\{[^}]*\}/g, "").split(/\s+/).filter((w) =>
-      /[A-Za-z]{2,}/.test(w)
+    if (key !== "settings.turn.title") {
+      assertEquals(banned.test(message), false, `${key}: ${message}`);
+    }
+    if (/relay/i.test(message)) assertEquals(mayNameRelay.test(key), true, key);
+  }
+});
+
+Deno.test("catalogue: sentence case, no all-caps labels", () => {
+  const acronyms = new Set(["IP", "TURN"]);
+  for (const [key, message] of Object.entries(en)) {
+    const words = message.replace(/\{[^}]*\}/g, "").split(/[^A-Za-z]+/).filter((w) =>
+      w.length >= 2 && !acronyms.has(w)
     );
     const shouting = words.filter((w) => w === w.toUpperCase());
     assertEquals(shouting, [], key);
+  }
+});
+
+Deno.test("catalogue: how a call ended has words for every case", () => {
+  for (const words of ["youEnded", "theyEnded", "theyDeclined", "noAnswer", "missed", "failed"]) {
+    assertEquals(`call.ended.${words}` in en, true, words);
   }
 });

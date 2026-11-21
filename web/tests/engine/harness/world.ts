@@ -2,8 +2,8 @@
 // each run a real engine over a real parolnet-wasm instance (so the crypto, the pairing code
 // and the channel binding are the real thing) with in-memory storage.
 //
-// The wasm package is built by `deno task wasm` into `.pkg/` next to this directory, or
-// found through PAROLNET_WASM_PKG.
+// The wasm package is the one `denext task build-wasm` builds (web/.wasm-pkg), or the one
+// PAROLNET_WASM_PKG names.
 import { Engine, type EngineConfig } from "../../../src/engine/engine.ts";
 import type {
   FetchResponse,
@@ -25,8 +25,9 @@ import {
   tick,
 } from "./fakes.ts";
 
+/** PAROLNET_WASM_PKG, else the app's own build (`denext task build-wasm` writes web/.wasm-pkg). */
 const pkgDir = Deno.env.get("PAROLNET_WASM_PKG") ??
-  new URL("../.pkg/", import.meta.url).pathname;
+  new URL("../../../.wasm-pkg", import.meta.url).pathname;
 let wasmBytes: Uint8Array | null = null;
 let instances = 0;
 
@@ -36,7 +37,7 @@ export async function newWasm(): Promise<WasmApi> {
     wasmBytes ??= await Deno.readFile(`${pkgDir}/parolnet_wasm_bg.wasm`);
   } catch {
     throw new Error(
-      `parolnet-wasm is not built: run \`deno task wasm\` (looked in ${pkgDir})`,
+      `parolnet-wasm is not built: run \`denext task build-wasm\` (looked in ${pkgDir})`,
     );
   }
   // A distinct module specifier gives a distinct module instance, and with it a distinct

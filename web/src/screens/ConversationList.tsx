@@ -1,146 +1,93 @@
-// One list for people and groups: who is online now first, then who is away. A row carries
-// an amber "{n} waiting" chip while messages for that contact are still on this device.
-import { useState } from "denext";
-import { Button } from "../components/Button.tsx";
-import { CodeBlock } from "../components/Codes.tsx";
+// The conversation list: who is online now first, then who is away, each by last activity.
+// A row carries an amber "{n} waiting" chip while messages for that contact are still on this
+// device, and a count of what arrived and has not been read.
 import { ConversationRow, SectionHeader } from "../components/ConversationRow.tsx";
+import { Icon } from "../components/Icon.tsx";
 import { Line } from "../components/Line.tsx";
 import { Panel } from "../components/Panel.tsx";
-import { Sheet } from "../components/Sheet.tsx";
-import { showToast } from "../components/Toast.tsx";
+import { UpdateNotice } from "../components/UpdateNotice.tsx";
 import { t } from "../i18n/index.ts";
-import { applyUpdate, updateReady } from "../platform/service-worker.ts";
-import { wasmStatus } from "../platform/wasm.ts";
+import { dismissInstall, install, installAvailable } from "../platform/install.ts";
+import { updateReady } from "../platform/service-worker.ts";
 import { hrefOf, navigate, type Route } from "../router.ts";
 import { useStore } from "../state/context.ts";
-import { type ChatMessage, type Contact, isOnline } from "../state/model.ts";
-import { messagesOf, waitingCount } from "../state/store.ts";
-
-/** A stand-in until pairing is ported: the real code comes from this device's identity. */
-const FAKE_OWN_CODE = "7K4MQ2ZD9XTBH6RP";
+import { type ChatMessage, type ContactView, isOnline, sortContacts } from "../state/model.ts";
+import { messagesOf } from "../state/store.ts";
 
 export function previewOf(last: ChatMessage | undefined): string {
   if (!last) return t("list.preview.none");
-  const text = last.body.kind === "text"
-    ? last.body.text
-    : last.body.kind === "file"
-    ? t("list.preview.file", { name: last.body.name })
-    : t(last.body.media === "video" ? "message.videoInvite" : "message.voiceInvite");
+  const attachment = last.attachment;
+  const text = !attachment
+    ? last.text
+    : attachment.kind === "file"
+    ? t("list.preview.file", { name: attachment.name })
+    : t(attachment.media === "video" ? "message.videoInvite" : "message.voiceInvite");
   return last.direction === "Sent" ? t("list.preview.you", { text }) : text;
 }
 
-function AddContactSheet({ onClose }: { onClose: () => void }) {
+/** What the app has to say on its own: storage failed, or the person's relay server did. */
+function NoticePanel() {
   const store = useStore();
-  const [name, setName] = useState("");
-  const [code, setCode] = useState("");
-  const [problem, setProblem] = useState(false);
-
-  const copy = async () => {
-    try {
-      await navigator.clipboard.writeText(FAKE_OWN_CODE);
-      showToast(t("toast.codeCopied"));
-    } catch {
-      showToast(t("sheet.add.copyFailed"));
-    }
-  };
-
-  const submit = (event: { preventDefault(): void }) => {
-    event.preventDefault();
-    if (!name.trim() || !code.trim()) {
-      setProblem(true);
-      return;
-    }
-    const contact = store.addContact(name.trim(), code.trim());
-    onClose();
-    showToast(t("toast.contactAdded", { name: contact.name }));
-    navigate({ name: "conversation", peerId: contact.peerId });
-  };
-
-  return (
-    <Sheet title={t("sheet.add.title")} testId="sheet-add" onClose={onClose}>
-      <div className="field">
-        <span className="field__label">{t("sheet.add.yourCode")}</span>
-        <CodeBlock code={FAKE_OWN_CODE} label={t("code.label")} testId="own-code" />
-        <span className="field__help">{t("sheet.add.yourCodeHelp")}</span>
+  const notice = store.notice.value;
+  if (!notice) return null;
+  if (notice.code === "TurnUnusable") {
+    return (
+      <div className="list__notice">
+        <Panel
+          tone="amber"
+          testId="notice-turn"
+          title={t("notice.turn.title")}
+          actions={[
+            {
+              label: t("action.openSettings"),
+              testId: "notice-settings",
+              primary: true,
+              onClick: () => {
+                store.dismissNotice();
+                navigate({ name: "settings" });
+              },
+            },
+            { label: t("action.dismiss"), testId: "notice-dismiss", onClick: store.dismissNotice },
+          ]}
+        >
+          {t("notice.turn.body")}
+        </Panel>
       </div>
-      <Button testId="own-code-copy" onClick={copy}>{t("sheet.add.copy")}</Button>
-      <form className="sheet__form" onSubmit={submit} noValidate>
-        <label className="field">
-          <span className="field__label">{t("sheet.add.theirName")}</span>
-          <input
-            className="field__input"
-            value={name}
-            autoComplete="off"
-            data-testid="add-name"
-            onInput={(e) => setName(e.currentTarget.value)}
-          />
-        </label>
-        <label className="field">
-          <span className="field__label">{t("sheet.add.theirCode")}</span>
-          <input
-            className="field__input field__input--code"
-            value={code}
-            autoComplete="off"
-            autoCapitalize="characters"
-            spellcheck={false}
-            dir="ltr"
-            data-testid="add-code"
-            onInput={(e) => setCode(e.currentTarget.value)}
-          />
-        </label>
-        <p className="field__problem" role="alert" data-testid="add-problem">
-          {problem ? t("sheet.add.needBoth") : ""}
-        </p>
-        <Button variant="primary" type="submit" testId="add-submit" block>
-          {t("sheet.add.submit")}
-        </Button>
-      </form>
-    </Sheet>
-  );
-}
-
-/** Reserved height in every state, so the list does not move when encryption is ready. */
-function DeviceStatus() {
-  const status = wasmStatus.value;
-  let text: string;
-  if (status.state === "ready") text = `${t("device.ready")} · ${status.version}`;
-  else if (status.state === "failed") text = t("device.failed");
-  else {
-    const percent = status.state === "loading" && status.total > 0
-      ? Math.floor((status.loaded / status.total) * 100)
-      : 0;
-    text = t("device.loading", { percent });
+    );
   }
   return (
-    <p
-      className={`device-status device-status--${status.state}`}
-      role="status"
-      data-testid="device-status"
-      data-state={status.state}
-    >
-      {text}
-    </p>
+    <div className="list__notice">
+      <Panel
+        tone="red"
+        testId="notice-storage"
+        title={t("notice.storage.title")}
+        actions={[
+          { label: t("action.dismiss"), testId: "notice-dismiss", onClick: store.dismissNotice },
+        ]}
+      >
+        {t("notice.storage.body")}
+      </Panel>
+    </div>
   );
 }
 
 export function ConversationList({ current }: { current: Route }) {
   const store = useStore();
-  const [adding, setAdding] = useState(false);
-  const contacts = store.contacts.value;
+  const contacts = sortContacts(store.contacts.value);
   const online = contacts.filter((c) => isOnline(c.path));
   const away = contacts.filter((c) => !isOnline(c.path));
   const selfOnline = store.selfOnline.value;
 
-  const row = (contact: Contact) => {
-    const messages = messagesOf(store, contact.peerId);
+  const row = (view: ContactView) => {
+    const peerId = view.contact.peerId;
+    const messages = messagesOf(store, peerId);
     return (
-      <li key={contact.peerId}>
+      <li key={peerId} data-testid="contact-item" data-peer-id={peerId}>
         <ConversationRow
-          contact={contact}
+          view={view}
           preview={previewOf(messages[messages.length - 1])}
-          waiting={waitingCount(messages)}
-          href={hrefOf({ name: "conversation", peerId: contact.peerId })}
-          current={current.name === "conversation" && current.peerId === contact.peerId}
+          href={hrefOf({ name: "conversation", peerId })}
+          current={current.name === "conversation" && current.peerId === peerId}
         />
       </li>
     );
@@ -150,36 +97,40 @@ export function ConversationList({ current }: { current: Route }) {
     <div className="list" data-testid="conversation-list">
       <header className="list__header">
         <h1 className="list__title">{t("list.title")}</h1>
-        {contacts.length > 0 && (
-          <Button
-            variant="primary"
-            testId="add-contact"
-            onClick={() => setAdding(true)}
+        <div className="list__actions">
+          {contacts.length > 0 && (
+            <a
+              className="icon-btn icon-btn--filled"
+              href={hrefOf({ name: "add" })}
+              aria-label={t("list.addContact")}
+              title={t("list.addContact")}
+              aria-current={current.name === "add" ? "page" : undefined}
+              data-testid="add-contact"
+            >
+              <Icon name="plus" />
+            </a>
+          )}
+          <a
+            className="icon-btn"
+            href={hrefOf({ name: "settings" })}
+            aria-label={t("list.settings")}
+            title={t("list.settings")}
+            aria-current={current.name === "settings" ? "page" : undefined}
+            data-testid="open-settings"
           >
-            {t("list.addContact")}
-          </Button>
-        )}
+            <Icon name="settings" />
+          </a>
+        </div>
       </header>
       {!selfOnline && (
         <div className="list__line">
           <Line state="self-offline" name="" testId="list-line" />
         </div>
       )}
+      <NoticePanel />
       {updateReady.value && (
         <div className="list__notice">
-          <Panel
-            tone="plain"
-            testId="update-ready"
-            title={t("update.title")}
-            actions={[{
-              label: t("update.reload"),
-              testId: "update-reload",
-              primary: true,
-              onClick: applyUpdate,
-            }]}
-          >
-            {t("update.body")}
-          </Panel>
+          <UpdateNotice />
         </div>
       )}
       <nav className="list__scroll" aria-label={t("list.title")}>
@@ -187,9 +138,13 @@ export function ConversationList({ current }: { current: Route }) {
           <div className="list__empty" data-testid="list-empty">
             <h2 className="list__empty-title">{t("list.empty.title")}</h2>
             <p>{t("list.empty.body")}</p>
-            <Button variant="primary" testId="add-contact" onClick={() => setAdding(true)}>
+            <a
+              className="btn btn--primary"
+              href={hrefOf({ name: "add" })}
+              data-testid="add-contact"
+            >
               {t("list.addContact")}
-            </Button>
+            </a>
           </div>
         )}
         {online.length > 0 && (
@@ -205,10 +160,30 @@ export function ConversationList({ current }: { current: Route }) {
           </section>
         )}
       </nav>
-      <footer className="list__footer">
-        <DeviceStatus />
-      </footer>
-      {adding && <AddContactSheet onClose={() => setAdding(false)} />}
+      {installAvailable.value && contacts.length > 0 && (
+        <footer className="list__footer" data-testid="install-hint">
+          <p className="list__hint">{t("install.hint")}</p>
+          <div className="list__hint-actions">
+            <button
+              type="button"
+              className="btn btn--quiet"
+              data-testid="install-action"
+              onClick={() =>
+                void install()}
+            >
+              {t("install.action")}
+            </button>
+            <button
+              type="button"
+              className="btn btn--quiet"
+              data-testid="install-later"
+              onClick={dismissInstall}
+            >
+              {t("install.later")}
+            </button>
+          </div>
+        </footer>
+      )}
     </div>
   );
 }

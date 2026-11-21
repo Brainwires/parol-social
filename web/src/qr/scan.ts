@@ -2,6 +2,7 @@
 // reads QR codes; otherwise jsQR (public/vendor/jsqr.js), loaded the first time it is needed.
 // Nothing leaves the page: frames go from the <video> to a canvas to the decoder.
 import { assetUrl } from "../platform/base.ts";
+import { encodeQr } from "./encode.ts";
 
 type Decode = (frame: HTMLCanvasElement) => Promise<string | null>;
 
@@ -49,33 +50,51 @@ function withJsQr(): Decode {
   };
 }
 
-/** Which decoder this browser gets. Exported for the tests. */
+const PROBE = "parolnet";
+
+/** A QR code of our own on a canvas: what a decoder that works must be able to read. */
+function probeFrame(): HTMLCanvasElement {
+  const matrix = encodeQr(new TextEncoder().encode(PROBE));
+  const scale = 6;
+  const quiet = 4;
+  const canvas = document.createElement("canvas");
+  canvas.width = canvas.height = (matrix.size + 2 * quiet) * scale;
+  const context = canvas.getContext("2d");
+  if (!context) return canvas;
+  context.fillStyle = "#ffffff";
+  context.fillRect(0, 0, canvas.width, canvas.height);
+  context.fillStyle = "#000000";
+  matrix.modules.forEach((row, y) =>
+    row.forEach((dark, x) => {
+      if (dark) context.fillRect((x + quiet) * scale, (y + quiet) * scale, scale, scale);
+    })
+  );
+  return canvas;
+}
+
+/** How long a BarcodeDetector gets to prove itself before the bundled decoder is used. */
+const PROBE_TIMEOUT_MS = 1500;
+
+async function nativeDecoder(Native: DetectorClass): Promise<Decode | null> {
+  if (!(await Native.getSupportedFormats()).includes("qr_code")) return null;
+  const detector = new Native({ formats: ["qr_code"] });
+  if ((await detector.detect(probeFrame()))[0]?.rawValue !== PROBE) return null;
+  return async (frame) => (await detector.detect(frame))[0]?.rawValue || null;
+}
+
+/**
+ * Which decoder this browser gets. A BarcodeDetector that says it reads QR codes is only
+ * believed once it has read one, and promptly: on some platforms it exists and finds
+ * nothing, or never answers.
+ */
 export async function chooseDecoder(): Promise<{ kind: "native" | "jsqr"; decode: Decode }> {
   const Native = (globalThis as unknown as { BarcodeDetector?: DetectorClass }).BarcodeDetector;
   if (Native) {
-    try {
-      if ((await Native.getSupportedFormats()).includes("qr_code")) {
-        const detector = new Native({ formats: ["qr_code"] });
-        const fallback = withJsQr();
-        let broken = false;
-        return {
-          kind: "native",
-          async decode(frame) {
-            if (!broken) {
-              try {
-                return (await detector.detect(frame))[0]?.rawValue || null;
-              } catch {
-                // Present but not working on this platform: use the bundled decoder.
-                broken = true;
-              }
-            }
-            return fallback(frame);
-          },
-        };
-      }
-    } catch {
-      // Fall through to the bundled decoder.
-    }
+    const decode = await Promise.race([
+      nativeDecoder(Native).catch(() => null),
+      new Promise<null>((resolve) => setTimeout(() => resolve(null), PROBE_TIMEOUT_MS)),
+    ]);
+    if (decode) return { kind: "native", decode };
   }
   return { kind: "jsqr", decode: withJsQr() };
 }

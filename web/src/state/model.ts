@@ -1,69 +1,39 @@
-// The app's data model. The enums mirror the Rust core (crates/parolnet-app/src/lib.rs and
-// call.rs) by name, so the same events can drive this UI and the GPUI desktop app.
+// The app's data model: the engine's own vocabulary (src/engine/types.ts, which mirrors the
+// Rust core by name), plus the few things only the interface knows. One vocabulary drives this
+// UI and the GPUI desktop app.
+import type {
+  CallEnd,
+  ChatMessage as EngineMessage,
+  ContactView,
+  PathState,
+} from "../engine/types.ts";
 
-/** The direct path to a contact (`PathState` in the core). */
-export type PathState =
-  | "Unknown" // No presence information yet.
-  | "Offline" // The contact is away (or does not watch us back yet).
-  | "Connecting" // Setting up the direct connection.
-  | "Direct" // The data channel is open.
-  | "NoDirectPath" // Online, but the two networks would not connect directly.
-  | "BindingFailed"; // The last connection failed its end-to-end check (PNP-001 §10.5.1).
+export type {
+  CallEnd,
+  CallInfo,
+  CallState,
+  Contact,
+  ContactView,
+  DeliveryState,
+  Direction,
+  NoticeCode,
+  PairingCode,
+  PathState,
+  RelayState,
+  Verification,
+} from "../engine/types.ts";
 
-/** Where a message is (`DeliveryState` in the core). */
-export type DeliveryState =
-  | "Queued" // Waiting on this device.
-  | "Sent" // Handed to the contact's device.
-  | "Received" // A message we received.
-  | "Dropped"; // Dropped from the queue before it could be sent.
-
-export type Direction = "Sent" | "Received";
-
-/** The home relay connection (`RelayState` in the core). */
-export type RelayState =
-  | { kind: "Connecting" }
-  | { kind: "Registered"; profile: string }
-  | { kind: "Disconnected"; reason: string };
-
-export type CallEnd = "HungUp" | "RemoteHungUp" | "Declined" | "RemoteDeclined" | "Failed";
-
-/** `CallState` in the core. */
-export type CallState =
-  | { kind: "Outgoing" }
-  | { kind: "Incoming" }
-  | { kind: "Connecting" }
-  | { kind: "Active" }
-  | { kind: "Ended"; end: CallEnd };
-
-export type CallMedia = "voice" | "video";
-
-export interface ActiveCall {
-  peerId: string;
-  media: CallMedia;
-  state: CallState;
-}
-
-export interface Contact {
-  /** SHA-256 of the contact's Ed25519 public key, hex. Groups use their group id. */
-  peerId: string;
-  name: string;
-  kind: "person" | "group";
-  path: PathState;
-}
-
-/** What a bubble carries. Text, files and call invitations share one form. */
-export type MessageBody =
-  | { kind: "text"; text: string }
+/**
+ * What a bubble can carry besides text. The engine sends text only in this phase; the state
+ * lab's made-up conversations use these to show the one form files and call invitations share.
+ */
+export type Attachment =
   | { kind: "file"; name: string; bytes: number }
-  | { kind: "call"; media: CallMedia };
+  | { kind: "call"; media: "voice" | "video" };
 
-export interface ChatMessage {
-  id: number;
-  peerId: string;
-  direction: Direction;
-  body: MessageBody;
-  timestampMs: number;
-  state: DeliveryState;
+/** A message as the screens show it: the engine's, optionally with a lab attachment. */
+export interface ChatMessage extends EngineMessage {
+  readonly attachment?: Attachment;
 }
 
 /** The contact is reachable by the relay: listed under "Online now". */
@@ -96,7 +66,39 @@ export function lineState(path: PathState, selfOnline: boolean): LineState {
   }
 }
 
-/** The plain text of a message, for previews. */
-export function previewText(body: MessageBody): string | null {
-  return body.kind === "text" ? body.text : body.kind === "file" ? body.name : null;
+/** The list's order: who is online first, then by last activity, newest first. */
+export function sortContacts(contacts: readonly ContactView[]): ContactView[] {
+  return [...contacts].sort((a, b) =>
+    Number(isOnline(b.path)) - Number(isOnline(a.path)) ||
+    b.lastActivityMs - a.lastActivityMs ||
+    a.contact.name.localeCompare(b.contact.name)
+  );
+}
+
+/** How a call ended, as the interface words it (one message per engine `CallEnd`). */
+export type CallEndWords =
+  | "youEnded"
+  | "theyEnded"
+  | "youDeclined"
+  | "theyDeclined"
+  | "noAnswer"
+  | "missed"
+  | "failed";
+
+export function callEndWords(end: CallEnd, incoming: boolean): CallEndWords {
+  switch (end.kind) {
+    case "HungUp":
+      return "youEnded";
+    case "RemoteHungUp":
+      return "theyEnded";
+    case "Declined":
+      return "youDeclined";
+    case "Rejected":
+      return "theyDeclined";
+    case "NoAnswer":
+      // We did not pick up, or they did not.
+      return incoming ? "missed" : "noAnswer";
+    case "Failed":
+      return "failed";
+  }
 }

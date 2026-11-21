@@ -9,11 +9,22 @@ export function groups(value: string, size: number): string[] {
 
 /** A pairing code, grouped in fours. */
 export function CodeBlock(
-  { code, label, testId }: { code: string; label: string; testId: string },
+  { code, label, testId, small = false }: {
+    code: string;
+    label: string;
+    testId: string;
+    /** A long code (a pairing code is a few hundred characters): set smaller. */
+    small?: boolean;
+  },
 ) {
   const clean = code.replace(/\s+/g, "");
   return (
-    <code className="code" role="group" aria-label={label} data-testid={testId}>
+    <code
+      className={small ? "code code--small" : "code"}
+      role="group"
+      aria-label={label}
+      data-testid={testId}
+    >
       {groups(clean, 4).map((group, i) => <span key={i}>{group}</span>)}
     </code>
   );

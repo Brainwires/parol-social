@@ -15,7 +15,7 @@
     min-inline-size: 0;
     min-block-size: 0;
   }
-  .app[data-view="conversation"] .app__list,
+  .app[data-view="main"] .app__list,
   .app[data-view="list"] .app__main {
     display: none;
   }
@@ -23,7 +23,7 @@
     .app {
       grid-template-columns: var(--layout-list-width) minmax(0, 1fr);
     }
-    .app[data-view="conversation"] .app__list,
+    .app[data-view="main"] .app__list,
     .app[data-view="list"] .app__main {
       display: flex;
     }
@@ -76,22 +76,31 @@
   .list__empty-title {
     font-size: var(--text-lead);
   }
+  .list__actions {
+    display: flex;
+    align-items: center;
+    gap: var(--space-2);
+  }
+  .list__actions .icon-btn:not(.icon-btn--filled)[aria-current="page"] {
+    background: var(--fog);
+  }
   .list__footer {
-    padding-block: var(--space-2);
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-2);
+    padding-block: var(--space-3);
     padding-inline: var(--space-4);
-    padding-block-end: max(var(--space-2), env(safe-area-inset-bottom));
+    padding-block-end: max(var(--space-3), env(safe-area-inset-bottom));
     border-block-start: var(--border-hairline) solid var(--fog);
   }
-  .device-status {
-    min-block-size: 1.5rem;
+  .list__hint {
     color: var(--ink-2);
     font-size: var(--text-caption);
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
   }
-  .device-status--failed {
-    color: var(--flare);
+  .list__hint-actions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: var(--space-2);
   }
   .sheet__form {
     display: flex;
@@ -147,8 +156,10 @@
   .conversation__back {
     grid-area: back;
   }
-  .conversation__header > .avatar {
+  .conversation__avatar {
     grid-area: avatar;
+    border-radius: var(--radius-full);
+    cursor: pointer;
   }
   .conversation__name {
     grid-area: name;
@@ -192,19 +203,33 @@
     inset-inline-end: var(--space-2);
     max-inline-size: calc(100% - 2 * var(--space-2));
   }
-  .conversation__call {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    gap: var(--space-3);
-    padding-block: var(--space-2);
-    padding-inline: var(--space-4);
-    background: var(--open-fill);
-    color: var(--ink);
-  }
   .conversation__panel {
     padding-block: var(--space-2);
     padding-inline: var(--space-4);
+  }
+  /* "Not verified yet": plain words and the one thing that settles it. */
+  .conversation__verify {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    justify-content: space-between;
+    gap: var(--space-1) var(--space-3);
+    padding-block: var(--space-1);
+    padding-inline: var(--space-4);
+    border-block-end: var(--border-hairline) solid var(--fog);
+    color: var(--ink-2);
+    font-size: var(--text-caption);
+  }
+  .conversation__problem {
+    padding-inline: var(--space-4);
+    color: var(--flare);
+    font-size: var(--text-caption);
+  }
+  .conversation__problem:empty {
+    display: none;
+  }
+  .conversation__problem:not(:empty) {
+    padding-block: var(--space-2) 0;
   }
 
   /* Thread */
@@ -268,5 +293,406 @@
   }
   .thread__caption--dropped {
     color: var(--flare);
+  }
+
+  /* A screen beside the list: add a contact, settings. */
+  .screen {
+    display: flex;
+    flex-direction: column;
+    flex: 1;
+    min-block-size: 0;
+  }
+  .screen__header {
+    display: flex;
+    align-items: center;
+    gap: var(--space-2);
+    min-block-size: 4.25rem;
+    padding-block: var(--space-2);
+    padding-inline: var(--space-2) var(--space-4);
+    padding-block-start: max(var(--space-2), env(safe-area-inset-top));
+    border-block-end: var(--border-hairline) solid var(--fog);
+  }
+  .screen__title {
+    font-size: var(--text-lead);
+  }
+  .screen__title:focus,
+  .screen__title:focus-visible {
+    outline: none;
+  }
+  @media (min-width: 900px) {
+    .screen__header {
+      padding-inline-start: var(--space-4);
+    }
+  }
+  .screen__body {
+    flex: 1;
+    min-block-size: 0;
+    overflow-y: auto;
+    padding: var(--space-4);
+    padding-block-end: max(var(--space-6), env(safe-area-inset-bottom));
+  }
+  .screen__content {
+    max-inline-size: 34rem;
+    margin-inline: auto;
+  }
+
+  /* Before the app: loading, first run, another tab, could not start. */
+  /* Laid out from a fixed point near the top, so the name does not move when the loading
+     line gives way to the first-run text. */
+  .start {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-start;
+    gap: var(--space-4);
+    min-block-size: 100dvh;
+    max-inline-size: 30rem;
+    margin-inline: auto;
+    padding: var(--space-5);
+    padding-block-start: max(18dvh, calc(var(--space-6) + env(safe-area-inset-top)));
+    padding-block-end: max(var(--space-6), env(safe-area-inset-bottom));
+  }
+  .start .panel {
+    margin-block-start: var(--space-5);
+  }
+  .start__name {
+    font-size: var(--text-display);
+  }
+  .start__title {
+    font-size: var(--text-title);
+  }
+  .start__name:focus,
+  .start__name:focus-visible,
+  .start__title:focus,
+  .start__title:focus-visible {
+    outline: none;
+  }
+  .start__lead {
+    font-size: var(--text-lead);
+    line-height: var(--line-tight);
+  }
+  .start__body,
+  .start__status {
+    color: var(--ink-2);
+  }
+  .start__status {
+    min-block-size: 1.5rem;
+    font-size: var(--text-caption);
+  }
+  .start .btn {
+    min-inline-size: 10rem;
+  }
+
+  /* Add a contact */
+  .pairing,
+  .pairing__own,
+  .pairing__scan,
+  .pairing__paste,
+  .pairing__name {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-3);
+  }
+  .pairing {
+    gap: var(--space-5);
+  }
+  .pairing__own,
+  .pairing__scan {
+    align-items: flex-start;
+  }
+  .pairing__label {
+    font-size: var(--text-body);
+  }
+  .pairing__expiry {
+    color: var(--lamp);
+    font-size: var(--text-caption);
+    font-weight: var(--weight-medium);
+  }
+  .pairing__help,
+  .pairing__ip {
+    color: var(--ink-2);
+    font-size: var(--text-caption);
+  }
+  .pairing__actions,
+  .pairing__theirs {
+    display: flex;
+    flex-wrap: wrap;
+    gap: var(--space-2);
+  }
+  .pairing__theirs .btn {
+    flex: 1 1 10rem;
+  }
+  .pairing__video {
+    inline-size: min(100%, 22rem);
+    aspect-ratio: 1;
+    border-radius: var(--radius-panel);
+    background: var(--video-ground);
+    object-fit: cover;
+  }
+
+  /* Settings */
+  .settings {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-6);
+  }
+  .settings__group,
+  .settings__item,
+  .settings__advanced > form {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-start;
+    gap: var(--space-3);
+  }
+  .settings__group > *,
+  .settings__item > .field,
+  .settings__item > .switch {
+    inline-size: 100%;
+  }
+  .settings__group > .btn,
+  .settings__item > .btn {
+    inline-size: auto;
+  }
+  .settings__group-title {
+    padding-block-end: var(--space-2);
+    border-block-end: var(--border-hairline) solid var(--fog);
+    font-size: var(--text-lead);
+  }
+  .settings__item-title {
+    font-size: var(--text-body);
+  }
+  .settings__item {
+    padding-block-start: var(--space-2);
+  }
+  .settings__actions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: var(--space-2);
+  }
+  .settings__summary {
+    display: flex;
+    align-items: center;
+    min-block-size: var(--target-min);
+    font-weight: var(--weight-medium);
+    cursor: pointer;
+  }
+  .settings__advanced > form {
+    padding-block-start: var(--space-2);
+  }
+
+  /* Incoming call: the whole screen on a phone, a banner when there is room. */
+  .incoming {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: var(--space-4);
+    inline-size: 100%;
+    max-inline-size: 100%;
+    block-size: 100dvh;
+    max-block-size: 100dvh;
+    margin: 0;
+    padding: var(--space-5);
+    border: 0;
+    background: var(--surface);
+    color: var(--ink);
+    text-align: center;
+  }
+  .incoming:not([open]) {
+    display: none;
+  }
+  .incoming::backdrop {
+    background: rgb(11 18 22 / 0.55);
+  }
+  .incoming__words {
+    font-size: var(--text-title);
+    font-weight: var(--weight-bold);
+    line-height: var(--line-tight);
+  }
+  .incoming__words:focus,
+  .incoming__words:focus-visible {
+    outline: none;
+  }
+  .incoming__actions {
+    display: flex;
+    flex-wrap: wrap;
+    justify-content: center;
+    gap: var(--space-3);
+  }
+  .incoming__actions .btn {
+    min-inline-size: 8.5rem;
+  }
+  @media (min-width: 900px) {
+    .incoming {
+      flex-direction: row;
+      justify-content: flex-start;
+      inline-size: min(40rem, calc(100% - 2 * var(--space-5)));
+      block-size: fit-content;
+      margin-block: var(--space-4) auto;
+      margin-inline: auto;
+      padding: var(--space-4);
+      border: var(--border-hairline) solid var(--ink-2);
+      border-radius: var(--radius-panel);
+      text-align: start;
+    }
+    .incoming__words {
+      flex: 1;
+      font-size: var(--text-lead);
+    }
+    .incoming__actions {
+      flex-wrap: nowrap;
+    }
+    .incoming__actions .btn {
+      min-inline-size: 0;
+    }
+  }
+
+  /* The call: their video fills the window, ours floats, the controls sit at the bottom. */
+  .call {
+    inline-size: 100%;
+    max-inline-size: 100%;
+    block-size: 100dvh;
+    max-block-size: 100dvh;
+    margin: 0;
+    padding: 0;
+    border: 0;
+    background: var(--video-ground);
+    color: var(--on-video);
+    overflow: hidden;
+    /* Over video the ring is the same amber in both themes. */
+    --focus-color: var(--lamp-line);
+  }
+  .call[open] {
+    display: grid;
+    grid-template-rows: auto minmax(0, 1fr) auto;
+  }
+  .call__stage {
+    grid-row: 1 / -1;
+    grid-column: 1;
+    position: relative;
+    min-block-size: 0;
+  }
+  .call__remote {
+    position: absolute;
+    inset: 0;
+    inline-size: 100%;
+    block-size: 100%;
+    object-fit: contain;
+    background: var(--video-ground);
+  }
+  .call__avatar {
+    position: absolute;
+    inset: 0;
+    display: grid;
+    place-items: center;
+  }
+  .call__avatar .avatar {
+    inline-size: 7rem;
+    block-size: 7rem;
+    font-size: var(--text-display);
+  }
+  .call__self {
+    position: absolute;
+    inset-block-end: 7.5rem;
+    inset-inline-end: var(--space-4);
+    inline-size: min(30vw, 11rem);
+    aspect-ratio: 3 / 4;
+    border-radius: var(--radius-panel);
+    border: var(--border-hairline) solid var(--on-video);
+    background: var(--video-ground);
+    object-fit: cover;
+  }
+  .call__self--off {
+    display: grid;
+    place-items: center;
+    padding: var(--space-2);
+    color: var(--on-video);
+    font-size: var(--text-caption);
+    text-align: center;
+  }
+  @media (min-width: 900px) {
+    .call__self {
+      aspect-ratio: 4 / 3;
+      inline-size: 14rem;
+    }
+  }
+  .call__header {
+    grid-row: 1;
+    grid-column: 1;
+    z-index: 1;
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-1);
+    padding: var(--space-4);
+    padding-block-start: max(var(--space-4), env(safe-area-inset-top));
+    background: linear-gradient(to bottom, var(--video-ground), transparent);
+  }
+  .call__name {
+    font-size: var(--text-title);
+  }
+  .call__name:focus,
+  .call__name:focus-visible {
+    outline: none;
+  }
+  .call__status,
+  .call__timer {
+    font-size: var(--text-body);
+  }
+  .call__timer {
+    font-family: var(--font-mono);
+    font-variant-numeric: tabular-nums;
+  }
+  .call__controls {
+    grid-row: 3;
+    grid-column: 1;
+    z-index: 1;
+    display: flex;
+    flex-wrap: wrap;
+    justify-content: center;
+    gap: var(--space-3);
+    padding: var(--space-4);
+    padding-block-end: max(var(--space-5), env(safe-area-inset-bottom));
+    background: linear-gradient(to top, var(--video-ground), transparent);
+  }
+  .call__control {
+    inline-size: 3.5rem;
+    block-size: 3.5rem;
+    border-radius: var(--radius-full);
+    border: var(--border-state) solid var(--on-video);
+    background: var(--video-ground);
+    color: var(--on-video);
+  }
+  /* Switched on (muted, camera off): filled, and the icon itself is struck through. */
+  .call__control[aria-pressed="true"] {
+    background: var(--on-video);
+    color: var(--video-ground);
+  }
+  .call__control--end {
+    border-color: var(--flare-on-video);
+    color: var(--flare-on-video);
+  }
+  @media (hover: hover) {
+    .call .call__control:not([aria-pressed="true"]):hover {
+      background: var(--video-ground);
+      border-width: 3px;
+    }
+  }
+  .call__controls .btn--primary {
+    background: var(--on-video);
+    border-color: var(--on-video);
+    color: var(--video-ground);
+  }
+  .call__output {
+    position: relative;
+  }
+  .call__output-menu {
+    inset-block-start: auto;
+    inset-block-end: calc(100% + var(--space-2));
+    inset-inline-end: auto;
+    inset-inline-start: 50%;
+    transform: translateX(-50%);
+    color: var(--ink);
+  }
+  [dir="rtl"] .call__output-menu {
+    transform: translateX(50%);
   }
 }

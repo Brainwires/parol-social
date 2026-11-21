@@ -1,20 +1,42 @@
 // The message catalogue. English is bundled; every other locale is a JSON file loaded the
-// first time it is chosen (its own chunk). `t()` reads the locale signal, so a component that
-// calls it re-renders when the locale changes.
+// first time it is chosen (its own chunk). A locale may lack keys: each missing key falls
+// back to English. `t()` reads the locale signal, so a component that calls it re-renders
+// when the locale changes.
 import { computed, type ReadonlySignal, signal } from "denext/signals";
 import { assetUrl } from "../platform/base.ts";
+import { readPref, writePref } from "../platform/prefs.ts";
 import { formatMessage, type MessageParams } from "./format.ts";
 import en from "./locales/en.json" with { type: "json" };
 
 export type MessageKey = keyof typeof en;
 type Catalogue = Partial<Record<MessageKey, string>>;
 
-/** Locales with a catalogue. The other eight of the old PWA come with the protocol port. */
+/** Locales with a catalogue of their own, each loaded on demand. */
 const LOADERS: Record<string, () => Promise<{ default: Catalogue }>> = {
   ar: () => import("./locales/ar.json", { with: { type: "json" } }),
+  de: () => import("./locales/de.json", { with: { type: "json" } }),
+  es: () => import("./locales/es.json", { with: { type: "json" } }),
+  fa: () => import("./locales/fa.json", { with: { type: "json" } }),
+  fr: () => import("./locales/fr.json", { with: { type: "json" } }),
+  it: () => import("./locales/it.json", { with: { type: "json" } }),
+  ja: () => import("./locales/ja.json", { with: { type: "json" } }),
+  ko: () => import("./locales/ko.json", { with: { type: "json" } }),
 };
 
-export const LOCALES = ["en", ...Object.keys(LOADERS)] as const;
+/** Each language under its own name, in the order the settings list them. */
+export const LANGUAGES: ReadonlyArray<{ code: string; name: string }> = [
+  { code: "en", name: "English" },
+  { code: "ar", name: "العربية" },
+  { code: "de", name: "Deutsch" },
+  { code: "es", name: "Español" },
+  { code: "fa", name: "فارسی" },
+  { code: "fr", name: "Français" },
+  { code: "it", name: "Italiano" },
+  { code: "ja", name: "日本語" },
+  { code: "ko", name: "한국어" },
+];
+
+export const LOCALES: readonly string[] = LANGUAGES.map((language) => language.code);
 
 const RTL = new Set(["ar", "fa", "he", "ur"]);
 /** Locales whose script needs Vazirmatn; its stylesheet is linked only for them. */
@@ -56,6 +78,26 @@ export async function setLocale(code: string): Promise<void> {
   if (ARABIC_SCRIPT.has(code)) linkArabicFont();
   current.value = code;
   applyToDocument();
+}
+
+/** The person chose a language: use it and remember it on this device. */
+export async function chooseLocale(code: string): Promise<void> {
+  await setLocale(code);
+  writePref("locale", code);
+}
+
+/**
+ * The language to start in: the one chosen on this device, else the first of the browser's
+ * languages the app has, else English.
+ */
+export function preferredLocale(browserLanguages: readonly string[]): string {
+  const saved = readPref("locale");
+  if (saved && LOCALES.includes(saved)) return saved;
+  for (const tag of browserLanguages) {
+    const base = tag.toLowerCase().split("-")[0];
+    if (LOCALES.includes(base)) return base;
+  }
+  return "en";
 }
 
 /** State lab only: force a direction regardless of the locale (null follows the locale). */

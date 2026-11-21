@@ -5,7 +5,12 @@
 //      index.js / index.css) and makes their URLs in index.html relative (Denext writes
 //      "/assets/…", which only works at the origin's root);
 //   2. writes the service worker's precache list into out/sw.js from the files really exported;
-//   3. measures the first-load JavaScript and fails over the budget.
+//   3. copies the third-party notices to out/licences.txt (Settings, About links to it);
+//   4. measures the first-load JavaScript and fails over the budget;
+//   5. fails if a production export contains the test hooks.
+//
+// `--test` (the `build:test` task) is the development and test build: it has the state lab
+// and the test hooks, so steps 4 and 5 only report, and the result is moved to out-test/.
 import { encodeHex } from "@std/encoding/hex";
 import { walk } from "@std/fs/walk";
 import { fromFileUrl, join, relative, SEPARATOR } from "@std/path";
@@ -68,8 +73,19 @@ async function hashEntry(outDir: string, html: string, name: string): Promise<st
   return html.replace(absolute, `"./assets/${hashed}"`);
 }
 
-export async function postexport(outDir: string): Promise<void> {
+export interface PostexportOptions {
+  /** The development and test build: report the size, allow the test hooks. */
+  test?: boolean;
+  /** The third-party notices to ship as licences.txt. */
+  notices?: string;
+}
+
+/** What only a test build may contain. */
+export const TEST_ONLY_MARKERS = ["__parolnetTest", "parolnet:test"];
+
+export async function postexport(outDir: string, options: PostexportOptions = {}): Promise<void> {
   const indexPath = join(outDir, "index.html");
+  if (options.notices) await Deno.copyFile(options.notices, join(outDir, "licences.txt"));
   let html = await Deno.readTextFile(indexPath);
 
   // Nothing else may import the entry by its old name once it is renamed.
@@ -127,11 +143,32 @@ export async function postexport(outDir: string): Promise<void> {
   console.log(`  version ${precache.version}, ${files.length} files precached`);
   console.log(`  first-load JS: ${kb(raw)} raw, ${kb(gzip)} gzip (${seen.size} files)`);
   console.log(`  stylesheet:    ${kb(css.length)} raw, ${kb(await gzipSize(css))} gzip`);
+  if (options.test) return;
   if (gzip > FIRST_LOAD_BUDGET_BYTES) {
     throw new Error(`postexport: first-load JS ${kb(gzip)} is over ${kb(FIRST_LOAD_BUDGET_BYTES)}`);
+  }
+  // The production export never carries the test hooks or the state lab.
+  for await (const entry of walk(join(outDir, "assets"), { exts: [".js"] })) {
+    const source = await Deno.readTextFile(entry.path);
+    for (const marker of TEST_ONLY_MARKERS) {
+      if (source.includes(marker)) {
+        throw new Error(`postexport: ${entry.name} contains "${marker}" (test builds only)`);
+      }
+    }
   }
 }
 
 if (import.meta.main) {
-  await postexport(fromFileUrl(new URL("../out", import.meta.url)));
+  const test = Deno.args.includes("--test");
+  const out = fromFileUrl(new URL("../out", import.meta.url));
+  await postexport(out, {
+    test,
+    notices: fromFileUrl(new URL("../THIRD_PARTY.md", import.meta.url)),
+  });
+  if (test) {
+    const target = fromFileUrl(new URL("../out-test", import.meta.url));
+    await Deno.remove(target, { recursive: true }).catch(() => {});
+    await Deno.rename(out, target);
+    console.log("  test build moved to out-test/");
+  }
 }

@@ -1,5 +1,10 @@
 import { assertEquals } from "@std/assert";
-import { isImmutable, isPrecached, staticImports } from "../../scripts/postexport.ts";
+import {
+  isImmutable,
+  isPrecached,
+  staticImports,
+  TEST_ONLY_MARKERS,
+} from "../../scripts/postexport.ts";
 
 Deno.test("postexport: which files are cached forever", () => {
   assertEquals(isImmutable("assets/index-I2UQPTMK.js"), true);
@@ -18,6 +23,14 @@ Deno.test("postexport: the worker never precaches itself", () => {
   assertEquals(isPrecached("sw.js"), false);
   assertEquals(isPrecached("assets/index-I2UQPTMK.js.gz"), false);
   assertEquals(isPrecached("index.html"), true);
+  // The scanner's fallback decoder is there offline; the licence notices are not needed.
+  assertEquals(isPrecached("vendor/jsqr.js"), true);
+  assertEquals(isPrecached("licences.txt"), false);
+});
+
+Deno.test("postexport: what marks a test build", () => {
+  // The names the test hooks put on `window`; a production export with either fails.
+  assertEquals(TEST_ONLY_MARKERS, ["__parolnetTest", "parolnet:test"]);
 });
 
 Deno.test("postexport: static imports of a chunk", () => {
