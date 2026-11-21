@@ -1,12 +1,18 @@
 # PNP-001: ParolNet Wire Protocol
 
 ### Status: CANDIDATE
-### Version: 0.12
-### Date: 2026-11-20
+### Version: 0.13
+### Date: 2026-11-21
 
 ---
 
 ## Changelog
+
+**v0.13 (2026-11-21) — Client ICE policy: TURN is the user's own; re-probing after `peer_offline`**
+
+- §10.5 gains "TURN is user-supplied": a client never takes a TURN server from a signaling-only relay and ships none; the only TURN server it uses is one the user configured, either as one more candidate or, in relay-only mode, as the only path, with no fallback to a direct connection when that server gives no relay candidate. **PNP-001-MUST-082**
+- §10.5 gains "Presence without a push": a `peer_offline` answer that no `presence` push backs is provisional, so the client offers again with exponential backoff and jitter under a budget well below the relay's signaling caps, whether or not messages are queued. Before, a contact that did not (yet) watch back, or lay beyond the 256 watched ids, stayed "offline" until the user intervened. **PNP-001-SHOULD-019**
+- MUST count: 82.
 
 **v0.12 (2026-11-20) — Direct data-channel binding**
 
@@ -656,6 +662,10 @@ A relay operates in exactly one of two profiles:
 **Presence push.** A registered client MAY send `{type:"watch", peer_ids:[<hex PeerId>, …]}`. Each `watch` replaces the sender's previous set; the relay keeps at most 256 ids per sender and drops malformed ids and the sender's own id. The relay MUST report presence only between **mutual** watchers: it sends `{type:"presence", peer_id:X, online:true}` to W only if W watches X and X watches W — immediately after either `watch` makes the pair mutual while both are online, and when X registers later — and `{type:"presence", peer_id:X, online:false}` when X's socket closes. **PNP-001-MUST-076** A stranger who watches a PeerId therefore learns nothing from the push. The watch set is dropped when the socket closes. `watch` and `presence` are available in both profiles.
 
 **Client behaviour (non-normative rationale, normative SHOULD).** Because a signaling-only relay forwards at most a few dozen signaling frames per minute per sender, clients SHOULD send connection SDP non-trickle (wait for ICE gathering to complete, bounded at a few seconds, and send the candidates inside the offer / answer), SHOULD stagger new connection attempts, and SHOULD back off on `rate_limited` instead of retrying at once. **PNP-001-SHOULD-016** With no relay message path, all content (chat, group fan-out, files, call signalling) rides the direct peer-to-peer data channel; messages for a contact who is offline queue on the sender until both are online. Direct connections reveal each side's network address to the contact (never to strangers, since connections are only attempted to contacts); clients SHOULD say so plainly and SHOULD let the user configure their own TURN server, which then relays only for that user.
+
+**TURN is user-supplied (client).** A TURN server sits on the path of every packet it relays and learns both endpoints' addresses, so which one is used is the user's decision alone. A client MUST NOT gather relay candidates from, or send any traffic through, a TURN server announced by a relay whose profile is `signaling-only` (it takes only the `stun:` URIs of that relay's `/turn-credentials` answer and ignores every other URI and any `username` / `credential`), and MUST NOT have a TURN server built in. The only TURN server such a client uses is one the user configured with its own credential. That server is used in one of two ways, which the user chooses: as one more candidate next to the direct ones (for pairs with no direct path), or **relay-only**, where the client MUST gather and signal relay candidates from that server only (no host or server-reflexive candidate, and no related address that names one), MUST NOT send connectivity checks to, or answer them from, any address but through that server, and, when the server yields no relay candidate (unreachable, credential refused), MUST NOT fall back to a direct connection: the contact is reported as having no path, and the user is told why. **PNP-001-MUST-082** The reference native client applies the first sentence to relays of either profile. Relay-only hides the user's address from contacts; the TURN server's operator still sees it, which is why it must be the user's own.
+
+**Presence without a push (client).** A `peer_offline` answer says only that the recipient was not registered at that moment. Unless the pair are mutual watchers within the 256-id limit, the relay never reports that this changed. A client whose only evidence that a contact is offline is a `peer_offline` answer (no `presence` push for that contact since) SHOULD treat it as provisional and offer again with exponential backoff and jitter, whether or not messages are queued for the contact (the reference client: after 15 seconds, doubling up to 5 minutes for a contact that has queued messages or that the user asked to connect to, and up to 15 minutes for any other), and SHOULD stop when a connection comes up or a `presence` push for the contact arrives; a push is authoritative in both directions, so a contact pushed offline is not probed. A user's explicit request to connect SHOULD offer at once and start the backoff over. All such probes together SHOULD stay well below the per-sender caps of MUST-074 (the reference client: a bucket of 12 probes refilled one per minute, at most 72 an hour, contacts the user waits for first) and SHOULD pause while the client backs off after `rate_limited`. **PNP-001-SHOULD-019**
 
 **Logging.** A relay SHOULD NOT write PeerIds at its default log level, SHOULD NOT write access logs that pair client addresses with PeerIds, and SHOULD NOT accept PeerIds in request URLs; the reference signaling-only relay answers `GET /bootstrap` with an empty list and ignores its `exclude` parameter. **PNP-001-SHOULD-017**
 

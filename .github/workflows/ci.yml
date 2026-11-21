@@ -171,6 +171,61 @@ jobs:
       - name: Interop (loopback host candidates)
         run: INTEROP_ICE=loopback node apps/desktop/interop/pwa-interop.mjs
 
+  turn-coturn:
+    name: User-supplied TURN (coturn)
+    # parolnet-rtc's relay-only path against a real TURN server. coturn stands in for the server
+    # a user would run: ParolNet operates none and the relay never offers one. The in-process
+    # test server covers the same exchange in the Test job; this job catches a disagreement
+    # with a real implementation (authentication, permissions, channel data, release).
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-turn-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-turn-
+      - name: Install coturn
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y coturn
+          sudo systemctl stop coturn || true
+      - name: Start coturn with a static test user
+        run: |
+          # The runner's own address, not loopback: coturn refuses loopback peers by default,
+          # and both test peers' relayed addresses are on this address.
+          ip=$(hostname -I | awk '{print $1}')
+          echo "TURN_IP=$ip" >> "$GITHUB_ENV"
+          turnserver --listening-ip "$ip" --relay-ip "$ip" --listening-port 3478 \
+            --min-port 49160 --max-port 49260 \
+            --lt-cred-mech --user parolnet-ci:parolnet-ci-password --realm parolnet.test \
+            --fingerprint --no-tls --no-dtls --no-cli --no-multicast-peers \
+            --log-file stdout --simple-log > coturn.log 2>&1 &
+          for _ in $(seq 1 50); do
+            if ss -lun | grep -q "$ip:3478"; then exit 0; fi
+            sleep 0.2
+          done
+          cat coturn.log
+          exit 1
+      - name: Relay-only through coturn
+        env:
+          PAROLNET_TEST_TURN_REQUIRED: "1"
+          PAROLNET_TEST_TURN_USER: parolnet-ci
+          PAROLNET_TEST_TURN_PASS: parolnet-ci-password
+        run: |
+          export PAROLNET_TEST_TURN_URI="turn:$TURN_IP:3478?transport=udp"
+          export PAROLNET_TEST_BIND_IP="$TURN_IP"
+          cargo test -p parolnet-rtc --test turn relay_only_through_an_external_turn_server -- --nocapture
+      - name: coturn log
+        if: always()
+        run: cat coturn.log || true
+
   msrv:
     name: MSRV (1.91.0)
     runs-on: ubuntu-latest

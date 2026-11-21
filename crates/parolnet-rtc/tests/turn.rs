@@ -2,8 +2,10 @@
 //! test TURN server (`parolnet_rtc::test_turn`), and the failure modes of relay-only.
 //!
 //! `relay_only_through_an_external_turn_server` runs the same exchange against a real TURN
-//! server (coturn in CI) when `PAROLNET_TEST_TURN_URI`, `PAROLNET_TEST_TURN_USER` and
-//! `PAROLNET_TEST_TURN_PASS` are set, binding to `PAROLNET_TEST_BIND_IP` (default loopback).
+//! server (coturn in the CI job `turn-coturn`) when `PAROLNET_TEST_TURN_URI`,
+//! `PAROLNET_TEST_TURN_USER` and `PAROLNET_TEST_TURN_PASS` are set, binding to
+//! `PAROLNET_TEST_BIND_IP` (default loopback); with `PAROLNET_TEST_TURN_REQUIRED` a missing
+//! URI fails instead of skipping.
 
 use std::net::{IpAddr, SocketAddr};
 use std::time::Duration;
@@ -313,6 +315,11 @@ async fn relay_only_without_a_reachable_turn_server_does_not_start() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn relay_only_through_an_external_turn_server() {
     let Ok(uri) = std::env::var("PAROLNET_TEST_TURN_URI") else {
+        // The CI job that starts coturn sets this so a lost variable cannot pass as a skip.
+        assert!(
+            std::env::var_os("PAROLNET_TEST_TURN_REQUIRED").is_none(),
+            "PAROLNET_TEST_TURN_REQUIRED is set but PAROLNET_TEST_TURN_URI is not"
+        );
         eprintln!("PAROLNET_TEST_TURN_URI is not set: skipping the external TURN test");
         return;
     };

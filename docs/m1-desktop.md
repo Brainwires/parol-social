@@ -69,6 +69,33 @@ VP8 encoder (a C shim compiled against the system's headers, `apps/desktop/src/v
 default microphone through opus-rs (48 kHz mono, 20 ms); it plays the contact's Opus through cpal
 and shows its video in the call panel.
 
+## The user's own TURN server; contacts the relay called offline
+
+- **TURN is never the relay's.** The public relay is signaling-only and announces STUN URIs only;
+  the app would ignore TURN URIs and credentials from any relay, and has no TURN server built in.
+  Settings → "Relay through my own TURN server" takes the address (`turn:host:port`, UDP), a
+  username and a password of a server the user runs or rents, and a switch:
+  - off: the relay candidate is one more candidate, used by pairs with no direct path;
+  - "use only this server": relay candidates only. Contacts see the server's address instead of
+    the device's; nothing is sent to, or accepted from, any other address, and no host or
+    server-reflexive candidate (or related address) is signalled. If the server gives no relay
+    candidate the contact shows "no path" with a notice; there is no fallback to direct.
+
+  The settings are saved with the app state and apply at once: existing data connections are
+  rebuilt. `parolnet-rtc` drives the engine's sans-I/O `rtc-turn` client on the connection's own
+  socket (allocate, permissions, channel binds, refresh, release on close). Tests: an in-process
+  TURN server (`parolnet_rtc::test_turn`) under `crates/parolnet-rtc/tests/turn.rs` and
+  `crates/parolnet-app/tests/two_peers.rs` (pairing, chat and a video call relay-only on both
+  sides; restart; clearing; an unreachable server); CI job `turn-coturn` repeats the relay-only
+  exchange against coturn.
+- **Offline is provisional without a presence push.** The relay reports presence only between
+  mutual watchers. When the only evidence is a `peer_offline` answer, the contact is offered to
+  again with backoff (15 s doubling to 5 min for contacts the user waits for, 15 min for the
+  rest) under a shared budget of at most 72 probes an hour, until it answers or a presence push
+  arrives (`parolnet_app::reconnect`). `two_peers.rs` reproduces the old bug behind a proxy that
+  drops the client's `watch` frames: nothing queued, no push, the contact comes back, and the
+  connection is rebuilt by a probe.
+
 ## Known gaps
 
 - **Fixed: the PWA calling the desktop.** When Chromium offers it is the ICE controlling side,
@@ -79,8 +106,14 @@ and shows its video in the call panel.
   the PWA offers while it holds camera and microphone permission) run by default.
 - Camera capture (nokhwa / platform capture), echo cancellation (AEC3), device menus, camera on /
   off mid-call (renegotiation, E1), call stats in the UI.
-- TURN candidates for a user-supplied TURN server (`rtc-turn`); IPv6 host candidates and several
-  sockets; ICE restart on network change (E9).
+- TURN: the user's own TURN server over UDP works (below). TURN over TCP and TLS on 443 (for
+  networks that block UDP) is M4; `turn:...?transport=tcp` and `turns:` are refused by name. No
+  ICE restart, so a connection made before the TURN settings changed is rebuilt, not migrated; a
+  contact in a call keeps its connections until the next reconnect. The engine's TURN client
+  keeps its own copy of the password in memory without wiping it. Every re-probe of an offline
+  contact gathers candidates first (non-trickle), so with a TURN server set it allocates and
+  releases on that server once per probe.
+- IPv6 host candidates and several sockets; ICE restart on network change (E9).
 - `parolnet-store` (SQLCipher, key in the OS keychain); today's JSON state file is owner-only but
   not encrypted. Files (PNP-010), multi-device.
 
@@ -88,6 +121,6 @@ and shows its video in the call panel.
 
 1. Camera capture and AEC3 in a `parolnet-media` crate (the libvpx encoder / decoder and the test
    pattern move there), camera toggle mid-call.
-2. `parolnet-store` behind the same `Store` interface; settings screen with the user's TURN server
-   once `parolnet-rtc` gathers TURN candidates.
+2. `parolnet-store` behind the same `Store` interface (the TURN credential is in the JSON state
+   file until then).
 3. Interop in Firefox and WebKit.
