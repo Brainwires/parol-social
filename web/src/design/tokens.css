@@ -1,0 +1,94 @@
+/* Generated from tokens.json by scripts/gen-tokens.ts. Do not edit. */
+@layer reset, tokens, base, components, screens;
+@layer tokens {
+  :root {
+    color-scheme: light dark;
+    --paper: #F3F5F4;
+    --surface: #FFFFFF;
+    --fog: #E1E6E4;
+    --ink: #15232D;
+    --ink-2: #51606A;
+    --on-ink: #F3F5F4;
+    --open: #0F7A5C;
+    --open-fill: #D5EFE6;
+    --lamp: #8A5A00;
+    --lamp-line: #D9981E;
+    --lamp-fill: #FBEFD3;
+    --flare: #B3261E;
+    --flare-fill: #F9DEDB;
+    --video-ground: #0B1216;
+    --font-text: "Atkinson Hyperlegible Next", "Vazirmatn", system-ui, sans-serif;
+    --font-mono: "Atkinson Hyperlegible Mono", ui-monospace, monospace;
+    --weight-regular: 400;
+    --weight-medium: 500;
+    --weight-bold: 700;
+    --text-caption: 0.875rem;
+    --text-body: 1.0625rem;
+    --text-lead: 1.25rem;
+    --text-title: 1.5rem;
+    --text-display: 1.8125rem;
+    --line-tight: 1.2;
+    --line-text: 1.45;
+    --space-1: 4px;
+    --space-2: 8px;
+    --space-3: 12px;
+    --space-4: 16px;
+    --space-5: 24px;
+    --space-6: 32px;
+    --space-7: 48px;
+    --radius-control: 10px;
+    --radius-bubble: 14px;
+    --radius-bubble-tail: 4px;
+    --radius-panel: 12px;
+    --radius-full: 9999px;
+    --border-hairline: 1px;
+    --border-state: 1.5px;
+    --focus-width: 3px;
+    --focus-offset: 2px;
+    --focus-color: var(--lamp-line);
+    --target-min: 44px;
+    --layout-list-width: 360px;
+    --layout-split-min: 900px;
+    --layout-measure: 680px;
+    --motion-fill-stagger: 350ms;
+    --motion-fill-duration: 450ms;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --paper: #0F181D;
+      --surface: #172229;
+      --fog: #26343C;
+      --ink: #E8EEEC;
+      --ink-2: #9DACB3;
+      --on-ink: #0F181D;
+      --open: #5FD0AC;
+      --open-fill: #12382F;
+      --lamp: #F0BC55;
+      --lamp-line: #D9981E;
+      --lamp-fill: #3A2E12;
+      --flare: #FF8A80;
+      --flare-fill: #44201D;
+      --video-ground: #05090B;
+    }
+  }
+  :root[data-theme="light"] {
+    color-scheme: light;
+  }
+  :root[data-theme="dark"] {
+    color-scheme: dark;
+    --paper: #0F181D;
+    --surface: #172229;
+    --fog: #26343C;
+    --ink: #E8EEEC;
+    --ink-2: #9DACB3;
+    --on-ink: #0F181D;
+    --open: #5FD0AC;
+    --open-fill: #12382F;
+    --lamp: #F0BC55;
+    --lamp-line: #D9981E;
+    --lamp-fill: #3A2E12;
+    --flare: #FF8A80;
+    --flare-fill: #44201D;
+    --video-ground: #05090B;
+  }
+}

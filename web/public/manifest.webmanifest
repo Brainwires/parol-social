@@ -1,0 +1,18 @@
+{
+  "name": "ParolNet",
+  "short_name": "ParolNet",
+  "description": "Private calls, messages and files, straight between devices.",
+  "id": "./",
+  "start_url": "./",
+  "scope": "./",
+  "display": "standalone",
+  "background_color": "#0F181D",
+  "theme_color": "#0F181D",
+  "icons": [
+    { "src": "icons/icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any" },
+    { "src": "icons/icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any maskable" },
+    { "src": "icons/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any maskable" }
+  ],
+  "categories": ["communication", "social"],
+  "prefer_related_applications": false
+}
