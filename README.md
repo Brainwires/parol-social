@@ -71,11 +71,12 @@ apps/desktop (GPUI)      web/ (TS + wasm)        later: iOS / Android shells (Un
 | `parolnet-core` | Client library: bootstrap, sessions, groups, files | exists |
 | `parolnet-wasm` | Browser bindings for the PWA | exists |
 | `parolnet-relay-server` | Axum relay: signaling-only by default (register, SDP / ICE, presence, STUN URIs); opt-in relay profile with store-and-forward, federation, TURN credentials | exists |
-| `parolnet-rtc` | Async driver for the sans-I/O [`webrtc-rs-rtc`](https://github.com/Brainwires/webrtc-rs-rtc) engine (native): host + STUN candidates, data channels, RTP | M1 in progress |
+| `parolnet-rtc` | Async driver for the sans-I/O [`webrtc-rs-rtc`](https://github.com/Brainwires/webrtc-rs-rtc) engine (native): sockets on every interface (IPv4 and IPv6), STUN and the user's TURN server, data channels, RTP with RTX, ICE restart, track renegotiation, the congestion controller's estimate, a statistics digest; runs on real sockets or, in virtual time, on `parolnet-simnet` | M1 |
 | `parolnet-store` | Encrypted native persistence: SQLite with SQLCipher (bundled), database key in the OS keychain (`keyring`) or an owner-only key file on machines without one; identity, contacts, sessions, messages, sender queue, settings; schema migrations, incremental transactional writes, import of the earlier plaintext data directory, wipe | M1 |
 | `parolnet-app` | Headless client core: identity, PWA-compatible pairing, signaling-only relay client, a direct data channel per contact bound to the E2EE session (DTLS fingerprints, PNP-001 §10.5.1), 1:1 encrypted chat, sender-side queue, 1:1 voice / video calls | M1 |
 | `apps/desktop` | GPUI desktop client: contacts, pairing, chat (UI v0), 1:1 calls with camera, echo cancellation and device menus; the M0 video spike behind `--spike` | M1 |
 | `parolnet-media` | Call media for native clients (no dependency on the rest of the workspace): frames, the capture traits and synthetic sources, resampling, Opus, echo cancellation / noise suppression / gain (AEC3, pure Rust), the audio duplex path; behind opt-in features, VP8 through libvpx, microphone and speakers (cpal), camera capture (nokhwa) | M1 |
+| `parolnet-simnet` | Test-only: a deterministic in-memory network (loss, jitter, reordering, a rate cap) that runs `parolnet-rtc` in virtual time, and the M1 call checks on it (setup, renegotiation, ICE restart, the estimate; 2% loss, 300 kbit/s cap, 100 ms jitter) | M1 |
 | `parolnet-call`, `-transfer`, `-simnet` | Calls, PNP-010 transfer, network simulator | M1 |
 | `parolnet-mls`, `-sframe`, `-sfu` | MLS groups and devices, SFrame, the SFU | M2 |
 
