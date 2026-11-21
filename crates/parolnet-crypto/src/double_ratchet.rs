@@ -532,7 +532,9 @@ impl RatchetSession for DoubleRatchetSession {
 
         if need_dh_ratchet {
             // Skip any remaining messages in the current receiving chain
-            if let (Some(remote), Some(_)) = (self.dh_remote.as_ref(), self.recv_chain_key) {
+            if let Some(remote) = self.dh_remote.as_ref()
+                && self.recv_chain_key.is_some()
+            {
                 attempt.skip_message_keys(remote.as_bytes(), header.previous_chain_length)?;
             }
             attempt.dh_ratchet(self.dh_self.as_ref(), &header.ratchet_key)?;
