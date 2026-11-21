@@ -67,7 +67,7 @@ function OwnCode() {
   if (!pairing) {
     return (
       <div className="pairing__own" data-testid="pairing-own" data-state="making">
-        <p role="status">{failed ? t("error.generic") : t("add.making")}</p>
+        <p role="status">{failed ? t("add.makeFailed") : t("add.making")}</p>
         {failed && (
           <Button testId="pairing-retry" onClick={() => setAttempt(attempt + 1)}>
             {t("action.tryAgain")}
