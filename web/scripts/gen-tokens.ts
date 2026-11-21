@@ -14,7 +14,8 @@ export interface Tokens {
   space: Record<string, number>;
   radius: Record<string, number>;
   border: Record<string, number>;
-  focus: { width: number; offset: number; color: string };
+  /** `color` names a colour token per theme: the ring must clear 3:1 on every ground. */
+  focus: { width: number; offset: number; color: { light: string; dark: string } };
   target: { min: number };
   layout: Record<string, number>;
   motion: Record<string, number>;
@@ -37,7 +38,10 @@ function block(selector: string, lines: string[], indent = "  "): string {
 
 export function tokensToCss(tokens: Tokens): string {
   const light = Object.entries(tokens.color).map(([name, c]) => `--${name}: ${c.light};`);
-  const dark = Object.entries(tokens.color).map(([name, c]) => `--${name}: ${c.dark};`);
+  const dark = [
+    ...Object.entries(tokens.color).map(([name, c]) => `--${name}: ${c.dark};`),
+    `--focus-color: var(--${tokens.focus.color.dark});`,
+  ];
   const rest = [
     `--font-text: ${family(tokens.font.text)};`,
     `--font-mono: ${family(tokens.font.mono)};`,
@@ -49,7 +53,7 @@ export function tokensToCss(tokens: Tokens): string {
     ...Object.entries(tokens.border).map(([k, v]) => `--border-${k}: ${v}px;`),
     `--focus-width: ${tokens.focus.width}px;`,
     `--focus-offset: ${tokens.focus.offset}px;`,
-    `--focus-color: var(--${tokens.focus.color});`,
+    `--focus-color: var(--${tokens.focus.color.light});`,
     `--target-min: ${tokens.target.min}px;`,
     ...Object.entries(tokens.layout).map(([k, v]) => `--layout-${k}: ${v}px;`),
     ...Object.entries(tokens.motion).map(([k, v]) => `--motion-${k}: ${v}ms;`),

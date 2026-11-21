@@ -17,6 +17,8 @@
     --flare: #B3261E;
     --flare-fill: #F9DEDB;
     --video-ground: #0B1216;
+    --on-video: #F3F5F4;
+    --flare-on-video: #FF8A80;
     --font-text: "Atkinson Hyperlegible Next", "Vazirmatn", system-ui, sans-serif;
     --font-mono: "Atkinson Hyperlegible Mono", ui-monospace, monospace;
     --weight-regular: 400;
@@ -45,7 +47,7 @@
     --border-state: 1.5px;
     --focus-width: 3px;
     --focus-offset: 2px;
-    --focus-color: var(--lamp-line);
+    --focus-color: var(--lamp);
     --target-min: 44px;
     --layout-list-width: 360px;
     --layout-split-min: 900px;
@@ -69,6 +71,9 @@
       --flare: #FF8A80;
       --flare-fill: #44201D;
       --video-ground: #05090B;
+      --on-video: #E8EEEC;
+      --flare-on-video: #FF8A80;
+      --focus-color: var(--lamp-line);
     }
   }
   :root[data-theme="light"] {
@@ -90,5 +95,8 @@
     --flare: #FF8A80;
     --flare-fill: #44201D;
     --video-ground: #05090B;
+    --on-video: #E8EEEC;
+    --flare-on-video: #FF8A80;
+    --focus-color: var(--lamp-line);
   }
 }
