@@ -553,9 +553,8 @@ mod tests {
 
         // An envelope from one peer changes only that peer's session.
         for round in 0..3u8 {
-            for i in 0..remote.len() {
+            for (i, (peer, theirs)) in remote.iter_mut().enumerate() {
                 let before = sorted_export(&sessions);
-                let (peer, theirs) = &mut remote[i];
                 let env =
                     encrypt_into_envelope(theirs, &pid(0xEE), 0x01, &[round, i as u8], NOW, None)
                         .unwrap();
