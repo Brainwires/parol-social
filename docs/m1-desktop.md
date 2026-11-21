@@ -69,6 +69,47 @@ VP8 encoder (a C shim compiled against the system's headers, `apps/desktop/src/v
 default microphone through opus-rs (48 kHz mono, 20 ms); it plays the contact's Opus through cpal
 and shows its video in the call panel.
 
+## Storage (`parolnet-store`, third slice)
+
+Everything the client keeps is in one database in the data directory, `store.db`, encrypted page
+by page with SQLCipher (AES-256-CBC and HMAC-SHA512 per page, the WAL included): the identity
+secret, contacts, ratchet sessions, history, the sender queue, settings. Beside it sits
+`store.json`, plaintext, which names the key provider and the key's random id and nothing else.
+
+- **The key** is 256 random bits made on first run. The desktop app keeps it in the OS keychain
+  (`KeyStorage::Keychain`: macOS Keychain, Windows Credential Manager, Secret Service on Linux;
+  entry `social.parol.ParolNet` / `store-key-<id>`). The bot, `--call-check` and tests use
+  `KeyStorage::File`: `store.key`, owner-only, in the data directory. That is **weaker**: whoever
+  copies the directory has the key too; it exists for machines without a keychain service. A
+  store keeps the kind it was created with: opening a keychain store with `--key-storage file`
+  (or the reverse) is refused, and a store whose key is missing is reported, never recreated.
+  A Linux desktop without a Secret Service (no GNOME Keyring / KWallet running) fails to start
+  with the keychain; `--key-storage file` on a new data directory is the explicit way around.
+- **Decision: SQLCipher, not application-level record encryption.** The alternative (plain
+  SQLite, each record sealed with ChaCha20-Poly1305) would leave table sizes, row counts per
+  contact and write patterns readable on disk; SQLCipher leaves the file size. Its cost is a C
+  cipher: on Apple systems SQLCipher uses CommonCrypto from the system (nothing extra to build);
+  elsewhere it links OpenSSL's libcrypto, built from source by `openssl-src` and linked
+  statically, so the binary needs no system OpenSSL. Checked: macOS arm64 (build and tests),
+  Linux arm64 in a `rust:1.91-bookworm` container (build, 3.5 minutes cold). Not yet run: the
+  Windows x64 / arm64 builds. If the vendored OpenSSL proves a problem there, the fallback is the
+  record-encryption design behind the same `parolnet-store` API.
+- **Scope of CLAUDE.md invariant 6** ("no C dependencies for crypto"): it governs the E2EE
+  layer (`parolnet-crypto`, `parolnet-protocol`), which stays pure Rust. Storage encryption on
+  the device is a separate layer and uses SQLCipher's C cipher.
+- **Build requirements this adds**: a C compiler everywhere (already needed). Off Apple systems,
+  `perl` and `make` for OpenSSL (present on the Ubuntu runners and in the `rust` images). On
+  Windows, a native perl (Strawberry Perl; Git Bash's own perl cannot run OpenSSL's Configure,
+  so the workflow sets `OPENSSL_SRC_PERL`) and `nmake` from the Visual Studio tools.
+- **Writes**: the engine still calls `save_state` after each change; the store works out the
+  changed rows and a dedicated writer thread commits them in one transaction (WAL, every commit
+  synced). A thread rather than `spawn_blocking`: writes must land in order and one thread on one
+  channel gives that without a runtime. Shutdown waits for the last commit.
+- **Migration**: a data directory from slices 1-2 (`identity.key`, `state.json`) is imported on
+  first open, read back inside the transaction, then the plaintext files are overwritten with
+  zeros and removed, the identity last. On SSDs and copy-on-write filesystems overwriting is
+  best effort.
+
 ## Known gaps
 
 - **Fixed: the PWA calling the desktop.** When Chromium offers it is the ICE controlling side,
@@ -81,13 +122,17 @@ and shows its video in the call panel.
   off mid-call (renegotiation, E1), call stats in the UI.
 - TURN candidates for a user-supplied TURN server (`rtc-turn`); IPv6 host candidates and several
   sockets; ICE restart on network change (E9).
-- `parolnet-store` (SQLCipher, key in the OS keychain); today's JSON state file is owner-only but
-  not encrypted. Files (PNP-010), multi-device.
+- Storage (`parolnet-store`, see "Storage" below): no settings UI for "Delete all data on this
+  device" (`parolnet_app::delete_all_data` exists) or for a store whose key is gone from the
+  keychain (the start error says so); no key rotation; the keychain path has run on no real
+  keychain yet (opt-in test `crates/parolnet-store/tests/keychain.rs`), and the vendored OpenSSL
+  build has not run on the Windows runners.
+- Files (PNP-010), multi-device.
 
 ## Next slice
 
 1. Camera capture and AEC3 in a `parolnet-media` crate (the libvpx encoder / decoder and the test
    pattern move there), camera toggle mid-call.
-2. `parolnet-store` behind the same `Store` interface; settings screen with the user's TURN server
-   once `parolnet-rtc` gathers TURN candidates.
+2. Settings screen: the user's TURN server once `parolnet-rtc` gathers TURN candidates, and
+   "Delete all data on this device" over `parolnet-store`.
 3. Interop in Firefox and WebKit.

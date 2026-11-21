@@ -77,6 +77,18 @@ keychain and lets the user unlink a device remotely; once unlinked it decrypts n
 "Delete all data on this device" erases local state. A device that is unlocked and in the
 attacker's hands while linked exposes what it holds. *Detail: M1 (storage), M2 (unlink).*
 
+As built in M1 (`parolnet-store`): the identity secret, ratchet sessions, contacts, history and
+the sender queue are in one SQLCipher database (every page encrypted and authenticated, the
+write-ahead log included); its random 256-bit key is in the OS keychain. An attacker with the
+disk but not the user's login (a powered-off or locked device, a backup, a copied profile
+directory) learns the database's size and that ParolNet was used, not its content. An attacker
+who runs code as the logged-in user can ask the keychain for the key: that case is the unlocked
+device above. Headless installations without a keychain service keep the key in an owner-only
+file next to the database (an explicit setting, never a silent fallback), which protects nothing
+once the directory is copied. Deleting all data removes the key first, then the files; on flash
+storage old blocks may persist until reused, but without the key they are noise. SQLCipher's
+cipher is a C library (CommonCrypto, or OpenSSL's libcrypto), outside the pure-Rust E2EE layer.
+
 ### 3.5 Malicious update channel and supply chain
 A compromised build host, release server, dependency or update feed. Releases and update manifests
 are signed with a key held offline; clients verify before installing; builds are reproducible;

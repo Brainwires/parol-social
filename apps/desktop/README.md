@@ -19,8 +19,8 @@ needs system libraries the root workspace does not.
 | OS | Needs |
 | --- | --- |
 | macOS | Xcode (its Metal compiler; on Xcode 26 install the Metal toolchain component) or build with `--features runtime-shaders`; `brew install libvpx pkgconf` |
-| Linux | `libvpx-dev libasound2-dev pkg-config libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev libx11-xcb-dev libfontconfig-dev libvulkan1` and a Vulkan driver |
-| Windows | `vcpkg install libvpx:x64-windows-static-md` (or `arm64-windows-static-md`) with `VCPKG_ROOT` set |
+| Linux | `libvpx-dev libasound2-dev pkg-config libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev libx11-xcb-dev libfontconfig-dev libvulkan1` and a Vulkan driver; `perl` and `make` (the store's SQLCipher links an OpenSSL libcrypto built from source) |
+| Windows | `vcpkg install libvpx:x64-windows-static-md` (or `arm64-windows-static-md`) with `VCPKG_ROOT` set; Strawberry Perl for the OpenSSL build (from Git Bash set `OPENSSL_SRC_PERL=C:/Strawberry/perl/bin/perl.exe`, its own perl cannot run OpenSSL's Configure) |
 
 `VPX_LIB_DIR` (and `VPX_STATIC=1`, `VPX_INCLUDE_DIR` for the encoder shim `src/vp8enc.c`) points
 the build at a libvpx of your own. A C compiler is needed for that shim.
@@ -33,8 +33,10 @@ cargo test
 ## Run
 
 ```sh
-# the chat client (data in the platform's per-user data directory)
-cargo run --release -- [--relay wss://parol.social/ws] [--data-dir DIR]
+# the chat client (data in the platform's per-user data directory, encrypted; the key is in the
+# OS keychain, or with --key-storage file in a key file beside the data: weaker, for machines
+# without a keychain service; a data directory keeps the kind it was created with)
+cargo run --release -- [--relay wss://parol.social/ws] [--data-dir DIR] [--key-storage keychain|file]
 
 # the call media without a window: pair with a code, video-call, report what decoded
 cargo run --release -- --call-check --relay ws://HOST/ws --code CODE [--video] [--seconds 8]

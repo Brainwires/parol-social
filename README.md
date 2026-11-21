@@ -71,9 +71,10 @@ apps/desktop (GPUI)      pwa/ (JS + wasm)        later: iOS / Android shells (Un
 | `parolnet-wasm` | Browser bindings for the PWA | exists |
 | `parolnet-relay-server` | Axum relay: signaling-only by default (register, SDP / ICE, presence, STUN URIs); opt-in relay profile with store-and-forward, federation, TURN credentials | exists |
 | `parolnet-rtc` | Async driver for the sans-I/O [`webrtc-rs-rtc`](https://github.com/Brainwires/webrtc-rs-rtc) engine (native): host + STUN candidates, data channels, RTP | M1 in progress |
+| `parolnet-store` | Encrypted native persistence: SQLite with SQLCipher (bundled), database key in the OS keychain (`keyring`) or an owner-only key file on machines without one; identity, contacts, sessions, messages, sender queue, settings; schema migrations, incremental transactional writes, import of the earlier plaintext data directory, wipe | M1 |
 | `parolnet-app` | Headless client core: identity, PWA-compatible pairing, signaling-only relay client, a direct data channel per contact bound to the E2EE session (DTLS fingerprints, PNP-001 §10.5.1), 1:1 encrypted chat, sender-side queue, 1:1 voice / video calls | M1 |
 | `apps/desktop` | GPUI desktop client: contacts, pairing, chat (UI v0); the M0 video spike behind `--spike` | M1 first slice |
-| `parolnet-media`, `-call`, `-transfer`, `-store`, `-simnet` | Media, calls, PNP-010 transfer, storage, app core, network simulator | M1 |
+| `parolnet-media`, `-call`, `-transfer`, `-simnet` | Media, calls, PNP-010 transfer, network simulator | M1 |
 | `parolnet-mls`, `-sframe`, `-sfu` | MLS groups and devices, SFrame, the SFU | M2 |
 
 Media: Opus audio with echo cancellation (AEC3), VP8 video (VP9 / AV1 later), DTLS-SRTP end to end

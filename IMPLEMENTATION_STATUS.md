@@ -19,7 +19,7 @@ WebSocket and WebRTC data channels; native clients do not exist yet beyond the M
 
 ## Workspace
 
-The root Cargo workspace has 14 members; the desktop app is a separate workspace.
+The root Cargo workspace has 15 members; the desktop app is a separate workspace.
 
 | Crate | Current role |
 |------|--------------|
@@ -35,6 +35,7 @@ The root Cargo workspace has 14 members; the desktop app is a separate workspace
 | `parolnet-cli` | Headless test client (QR bootstrap, messaging over the relay) |
 | `parolnet-clause`, `parolnet-conformance` | Spec-clause attribute and the conformance suite |
 | `parolnet-rtc` | **New (M0, extended in M1).** Async driver for the sans-I/O `webrtc-rs-rtc` engine |
+| `parolnet-store` | **New (M1).** Encrypted native persistence: SQLite with SQLCipher, key in the OS keychain or a key file; identity, contacts, sessions, messages, queue, settings |
 | `parolnet-app` | **New (M1).** Headless client core: identity, pairing, signaling, direct data channels, 1:1 chat |
 | `xtask` | Clause and test-vector tooling |
 | `apps/desktop` (own workspace) | **New (M0/M1).** GPUI client: contacts, pairing, chat (UI v0); the M0 video spike behind `--spike` |
@@ -48,8 +49,19 @@ See [docs/m1-desktop.md](docs/m1-desktop.md) for what runs end to end, the tests
   `presence`, non-trickle `rtc_offer` / `rtc_answer`, `rtc_ice`), one direct WebRTC connection per
   contact with the PWA's `parolnet` data channel and JSON frames, 1:1 chat as PNP-001 TEXT
   envelopes, a sender-side queue (PWA limits) flushed when the channel opens, and the
-  "no direct path" state. State is a JSON file in the data directory, **not yet encrypted at
-  rest** (`parolnet-store` replaces it).
+  "no direct path" state. State lives in `parolnet-store` (below); the first slices' plaintext
+  JSON file and identity file are imported and removed on first start.
+- **`parolnet-store`** (new, third slice): one SQLCipher-encrypted SQLite database per data
+  directory for the identity secret, contacts, ratchet sessions, history, the sender queue and
+  settings. Random 256-bit key held by a key provider: the OS keychain (`keyring`; what the
+  desktop app uses), an owner-only key file (headless peers; weaker, it sits next to the
+  database) or memory (tests); the provider kind is fixed when the store is created. Version
+  table and forward migrations, incremental transactional writes on a writer thread (WAL,
+  synced commits), import of the plaintext layout, `wipe`. SQLCipher's cipher is C
+  (CommonCrypto on Apple systems, vendored OpenSSL libcrypto elsewhere): storage encryption,
+  not part of the pure-Rust E2EE layer. Not exercised yet: the keychain path on a real
+  keychain (an opt-in test exists, `tests/keychain.rs`), Windows builds of the vendored
+  OpenSSL, key rotation, and a UI for "delete all data" / a lost key.
 - **`parolnet-rtc`**: server-reflexive candidates from STUN (binding request on the connection's
   socket before its loop starts), text data-channel messages, the channel label on open,
   `default_local_ip`. Engine pin `v0.22.0+brainwires.5` (was `.3`; `.5` follows ICE renomination).
