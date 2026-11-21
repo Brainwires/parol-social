@@ -73,6 +73,12 @@ export interface StoreEnv {
   clearPreferences(): void;
   setTimeout(fn: () => void, ms: number): unknown;
   clearTimeout(handle: unknown): void;
+  /**
+   * Stop playing, now, every call stream that is not one of `streams`. Called in the same
+   * turn in which a call ends or its capture changes, before the engine releases the media
+   * (src/platform/playback.ts says why it cannot wait for the screen to render).
+   */
+  keepPlaying?(streams: readonly (MediaStream | null)[]): void;
   /** The engine started (or stopped: null). For lifecycle listeners and test hooks. */
   onEngine?(engine: EnginePort | null): void;
   /** Every engine event, after the store has applied it. For notifications. */
@@ -136,9 +142,13 @@ export function createEngineStore(env: StoreEnv): EngineStore {
 
   function syncMedia(callId: string): void {
     const media = engine?.callMedia(callId);
-    callMedia.value = media
+    const next = media
       ? { local: media.local as MediaStream | null, remote: media.remote as MediaStream | null }
       : NO_MEDIA;
+    // A stream the call no longer has (the camera was switched) stops playing here, before
+    // the engine stops its tracks.
+    env.keepPlaying?.([next.local, next.remote]);
+    callMedia.value = next;
   }
 
   async function syncTurn(): Promise<void> {
@@ -154,6 +164,9 @@ export function createEngineStore(env: StoreEnv): EngineStore {
       call.value = info;
       return;
     }
+    // Nothing plays the call's streams by the time this returns: the engine releases the
+    // capture and the connection next.
+    env.keepPlaying?.([]);
     // Say how it ended for a moment. A call we declined ourselves needs no words.
     callMedia.value = NO_MEDIA;
     if (info.state.end.kind === "Declined") {
@@ -234,6 +247,7 @@ export function createEngineStore(env: StoreEnv): EngineStore {
     unsubscribe = null;
     engine = null;
     env.clearTimeout(endedTimer);
+    env.keepPlaying?.([]);
     batch(() => {
       call.value = null;
       callMedia.value = NO_MEDIA;

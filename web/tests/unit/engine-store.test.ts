@@ -144,7 +144,7 @@ class FakeEngine implements EnginePort {
     this.calls.push(`hangup:${callId}`);
     return Promise.resolve();
   }
-  callMedia = () => ({ local: null, remote: null });
+  callMedia: EnginePort["callMedia"] = () => ({ local: null, remote: null });
   setMuted(_callId: string, muted: boolean) {
     this.calls.push(`mute:${muted}`);
   }
@@ -186,6 +186,10 @@ function call(kind: "Outgoing" | "Incoming" | "Connecting" | "Active", peerId = 
 }
 
 interface Harness {
+  /** Every `keepPlaying` call: the streams that may go on playing. */
+  kept: Array<readonly unknown[]>;
+  /** What the screens were shown (`callMedia`) at the moment of each of those calls. */
+  shownWhenKept: unknown[];
   store: EngineStore;
   engine: FakeEngine;
   /** What `prepared.start()` does next. */
@@ -206,6 +210,8 @@ function harness(options: { hasIdentity?: boolean; prepare?: () => never } = {})
   const engine = new FakeEngine();
   let handOver = () => {};
   const h: Harness = {
+    kept: [],
+    shownWhenKept: [],
     engine,
     starts: [],
     timers: [],
@@ -251,6 +257,10 @@ function harness(options: { hasIdentity?: boolean; prepare?: () => never } = {})
     },
     clearTimeout(handle) {
       if (handle) (handle as { live: boolean }).live = false;
+    },
+    keepPlaying(streams) {
+      h.kept.push(streams);
+      h.shownWhenKept.push(h.store.callMedia.value);
     },
     onEngine: (started) => void h.engines.push(started),
     onEvent: (event) => void h.events.push(event),
@@ -452,6 +462,52 @@ Deno.test("store: a call from ringing to how it ended", async () => {
   h.engine.emit({ kind: "Call", call: ended });
   h.store.dismissCall();
   assertEquals(h.store.call.value, null);
+});
+
+Deno.test("store: the call's streams stop playing in the turn the call ends or its capture changes", async () => {
+  const h = harness();
+  h.engine.view(ALICE, "Alice");
+  await h.store.start();
+  const local = { id: "local" } as unknown as MediaStream;
+  const remote = { id: "remote" } as unknown as MediaStream;
+  const streams: { local: MediaStream | null; remote: MediaStream | null } = {
+    local,
+    remote: null,
+  };
+  h.engine.callMedia = () => streams;
+
+  h.engine.emit({ kind: "Call", call: call("Active") });
+  h.engine.emit({ kind: "CallMedia", callId: "ca11" });
+  assertEquals(h.kept, [[local, null]]);
+  assertEquals(h.store.callMedia.value, { local, remote: null });
+
+  // The camera was switched: only the new capture may go on playing, and the page hears
+  // that before the screens see the new streams.
+  const other = { id: "other" } as unknown as MediaStream;
+  streams.local = other;
+  streams.remote = remote;
+  h.kept.length = h.shownWhenKept.length = 0;
+  h.engine.emit({ kind: "CallMedia", callId: "ca11" });
+  assertEquals(h.kept, [[other, remote]]);
+  assertEquals(h.shownWhenKept, [{ local, remote: null }]);
+  assertEquals(h.store.callMedia.value, { local: other, remote });
+
+  // The call ends: nothing plays any more by the time the event has been handled, which is
+  // before the engine releases the capture and the connection.
+  h.kept.length = h.shownWhenKept.length = 0;
+  h.engine.emit({
+    kind: "Call",
+    call: { ...call("Active"), state: { kind: "Ended", end: { kind: "RemoteHungUp" } } },
+  });
+  assertEquals(h.kept, [[]]);
+  assertEquals(h.shownWhenKept, [{ local: other, remote }]);
+  assertEquals(h.store.callMedia.value, { local: null, remote: null });
+
+  // Handing over to another tab stops the playing as well, before the engine shuts down.
+  h.engine.emit({ kind: "Call", call: call("Active") });
+  h.kept.length = 0;
+  h.handOver();
+  assertEquals(h.kept, [[]]);
 });
 
 Deno.test("store: the relay server's password goes in and never comes back", async () => {

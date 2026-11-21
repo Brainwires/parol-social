@@ -5,6 +5,7 @@ import { Engine } from "../engine/engine.ts";
 import type { Platform, WasmApi } from "../engine/platform.ts";
 import { type EnginePort, StartError, type StoreEnv } from "../state/engine-store.ts";
 import { callMedia } from "./devices.ts";
+import { keepOnly } from "./playback.ts";
 import { clearPrefs } from "./prefs.ts";
 import { relayUrl } from "./relay-url.ts";
 import { loadWasm } from "./wasm.ts";
@@ -76,6 +77,8 @@ export function browserEnv(options: EnvOptions): StoreEnv {
         }
       },
     },
+
+    keepPlaying: keepOnly,
 
     reload: () => location.reload(),
     clearPreferences: clearPrefs,

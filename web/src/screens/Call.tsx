@@ -15,6 +15,7 @@ import {
   deviceChoice,
   listDevices,
 } from "../platform/devices.ts";
+import { detach, play } from "../platform/playback.ts";
 import { startRinging, stopRinging } from "../platform/ring.ts";
 import { useStore } from "../state/context.ts";
 import { type CallEndWords, callEndWords, type CallInfo } from "../state/model.ts";
@@ -60,11 +61,9 @@ function Media({ stream, muted, className, label, sinkId, testId }: {
   useEffect(() => {
     const video = element.current;
     if (!video) return;
-    if (video.srcObject !== stream) video.srcObject = stream;
-    if (stream) void video.play().catch(() => {});
-    return () => {
-      video.srcObject = null;
-    };
+    // Through the registry, so the store can detach it the moment the call ends.
+    play(video, stream);
+    return () => detach(video);
   }, [stream]);
   useEffect(() => {
     const video = element.current as
