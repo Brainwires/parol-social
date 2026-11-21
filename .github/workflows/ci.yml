@@ -253,6 +253,65 @@ jobs:
         if: always()
         run: cat coturn.log || true
 
+  web:
+    name: Web app (Denext; unit tests, export, Chromium / Firefox / WebKit)
+    # web/: the Denext rewrite of the PWA. Builds the wasm core, lints, type-checks, runs the
+    # unit tests, exports the static site and drives it in three browsers under /pwa/ with the
+    # production Content-Security-Policy.
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    defaults:
+      run:
+        working-directory: web
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-web-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-web-
+      - name: Install wasm-pack
+        run: curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
+      - name: Install Denext
+        run: |
+          curl -fsSL https://denext.dev/install.sh | sh
+          echo "$HOME/.denext/bin" >> "$GITHUB_PATH"
+      - name: Install Denext's runtime
+        run: denext runtime install
+      - name: Build the wasm core
+        run: denext task build-wasm
+      - name: Lint, format, type-check
+        run: denext task lint && denext task fmt:check && denext task check
+      - name: Unit tests
+        run: denext task test
+      - name: Export the static site
+        run: denext task build
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+      - name: Playwright and its browsers
+        working-directory: web/tests/e2e
+        run: npm ci && npx playwright install --with-deps chromium firefox webkit
+      - name: Browser tests
+        working-directory: web/tests/e2e
+        run: npx playwright test
+      - name: Upload screenshots and the report
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: web-e2e
+          path: |
+            web/tests/e2e/artifacts/
+            web/tests/e2e/playwright-report/
+          if-no-files-found: ignore
+
   msrv:
     name: MSRV (1.91.0)
     runs-on: ubuntu-latest

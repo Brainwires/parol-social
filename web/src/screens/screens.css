@@ -1,0 +1,272 @@
+@layer reset, tokens, base, components, screens;
+
+@layer screens {
+  /* App frame: one column on a phone (stack navigation), list beside conversation when wide. */
+  .app {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr);
+    block-size: 100dvh;
+    background: var(--paper);
+  }
+  .app__list,
+  .app__main {
+    display: flex;
+    flex-direction: column;
+    min-inline-size: 0;
+    min-block-size: 0;
+  }
+  .app[data-view="conversation"] .app__list,
+  .app[data-view="list"] .app__main {
+    display: none;
+  }
+  @media (min-width: 900px) {
+    .app {
+      grid-template-columns: var(--layout-list-width) minmax(0, 1fr);
+    }
+    .app[data-view="conversation"] .app__list,
+    .app[data-view="list"] .app__main {
+      display: flex;
+    }
+    .app__list {
+      border-inline-end: var(--border-hairline) solid var(--fog);
+    }
+    .conversation__back {
+      display: none;
+    }
+  }
+
+  /* Conversation list */
+  .list {
+    display: flex;
+    flex-direction: column;
+    flex: 1;
+    min-block-size: 0;
+  }
+  .list__header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: var(--space-3);
+    min-block-size: 4.25rem;
+    padding-block: var(--space-3);
+    padding-inline: var(--space-4);
+    padding-block-start: max(var(--space-3), env(safe-area-inset-top));
+  }
+  .list__title {
+    font-size: var(--text-title);
+  }
+  .list__line,
+  .list__notice {
+    padding-block: 0 var(--space-3);
+    padding-inline: var(--space-4);
+  }
+  .list__scroll {
+    flex: 1;
+    min-block-size: 0;
+    overflow-y: auto;
+  }
+  .list__empty {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-start;
+    gap: var(--space-3);
+    max-inline-size: 26rem;
+    padding: var(--space-5) var(--space-4);
+  }
+  .list__empty-title {
+    font-size: var(--text-lead);
+  }
+  .list__footer {
+    padding-block: var(--space-2);
+    padding-inline: var(--space-4);
+    padding-block-end: max(var(--space-2), env(safe-area-inset-bottom));
+    border-block-start: var(--border-hairline) solid var(--fog);
+  }
+  .device-status {
+    min-block-size: 1.5rem;
+    color: var(--ink-2);
+    font-size: var(--text-caption);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .device-status--failed {
+    color: var(--flare);
+  }
+  .sheet__form {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-3);
+  }
+  .field__help {
+    color: var(--ink-2);
+    font-size: var(--text-caption);
+  }
+  .field__problem {
+    min-block-size: 1.5rem;
+    color: var(--flare);
+    font-size: var(--text-caption);
+  }
+
+  /* Conversation */
+  .conversation {
+    display: flex;
+    flex-direction: column;
+    flex: 1;
+    min-block-size: 0;
+    position: relative;
+  }
+  .conversation--placeholder {
+    align-items: center;
+    justify-content: center;
+    gap: var(--space-3);
+    padding: var(--space-5);
+    color: var(--ink-2);
+    text-align: center;
+  }
+  .conversation__placeholder-title {
+    color: var(--ink);
+    font-size: var(--text-lead);
+  }
+  /* Header. Phone: back, avatar, name, calls on one row and the line on its own row under
+     them. Wide: the line sits under the name. */
+  .conversation__header {
+    display: grid;
+    grid-template-columns: auto auto minmax(0, 1fr) auto auto;
+    grid-template-areas:
+      "back avatar name voice video"
+      "line line line line line";
+    align-items: center;
+    column-gap: var(--space-2);
+    row-gap: var(--space-1);
+    padding-block: var(--space-2);
+    padding-inline: var(--space-2);
+    padding-block-start: max(var(--space-2), env(safe-area-inset-top));
+    border-block-end: var(--border-hairline) solid var(--fog);
+  }
+  .conversation__back {
+    grid-area: back;
+  }
+  .conversation__header > .avatar {
+    grid-area: avatar;
+  }
+  .conversation__name {
+    grid-area: name;
+    font-size: var(--text-body);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  /* Focus arrives here on navigation, for screen readers; it is not a control. */
+  .conversation__name:focus,
+  .conversation__name:focus-visible {
+    outline: none;
+  }
+  .conversation__header > .line {
+    grid-area: line;
+    padding-inline: var(--space-2);
+  }
+  .conversation__header > [data-testid="call-voice"] {
+    grid-area: voice;
+  }
+  .conversation__header > [data-testid="call-video"] {
+    grid-area: video;
+  }
+  @media (min-width: 900px) {
+    .conversation__header {
+      grid-template-columns: auto minmax(0, 1fr) auto auto;
+      grid-template-areas:
+        "avatar name voice video"
+        "avatar line voice video";
+      column-gap: var(--space-3);
+      row-gap: 0;
+      min-block-size: 4.25rem;
+      padding-inline: var(--space-4) var(--space-2);
+    }
+    .conversation__header > .line {
+      padding-inline: 0;
+    }
+  }
+  .conversation__hint {
+    inset-block-start: 3.5rem;
+    inset-inline-end: var(--space-2);
+    max-inline-size: calc(100% - 2 * var(--space-2));
+  }
+  .conversation__call {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: var(--space-3);
+    padding-block: var(--space-2);
+    padding-inline: var(--space-4);
+    background: var(--open-fill);
+    color: var(--ink);
+  }
+  .conversation__panel {
+    padding-block: var(--space-2);
+    padding-inline: var(--space-4);
+  }
+
+  /* Thread */
+  .thread {
+    flex: 1;
+    min-block-size: 0;
+    overflow-y: auto;
+    padding-block: var(--space-2) var(--space-4);
+    padding-inline: var(--space-4);
+  }
+  .thread--empty {
+    display: grid;
+    place-items: center;
+  }
+  .thread__empty {
+    max-inline-size: 24rem;
+    color: var(--ink-2);
+    text-align: center;
+  }
+  .thread__list {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-1);
+    max-inline-size: var(--layout-measure);
+    margin-inline: auto;
+  }
+  .thread__item {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-start;
+  }
+  .thread__item--sent {
+    align-items: flex-end;
+  }
+  .thread__item--group-start {
+    margin-block-start: var(--space-3);
+  }
+  .thread__anchor {
+    position: relative;
+    display: flex;
+    justify-content: flex-end;
+    max-inline-size: min(34rem, 82%);
+  }
+  .thread__anchor .bubble {
+    max-inline-size: 100%;
+  }
+  /* The tail: the corner nearest the sender is tighter on the last bubble of a group. */
+  .bubble--tail-end {
+    border-end-end-radius: var(--radius-bubble-tail);
+  }
+  .bubble--tail-start {
+    border-end-start-radius: var(--radius-bubble-tail);
+  }
+  .thread__caption {
+    margin-block-start: var(--space-1);
+    font-size: var(--text-caption);
+    color: var(--ink-2);
+  }
+  .thread__caption--waiting {
+    color: var(--lamp);
+  }
+  .thread__caption--dropped {
+    color: var(--flare);
+  }
+}

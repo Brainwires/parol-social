@@ -1,0 +1,13 @@
+{
+  "name": "parolnet-web-e2e",
+  "private": true,
+  "type": "module",
+  "description": "Browser tests of the exported web app (Chromium, Firefox, WebKit).",
+  "scripts": {
+    "test": "playwright test",
+    "serve": "node static-server.mjs"
+  },
+  "devDependencies": {
+    "@playwright/test": "1.65.1"
+  }
+}
