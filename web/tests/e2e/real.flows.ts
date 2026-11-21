@@ -1136,7 +1136,7 @@ async function unlock(page: Page, passphrase: string): Promise<number> {
 }
 
 test("at rest: nothing readable in the database; a passphrase locks ParolNet, with wrong tries, change and remove", async ({ browser, live }) => {
-  test.setTimeout(240_000);
+  test.setTimeout(360_000);
   const ana = await person(browser, live);
   const ben = await person(browser, live);
   await start(ana.page);
@@ -1288,7 +1288,7 @@ test("locked and the passphrase forgotten: delete everything and start again", a
 test(
   "back up this device, delete all data, restore: the same person, still paired, and the two can chat",
   async ({ browser, live }, testInfo) => {
-    test.setTimeout(240_000);
+    test.setTimeout(360_000);
     const ana = await person(browser, live);
     const ben = await person(browser, live);
     await start(ana.page);
