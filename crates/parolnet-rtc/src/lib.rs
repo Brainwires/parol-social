@@ -2429,6 +2429,15 @@ async fn resolve_stun(servers: &[String], timeout: Duration) -> Vec<SocketAddr> 
 
 /// How often unanswered binding requests are sent again.
 const STUN_RESEND: Duration = Duration::from_millis(400);
+/// Once servers have answered, the round ends when no further answer came for this long: a
+/// socket on an interface without a route to the servers (a virtual machine's bridge, a
+/// tethering interface that is down) never gets one, and must not cost every connection the
+/// whole timeout.
+const STUN_SETTLE: Duration = Duration::from_millis(250);
+/// That early end waits for a first answer in each address family that was asked, but no
+/// longer than this from the start: a family without a route (IPv6 on a network that only
+/// hands out local addresses) must not hold the other one up for the whole timeout either.
+const STUN_FAMILY_WAIT: Duration = Duration::from_millis(600);
 
 /// One round of STUN gathering (RFC 5389 binding requests): every socket asks every server
 /// address of its own family for its mapped address. It runs before the connection's loop
@@ -2442,6 +2451,12 @@ struct StunGather {
     found: Vec<(SocketAddr, SocketAddr)>,
     deadline: Instant,
     next_send: Instant,
+    started: Instant,
+    /// When the last answer came.
+    last_answer: Option<Instant>,
+    /// Per family (IPv4, IPv6): whether any request went out, and whether any was answered.
+    asked: [bool; 2],
+    answered: [bool; 2],
     then: Option<AfterGather>,
 }
 
@@ -2466,6 +2481,7 @@ impl StunGather {
 
         let mut requests = Vec::new();
         let mut pending = HashMap::new();
+        let mut asked = [false; 2];
         for sock in socks {
             for target in targets
                 .iter()
@@ -2482,6 +2498,7 @@ impl StunGather {
                 }
                 pending.insert(msg.transaction_id.0, (sock.local, *target));
                 requests.push((sock.local, *target, msg.raw.clone()));
+                asked[usize::from(sock.local.is_ipv6())] = true;
             }
         }
         if requests.is_empty() {
@@ -2494,21 +2511,42 @@ impl StunGather {
             found: Vec::new(),
             deadline: now + timeout,
             next_send: now,
+            started: now,
+            last_answer: None,
+            asked,
+            answered: [false; 2],
             then,
         })
     }
 
+    /// When the round may end although requests are unanswered: [`STUN_SETTLE`] after the
+    /// last answer, once every family that was asked has one (or [`STUN_FAMILY_WAIT`] has
+    /// passed). `None` while nothing was answered: then only the timeout ends it.
+    fn settled_at(&self) -> Option<Instant> {
+        let last = self.last_answer?;
+        let every_family = (0..2).all(|f| !self.asked[f] || self.answered[f]);
+        let from = if every_family {
+            last
+        } else {
+            last.max(self.started + STUN_FAMILY_WAIT)
+        };
+        Some(from + STUN_SETTLE)
+    }
+
     fn done(&self, now: Instant) -> bool {
-        self.pending.is_empty() || now >= self.deadline
+        self.pending.is_empty()
+            || now >= self.deadline
+            || self.settled_at().is_some_and(|at| now >= at)
     }
 
     /// When the round next needs attention.
     fn wake(&self) -> Instant {
+        let wake = self.next_send.min(self.deadline);
         if self.pending.is_empty() {
             // Finished: now.
-            return self.next_send.min(self.deadline).min(now());
+            return wake.min(now());
         }
-        self.next_send.min(self.deadline)
+        self.settled_at().map_or(wake, |at| at.min(wake))
     }
 
     /// The requests to (re)send now, when a resend is due.
@@ -2547,6 +2585,8 @@ impl StunGather {
             return false;
         }
         self.pending.remove(&msg.transaction_id.0);
+        self.last_answer = Some(now());
+        self.answered[usize::from(local.is_ipv6())] = true;
         let mut xor = XorMappedAddress::default();
         if xor.get_from(&msg).is_ok() {
             let mapped = SocketAddr::new(xor.ip, xor.port);
@@ -2572,7 +2612,7 @@ impl StunGather {
                     let _ = net::send_to(sock.socket.as_ref(), &raw, target).await;
                 }
             }
-            let wake = tokio::time::Instant::from_std(self.next_send.min(self.deadline));
+            let wake = tokio::time::Instant::from_std(self.wake());
             match tokio::time::timeout_at(wake, recv_any(socks, start, &mut buf)).await {
                 Ok((index, Ok((n, from)))) => {
                     start = index + 1;

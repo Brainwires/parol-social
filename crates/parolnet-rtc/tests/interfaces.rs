@@ -191,6 +191,44 @@ async fn host_candidates_of_both_families_and_dual_stack_stun() {
     pair.close().await;
 }
 
+/// A socket that gets no STUN answer (its interface has no route to the servers) does not
+/// cost the connection the whole STUN timeout once another socket was answered.
+#[tokio::test]
+async fn gathering_does_not_wait_out_the_timeout_for_a_socket_without_an_answer() {
+    if !ipv6_loopback() {
+        eprintln!("skipped: no IPv6 loopback on this host");
+        return;
+    }
+    let net = Loopbacks::new(&["127.0.0.1", "::1"]);
+    let stun4 = stun_server("127.0.0.1:0").await;
+    // An IPv6 "server" that never answers.
+    let silent = UdpSocket::bind("[::1]:0").await.unwrap();
+    let mut config = config(&net, true);
+    config.stun_servers = vec![
+        format!("stun:{stun4}"),
+        format!("stun:[::1]:{}", silent.local_addr().unwrap().port()),
+    ];
+    config.stun_timeout = std::time::Duration::from_secs(5);
+    let started = std::time::Instant::now();
+    let mut pair = Pair::new(config, self::config(&net, false)).await;
+    let took = started.elapsed();
+    assert!(
+        took < std::time::Duration::from_secs(2),
+        "gathering took {took:?}"
+    );
+    pair.a.handle.create_offer().unwrap();
+    pair.until("the offer", 10, |p| !p.a.seen.descriptions.is_empty())
+        .await;
+    let offer = &pair.a.seen.descriptions[0].sdp;
+    assert!(
+        offer
+            .lines()
+            .any(|l| l.contains("typ srflx") && l.contains(" 127.0.0.1 40000 ")),
+        "{offer}"
+    );
+    pair.close().await;
+}
+
 #[tokio::test]
 async fn an_ice_restart_moves_to_the_addresses_the_machine_has_now() {
     if !ipv6_loopback() {
