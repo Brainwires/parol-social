@@ -15,9 +15,11 @@ use parolnet_protocol::channel_binding::{BindingError, ChannelBinding};
 use parolnet_protocol::codec::CborCodec;
 use parolnet_rtc::rtc::peer_connection::sdp::RTCSessionDescription;
 use parolnet_rtc::rtc::peer_connection::state::RTCPeerConnectionState;
-use parolnet_rtc::rtc::peer_connection::transport::{RTCIceCandidateInit, RTCIceServer};
+use parolnet_rtc::rtc::peer_connection::transport::RTCIceCandidateInit;
 use parolnet_rtc::rtc::rtp_transceiver::rtp_sender::RtpCodecKind;
-use parolnet_rtc::{MediaConfig, MediaKind, RtcConfig, RtcEvent, RtcHandle};
+use parolnet_rtc::{
+    IcePolicy, MediaConfig, MediaKind, RtcConfig, RtcError, RtcEvent, RtcHandle, TurnServer,
+};
 use rand::Rng as _;
 use tokio::sync::mpsc;
 use zeroize::Zeroize;
@@ -26,6 +28,7 @@ use crate::call::{
     CallEnd, CallInfo, CallMedia, CallSignal, CallState, FrameSink, MediaEvent, OutFrame,
     new_call_id,
 };
+use crate::reconnect::ProbeSchedule;
 use crate::signaling::{self, SigEvent, SigHandle, Signer};
 use crate::store::{QueuedEnvelope, State, Store};
 use crate::wire::{
@@ -34,7 +37,7 @@ use crate::wire::{
 };
 use crate::{
     AppConfig, AppError, AppEvent, AppHandle, ChatMessage, Command, Contact, ContactView,
-    DeliveryState, Direction, PathState, RelayState, Snapshot, now_ms,
+    DeliveryState, Direction, PathState, RelayState, Snapshot, TurnSettings, now_ms,
 };
 
 /// The initiator's wait for an answer (as the PWA).
@@ -52,9 +55,6 @@ const RETRY_MAX_ATTEMPTS: u32 = 8;
 /// New offers: at most 3 per 10 s (the relay allows 60 signaling frames a minute).
 const OFFERS_PER_WINDOW: usize = 3;
 const OFFER_WINDOW: Duration = Duration::from_secs(10);
-/// How often a contact we believe offline (from a `peer_offline` answer, without a presence
-/// subscription confirming it) is probed while we hold messages for it.
-const PROBE_EVERY: Duration = Duration::from_secs(5 * 60);
 const TICK: Duration = Duration::from_secs(15);
 const WATCH_MAX: usize = 256;
 const PENDING_ICE_MAX: usize = 32;
@@ -76,7 +76,7 @@ pub(crate) enum Input {
     RtcReady {
         peer: String,
         epoch: u64,
-        result: Result<RtcHandle, String>,
+        result: Result<RtcHandle, StartFailure>,
     },
     Rtc {
         peer: String,
@@ -87,12 +87,28 @@ pub(crate) enum Input {
     Tick,
     CallRtcReady {
         call_id: String,
-        result: Result<RtcHandle, String>,
+        result: Result<RtcHandle, StartFailure>,
     },
     CallRtc {
         call_id: String,
         event: RtcEvent,
     },
+}
+
+/// Why a connection could not start.
+pub(crate) struct StartFailure {
+    message: String,
+    /// No relay candidate although the user asked for relay-only.
+    no_relay: bool,
+}
+
+impl From<RtcError> for StartFailure {
+    fn from(e: RtcError) -> Self {
+        StartFailure {
+            no_relay: matches!(e, RtcError::Turn(_) | RtcError::TurnUri(_)),
+            message: e.to_string(),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -106,6 +122,8 @@ pub(crate) enum Timer {
     OfferFallback { peer: String },
     OfferSlot { peer: String },
     Retry { peer: String },
+    // A soft-offline contact is due for a probe (see `reconnect`).
+    Probe,
 }
 
 /// The presenter's half of a QR bootstrap (PNP-003), kept while its code is valid.
@@ -158,6 +176,8 @@ enum FailReason {
     Error,
     /// The peer's channel binding did not match (PNP-001-MUST-080).
     Binding,
+    /// Relay-only, and the user's TURN server gave no relay candidate.
+    NoRelay,
 }
 
 /// A call and its own WebRTC connection.
@@ -178,8 +198,15 @@ struct Call {
 struct PeerState {
     /// Presence: `Some(true)` online, `Some(false)` offline, `None` unknown.
     online: Option<bool>,
-    /// `online == Some(false)` came from a `peer_offline` answer, not a presence push.
+    /// `online == Some(false)` came from a `peer_offline` answer, not a presence push: a soft
+    /// verdict, re-probed with backoff (`reconnect`).
     offline_by_error: bool,
+    /// The user asked to connect (opened the chat, pressed retry) and no verified channel
+    /// has come of it yet: probed like a contact with queued messages.
+    wanted: bool,
+    /// The next connection attempt is a background probe: the path stays `Offline` unless
+    /// the contact answers.
+    quiet_probe: bool,
     conn: Option<Conn>,
     attempt: u32,
     failures: u32,
@@ -187,7 +214,6 @@ struct PeerState {
     fallback_armed: bool,
     retry_armed: bool,
     offer_waiting: bool,
-    last_probe: Option<Instant>,
 }
 
 impl Default for PeerState {
@@ -195,6 +221,8 @@ impl Default for PeerState {
         PeerState {
             online: None,
             offline_by_error: false,
+            wanted: false,
+            quiet_probe: false,
             conn: None,
             attempt: 0,
             failures: 0,
@@ -202,7 +230,6 @@ impl Default for PeerState {
             fallback_armed: false,
             retry_armed: false,
             offer_waiting: false,
-            last_probe: None,
         }
     }
 }
@@ -229,6 +256,12 @@ struct Engine {
     signaling_backoff_until: Option<Instant>,
     rate_limit_hits: u32,
     calls: HashMap<String, Call>,
+    /// Contacts the relay called offline without a presence push to say when that changes.
+    probes: ProbeSchedule,
+    /// When the pending `Timer::Probe` fires.
+    probe_wake: Option<Instant>,
+    /// When the user was last told their TURN server is unreachable.
+    turn_notice_at: Option<Instant>,
 }
 
 pub(crate) async fn start(
@@ -321,6 +354,7 @@ pub(crate) async fn start(
         });
     }
 
+    let reconnect = cfg.reconnect.clone();
     let handle = AppHandle {
         tx: input_tx.clone(),
         peer_id: me.clone(),
@@ -348,6 +382,9 @@ pub(crate) async fn start(
         signaling_backoff_until: None,
         rate_limit_hits: 0,
         calls: HashMap::new(),
+        probes: ProbeSchedule::new(reconnect, Instant::now()),
+        probe_wake: None,
+        turn_notice_at: None,
     };
     // Messages queued in an earlier run show as queued again.
     let queued: Vec<(String, u64)> = engine
@@ -550,9 +587,16 @@ impl Engine {
                 let _ = reply.send(result);
             }
             Command::Connect(peer) => {
+                // The user asked: offer now (the offer limiter still applies), and start the
+                // soft-offline backoff over.
+                let contact = self.is_contact(&peer);
                 let st = self.peer_mut(&peer);
                 st.attempt = 0;
+                st.quiet_probe = false;
+                st.wanted = contact && !st.conn.as_ref().is_some_and(Conn::is_verified);
+                self.probes.restart(&peer, Instant::now());
                 self.connect(&peer, true);
+                self.arm_probe_wake();
             }
             Command::StartCall(peer, video, reply) => {
                 let _ = reply.send(self.start_call(&peer, video));
@@ -568,6 +612,12 @@ impl Engine {
                     None => Err(AppError::UnknownCall(id)),
                 };
                 let _ = reply.send(r);
+            }
+            Command::TurnSettings(reply) => {
+                let _ = reply.send(self.state.turn.clone());
+            }
+            Command::SetTurnSettings(settings, reply) => {
+                let _ = reply.send(self.set_turn(settings));
             }
             Command::Shutdown(_) => unreachable!("handled in run"),
         }
@@ -592,7 +642,88 @@ impl Engine {
                 })
                 .collect(),
             pairing_open: self.pairing_open(),
+            turn_configured: self.state.turn.is_some(),
+            relay_only: self.state.turn.as_ref().is_some_and(|t| t.relay_only),
         }
+    }
+
+    /// The user's TURN server and the ICE policy for a new connection. Nothing here comes
+    /// from a relay: without the user's own settings there is no TURN at all.
+    fn ice_setup(&self) -> (Option<TurnServer>, IcePolicy) {
+        match &self.state.turn {
+            Some(t) => (
+                Some(TurnServer {
+                    uri: t.uri.clone(),
+                    username: t.username.clone(),
+                    password: t.password.clone(),
+                }),
+                if t.relay_only {
+                    IcePolicy::Relay
+                } else {
+                    IcePolicy::All
+                },
+            ),
+            None => (None, IcePolicy::All),
+        }
+    }
+
+    /// Store (or with `None` clear) the user's TURN server. It applies to every connection
+    /// made from now on; data connections that exist are replaced at once so that turning
+    /// relay-only on (or off) takes effect now, and contacts that had no path are tried
+    /// again. A contact in a call keeps its connections until the next reconnect.
+    fn set_turn(&mut self, settings: Option<TurnSettings>) -> Result<(), AppError> {
+        let settings = settings.map(TurnSettings::validated).transpose()?;
+        if self.state.turn == settings {
+            return Ok(());
+        }
+        self.state.turn = settings;
+        self.save();
+        self.turn_notice_at = None;
+        let in_call: Vec<String> = self
+            .calls
+            .values()
+            .filter(|c| !c.info.is_over())
+            .map(|c| c.info.peer_id.clone())
+            .collect();
+        let connected: Vec<String> = self
+            .peers
+            .iter()
+            .filter(|(p, st)| st.conn.is_some() && !in_call.contains(p))
+            .map(|(p, _)| p.clone())
+            .collect();
+        for peer in connected {
+            self.drop_conn(&peer);
+            let st = self.peer_mut(&peer);
+            if st.online == Some(false) {
+                continue; // a probe was under way; the next one uses the new settings
+            }
+            st.attempt = 0;
+            st.failures = 0;
+            self.set_path(&peer, PathState::Connecting);
+            self.connect(&peer, true);
+        }
+        // Contacts that had no path (and may have run out of retries) get a fresh try.
+        let stuck: Vec<String> = self
+            .state
+            .contacts
+            .iter()
+            .map(|c| c.peer_id.clone())
+            .filter(|p| {
+                self.peers.get(p).is_some_and(|st| {
+                    st.conn.is_none()
+                        && st.online != Some(false)
+                        && st.path == PathState::NoDirectPath
+                })
+            })
+            .collect();
+        for peer in stuck {
+            let st = self.peer_mut(&peer);
+            st.attempt = 0;
+            st.failures = 0;
+            self.set_path(&peer, PathState::Connecting);
+            self.connect(&peer, true);
+        }
+        Ok(())
     }
 
     fn create_pairing_code(&mut self) -> Result<String, AppError> {
@@ -681,8 +812,10 @@ impl Engine {
         let st = self.peer_mut(&peer);
         st.online = None;
         st.offline_by_error = false;
+        st.quiet_probe = false;
         st.attempt = 0;
         st.failures = 0;
+        self.probes.clear(&peer);
         self.drop_conn(&peer);
         self.connect(&peer, true);
         Ok(contact)
@@ -728,6 +861,8 @@ impl Engine {
                 self.mark_message(&p, d, DeliveryState::Dropped);
             }
             self.connect(peer, false);
+            // A soft-offline contact is now waited for: its next probe may be due sooner.
+            self.arm_probe_wake();
         }
         self.state.push_message(msg.clone());
         self.persist_sessions();
@@ -863,6 +998,7 @@ impl Engine {
                 let st = self.peer_mut(peer);
                 st.attempt = 0;
                 st.failures = 0;
+                st.wanted = false;
                 tracing::info!(peer = %crate::short_id(peer), "direct channel verified");
                 // A presenter whose session appeared with this very envelope binds now.
                 self.send_binding(peer);
@@ -934,6 +1070,7 @@ impl Engine {
                 for p in waiting {
                     self.connect(&p, false);
                 }
+                self.run_probes();
             }
             SigEvent::Disconnected { reason } => {
                 self.registered = false;
@@ -960,13 +1097,21 @@ impl Engine {
                 "peer_offline" => {
                     if let Some(peer) = peer_id {
                         let st = self.peer_mut(&peer);
+                        // After a presence push said offline the relay tells us when that
+                        // changes. Otherwise nobody will: the verdict is soft and the
+                        // contact is probed again with backoff.
+                        let pushed = st.online == Some(false) && !st.offline_by_error;
                         st.online = Some(false);
-                        st.offline_by_error = true;
-                        st.last_probe = Some(Instant::now());
+                        st.offline_by_error = !pushed;
                         let open = st.conn.as_ref().is_some_and(Conn::is_open);
                         if !open {
                             self.drop_conn(&peer);
                             self.set_path(&peer, PathState::Offline);
+                        }
+                        if !pushed && self.is_contact(&peer) {
+                            let jitter = rand::thread_rng().r#gen::<f64>();
+                            self.probes.note_offline(&peer, Instant::now(), jitter);
+                            self.arm_probe_wake();
                         }
                     }
                 }
@@ -988,10 +1133,13 @@ impl Engine {
     }
 
     fn on_presence(&mut self, peer: &str, online: bool) {
+        // A push is authoritative either way: the relay reports the next change too.
+        self.probes.clear(peer);
         let st = self.peer_mut(peer);
         let was = st.online;
         st.online = Some(online);
         st.offline_by_error = false;
+        st.quiet_probe = false;
         if online {
             if was != Some(true) {
                 st.attempt = 0;
@@ -1059,9 +1207,7 @@ impl Engine {
                     // Glare where we yield, or the peer restarted: take the new offer.
                     self.drop_conn(from);
                 }
-                let st = self.peer_mut(from);
-                st.online = Some(true);
-                st.offline_by_error = false;
+                self.mark_online(from);
                 self.start_conn(from, false, Some(offer));
             }
             SignalKind::Answer => {
@@ -1088,6 +1234,11 @@ impl Engine {
                     for c in conn.pending_ice.drain(..) {
                         let _ = h.add_remote_candidate(c);
                     }
+                }
+                // An answer means the contact is there (a probe found it).
+                self.mark_online(from);
+                if self.peers[from].path == PathState::Offline {
+                    self.set_path(from, PathState::Connecting);
                 }
             }
             SignalKind::Ice => {
@@ -1206,22 +1357,17 @@ impl Engine {
             verified: false,
         });
         st.fallback_armed = false;
-        if !matches!(st.path, PathState::NoDirectPath | PathState::BindingFailed) {
+        // A background probe of a contact believed offline shows nothing until it is answered.
+        let quiet = std::mem::take(&mut st.quiet_probe) && st.online == Some(false);
+        if !quiet && !matches!(st.path, PathState::NoDirectPath | PathState::BindingFailed) {
             self.set_path(peer, PathState::Connecting);
         }
+        let (turn, ice_policy) = self.ice_setup();
         let config = RtcConfig {
             bind: SocketAddr::new(self.bind_ip, 0),
-            ice_servers: self
-                .cfg
-                .user_ice_servers
-                .iter()
-                .map(|s| RTCIceServer {
-                    urls: s.urls.clone(),
-                    username: s.username.clone(),
-                    credential: s.credential.clone(),
-                })
-                .collect(),
             stun_servers: self.stun.clone(),
+            turn,
+            ice_policy,
             data_channel: initiator.then(|| DATA_CHANNEL_LABEL.to_owned()),
             ..Default::default()
         };
@@ -1253,7 +1399,7 @@ impl Engine {
                     let _ = input.send(Input::RtcReady {
                         peer: peer_owned,
                         epoch,
-                        result: Err(e.to_string()),
+                        result: Err(e.into()),
                     });
                 }
             }
@@ -1275,13 +1421,18 @@ impl Engine {
             .filter(|c| c.epoch == epoch)
     }
 
-    fn on_rtc_ready(&mut self, peer: &str, epoch: u64, result: Result<RtcHandle, String>) {
+    fn on_rtc_ready(&mut self, peer: &str, epoch: u64, result: Result<RtcHandle, StartFailure>) {
         let handle = match result {
             Ok(h) => h,
             Err(e) => {
-                tracing::warn!(peer = %crate::short_id(peer), %e, "could not start a connection");
+                tracing::warn!(peer = %crate::short_id(peer), e = %e.message, "could not start a connection");
                 if self.conn_mut(peer, epoch).is_some() {
-                    self.conn_failed(peer, FailReason::Error);
+                    if e.no_relay {
+                        self.notice_no_relay(&e.message);
+                        self.conn_failed(peer, FailReason::NoRelay);
+                    } else {
+                        self.conn_failed(peer, FailReason::Error);
+                    }
                 }
                 return;
             }
@@ -1370,9 +1521,7 @@ impl Engine {
                 if let Some(h) = conn.handle.as_ref() {
                     let _ = h.send_text(id, DcFrame::identity(&me));
                 }
-                let st = self.peer_mut(peer);
-                st.online = Some(true);
-                st.offline_by_error = false;
+                self.mark_online(peer);
                 tracing::info!(peer = %crate::short_id(peer), "data channel open; binding");
                 // PNP-001 §10.5.1: the bootstrap-completing envelope first (we scanned the
                 // peer's code), then our binding. Everything else waits for the peer's binding.
@@ -1436,6 +1585,9 @@ impl Engine {
         let failures = st.failures;
         let path = if reason == FailReason::Binding {
             PathState::BindingFailed
+        } else if reason == FailReason::NoRelay {
+            // Relay-only never falls back to a direct path.
+            PathState::NoDirectPath
         } else if was_open {
             PathState::Unknown
         } else if (reason == FailReason::IceFailed && failures >= 1)
@@ -1450,6 +1602,22 @@ impl Engine {
             self.peer_mut(peer).attempt = 0;
         }
         self.schedule_retry(peer, was_initiator);
+    }
+
+    /// Tell the user (at most once a minute) that relay-only has no relay to use.
+    fn notice_no_relay(&mut self, why: &str) {
+        let now = Instant::now();
+        if self
+            .turn_notice_at
+            .is_some_and(|t| now.duration_since(t) < Duration::from_secs(60))
+        {
+            return;
+        }
+        self.turn_notice_at = Some(now);
+        self.emit(AppEvent::Notice(format!(
+            "Your TURN server cannot be used ({why}). Relay-only is on, so no connection is \
+             made without it; check the server in Settings."
+        )));
     }
 
     fn schedule_retry(&mut self, peer: &str, was_initiator: bool) {
@@ -1561,7 +1729,73 @@ impl Engine {
                     self.connect(&peer, true);
                 }
             }
+            Timer::Probe => {
+                self.probe_wake = None;
+                self.run_probes();
+            }
         }
+    }
+
+    fn mark_online(&mut self, peer: &str) {
+        let st = self.peer_mut(peer);
+        st.online = Some(true);
+        st.offline_by_error = false;
+        self.probes.clear(peer);
+    }
+
+    /// Offer again to the soft-offline contacts that are due (`reconnect`). Nothing goes out
+    /// while the relay is away or has rate-limited us.
+    fn run_probes(&mut self) {
+        let now = Instant::now();
+        if !self.registered || self.signaling_backoff_until.is_some_and(|t| now < t) {
+            return;
+        }
+        let (state, peers) = (&self.state, &self.peers);
+        let due = self.probes.take_due(
+            now,
+            |p| probe_active(state, peers, p),
+            |p| probe_ready(peers, p),
+            || rand::thread_rng().r#gen::<f64>(),
+        );
+        for peer in due {
+            let soft = self
+                .peers
+                .get(&peer)
+                .is_some_and(|st| st.online == Some(false) && st.offline_by_error);
+            if !soft || !self.is_contact(&peer) {
+                self.probes.clear(&peer);
+                continue;
+            }
+            tracing::debug!(peer = %crate::short_id(&peer), "probing a contact the relay called offline");
+            self.peer_mut(&peer).quiet_probe = true;
+            self.connect(&peer, true);
+        }
+        self.arm_probe_wake();
+    }
+
+    /// Make sure a `Timer::Probe` fires when the next probe is due.
+    fn arm_probe_wake(&mut self) {
+        let now = Instant::now();
+        let (state, peers) = (&self.state, &self.peers);
+        let Some(at) = self.probes.next_wake(
+            now,
+            |p| probe_active(state, peers, p),
+            |p| probe_ready(peers, p),
+        ) else {
+            return;
+        };
+        if self
+            .probe_wake
+            .is_some_and(|armed| armed > now && armed <= at)
+        {
+            return;
+        }
+        self.probe_wake = Some(at);
+        self.after(
+            at.saturating_duration_since(now)
+                .max(Duration::from_millis(20)),
+            Timer::Probe,
+        );
     }
 
     fn on_tick(&mut self) {
@@ -1584,18 +1818,12 @@ impl Engine {
             if st.conn.is_some() || st.retry_armed || st.offer_waiting || st.fallback_armed {
                 continue;
             }
-            match st.online {
-                None => self.connect(&peer, false),
-                Some(false)
-                    if st.offline_by_error
-                        && st.last_probe.is_none_or(|t| t.elapsed() >= PROBE_EVERY) =>
-                {
-                    st.last_probe = Some(Instant::now());
-                    self.connect(&peer, true);
-                }
-                _ => {}
+            if st.online.is_none() {
+                self.connect(&peer, false);
             }
         }
+        // Also the fallback for probes held back while the relay was away or rate-limiting.
+        self.run_probes();
     }
 
     // ── Incoming content ──────────────────────────────────────────
@@ -1901,19 +2129,12 @@ impl Engine {
         let video = c.info.video;
         let frames_rx = c.frames_rx.take();
         let media_tx = c.media_tx.clone();
+        let (turn, ice_policy) = self.ice_setup();
         let config = RtcConfig {
             bind: SocketAddr::new(self.bind_ip, 0),
-            ice_servers: self
-                .cfg
-                .user_ice_servers
-                .iter()
-                .map(|s| RTCIceServer {
-                    urls: s.urls.clone(),
-                    username: s.username.clone(),
-                    credential: s.credential.clone(),
-                })
-                .collect(),
             stun_servers: self.stun.clone(),
+            turn,
+            ice_policy,
             media: MediaConfig {
                 recv_opus: true,
                 send_opus: true,
@@ -1931,7 +2152,7 @@ impl Engine {
                 Err(e) => {
                     let _ = input.send(Input::CallRtcReady {
                         call_id: id,
-                        result: Err(e.to_string()),
+                        result: Err(e.into()),
                     });
                     return;
                 }
@@ -1990,12 +2211,12 @@ impl Engine {
         });
     }
 
-    fn on_call_ready(&mut self, call_id: &str, result: Result<RtcHandle, String>) {
+    fn on_call_ready(&mut self, call_id: &str, result: Result<RtcHandle, StartFailure>) {
         let handle = match result {
             Ok(h) => h,
             Err(e) => {
                 self.signal_call_end(call_id, false);
-                self.end_call(call_id, CallEnd::Failed(e));
+                self.end_call(call_id, CallEnd::Failed(e.message));
                 return;
             }
         };
@@ -2147,6 +2368,18 @@ impl Engine {
             CallSignal::Reject { .. } => self.end_call(&call_id, CallEnd::Rejected),
         }
     }
+}
+
+/// The user waits for this contact: messages are queued for it, or they asked to connect.
+fn probe_active(state: &State, peers: &HashMap<String, PeerState>, peer: &str) -> bool {
+    state.queued_for(peer) > 0 || peers.get(peer).is_some_and(|st| st.wanted)
+}
+
+/// No connection attempt to this contact is under way or scheduled.
+fn probe_ready(peers: &HashMap<String, PeerState>, peer: &str) -> bool {
+    peers.get(peer).is_none_or(|st| {
+        st.conn.is_none() && !st.retry_armed && !st.offer_waiting && !st.fallback_armed
+    })
 }
 
 /// The scanner's identity key from a bootstrap envelope's cleartext `source_hint`

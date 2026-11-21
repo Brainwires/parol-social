@@ -35,6 +35,8 @@ rand.workspace = true
 zeroize.workspace = true
 
 [dev-dependencies]
+# The in-process TURN server that stands in for the user's own.
+parolnet-rtc = { workspace = true, features = ["test-turn"] }
 tokio = { workspace = true, features = ["full", "test-util"] }
 # The bot example's call audio (a tone, Opus-encoded in pure Rust; the M0 interop pin).
 opus-rs = "=0.1.42"

@@ -122,6 +122,9 @@ pub struct State {
     pub messages: BTreeMap<String, Vec<ChatMessage>>,
     #[serde(skip)]
     pub next_message_id: u64,
+    /// The user's own TURN server ("Relay through my own TURN server"), if they set one.
+    #[serde(default)]
+    pub turn: Option<crate::TurnSettings>,
     #[serde(skip)]
     changes: Mutex<MessageChanges>,
 }

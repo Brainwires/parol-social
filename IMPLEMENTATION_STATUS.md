@@ -65,6 +65,13 @@ See [docs/m1-desktop.md](docs/m1-desktop.md) for what runs end to end, the tests
 - **`parolnet-rtc`**: server-reflexive candidates from STUN (binding request on the connection's
   socket before its loop starts), text data-channel messages, the channel label on open,
   `default_local_ip`. Engine pin `v0.22.0+brainwires.5` (was `.3`; `.5` follows ICE renomination).
+- **TURN, user-supplied only** (PNP-001-MUST-082): `parolnet-rtc` gathers a relay candidate from
+  the TURN server the user configured (UDP, long-term credentials, `rtc-turn` driven on the
+  connection's socket) and has a relay-only ICE policy; `parolnet-app` stores `TurnSettings` and
+  applies it to data and call connections; the desktop has the Settings pane. Nothing but STUN
+  URIs is taken from a relay. TURN over TCP / TLS is M4.
+- **Re-probing after `peer_offline`** (PNP-001-SHOULD-019): a contact the relay called offline
+  with no presence push behind it is offered to again with backoff under a probe budget.
 - **Desktop**: chat UI v0 (contact list with path badges, pairing screen with QR code and code
   entry, chat view with delivery state, rename, retry, the no-path message).
 

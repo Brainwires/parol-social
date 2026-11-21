@@ -38,7 +38,8 @@ relying on it.
   (registration, WebRTC offer / answer / ICE between two online contacts, presence, STUN URIs); no
   message, file, group, call or decoy traffic transits or is stored on it
   ([PNP-001 §10.5](specs/PNP-001-wire-protocol.md)). Content travels peer to peer, so a contact you
-  connect to sees your IP address unless you add your own TURN server; messages to an offline
+  connect to sees your IP address unless you relay through your own TURN server (Settings; the
+  relay never offers one and the apps have none built in); messages to an offline
   contact wait on your device. Operators who want store-and-forward, tokens, TURN credentials or
   federation run the relay profile (`SIGNALING_ONLY=0`).
 - **Metadata, honestly stated.** Your home relay learns your `PeerId`, your IP address, when you are

@@ -25,6 +25,7 @@ use parolnet_app::{
 };
 
 use crate::call::CallSession;
+use crate::settings::SettingsView;
 use crate::ui::VideoView;
 use tokio::sync::mpsc::UnboundedReceiver;
 
@@ -212,6 +213,7 @@ enum Pane {
     Welcome,
     Pair,
     Chat,
+    Settings,
 }
 
 /// The call the window shows (one at a time).
@@ -244,6 +246,8 @@ pub struct ChatView {
     /// Where call media tasks run.
     runtime: tokio::runtime::Handle,
     call: Option<UiCall>,
+    /// The settings pane (`settings.rs`).
+    settings: Entity<SettingsView>,
 }
 
 impl ChatView {
@@ -284,6 +288,8 @@ impl ChatView {
             },
         )
         .detach();
+
+        let settings = cx.new(|cx| SettingsView::new(app.clone(), window, cx));
 
         // Events up from the core.
         cx.spawn(async move |this, cx| {
@@ -336,6 +342,7 @@ impl ChatView {
             show_safety: false,
             runtime,
             call: None,
+            settings,
             code_input,
             composer,
             name_input,
@@ -758,6 +765,15 @@ impl ChatView {
                     .overflow_y_scroll()
                     .child(list),
             )
+            .child(
+                Button::new("settings")
+                    .label("Settings")
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.pane = Pane::Settings;
+                        this.notice = None;
+                        cx.notify();
+                    })),
+            )
     }
 
     fn render_pair(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -825,7 +841,7 @@ impl ChatView {
             .child(muted(
                 "Connections go directly between your devices. A contact you connect to can see \
                  your IP address; strangers never can. To hide it, add your own TURN server in \
-                 Settings (coming in a later build).",
+                 Settings.",
             ))
     }
 
@@ -1037,6 +1053,7 @@ impl Render for ChatView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let main = match (&self.pane, self.selected.clone()) {
             (Pane::Pair, _) => self.render_pair(cx).into_any_element(),
+            (Pane::Settings, _) => self.settings.clone().into_any_element(),
             (Pane::Chat, Some(peer)) => self.render_chat(&peer, cx).into_any_element(),
             _ => div()
                 .size_full()
