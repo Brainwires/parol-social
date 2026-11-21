@@ -2399,6 +2399,14 @@ export class Engine {
     return this.post(() => this.files.remove(id));
   }
 
+  /**
+   * Whether a file being received survives a reload of the page: true where the browser
+   * lets a page write its origin private file system, false where parts are kept in memory.
+   */
+  receivedFilesPersist(): boolean {
+    return this.files.persistent;
+  }
+
   /** Call a contact over a verified direct connection: audio, plus video when `video`. */
   startCall(peerId: string, video: boolean): Promise<CallInfo> {
     return this.post(() => this.calls.start(peerId, video));

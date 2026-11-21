@@ -170,6 +170,11 @@ export class TransferManager {
     return this.host.platform.wasm;
   }
 
+  /** A received part survives a reload of the page (the store is OPFS, not memory). */
+  get persistent(): boolean {
+    return this.files.persistent;
+  }
+
   private get limits(): TransferLimits {
     return this.limitsCache ??= this.wasm.pnp010_limits();
   }

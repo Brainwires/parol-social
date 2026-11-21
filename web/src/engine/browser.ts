@@ -16,6 +16,7 @@ import type {
   SocketFactory,
   WasmApi,
 } from "./platform.ts";
+import { OpfsFileStore } from "./files.ts";
 import { DB_NAME, type IdbFactory, IdbStorage } from "./storage.ts";
 
 // deno-lint-ignore no-explicit-any
@@ -183,6 +184,9 @@ export async function browserPlatform(
     media: options.media ??
       (g.navigator?.mediaDevices ? browserMedia : undefined),
     lock: browserLock(`${dbName}-engine`),
+    // Received files: OPFS where this browser can write it from a page (a part then
+    // survives a reload); otherwise the engine keeps them in memory.
+    files: (await OpfsFileStore.open()) ?? undefined,
   };
 }
 
