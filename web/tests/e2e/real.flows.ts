@@ -197,38 +197,23 @@ function connectionReport(page: Page): Promise<string> {
 }
 
 /**
- * The one failure of these flows that is expected, and only in Linux WebKit: the browser
- * can block a page's main thread for good when a playing stream is detached from its element
- * right after its camera track was switched off, which is what "Turn camera off" does to
- * the self view. It is the browser's defect: repro/README.md ("A second freeze") shows it
- * with no app code, and docs/web-port/app.md ("Owed") says what is left to try. A step that
- * names this, fails, and finds a page that no longer answers ends the test as skipped with
- * this reason, so that the report says what happened; any other failure of the step, in any
- * browser, is a failure. The freeze at hang-up, which the app does avoid, is not excused.
- */
-const KNOWN_WEBKIT_FREEZE =
-  'Linux WebKit froze the page at "Turn camera off" (tests/e2e/repro, camera-off)';
-
-/**
  * Run `step`; if it throws, or takes longer than `within`, attach each page's call log,
- * whether it still answers, and its connection report to the failure. With `knownFreeze`,
- * a failure that left a page frozen in WebKit skips the test with that reason.
+ * whether it still answers, and its connection report to the failure. No failure is
+ * excused: a page the browser froze (WebKit on Linux could, at "Turn camera off", until the
+ * self view was made to let go first; tests/e2e/repro) fails the test like anything else.
  * `PAROLNET_CONNECTION_REPORT=1` prints the reports after a success too.
  */
 async function withConnectionReport(
   people: Record<string, Page>,
   step: () => Promise<void>,
   within?: number,
-  knownFreeze?: string,
 ): Promise<void> {
-  let frozen = false;
   const report = async () => {
     // All at once, and none waited for longer than a few seconds: the test may be close to
     // its own timeout, and a frozen page never answers.
     const texts = await Promise.all(
       Object.values(people).map(async (page) => {
         const state = await answers(page);
-        if (state !== "the page answers") frozen = true;
         const connections = state === "the page answers"
           ? await Promise.race([
             connectionReport(page),
@@ -262,11 +247,6 @@ async function withConnectionReport(
     ]);
   } catch (error) {
     await report();
-    // The one expected failure: see `KNOWN_WEBKIT_FREEZE`.
-    test.skip(
-      knownFreeze !== undefined && frozen && test.info().project.name === "flows-webkit",
-      knownFreeze,
-    );
     throw error;
   } finally {
     clearTimeout(timer);
@@ -842,7 +822,6 @@ test("a video call: ring, accept, controls, end; and a declined call", async ({ 
       await ben.page.getByTestId("call-mute").click();
     },
     30_000,
-    KNOWN_WEBKIT_FREEZE,
   );
 
   // Ana ends it. Ben is told how it ended; both devices let the camera and the connection

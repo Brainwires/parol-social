@@ -86,8 +86,9 @@ four. The parameters are stored with the wrapped keys and are part of their asso
 so they can be raised later without breaking existing locks, and changing them on disk makes
 the unlock fail rather than weaker. The implementation is RustCrypto's `argon2` in
 `parolnet-crypto` (`kdf::argon2id`), exported from the wasm core; it is checked against
-OpenSSL's Argon2id. PBKDF2 is not used anywhere. Measured in the flows (unlock, including the
-start of the engine, on an Apple M-series machine): about 0.2 s in Chromium, 0.3 s in Firefox;
+OpenSSL's Argon2id. PBKDF2 is not used anywhere. Measured in the flows (from pressing Unlock
+to the app on screen, so including the start of the engine, on an Apple M-series machine):
+about 0.22 s in Chromium, 0.26 s in Firefox, 0.26 to 0.5 s in WebKit (Linux, in a container);
 a phone will take a few times longer. The derivation runs on the main thread; the screen says
 "Working" first. After the first use the wasm instance keeps the 64 MiB it grew by until the
 page is closed.

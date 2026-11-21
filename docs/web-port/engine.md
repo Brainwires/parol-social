@@ -386,8 +386,9 @@ freeze the page too.** No track ends here. The main thread is inside a state cha
 element's pipeline, waiting on a condition inside WebKit, while a streaming thread of the
 capture is in an object's destruction, also waiting inside WebKit (`web/tests/e2e/repro`,
 `camera-off`). The engine has no part in it: it is what the call screen does at "Turn camera
-off", and it is not fixed (app.md, "Browsers" and "Owed"). In those 156 runs it froze the
-page of the person who pressed the button 3 times.
+off". In those 156 runs it froze the page of the person who pressed the button 3 times. The
+app now detaches the self view before the track is switched off instead of after, which does
+not freeze (app.md, "Browsers"; the numbers are in `web/tests/e2e/repro/README.md`).
 
 ## Running the tests
 
