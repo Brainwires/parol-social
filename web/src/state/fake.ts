@@ -12,8 +12,11 @@ import type {
   PairingCode,
   PathState,
   RelayState,
+  TransferInfo,
   Verification,
 } from "./model.ts";
+import { transferOver } from "./model.ts";
+import { saveFile } from "./save-file.ts";
 import type { AppStore, CallMediaStreams, FakeControls, Notice, Phase, TurnView } from "./store.ts";
 
 const MINUTE = 60_000;
@@ -101,6 +104,82 @@ function seedMessages(): Map<string, ChatMessage[]> {
   return all;
 }
 
+type SeedTransfer = Pick<TransferInfo, "direction" | "name" | "size" | "mime" | "state"> & {
+  bytesDone?: number;
+  pending?: boolean;
+  /** Minutes after the seed epoch: after the thread's last message. */
+  at: number;
+};
+
+const SEED_TRANSFERS: Record<string, SeedTransfer[]> = {
+  [FAKE_PEERS.mira]: [
+    {
+      direction: "Received",
+      name: "minutes-march.pdf",
+      size: 1_248_512,
+      mime: "application/pdf",
+      state: { kind: "Complete" },
+      bytesDone: 1_248_512,
+      at: 13,
+    },
+    {
+      direction: "Sent",
+      name: "projector-slides-for-saturday-with-the-long-name-final-version-2.pdf",
+      size: 48_000_000,
+      mime: "application/pdf",
+      state: { kind: "Active" },
+      bytesDone: 12_000_000,
+      at: 14,
+    },
+    {
+      direction: "Received",
+      name: "harbour-photos.zip",
+      size: 23_400_000,
+      mime: "application/zip",
+      state: { kind: "Offered" },
+      at: 15,
+    },
+  ],
+  [FAKE_PEERS.kofi]: [
+    {
+      direction: "Sent",
+      name: "harbour-panorama.jpg",
+      size: 5_200_000,
+      mime: "image/jpeg",
+      state: { kind: "Waiting" },
+      at: 7,
+    },
+  ],
+};
+
+/** A transfer id: 32 hex digits. */
+function transferId(n: number): string {
+  return n.toString(16).padStart(32, "0");
+}
+
+function seedTransfers(): Map<string, TransferInfo[]> {
+  let n = 0;
+  const all = new Map<string, TransferInfo[]>();
+  for (const [peer, list] of Object.entries(SEED_TRANSFERS)) {
+    all.set(
+      peer,
+      list.map(({ at, bytesDone, pending, ...rest }): TransferInfo => ({
+        ...rest,
+        id: transferId(++n),
+        peerId: peer,
+        bytesDone: bytesDone ?? 0,
+        pending: pending ?? false,
+        createdMs: SEED_EPOCH_MS + at * MINUTE,
+        available: rest.direction === "Received" && rest.state.kind === "Complete",
+      })),
+    );
+  }
+  return all;
+}
+
+/** What a made-up received file holds: never shown, only saved. */
+const SAMPLE_FILE_TEXT = "A sample file from the ParolNet state lab.\n";
+
 function seedContacts(): Contact[] {
   return SEED_CONTACTS.map(([id, name, , verified], index): Contact => ({
     peerId: id,
@@ -129,6 +208,8 @@ export interface FakeStoreOptions {
   retryDelayMs?: number;
   /** Start with no contacts (the empty state). */
   empty?: boolean;
+  /** How long "hashing" a file to offer takes. */
+  hashDelayMs?: number;
 }
 
 export function createFakeStore(options: FakeStoreOptions = {}): AppStore & FakeControls {
@@ -143,6 +224,10 @@ export function createFakeStore(options: FakeStoreOptions = {}): AppStore & Fake
   const messages = signal<ReadonlyMap<string, readonly ChatMessage[]>>(
     options.empty ? new Map() : seedMessages(),
   );
+  const transfers = signal<ReadonlyMap<string, readonly TransferInfo[]>>(
+    options.empty ? new Map() : seedTransfers(),
+  );
+  const filesPersist = signal(true);
   const contacts = signal<readonly ContactView[]>([]);
   const call = signal<CallInfo | null>(null);
   const callMedia = signal<CallMediaStreams>({ local: null, remote: null });
@@ -150,6 +235,8 @@ export function createFakeStore(options: FakeStoreOptions = {}): AppStore & Fake
   const turn = signal<TurnView | null>(null);
   const notice = signal<Notice | null>(null);
   let nextId = 1000;
+  let nextTransfer = 1000;
+  const hashDelayMs = options.hashDelayMs ?? 600;
 
   const pathOf = (peer: string): PathState => paths.value.get(peer) ?? "Unknown";
   const lineOpen = (peer: string) => selfOnline.value && pathOf(peer) === "Direct";
@@ -187,10 +274,47 @@ export function createFakeStore(options: FakeStoreOptions = {}): AppStore & Fake
     throw new EngineError("NotQueued", "that message has already left this device");
   }
 
+  function findTransfer(id: string): TransferInfo {
+    for (const list of transfers.value.values()) {
+      const found = list.find((t) => t.id === id);
+      if (found) return found;
+    }
+    throw new EngineError("UnknownTransfer", "no such transfer to act on");
+  }
+
+  function changeTransfer(id: string, change: (t: TransferInfo) => TransferInfo | null): void {
+    const before = findTransfer(id);
+    const next = new Map(transfers.value);
+    const list = next.get(before.peerId) ?? [];
+    const after = change(before);
+    next.set(
+      before.peerId,
+      after ? list.map((t) => (t.id === id ? after : t)) : list.filter((t) => t.id !== id),
+    );
+    transfers.value = next;
+  }
+
+  /** A command about a transfer: the fake answers at once, or rejects the way the engine does. */
+  function onTransfer(id: string, change: (t: TransferInfo) => TransferInfo | null) {
+    try {
+      changeTransfer(id, change);
+      return Promise.resolve();
+    } catch (error) {
+      return Promise.reject(error);
+    }
+  }
+
   /** Deliver what waited for this contact. */
   function flush(peer: string): void {
     if (!lineOpen(peer)) return;
     update(peer, (list) => list.map((m) => (m.state === "Queued" ? { ...m, state: "Sent" } : m)));
+    const files = transfers.value.get(peer);
+    if (files?.some((t) => t.pending)) {
+      transfers.value = new Map(transfers.value).set(
+        peer,
+        files.map((t) => (t.pending ? { ...t, pending: false } : t)),
+      );
+    }
   }
 
   function setPath(peer: string, path: PathState): void {
@@ -213,6 +337,8 @@ export function createFakeStore(options: FakeStoreOptions = {}): AppStore & Fake
     selfOnline,
     contacts,
     messages,
+    transfers,
+    filesPersist,
     call,
     callMedia,
     pairing,
@@ -270,6 +396,78 @@ export function createFakeStore(options: FakeStoreOptions = {}): AppStore & Fake
     },
 
     markRead() {},
+
+    async offerFile(peer, file) {
+      // The engine reads the whole file for its hash first; the lab takes a moment too.
+      await new Promise((done) => setTimeout(done, hashDelayMs));
+      const info: TransferInfo = {
+        id: transferId(++nextTransfer),
+        peerId: peer,
+        direction: "Sent",
+        name: file.name,
+        size: file.size,
+        mime: file.type,
+        state: { kind: "Offered" },
+        bytesDone: 0,
+        pending: !lineOpen(peer),
+        createdMs: Date.now(),
+        available: false,
+      };
+      transfers.value = new Map(transfers.value).set(peer, [
+        ...(transfers.value.get(peer) ?? []),
+        info,
+      ]);
+      return info;
+    },
+    acceptTransfer(id) {
+      return onTransfer(id, (t) => {
+        if (t.direction !== "Received" || t.state.kind !== "Offered") {
+          throw new EngineError("UnknownTransfer", "nothing to accept");
+        }
+        const open = lineOpen(t.peerId);
+        return { ...t, state: { kind: open ? "Active" : "Waiting" }, pending: !open };
+      });
+    },
+    declineTransfer(id) {
+      return onTransfer(id, (t) => {
+        if (t.direction !== "Received" || t.state.kind !== "Offered") {
+          throw new EngineError("UnknownTransfer", "nothing to decline");
+        }
+        return { ...t, state: { kind: "Declined" }, pending: !lineOpen(t.peerId) };
+      });
+    },
+    cancelTransfer(id) {
+      return onTransfer(id, (t) => {
+        if (transferOver(t)) throw new EngineError("UnknownTransfer", "it is already over");
+        return {
+          ...t,
+          state: { kind: "Cancelled", byPeer: false, reason: "User" },
+          bytesDone: t.direction === "Received" ? 0 : t.bytesDone,
+          pending: !lineOpen(t.peerId),
+        };
+      });
+    },
+    async saveTransfer(id) {
+      const t = findTransfer(id);
+      const outcome = await saveFile(
+        t.name,
+        () =>
+          Promise.resolve(
+            t.available ? new Blob([SAMPLE_FILE_TEXT], { type: t.mime }) : null,
+          ),
+      );
+      if (outcome === "missing") {
+        throw new EngineError("UnknownTransfer", "the file is no longer on this device");
+      }
+    },
+    removeTransfer(id) {
+      return onTransfer(id, (t) => {
+        if (!transferOver(t)) {
+          throw new EngineError("UnknownTransfer", "only a finished transfer can be removed");
+        }
+        return null;
+      });
+    },
 
     createPairingCode() {
       const code: PairingCode = { code: FAKE_CODE, expiresAtMs: Date.now() + 28 * MINUTE };
@@ -329,6 +527,9 @@ export function createFakeStore(options: FakeStoreOptions = {}): AppStore & Fake
         const next = new Map(messages.value);
         next.delete(peer);
         messages.value = next;
+        const files = new Map(transfers.value);
+        files.delete(peer);
+        transfers.value = files;
         person((list) => list.filter((c) => c.peerId !== peer));
       });
       return Promise.resolve();
@@ -428,6 +629,7 @@ export function createFakeStore(options: FakeStoreOptions = {}): AppStore & Fake
         people.value = [];
         paths.value = new Map();
         messages.value = new Map();
+        transfers.value = new Map();
         call.value = null;
         publish();
       });
@@ -440,6 +642,7 @@ export function createFakeStore(options: FakeStoreOptions = {}): AppStore & Fake
         people.value = options.empty ? [] : seedContacts();
         paths.value = new Map(options.empty ? [] : SEED_CONTACTS.map(([id, , path]) => [id, path]));
         messages.value = options.empty ? new Map() : seedMessages();
+        transfers.value = options.empty ? new Map() : seedTransfers();
         call.value = null;
         pairing.value = null;
         publish();

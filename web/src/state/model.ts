@@ -8,10 +8,13 @@ import type {
   PathState,
 } from "../engine/types.ts";
 
+export { transferOver } from "../engine/types.ts";
+
 export type {
   CallEnd,
   CallInfo,
   CallState,
+  CancelReason,
   Contact,
   ContactView,
   DeliveryState,
@@ -20,6 +23,8 @@ export type {
   PairingCode,
   PathState,
   RelayState,
+  TransferInfo,
+  TransferState,
   Verification,
 } from "../engine/types.ts";
 
