@@ -56,6 +56,8 @@ pub const REGISTER_TIMEOUT_SECS: u64 = 10;
 pub const MAX_PEERS_PER_IP: usize = 3;
 /// Register frames (challenge requests and answers) one socket may send.
 pub const MAX_REGISTER_ATTEMPTS: u32 = 4;
+/// Seconds a register challenge stays answerable after it was issued.
+pub const REGISTER_CHALLENGE_TTL_SECS: u64 = 60;
 /// PeerIds one socket may watch for presence.
 pub const MAX_WATCH_IDS: usize = 256;
 /// Frames of any type one socket may send per minute (signaling-only).

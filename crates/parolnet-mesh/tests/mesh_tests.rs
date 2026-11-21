@@ -667,3 +667,94 @@ async fn test_process_gossip_empty_pubkey_rejected() {
         "expected validation error for empty pubkey, got: {err}"
     );
 }
+
+// ── Forwarded gossip (PNP-005 §3.1, §5.2) ───────────────────────
+
+/// A connection that records what is sent on it.
+struct CapturingConn {
+    sent: std::sync::Mutex<Vec<Vec<u8>>>,
+}
+
+#[async_trait::async_trait]
+impl parolnet_transport::Connection for CapturingConn {
+    async fn send(&self, data: &[u8]) -> Result<(), parolnet_transport::TransportError> {
+        self.sent.lock().unwrap().push(data.to_vec());
+        Ok(())
+    }
+    async fn recv(&self) -> Result<Vec<u8>, parolnet_transport::TransportError> {
+        std::future::pending().await
+    }
+    async fn close(&self) -> Result<(), parolnet_transport::TransportError> {
+        Ok(())
+    }
+    fn peer_addr(&self) -> Option<std::net::SocketAddr> {
+        None
+    }
+}
+
+/// Run `cbor` through a fresh gossip node with one connected peer and return
+/// what the node forwarded to that peer.
+async fn forward_through_fresh_node(cbor: &[u8], node_seed: u8) -> Vec<u8> {
+    let signing_key = SigningKey::from_bytes(&[node_seed; 32]);
+    let peer_id = PeerId(Sha256::digest(signing_key.verifying_key().to_bytes()).into());
+    let pool = Arc::new(ConnectionPool::new());
+    let conn = Arc::new(CapturingConn {
+        sent: std::sync::Mutex::new(Vec::new()),
+    });
+    pool.add_peer(PeerId([node_seed ^ 0x55; 32]), conn.clone())
+        .await
+        .unwrap();
+    let mut gossip = StandardGossip::new(peer_id, signing_key, pool);
+    gossip.default_difficulty = 8;
+
+    let action = gossip.process_gossip(cbor).await;
+    assert!(action.is_ok(), "node {node_seed:#x} refused: {action:?}");
+    let sent = conn.sent.lock().unwrap();
+    assert_eq!(sent.len(), 1, "node {node_seed:#x} did not forward");
+    sent[0].clone()
+}
+
+/// The originator signs `ttl`, and every hop decrements it (PNP-005 §5.2).
+/// A message must still verify at the second hop and beyond.
+#[tokio::test]
+async fn test_forwarded_gossip_verifies_at_later_hops() {
+    let (cbor, _, _) = make_valid_gossip_cbor();
+
+    let after_one = forward_through_fresh_node(&cbor, 0xA1).await;
+    let env = GossipEnvelope::from_cbor(&after_one).unwrap();
+    assert_eq!((env.ttl, env.hops), (6, 1));
+
+    let after_two = forward_through_fresh_node(&after_one, 0xA2).await;
+    let env = GossipEnvelope::from_cbor(&after_two).unwrap();
+    assert_eq!((env.ttl, env.hops), (5, 2));
+
+    let after_three = forward_through_fresh_node(&after_two, 0xA3).await;
+    let env = GossipEnvelope::from_cbor(&after_three).unwrap();
+    assert_eq!((env.ttl, env.hops), (4, 3));
+}
+
+/// A forwarder that hands a message more remaining hops than the originator
+/// signed for is refused: the signature covers the originator's `ttl`.
+#[tokio::test]
+async fn test_forwarded_gossip_with_raised_ttl_rejected() {
+    let (cbor, _, _) = make_valid_gossip_cbor();
+    let after_one = forward_through_fresh_node(&cbor, 0xA1).await;
+
+    let mut env = GossipEnvelope::from_cbor(&after_one).unwrap();
+    env.ttl = 9;
+    let result = make_test_gossip()
+        .process_gossip(&env.to_cbor().unwrap())
+        .await;
+    assert!(result.is_err(), "raised ttl was accepted: {result:?}");
+
+    // Arithmetic that cannot be an originator's value is refused, not wrapped.
+    let mut env = GossipEnvelope::from_cbor(&after_one).unwrap();
+    env.hops = 255;
+    let result = make_test_gossip()
+        .process_gossip(&env.to_cbor().unwrap())
+        .await;
+    assert!(
+        result.is_err(),
+        "overflowing ttl + hops was accepted: {result:?}"
+    );
+}

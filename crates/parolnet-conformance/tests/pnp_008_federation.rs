@@ -10,7 +10,7 @@
 use parolnet_clause::clause;
 use parolnet_protocol::address::PeerId;
 use parolnet_relay::authority::{AuthorityEndorsement, EndorsedDescriptor, SignedDirectory};
-use parolnet_relay::directory::RelayDescriptor;
+use parolnet_relay::directory::{RelayDescriptor, RelayDirectory};
 use parolnet_relay::trust_roots::{
     AUTHORITY_PUBKEYS, AUTHORITY_THRESHOLD, is_trusted_authority, network_id,
 };
@@ -23,19 +23,26 @@ fn sk(seed: u8) -> SigningKey {
     SigningKey::from_bytes(&s)
 }
 
-fn make_descriptor(peer_id: PeerId, timestamp: u64) -> RelayDescriptor {
-    RelayDescriptor {
-        peer_id,
-        identity_key: [0xAA; 32],
-        x25519_key: [0xBB; 32],
-        addr: "127.0.0.1:9000".parse().unwrap(),
-        bandwidth_class: 1,
-        uptime_secs: 3600,
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+}
+
+/// A descriptor signed by `relay_key`, for the PeerId that key hashes to.
+fn signed_descriptor(relay_key: &SigningKey, addr: &str, timestamp: u64) -> RelayDescriptor {
+    let identity_key = relay_key.verifying_key().to_bytes();
+    RelayDirectory::create_descriptor(
+        PeerId::from_public_key(&identity_key),
+        identity_key,
+        [0xBB; 32],
+        addr.parse().unwrap(),
+        1,
+        3600,
         timestamp,
-        signature: [0u8; 64],
-        bandwidth_estimate: 1000,
-        next_pubkey: None,
-    }
+        relay_key,
+    )
 }
 
 fn make_endorsement(
@@ -88,18 +95,15 @@ fn descriptor_validation_requires_valid_endorsement_for_trusted_authority() {
     // MUST-027: at least one authority endorsement signature must verify.
     // MUST-028: descriptors failing validation MUST be dropped.
     let sk1 = sk(1);
-    let peer_id = PeerId([0x42; 32]);
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_secs();
-    let endorsement = make_endorsement(&sk1, peer_id, now, now + 86400);
+    let now = now_secs();
+    let descriptor = signed_descriptor(&sk(7), "127.0.0.1:9000", now);
+    let endorsement = make_endorsement(&sk1, descriptor.peer_id, now, now + 86400);
 
     let trusted = [sk1.verifying_key().to_bytes()];
     let untrusted = [sk(9).verifying_key().to_bytes()];
 
     let desc = EndorsedDescriptor {
-        descriptor: make_descriptor(peer_id, now),
+        descriptor,
         endorsements: vec![endorsement],
     };
 
@@ -131,17 +135,21 @@ fn threshold_requires_distinct_authority_signatures() {
     // MUST-057 (distinctness): one authority cannot meet threshold 2 by
     // double-signing. verify_threshold must count each authority once.
     let sk1 = sk(1);
-    let peer_id = PeerId([0x42; 32]);
     let trusted = [sk1.verifying_key().to_bytes()];
+    let now = now_secs();
+    let descriptor = signed_descriptor(&sk(7), "127.0.0.1:9000", now);
+    let peer_id = descriptor.peer_id;
 
     let desc = EndorsedDescriptor {
-        descriptor: make_descriptor(peer_id, 1000),
+        descriptor,
         endorsements: vec![
-            make_endorsement(&sk1, peer_id, 1000, 1000 + 86400),
-            make_endorsement(&sk1, peer_id, 1001, 1001 + 86400),
+            make_endorsement(&sk1, peer_id, now, now + 86400),
+            make_endorsement(&sk1, peer_id, now + 1, now + 1 + 86400),
         ],
     };
-    // Two signatures, same authority, threshold 2: MUST fail
+    // Each endorsement counts on its own ...
+    assert!(desc.verify_threshold(&trusted, 1).unwrap());
+    // ... but two signatures of the same authority do not meet threshold 2.
     assert!(!desc.verify_threshold(&trusted, 2).unwrap());
 }
 
@@ -150,18 +158,22 @@ fn threshold_requires_distinct_authority_signatures() {
 fn expired_endorsement_is_rejected_by_threshold_check() {
     // MUST-027 §6.3 validation: expired endorsements MUST NOT count.
     let sk1 = sk(1);
-    let peer_id = PeerId([0x42; 32]);
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_secs();
+    let now = now_secs();
+    let descriptor = signed_descriptor(&sk(7), "127.0.0.1:9000", now);
+    let peer_id = descriptor.peer_id;
 
     let trusted = [sk1.verifying_key().to_bytes()];
     let desc = EndorsedDescriptor {
-        descriptor: make_descriptor(peer_id, now),
+        descriptor: descriptor.clone(),
         endorsements: vec![make_endorsement(&sk1, peer_id, now - 2 * 86400, now - 3600)],
     };
     assert!(!desc.verify_threshold(&trusted, 1).unwrap());
+    // The same descriptor with a current endorsement passes: expiry was the reason.
+    let current = EndorsedDescriptor {
+        descriptor,
+        endorsements: vec![make_endorsement(&sk1, peer_id, now, now + 3600)],
+    };
+    assert!(current.verify_threshold(&trusted, 1).unwrap());
 }
 
 #[clause("PNP-008-MUST-027")]
@@ -169,17 +181,81 @@ fn expired_endorsement_is_rejected_by_threshold_check() {
 fn endorsement_bound_to_peer_id_rejects_cross_binding() {
     // MUST-027: endorsement must be for this descriptor's peer_id.
     let sk1 = sk(1);
-    let peer_a = PeerId([0x42; 32]);
-    let peer_b = PeerId([0x77; 32]);
-    let endorsement_for_a = make_endorsement(&sk1, peer_a, 1000, 1000 + 86400);
+    let now = now_secs();
+    let relay_a = signed_descriptor(&sk(7), "127.0.0.1:9000", now);
+    let relay_b = signed_descriptor(&sk(8), "127.0.0.1:9001", now);
+    let endorsement_for_a = make_endorsement(&sk1, relay_a.peer_id, now, now + 86400);
 
     let trusted = [sk1.verifying_key().to_bytes()];
-    // Endorsement references peer_a but descriptor is peer_b
+    // Endorsement references relay A but the descriptor is relay B's
     let desc = EndorsedDescriptor {
-        descriptor: make_descriptor(peer_b, 1000),
-        endorsements: vec![endorsement_for_a],
+        descriptor: relay_b,
+        endorsements: vec![endorsement_for_a.clone()],
     };
     assert!(!desc.verify_threshold(&trusted, 1).unwrap());
+    let desc = EndorsedDescriptor {
+        descriptor: relay_a,
+        endorsements: vec![endorsement_for_a],
+    };
+    assert!(desc.verify_threshold(&trusted, 1).unwrap());
+}
+
+/// MUST-027 items 1 and 3, MUST-028: an endorsement names a PeerId, so the
+/// descriptor has to be that relay's own (PeerId the hash of its identity key,
+/// signed by that key) and recent before any endorsement counts. Otherwise a
+/// public endorsement could be attached to someone else's keys and address.
+#[clause("PNP-008-MUST-027", "PNP-008-MUST-028")]
+#[test]
+fn endorsement_does_not_carry_to_a_descriptor_the_relay_did_not_sign() {
+    let authority = sk(1);
+    let trusted = [authority.verifying_key().to_bytes()];
+    let (relay, attacker) = (sk(7), sk(66));
+    let now = now_secs();
+
+    let genuine = signed_descriptor(&relay, "198.51.100.7:443", now);
+    let endorsement = make_endorsement(&authority, genuine.peer_id, now, now + 86400);
+    let accepted = |descriptor: RelayDescriptor| {
+        EndorsedDescriptor {
+            descriptor,
+            endorsements: vec![endorsement.clone()],
+        }
+        .verify_threshold(&trusted, 1)
+        .unwrap()
+    };
+    assert!(accepted(genuine.clone()));
+
+    // The attacker's keys and address under the endorsed PeerId, signed by the attacker.
+    let mut forged = signed_descriptor(&attacker, "203.0.113.66:443", now);
+    forged.peer_id = genuine.peer_id;
+    forged.signature = attacker.sign(&forged.signable_bytes()).to_bytes();
+    assert!(!accepted(forged.clone()));
+
+    // The relay's descriptor with its address, its onion key or its timestamp changed.
+    let mutations: [fn(&mut RelayDescriptor); 3] = [
+        |d| d.addr = "203.0.113.66:443".parse().unwrap(),
+        |d| d.x25519_key = [0xEE; 32],
+        |d| d.timestamp += 1,
+    ];
+    for mutate in mutations {
+        let mut altered = genuine.clone();
+        mutate(&mut altered);
+        assert!(!accepted(altered));
+    }
+
+    // Item 3: a genuine descriptor older than seven days.
+    assert!(!accepted(signed_descriptor(
+        &relay,
+        "198.51.100.7:443",
+        now - 7 * 86400 - 1
+    )));
+
+    // The directory's unendorsed path refuses the forgery too (MUST-028: not stored).
+    let mut dir = RelayDirectory::new();
+    assert!(dir.handle_gossip_descriptor(genuine.clone(), now));
+    forged.timestamp += 10;
+    forged.signature = attacker.sign(&forged.signable_bytes()).to_bytes();
+    assert!(!dir.handle_gossip_descriptor(forged, now));
+    assert_eq!(dir.lookup_addr(&genuine.peer_id), Some(genuine.addr));
 }
 
 // -- §6.2 IBLT sizing tiers --------------------------------------------------
@@ -687,11 +763,18 @@ fn bootstrap_channels_do_not_grant_trust_only_descriptors() {
     // signing authority isn't in trust_roots, even if we "obtained" them from
     // a bootstrap channel.
     let sk1 = sk(1);
-    let peer_id = PeerId([0x42; 32]);
+    let now = now_secs();
+    let descriptor = signed_descriptor(&sk(7), "127.0.0.1:9000", now);
+    let peer_id = descriptor.peer_id;
     let desc = EndorsedDescriptor {
-        descriptor: make_descriptor(peer_id, 1000),
-        endorsements: vec![make_endorsement(&sk1, peer_id, 1000, 1000 + 86400)],
+        descriptor,
+        endorsements: vec![make_endorsement(&sk1, peer_id, now, now + 86400)],
     };
+    // Valid in every respect but the authority: sk1 itself would accept it.
+    assert!(
+        desc.verify_threshold(&[sk1.verifying_key().to_bytes()], 1)
+            .unwrap()
+    );
     // sk1 is NOT a trusted authority by default → untrusted channel payload
     // MUST NOT be accepted.
     assert!(!desc.verify_threshold(AUTHORITY_PUBKEYS, 1).unwrap_or(false));

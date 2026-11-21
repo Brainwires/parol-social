@@ -6,6 +6,7 @@
 use parolnet_protocol::file::{DEFAULT_CHUNK_SIZE, FileChunkHeader, FileOffer};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
+use subtle::ConstantTimeEq;
 
 /// Sanitize a file name to prevent path traversal and other attacks.
 ///
@@ -178,7 +179,8 @@ impl FileTransferReceiver {
         hasher.update(&data);
         let computed: [u8; 32] = hasher.finalize().into();
 
-        if computed != self.offer.sha256 {
+        // PNP-007-MUST-062: constant time.
+        if !bool::from(computed.ct_eq(&self.offer.sha256)) {
             return Err(crate::CoreError::SessionError(
                 "SHA-256 integrity check failed".into(),
             ));
