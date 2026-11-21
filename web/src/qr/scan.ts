@@ -139,8 +139,10 @@ export async function startScanner(
     if (stopped) return;
     stopped = true;
     clearTimeout(timer);
-    for (const track of stream.getTracks()) track.stop();
+    // Let the element go before its tracks end: ending a track that a <video> still plays can
+    // block the page in WebKit's GStreamer ports (web/tests/e2e/repro).
     video.srcObject = null;
+    for (const track of stream.getTracks()) track.stop();
   };
 
   try {
