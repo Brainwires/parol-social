@@ -1,0 +1,143 @@
+@layer reset, tokens, base, components, screens;
+
+@layer reset {
+  *,
+  *::before,
+  *::after {
+    box-sizing: border-box;
+  }
+  html {
+    -webkit-text-size-adjust: 100%;
+    text-size-adjust: 100%;
+  }
+  body,
+  h1,
+  h2,
+  h3,
+  p,
+  ol,
+  ul,
+  dl,
+  dd,
+  figure {
+    margin: 0;
+  }
+  ol,
+  ul {
+    padding: 0;
+    list-style: none;
+  }
+  button,
+  input,
+  textarea,
+  select {
+    font: inherit;
+    color: inherit;
+    letter-spacing: inherit;
+  }
+  button {
+    border: 0;
+    background: none;
+    padding: 0;
+  }
+  a {
+    color: inherit;
+  }
+  svg {
+    display: block;
+  }
+}
+
+@layer base {
+  @font-face {
+    font-family: "Atkinson Hyperlegible Next";
+    font-style: normal;
+    font-weight: 200 800;
+    font-display: swap;
+    src: url("../fonts/atkinson-hyperlegible-next-latin-5.3.0.woff2") format("woff2");
+    unicode-range:
+      U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC, U+0304, U+0308,
+      U+0329, U+2000-206F, U+20AC, U+2122, U+2191, U+2193, U+2212, U+2215, U+FEFF, U+FFFD;
+  }
+  @font-face {
+    font-family: "Atkinson Hyperlegible Next";
+    font-style: normal;
+    font-weight: 200 800;
+    font-display: swap;
+    src: url("../fonts/atkinson-hyperlegible-next-latin-ext-5.3.0.woff2") format("woff2");
+    unicode-range:
+      U+0100-02BA, U+02BD-02C5, U+02C7-02CC, U+02CE-02D7, U+02DD-02FF, U+1D00-1DBF, U+1E00-1E9F,
+      U+1EF2-1EFF, U+2020, U+20A0-20AB, U+20AD-20C0, U+2113, U+2C60-2C7F, U+A720-A7FF;
+  }
+  @font-face {
+    font-family: "Atkinson Hyperlegible Mono";
+    font-style: normal;
+    font-weight: 200 800;
+    font-display: swap;
+    src: url("../fonts/atkinson-hyperlegible-mono-latin-5.3.0.woff2") format("woff2");
+    unicode-range:
+      U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC, U+0304, U+0308,
+      U+0329, U+2000-206F, U+20AC, U+2122, U+2191, U+2193, U+2212, U+2215, U+FEFF, U+FFFD;
+  }
+  @font-face {
+    font-family: "Atkinson Hyperlegible Mono";
+    font-style: normal;
+    font-weight: 200 800;
+    font-display: swap;
+    src: url("../fonts/atkinson-hyperlegible-mono-latin-ext-5.3.0.woff2") format("woff2");
+    unicode-range:
+      U+0100-02BA, U+02BD-02C5, U+02C7-02CC, U+02CE-02D7, U+02DD-02FF, U+1D00-1DBF, U+1E00-1E9F,
+      U+1EF2-1EFF, U+2020, U+20A0-20AB, U+20AD-20C0, U+2113, U+2C60-2C7F, U+A720-A7FF;
+  }
+
+  html {
+    background: var(--paper);
+    color: var(--ink);
+    font-family: var(--font-text);
+    font-size: 100%;
+    line-height: var(--line-text);
+  }
+  body {
+    font-size: var(--text-body);
+    font-weight: var(--weight-regular);
+    min-block-size: 100dvh;
+    overflow-wrap: break-word;
+  }
+  h1,
+  h2,
+  h3 {
+    font-weight: var(--weight-bold);
+    line-height: var(--line-tight);
+    font-size: inherit;
+  }
+  /* One focus ring everywhere: 3px lamp-line, 2px away from the control. */
+  :focus-visible {
+    outline: var(--focus-width) solid var(--focus-color);
+    outline-offset: var(--focus-offset);
+  }
+  :focus:not(:focus-visible) {
+    outline: none;
+  }
+  ::selection {
+    background: var(--ink);
+    color: var(--on-ink);
+  }
+  .visually-hidden {
+    position: absolute;
+    inline-size: 1px;
+    block-size: 1px;
+    margin: -1px;
+    overflow: hidden;
+    clip-path: inset(50%);
+    white-space: nowrap;
+  }
+  /* The placeholder Denext's shell paints until the bundle renders (spa.loading). */
+  .boot {
+    display: grid;
+    place-items: center;
+    min-block-size: 100dvh;
+    color: var(--ink-2);
+    font-weight: var(--weight-bold);
+    font-size: var(--text-lead);
+  }
+}

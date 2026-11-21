@@ -127,6 +127,21 @@ bind-mounts `./pwa` into the running container lets you edit and reload; `npm ru
 rebuilds only the wasm. See [GETTING-STARTED.md](GETTING-STARTED.md) and
 [STARTUP-GUIDE.md](STARTUP-GUIDE.md).
 
+### Web app rewrite (`web/`)
+
+The PWA is being rewritten as a [Denext](https://denext.dev) app with a new design
+([docs/ux/web-app.md](docs/ux/web-app.md)). Phase 1 is in `web/`: the platform (static export
+under `/pwa/`, strict CSP, wasm, service worker, offline) and the design system and
+conversation screens on fake state. `pwa/` stays the deployed client until the protocol
+services are ported. See [web/README.md](web/README.md).
+
+```bash
+cd web
+denext task build-wasm   # crates/parolnet-wasm -> web/public/wasm
+denext task build        # static site in web/out
+denext task test         # unit tests; `denext task e2e` runs the three browsers
+```
+
 ## Roadmap
 
 | Milestone | Scope |

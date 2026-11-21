@@ -1,0 +1,50 @@
+{
+  "tasks": {
+    "dev": "denext dev .",
+    "tokens": "denext deno run --allow-read=. --allow-write=src/design scripts/gen-tokens.ts",
+    "build-wasm": "denext deno run -A scripts/build-wasm.ts",
+    "build": "denext task tokens && denext export . && denext deno run --allow-read=. --allow-write=out scripts/postexport.ts",
+    "export": "denext task build",
+    "serve": "node tests/e2e/static-server.mjs",
+    "test": "denext test tests/unit",
+    "e2e": "cd tests/e2e && npm ci && npx playwright test",
+    "lint": "denext lint",
+    "fmt": "denext fmt",
+    "fmt:check": "denext fmt --check",
+    "check": "denext check src scripts tests/unit denext.config.ts"
+  },
+  "compilerOptions": {
+    "jsx": "react-jsx",
+    "jsxImportSource": "denext",
+    "lib": ["deno.window", "dom", "dom.iterable", "dom.asynciterable"]
+  },
+  "imports": {
+    "denext": "jsr:@denext/denext@^4.21.0",
+    "denext/": "jsr:/@denext/denext@^4.21.0/",
+    "@std/assert": "jsr:@std/assert@^1.0.0",
+    "@std/path": "jsr:@std/path@^1.0.0",
+    "@std/fs": "jsr:@std/fs@^1.0.0",
+    "@std/encoding": "jsr:@std/encoding@^1.0.0",
+    "@std/tar": "jsr:@std/tar@^0.1.4"
+  },
+  "minimumDependencyAge": {
+    "age": "P1D",
+    "exclude": ["jsr:@denext/denext"]
+  },
+  "fmt": {
+    "lineWidth": 100,
+    "exclude": ["public/wasm/", "public/fonts/", "src/design/tokens.css"]
+  },
+  "lint": {
+    "exclude": ["public/wasm/", "tests/e2e/"]
+  },
+  "exclude": [
+    "out/",
+    ".denext/",
+    ".wasm-pkg/",
+    "node_modules/",
+    "tests/e2e/node_modules/",
+    "tests/e2e/artifacts/",
+    "tests/e2e/test-results/"
+  ]
+}
