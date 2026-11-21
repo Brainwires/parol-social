@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed — the sender-key chain index cannot wrap (`parolnet-crypto`)
+- `SenderKeyState::encrypt` returns an error when the chain index is `u32::MAX` in place of overflowing (a panic in debug builds, a wrapped index in release), and `decrypt` refuses a message claiming index `u32::MAX`, which would have wrapped the receiver's index the same way. A failed encrypt at the limit changes nothing; the sender has to rotate.
+
 ### Security — sender-key rotation replaces the signing key pair (PNP-009 §7.2, MUST-029)
 - `SenderKeyState::rotate` replaced the chain key and reset the index but kept the Ed25519 signing key, against PNP-009-MUST-029. Every member holds a sender's chain key, so the signature is all that stops one member writing as another: a signing key that had leaked stayed good for forging after the rotation that was supposed to answer the leak (MUST-027). Rotation now generates a new pair; the distribution built afterwards carries the new verification key, as it always carried the current one, and the old private key zeroizes when dropped. Nothing changes on the wire. A receiver still holding the pre-rotation state now fails the signature check on the new chain, where it used to fail the AEAD check.
 

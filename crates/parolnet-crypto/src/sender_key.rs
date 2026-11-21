@@ -133,6 +133,15 @@ impl SenderKeyState {
                 reason: "receiver-only state cannot encrypt".into(),
             })?;
 
+        // The index after this message must exist: a chain at u32::MAX is used up, and the
+        // sender has to rotate (PNP-009 §7). Checked before anything is derived.
+        let next_index = self
+            .chain_index
+            .checked_add(1)
+            .ok_or(CryptoError::SenderKeyError {
+                reason: "sender key chain exhausted: rotate".into(),
+            })?;
+
         // Derive the message key and advance the chain.
         let message_key = Zeroizing::new(Self::chain_step(&mut self.chain_key)?);
 
@@ -150,7 +159,7 @@ impl SenderKeyState {
         let signature = signing_key.sign(&signed_data);
 
         let old_index = self.chain_index;
-        self.chain_index += 1;
+        self.chain_index = next_index;
 
         Ok(SenderKeyMessage {
             chain_index: old_index,
@@ -207,6 +216,15 @@ impl SenderKeyState {
             return Ok(plaintext);
         }
 
+        // The index this message would leave the chain at. No sender produces a message at
+        // u32::MAX (`encrypt` refuses), so one that claims it is refused in place of wrapping.
+        let next_index = msg
+            .chain_index
+            .checked_add(1)
+            .ok_or(CryptoError::SenderKeyError {
+                reason: "chain index out of range".into(),
+            })?;
+
         // Ratchet a copy of the chain forward, collecting the keys of the skipped messages.
         let skip_count = msg.chain_index - self.chain_index;
         if skip_count > MAX_SKIP
@@ -233,7 +251,7 @@ impl SenderKeyState {
             self.skipped_keys.insert(idx, *mk);
         }
         self.chain_key = *chain_key;
-        self.chain_index = msg.chain_index + 1;
+        self.chain_index = next_index;
 
         Ok(plaintext)
     }
@@ -460,6 +478,55 @@ mod tests {
             new_receiver.decrypt(&forged),
             Err(CryptoError::SignatureVerificationFailed)
         ));
+    }
+
+    /// The chain index is a `u32` and the low four bytes of the nonce: at its limit the
+    /// chain refuses to encrypt and to accept, in place of wrapping.
+    #[test]
+    fn chain_index_does_not_wrap() {
+        let mut sender = SenderKeyState::new();
+        sender.chain_index = u32::MAX - 1;
+        let mut receiver =
+            SenderKeyState::from_distribution(&sender.create_distribution([0x42; 32])).unwrap();
+
+        // The last usable index.
+        let last = sender.encrypt(b"last").unwrap();
+        assert_eq!(last.chain_index, u32::MAX - 1);
+        assert_eq!(sender.chain_index, u32::MAX);
+
+        // At the limit: an error, and the state is untouched.
+        let chain_key = sender.chain_key;
+        assert!(sender.encrypt(b"one too many").is_err());
+        assert_eq!(sender.chain_index, u32::MAX);
+        assert_eq!(sender.chain_key, chain_key);
+
+        // A sender that ignores the limit: the receiver refuses index u32::MAX unchanged.
+        let mut step = receiver.chain_key;
+        SenderKeyState::chain_step(&mut step).unwrap();
+        let key_at_max = SenderKeyState::chain_step(&mut step).unwrap();
+        let nonce = SenderKeyState::build_nonce(&sender.signing_public_key, u32::MAX);
+        let ciphertext = ChaCha20Poly1305Cipher::new(&key_at_max)
+            .unwrap()
+            .encrypt(&nonce, b"wrapped", &[])
+            .unwrap();
+        let mut signed = u32::MAX.to_be_bytes().to_vec();
+        signed.extend_from_slice(&ciphertext);
+        let at_max = SenderKeyMessage {
+            chain_index: u32::MAX,
+            signature: sender
+                .signing_key
+                .as_ref()
+                .unwrap()
+                .sign(&signed)
+                .to_bytes()
+                .to_vec(),
+            ciphertext,
+        };
+        assert_rejected_unchanged(&mut receiver, &at_max);
+
+        // The genuine last message still decrypts.
+        assert_eq!(receiver.decrypt(&last).unwrap(), b"last");
+        assert_eq!(receiver.chain_index, u32::MAX);
     }
 
     // ── Atomic decrypt ──────────────────────────────────────────────────
