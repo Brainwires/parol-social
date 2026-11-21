@@ -5,7 +5,14 @@
 //
 //   npx playwright test --project=flows-chromium      (needs the relay binary, see harness.ts)
 import type { Browser, BrowserContext, Page } from "@playwright/test";
-import { expect, expectClean, type Problems, type Server, test, watch } from "./harness.ts";
+import {
+  expect,
+  expectClean,
+  type Problems,
+  type Server,
+  test,
+  watch,
+} from "./harness.ts";
 
 const PHONE = { width: 390, height: 844 };
 const WIDE = { width: 1280, height: 900 };
@@ -82,14 +89,19 @@ async function recordPeerConnections(context: BrowserContext): Promise<void> {
             watched.add(dtls);
             const n = watched.size;
             note(`dtls transport ${n} (mid ${t.mid}) ${dtls.state}`);
-            dtls.addEventListener("statechange", () => note(`dtls transport ${n} ${dtls.state}`));
+            dtls.addEventListener(
+              "statechange",
+              () => note(`dtls transport ${n} ${dtls.state}`),
+            );
           }
         });
         pc.addEventListener(
           "icecandidate",
           (e) =>
             note(
-              `local candidate ${e.candidate ? e.candidate.candidate || "(end)" : "(null)"}`,
+              `local candidate ${
+                e.candidate ? e.candidate.candidate || "(end)" : "(null)"
+              }`,
             ),
         );
         pc.addEventListener("icecandidateerror", (e) => {
@@ -126,7 +138,10 @@ function answers(page: Page): Promise<string> {
   return Promise.race([
     page.evaluate(() => "the page answers"),
     new Promise<string>((done) =>
-      setTimeout(() => done("the page does not answer: its main thread is blocked"), 5_000)
+      setTimeout(
+        () => done("the page does not answer: its main thread is blocked"),
+        5_000,
+      )
     ),
   ]).catch((e) => `the page does not answer: ${e}`);
 }
@@ -138,11 +153,17 @@ function connectionReport(page: Page): Promise<string> {
     const kept = (window as unknown as { __pcs?: Kept[] }).__pcs ?? [];
     const out: string[] = [];
     for (const video of document.querySelectorAll("video")) {
-      const tracks = (video.srcObject as MediaStream | null)?.getTracks().map((t) =>
-        `${t.kind} ${t.readyState}${t.enabled ? "" : " disabled"}${t.muted ? " muted" : ""}`
+      const tracks = (video.srcObject as MediaStream | null)?.getTracks().map((
+        t,
+      ) =>
+        `${t.kind} ${t.readyState}${t.enabled ? "" : " disabled"}${
+          t.muted ? " muted" : ""
+        }`
       );
       out.push(
-        `video ${video.dataset.testid}: ${video.paused ? "paused" : "playing"}, ` +
+        `video ${video.dataset.testid}: ${
+          video.paused ? "paused" : "playing"
+        }, ` +
           `readyState ${video.readyState}, ${video.videoWidth}x${video.videoHeight}, ` +
           `tracks: ${tracks ? tracks.join("; ") || "none" : "no stream"}`,
       );
@@ -170,10 +191,14 @@ function connectionReport(page: Page): Promise<string> {
       try {
         const stats = await pc.getStats();
         const byId = new Map<string, Record<string, unknown>>();
-        stats.forEach((r: Record<string, unknown>) => byId.set(r.id as string, r));
+        stats.forEach((r: Record<string, unknown>) =>
+          byId.set(r.id as string, r)
+        );
         const where = (id: unknown) => {
           const c = byId.get(id as string);
-          return c ? `${c.candidateType} ${c.protocol} ${c.address ?? c.ip}:${c.port}` : "?";
+          return c
+            ? `${c.candidateType} ${c.protocol} ${c.address ?? c.ip}:${c.port}`
+            : "?";
         };
         stats.forEach((r: Record<string, unknown>) => {
           if (r.type === "candidate-pair") {
@@ -231,10 +256,14 @@ async function withConnectionReport(
         const connections = state === "the page answers"
           ? await Promise.race([
             connectionReport(page),
-            new Promise<string>((done) => setTimeout(() => done("no report in 10 s"), 10_000)),
+            new Promise<string>((done) =>
+              setTimeout(() => done("no report in 10 s"), 10_000)
+            ),
           ]).catch((e) => `no report: ${e}`)
           : "no report";
-        const calls = (callLogs.get(page) ?? []).map((l) => `  ${l}`).join("\n");
+        const calls = (callLogs.get(page) ?? []).map((l) => `  ${l}`).join(
+          "\n",
+        );
         return `${state}\ncall log:\n${calls || "  (nothing)"}\n${connections}`;
       }),
     );
@@ -253,7 +282,8 @@ async function withConnectionReport(
       new Promise<void>((_done, fail) => {
         if (within !== undefined) {
           timer = setTimeout(
-            () => fail(new Error(`this step did not finish in ${within / 1000} s`)),
+            () =>
+              fail(new Error(`this step did not finish in ${within / 1000} s`)),
             within,
           );
         }
@@ -263,7 +293,8 @@ async function withConnectionReport(
     await report();
     // The one expected failure: see `KNOWN_WEBKIT_FREEZE`.
     test.skip(
-      knownFreeze !== undefined && frozen && test.info().project.name === "flows-webkit",
+      knownFreeze !== undefined && frozen &&
+        test.info().project.name === "flows-webkit",
       knownFreeze,
     );
     throw error;
@@ -283,7 +314,9 @@ function shownCode(page: Page): Promise<string> {
     svg.setAttribute("height", "400");
     svg.querySelector("rect")!.setAttribute("fill", "#ffffff");
     svg.querySelector("path")!.setAttribute("fill", "#000000");
-    return `data:image/svg+xml;base64,${btoa(new XMLSerializer().serializeToString(svg))}`;
+    return `data:image/svg+xml;base64,${
+      btoa(new XMLSerializer().serializeToString(svg))
+    }`;
   });
 }
 
@@ -419,7 +452,8 @@ async function pairByPaste(
   await nameContact(presenter, names.scanner);
 }
 
-const lineOf = (page: Page) => page.getByTestId("conversation").getByTestId("line");
+const lineOf = (page: Page) =>
+  page.getByTestId("conversation").getByTestId("line");
 
 async function openLine(...pages: Page[]): Promise<void> {
   for (const page of pages) {
@@ -582,7 +616,8 @@ test("a code works only while its screen is open; someone who used it is asked f
   await expect(ana.page.getByTestId("name-prompt")).toHaveCount(0);
   // The confirmation stays clear of the composer.
   const toast = (await ana.page.getByTestId("toast").boundingBox())!;
-  const composer = (await ana.page.getByTestId("composer-input").boundingBox())!;
+  const composer =
+    (await ana.page.getByTestId("composer-input").boundingBox())!;
   expect(toast.y + toast.height).toBeLessThan(composer.y);
 
   await openLine(ana.page, ben.page);
@@ -849,9 +884,9 @@ test("a video call: ring, accept, controls, end; and a declined call", async ({ 
   // teardown is reported as such, with the engine's last line.
   const captures = (page: Page) =>
     page.evaluate(() =>
-      (window as unknown as { __captures: MediaStream[] }).__captures.flatMap((stream) =>
-        stream.getTracks().map((track) => track.readyState)
-      )
+      (window as unknown as { __captures: MediaStream[] }).__captures.flatMap((
+        stream,
+      ) => stream.getTracks().map((track) => track.readyState))
     );
   type Kept = { pc: RTCPeerConnection };
   // The call's connection is the one that carries media.
@@ -864,7 +899,9 @@ test("a video call: ring, accept, controls, end; and a declined call", async ({ 
   const signaling = (page: Page, which: number[]) =>
     page.evaluate(
       (which) =>
-        which.map((i) => (window as unknown as { __pcs: Kept[] }).__pcs[i].pc.signalingState),
+        which.map((i) =>
+          (window as unknown as { __pcs: Kept[] }).__pcs[i].pc.signalingState
+        ),
       which,
     );
   await withConnectionReport({ ana: ana.page, ben: ben.page }, async () => {
@@ -878,7 +915,9 @@ test("a video call: ring, accept, controls, end; and a declined call", async ({ 
     // same time. Ben closes his; Ana's goes away by itself.
     await Promise.all([
       (async () => {
-        await expect(ana.page.getByTestId("call-status")).toHaveText("Call ended");
+        await expect(ana.page.getByTestId("call-status")).toHaveText(
+          "Call ended",
+        );
         await expect(ana.page.getByTestId("call-remote")).toHaveCount(0);
       })(),
       (async () => {
@@ -896,7 +935,9 @@ test("a video call: ring, accept, controls, end; and a declined call", async ({ 
     for (const page of [ana.page, ben.page]) {
       // The capture is stopped and the call's connection closed.
       await expect.poll(() => captures(page)).toEqual(["ended", "ended"]);
-      await expect.poll(() => signaling(page, connections.get(page)!)).toEqual(["closed"]);
+      await expect.poll(() => signaling(page, connections.get(page)!)).toEqual([
+        "closed",
+      ]);
     }
   }, 60_000);
 
@@ -933,7 +974,8 @@ const fileBubble = (page: Page, name: string) =>
  */
 async function saveByDownload(context: BrowserContext): Promise<void> {
   await context.addInitScript(() => {
-    delete (window as unknown as { showSaveFilePicker?: unknown }).showSaveFilePicker;
+    delete (window as unknown as { showSaveFilePicker?: unknown })
+      .showSaveFilePicker;
   });
 }
 
@@ -984,7 +1026,10 @@ test("a file: offered, accepted, progress in words, verified and saved; one decl
     ana.page.waitForEvent("download"),
     got.getByTestId("transfer-save").click(),
   ]);
-  expect(download.suggestedFilename()).toBe("field notes.pdf");
+  // (WebKit on Linux writes the space in a download's name as an underscore.)
+  expect(download.suggestedFilename().replace("_", " ")).toBe(
+    "field notes.pdf",
+  );
   const saved = await readFile(await download.path());
   expect(saved.length).toBe(data.length);
   expect(createHash("sha256").update(saved).digest("hex")).toBe(sha256);
@@ -1058,13 +1103,21 @@ test("a file offered while they are away waits on this device and goes when they
   const again = await ana.context.newPage();
   const problems = await watch(again, live);
   await again.goto(live.url);
-  await expect(waiting).toHaveAttribute("data-pending", "false", { timeout: 90_000 });
-  await again.getByTestId("conversation-list").getByRole("link", { name: /Ben/ }).click();
+  await expect(waiting).toHaveAttribute("data-pending", "false", {
+    timeout: 90_000,
+  });
+  await again.getByTestId("conversation-list").getByRole("link", {
+    name: /Ben/,
+  }).click();
   const got = fileBubble(again, "for later.bin");
   await expect(got).toHaveAttribute("data-state", "offered", CONNECT);
   await got.getByTestId("transfer-accept").click();
-  await expect(got).toHaveAttribute("data-state", "complete", { timeout: 60_000 });
-  await expect(waiting).toHaveAttribute("data-state", "complete", { timeout: 60_000 });
+  await expect(got).toHaveAttribute("data-state", "complete", {
+    timeout: 60_000,
+  });
+  await expect(waiting).toHaveAttribute("data-state", "complete", {
+    timeout: 60_000,
+  });
 
   await expectClean(problems);
   await expectClean(ben.problems);
