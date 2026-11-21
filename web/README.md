@@ -102,6 +102,9 @@ and `wasm-pack`. Run from `web/`.
   docker run --rm --ipc=host -v "$PWD":/work -w /work/tests/e2e \
     mcr.microsoft.com/playwright:v1.65.1-noble npx playwright test --project=webkit
   ```
+  - `repro/`: a page with no app code that shows WebKit on Linux freezing when a track ends under a
+    playing `<video>`, and the order of teardown that avoids it (`repro/README.md`). Not part of any
+    test run.
 - The seven desktop ↔ browser interop cases run against this app with
   `INTEROP_APP=web node apps/desktop/interop/pwa-interop.mjs` (from the repository root, after
   `denext task build:test`).

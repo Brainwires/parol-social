@@ -136,6 +136,9 @@ instead of "could not connect".
   exactly as in `types.ts`. `Direct` means open **and** verified.
 - `CallEnd` is `{ kind: "HungUp" | "RemoteHungUp" | "Declined" | "Rejected" | "NoAnswer" } |
   { kind: "Failed", reason }` (the native names; "the contact declined" is `Rejected`).
+- On `Call` with `Ended`, and on `CallMedia` for a stream `callMedia()` no longer returns, the
+  store detaches every media element playing the call's streams before the listener returns:
+  the engine releases the media right after ("The end of a call").
 - `Contact` has `verified: "in-person" | "compared" | "no"`, `identityKey`, `addedMs`. Path, queued
   count, unread count and last activity are on `ContactView`, not on the contact.
 - `ChatMessage.text` is a string (text only in this phase); `id` is a number, increasing.
@@ -237,9 +240,25 @@ sessions, which drops the pending bootstrap, so a code being shown is closed (`P
 `null`); the engine tests cover both. The contact is not told.
 
 **Switching cameras.** `replaceCamera` swaps the video sender's track (`replaceTrack`, no
-renegotiation), stops the old video track, and keeps the microphone. The engine owns the new
-stream from then on and stops it when the call ends; a refused switch stops the offered
+renegotiation) and keeps the microphone. `CallMedia` announces the new capture first; the old
+video track is stopped in a later task (as at the end of a call, below). The engine owns the
+new stream from then on and stops it when the call ends; a refused switch stops the offered
 stream.
+
+**The end of a call.** In this order: the call is forgotten, its timers cancelled and the
+connection's handlers removed; `Call` with `Ended` is emitted; then, in tasks of their own on
+the platform's clock (`setTimeout(…, 0)`, one after the other, also after `shutdown`), the
+capture's tracks are stopped and the connection is closed. Each step is guarded and nothing
+awaits it, so a step that throws, or a browser call that never returns, keeps neither the
+ended state nor the next call waiting; a call started in between is not touched. A line is
+logged before each browser call (`[Call] <id> releasing the capture`, `closing the media
+connection`, `released`), so a page that freezes there names the call in its last line.
+The order is not a matter of taste: in WebKit on Linux (GStreamer) a track that ends while a
+media element still plays its stream can block the main thread for good inside
+`RTCPeerConnection.close()` or `MediaStreamTrack.stop()` ("Defects found" below,
+`web/tests/e2e/repro`). **A listener of `Ended` must stop playing the call's streams before
+it returns** (`srcObject = null` on every element); the same holds for a stream that
+`CallMedia` no longer lists.
 
 **Calls.** Per-call `RTCPeerConnection`; `offer` / `answer` carry the SDP with its candidates;
 incoming `ice` is accepted, also before the user accepts; every signal is matched by `callId` and
@@ -250,7 +269,7 @@ rule, applied by the engine): Linux WebKit (GStreamer) leaves the offerer's `con
 at "connecting" after the answer bundles the media lines and the extra transport closes.
 `bundlePolicy: "max-bundle"` would avoid the extra transport, but Firefox then offers
 bundle-only lines, which the desktop engine rejects. Capture goes through the injected `MediaDevices` when the call starts or is
-accepted; the engine stops the tracks it obtained when the call ends.
+accepted; the engine stops the tracks it obtained when the call ends ("The end of a call").
 
 **Timers and limits.** As the native core: answer 20 s, connect 45 s, offer fallback 10 s + up to
 2 s, disconnect grace 5 s, binding 20 s, retry 5 s doubling to 5 min (8 attempts), probes 15 s
@@ -330,6 +349,29 @@ nor B can decrypt the other's next message. `web/tests/engine/engine_chat_test.t
 pairing a new contact, or an undecryptable envelope, leaves other sessions intact", fails
 without the engine's rollback. The fix belongs in `parolnet-crypto`: decrypt on a copy of the
 session and commit on success.
+
+**WebKit on Linux: a track that ends while an element plays it can freeze the page.** In
+the GStreamer ports (WPE, WebKitGTK; seen in the WPE build of Playwright 1.65.1),
+`RTCPeerConnection.close()` and `MediaStreamTrack.stop()` sometimes never return when a
+`<video>` is still playing the stream whose track they end: the main thread posts a message
+on the element's playback pipeline, the playback bin deactivates a pad synchronously, and
+that waits for the stream lock of a streaming thread that is itself waiting in a sink. The
+page is dead from then on. `web/tests/e2e/repro` reproduces it with no app code (11 of 30
+pages, three calls each, on a busy machine) and shows that it does not happen when the
+elements are detached first (0 of 30). It was the cause of the WebKit call flow failing in CI
+at hang-up: with the engine closing the connection before the screen had let go of the
+streams, the flow froze in 6 of 36 runs under load; the page's last line was the one before
+`pc.close()`. The engine now publishes the end first and releases afterwards ("The end of a
+call"): in the 156 runs of the same flow on the final code no page froze at hang-up (153
+passed; the other 3 are the next paragraph). Not reported upstream yet.
+
+**WebKit on Linux: detaching a stream right after its camera track was switched off can
+freeze the page too.** No track ends here. The main thread is inside a state change of the
+element's pipeline, waiting on a condition inside WebKit, while a streaming thread of the
+capture is in an object's destruction, also waiting inside WebKit (`web/tests/e2e/repro`,
+`camera-off`). The engine has no part in it: it is what the call screen does at "Turn camera
+off", and it is not fixed (app.md, "Browsers" and "Owed"). In those 156 runs it froze the
+page of the person who pressed the button 3 times.
 
 ## Running the tests
 
