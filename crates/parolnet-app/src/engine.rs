@@ -113,38 +113,16 @@ impl From<RtcError> for StartFailure {
 
 #[derive(Debug)]
 pub(crate) enum Timer {
-    AnswerTimeout {
-        peer: String,
-        epoch: u64,
-    },
-    ConnectTimeout {
-        peer: String,
-        epoch: u64,
-    },
-    DisconnectGrace {
-        peer: String,
-        epoch: u64,
-    },
-    BindingTimeout {
-        peer: String,
-        epoch: u64,
-    },
-    CallRing {
-        call_id: String,
-    },
-    CallConnect {
-        call_id: String,
-    },
-    OfferFallback {
-        peer: String,
-    },
-    OfferSlot {
-        peer: String,
-    },
-    Retry {
-        peer: String,
-    },
-    /// A soft-offline contact is due for a probe (see `reconnect`).
+    AnswerTimeout { peer: String, epoch: u64 },
+    ConnectTimeout { peer: String, epoch: u64 },
+    DisconnectGrace { peer: String, epoch: u64 },
+    BindingTimeout { peer: String, epoch: u64 },
+    CallRing { call_id: String },
+    CallConnect { call_id: String },
+    OfferFallback { peer: String },
+    OfferSlot { peer: String },
+    Retry { peer: String },
+    // A soft-offline contact is due for a probe (see `reconnect`).
     Probe,
 }
 
