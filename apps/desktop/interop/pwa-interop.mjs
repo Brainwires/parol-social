@@ -77,6 +77,11 @@
 //      getUserMedia stream): the same renomination as case 6 on a chat connection. The PWA
 //      pastes the desktop's code and must be the offerer; bindings verified, messages both
 //      ways, and again after the connection has settled.
+//   8. (web app only) Files, PNP-010: the desktop offers a file, the web app accepts it in the
+//      conversation and stores it; the web app then offers one (picked in the composer) and
+//      the desktop accepts it. Each is INTEROP_FILE_MIB MiB (default 8; the M1 bar is 100) and
+//      is compared by SHA-256 on the receiving side. The old PWA has no PNP-010: its target
+//      skips the case. INTEROP_FILES=0 skips it; INTEROP_ONLY=files runs it alone.
 //
 // Every PWA connection records its selected ICE candidate pair changes (`window.__pcs[i]
 // .__pairChanges`); a failure report prints them with the page console and the bot's stderr.
@@ -90,7 +95,8 @@ import { chromium, firefox, webkit } from "playwright";
 import { spawn } from "node:child_process";
 import { createServer, request as httpRequest } from "node:http";
 import { connect as netConnect, createServer as netCreateServer } from "node:net";
-import { createReadStream, existsSync, mkdtempSync, rmSync, statSync } from "node:fs";
+import { createHash, randomFillSync } from "node:crypto";
+import { closeSync, createReadStream, existsSync, mkdtempSync, openSync, rmSync, statSync, writeSync } from "node:fs";
 import { networkInterfaces, tmpdir } from "node:os";
 import { dirname, extname, join, normalize, resolve, sep } from "node:path";
 import { createInterface } from "node:readline";
@@ -297,7 +303,7 @@ async function startPwaServer(relayPort) {
 // ── Desktop bot ──────────────────────────────────────────────
 
 class Bot {
-  constructor(name, relayPort, bindIp) {
+  constructor(name, relayPort, bindIp, extraArgs = []) {
     this.name = name;
     this.events = [];
     this.stderr = [];
@@ -305,7 +311,7 @@ class Bot {
     const dir = join(work, `bot-${name}`);
     this.child = spawn(
       botBin,
-      ["--relay", `ws://127.0.0.1:${relayPort}/ws`, "--data-dir", dir, "--host-only", "--bind", bindIp],
+      ["--relay", `ws://127.0.0.1:${relayPort}/ws`, "--data-dir", dir, "--host-only", "--bind", bindIp, ...extraArgs],
       {
         env: { ...process.env, RUST_LOG: process.env.RUST_LOG || "warn,parolnet_rtc=info,parolnet_app=info" },
         stdio: ["pipe", "pipe", "pipe"],
@@ -818,6 +824,23 @@ class Web extends Client {
     await this.page.click('[data-testid="call-hangup"]');
   }
 
+  /// The file bubble of a transfer in the open conversation.
+  bubble(id) {
+    return this.page.locator(`[data-testid="transfer-bubble"][data-transfer-id="${id}"]`);
+  }
+
+  /// Accept an offered file in the conversation with `peer`.
+  async acceptFile(peer, id) {
+    await this.goTo(`#/c/${peer}`);
+    await this.bubble(id).locator('[data-testid="transfer-accept"]').click();
+  }
+
+  /// Pick a file in the conversation's composer (the attach control's file input).
+  async sendFile(peer, path) {
+    await this.goTo(`#/c/${peer}`);
+    await this.page.setInputFiles('[data-testid="composer-file"]', path);
+  }
+
   async learnedIceServers() {
     const servers = await this.hook("iceServers").catch(() => []);
     if (servers.length > 0) return JSON.stringify(servers);
@@ -1086,6 +1109,102 @@ async function casePwaOffersWithMedia(ctx) {
 
 // ── Main ─────────────────────────────────────────────────────
 
+/// A file of `size` random bytes; returns its SHA-256 (hex).
+function writeRandomFile(path, size) {
+  const fd = openSync(path, "w");
+  const hash = createHash("sha256");
+  const block = Buffer.alloc(1 << 20);
+  for (let left = size; left > 0; ) {
+    const n = Math.min(left, block.length);
+    randomFillSync(block, 0, n);
+    writeSync(fd, block, 0, n);
+    hash.update(block.subarray(0, n));
+    left -= n;
+  }
+  closeSync(fd);
+  return hash.digest("hex");
+}
+
+async function caseFiles(ctx) {
+  const tag = "case 8 (files, PNP-010)";
+  const mib = Number(process.env.INTEROP_FILE_MIB || 8);
+  const size = mib * 1024 * 1024 + 12_345;
+  const patience = 120_000 + mib * 3_000;
+  const profile = mkdtempSync(join(work, `${browserName}-8-`));
+  const browser = await launchBrowser(profile);
+  cleanups.push(() => browser.close().catch(() => {}));
+  const downloads = join(work, "bot-files-downloads");
+  const bot = new Bot("files", ctx.relayPort, ctx.bindIp, ["--downloads", downloads]);
+  const ready = await bot.wait("ready", (e) => e.event === "ready");
+  bot.peerId = ready.peer_id;
+  await bot.wait("registered", (e) => e.event === "relay" && e.state.includes("Registered"));
+  const pwa = await App.open(browser, ctx.site, "files");
+  const mark = bot.events.length;
+  bot.send("code");
+  const { code } = await bot.wait("code", (e) => e.event === "code", 10_000, mark);
+  await pwa.pasteCode(code);
+  await bot.wait("direct path", (e) => e.event === "path" && e.peer_id === pwa.peerId && e.state === "Direct", 45_000);
+  await bothVerified(bot, pwa, tag);
+
+  // Desktop -> web app.
+  const fromDesktop = join(work, "from the desktop.bin");
+  const sha1 = writeRandomFile(fromDesktop, size);
+  bot.send(`sendfile ${pwa.peerId} ${fromDesktop}`);
+  const offered = await bot.wait("its offer delivered", (e) => e.event === "transfer" && e.direction === "Sent" && e.state === "Offered" && !e.pending);
+  await until(`${tag}: the web app shows the desktop's offer`, 30_000, async () =>
+    (await pwa.hook("transfers", bot.peerId)).some((t) => t.id === offered.id && t.state === "offered" && t.direction === "received"),
+  );
+  let t0 = Date.now();
+  await pwa.acceptFile(bot.peerId, offered.id);
+  await bot.wait("complete (the web app's word)", (e) => e.event === "transfer" && e.id === offered.id && e.state === "Complete", patience);
+  const down = (mib * 1000) / (Date.now() - t0);
+  await until(`${tag}: the web app has the whole file`, 30_000, async () =>
+    (await pwa.hook("transfers", bot.peerId)).some((t) => t.id === offered.id && t.state === "complete" && t.available && t.bytesDone === size),
+  );
+  const stored = await pwa.hook("transferDigest", offered.id);
+  if (!stored || stored.size !== size || stored.sha256 !== sha1) {
+    throw new Error(`${tag}: the file in the web app is not the file the desktop sent (${JSON.stringify(stored)} vs ${size} ${sha1})`);
+  }
+  const shown = await pwa.bubble(offered.id).getAttribute("data-state");
+  if (shown !== "complete") throw new Error(`${tag}: the web app's bubble says ${shown}, not complete`);
+  if (!(await pwa.bubble(offered.id).locator('[data-testid="transfer-save"]').isVisible())) {
+    throw new Error(`${tag}: the received file offers no way to save it`);
+  }
+  const persistent = await pwa.hook("filesPersist");
+  log(`${tag}: desktop -> web app, ${mib} MiB verified by SHA-256, ${down.toFixed(1)} MiB/s, stored in ${persistent ? "OPFS" : "memory"}`);
+
+  // Web app -> desktop.
+  const fromWeb = join(work, "from the web app.bin");
+  const sha2 = writeRandomFile(fromWeb, size);
+  const offerMark = bot.events.length;
+  await pwa.sendFile(bot.peerId, fromWeb);
+  const incoming = await bot.wait(
+    "the web app's offer",
+    (e) => e.event === "transfer" && e.direction === "Received" && e.state === "Offered",
+    patience,
+    offerMark,
+  );
+  if (incoming.size !== size || incoming.name !== "from the web app.bin") {
+    throw new Error(`${tag}: the desktop was offered ${incoming.name} (${incoming.size} bytes)`);
+  }
+  t0 = Date.now();
+  bot.send(`acceptfile ${incoming.id}`);
+  const done = await bot.wait("the file from the web app", (e) => e.event === "transfer" && e.id === incoming.id && e.state === "Complete", patience);
+  const up = (mib * 1000) / (Date.now() - t0);
+  if (done.sha256 !== sha2) throw new Error(`${tag}: the desktop received ${done.sha256}, the web app sent ${sha2}`);
+  if (!done.path?.startsWith(downloads) || statSync(done.path).size !== size) {
+    throw new Error(`${tag}: the desktop's file is at ${done.path}`);
+  }
+  await until(`${tag}: the web app learns that the desktop has the file`, 30_000, async () =>
+    (await pwa.hook("transfers", bot.peerId)).some((t) => t.id === incoming.id && t.state === "complete" && t.direction === "sent"),
+  );
+  log(`${tag}: web app -> desktop, ${mib} MiB verified by SHA-256, ${up.toFixed(1)} MiB/s`);
+  await bot.quit();
+  await closing(pwa, tag);
+  await browser.close();
+  return bot;
+}
+
 async function main() {
   if (!existsSync(botBin)) throw new Error(`bot binary not found: ${botBin} (cargo build -p parolnet-app --example bot)`);
   const bindIp = mode === "loopback" ? "127.0.0.1" : lanIPv4();
@@ -1095,11 +1214,16 @@ async function main() {
   const ctx = { relayPort, site, bindIp };
 
   const bots = [];
-  bots.push(await caseDesktopEntersPwaCode(ctx));
-  bots.push(await casePwaPastesDesktopCode(ctx));
-  bots.push(await caseTamperedBindingIsRefused(ctx));
-  if (process.env.INTEROP_CALLS !== "0") bots.push(await caseCalls(ctx));
-  bots.push(await casePwaOffersWithMedia(ctx));
+  const filesOnly = process.env.INTEROP_ONLY === "files";
+  if (filesOnly && target !== "web") throw new Error("INTEROP_ONLY=files needs INTEROP_APP=web");
+  if (!filesOnly) {
+    bots.push(await caseDesktopEntersPwaCode(ctx));
+    bots.push(await casePwaPastesDesktopCode(ctx));
+    bots.push(await caseTamperedBindingIsRefused(ctx));
+    if (process.env.INTEROP_CALLS !== "0") bots.push(await caseCalls(ctx));
+    bots.push(await casePwaOffersWithMedia(ctx));
+  }
+  if (target === "web" && process.env.INTEROP_FILES !== "0") bots.push(await caseFiles(ctx));
 
   // Host candidates only: no page may have learned a STUN / TURN server (that would mean a
   // request left the machine).
@@ -1112,7 +1236,10 @@ async function main() {
     if (!resolved) throw new Error(`mDNS mode: the desktop never received an mDNS answer for ${Browser}'s .local candidates`);
     log(`mDNS: the desktop resolved ${Browser}'s .local candidates`);
   }
-  const cases = 5 + (process.env.INTEROP_CALLS === "0" ? 0 : process.env.INTEROP_PWA_CALLS === "0" ? 1 : 2);
+  const cases = filesOnly
+    ? 1
+    : 5 + (process.env.INTEROP_CALLS === "0" ? 0 : process.env.INTEROP_PWA_CALLS === "0" ? 1 : 2) +
+      (target === "web" && process.env.INTEROP_FILES !== "0" ? 1 : 0);
   log(`PASS: desktop <-> ${target === "web" ? "web app" : "PWA"} interop, ${Browser}, ${mode} candidates (${cases} cases)`);
 }
 

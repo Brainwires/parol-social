@@ -300,7 +300,8 @@ per contact, 2000 in total.
 | No re-probing after `peer_offline` | The native schedule | PNP-001-SHOULD-019, `reconnect.rs` |
 | Calls trickle; `ice` before accept dropped; `reject` only a toast; `callId` ignored | Non-trickle; `ice` buffered; teardown on both sides; `callId` and peer checked; busy → `reject` | inventory §12.1 #4-6, `engine.rs:2302-2370` |
 | `navigator.storage.persist()` at boot | Never called by the engine (`requestPersistentStorage()` for the UI): Firefox answers with a prompt | found in the Firefox run |
-| Decoy, duress, cover traffic, tokens, onion, telemetry, relay `message`, groups, files, identity rotation | Not ported | inventory DROP / DEFER |
+| Decoy, duress, cover traffic, tokens, onion, telemetry, relay `message`, groups, identity rotation | Not ported | inventory DROP / DEFER |
+| Files as PNP-007 §7 envelopes of 4096-byte chunks (never interoperable) | PNP-010: see "File transfer" below | `specs/PNP-010-file-transfer.md` |
 
 One deviation from the **native core**: the web client keeps the spec's keepalive (20 s / 40 s);
 the desktop pings every 25 s and has no silence timeout (inventory §12.1 #10).
@@ -396,9 +397,50 @@ scenarios of `e2e/run.mjs` are covered there through the app instead: `web/tests
 (web ↔ web) and `apps/desktop/interop/pwa-interop.mjs` with `INTEROP_APP=web` (web ↔ desktop),
 both in job `pwa-interop`.
 
+## File transfer (PNP-010)
+
+`transfers.ts` and `files.ts`, with `crates/parolnet-app/src/engine/transfers.rs` and
+`transfer.rs` as the reference; everything that decides what is valid or touches a key is in the
+wasm core (`crates/parolnet-wasm/src/transfer.rs` over `crates/parolnet-transfer`).
+
+- **API**: `offerFile(peerId, file)` (a browser `File`; it is read once for its SHA-256 before
+  the offer exists, outside the mailbox), `acceptTransfer`, `declineTransfer`, `cancelTransfer`,
+  `transfers(peerId?)`, `transferFile(id)` (a received, complete file as a `Blob` over what is
+  stored), `removeTransfer(id)`, `receivedFilesPersist()`. Events: `Transfer` (every change, and
+  progress at most five times a second) and `TransferRemoved`; notice code `Transfer` when
+  something that arrived did not verify.
+- **Control messages** are `FILE_TRANSFER` (0x15) envelopes on the verified channel. One that
+  cannot go yet stays in the transfer's row as `pending` and is sealed and sent when the
+  channel verifies (`TransferInfo.pending` is what a UI shows as "waiting on this device").
+- **The record stream**: the receiver opens `pn-file/<id>` on the contact's connection after
+  its accept has left, at most four at once. The engine now handles `ondatachannel` on both
+  sides of a connection: the `parolnet` channel as before, a `pn-file/` channel the wasm core
+  admits (an accepted transfer this device sends, a verified connection), anything else is
+  closed. A channel's handlers are attached in the task that announces it (`adopt`), because
+  the receiver's RESUME can arrive before the mailbox has looked at the channel.
+- **Sending**: the picked `File` is read 1 MiB at a time, each record is sealed in wasm and
+  sent; the loop pauses above 4 MiB of `bufferedAmount` and continues at 1 MiB
+  (`bufferedamountlow`, with a look at the amount every 50 ms in case the event is missed).
+- **Receiving**: plaintext is written to a `FileStore` as segments of 256 records (16 MiB), each
+  written once; a segment's records count as stored when it is closed, and the count is saved
+  then. The finished file is a `Blob` over the segments. `OpfsFileStore` (the origin private
+  file system, when the browser lets a page use `createWritable`) keeps segments across a
+  reload: the engine reads them back into the hash and asks for the next record.
+  `MemoryFileStore` (Blobs) is the fallback: a reload starts that file over.
+- **A reload of the sending page** loses the `File`, so its unfinished outgoing transfers are
+  cancelled with reason `Unavailable` at the next start (PNP-010-MAY-001) and the contact is
+  told when it is next reachable.
+- **Storage**: one row per transfer in the `settings` store under `transfer:<id>` (no schema
+  change): the offer with the file key until the transfer is over, the phase, the segment
+  list, the pending control message. Received files are plaintext in OPFS until the transfer
+  is removed, its contact is removed, or "delete all data".
+- **Not solved**: a page cannot slow a sender down. `RTCDataChannel` has no receive-side
+  backpressure, so when the sender is faster than this device's storage the unprocessed
+  records wait in the page's memory. The protocol has no credit scheme for that yet.
+
 ## Not done in this phase
 
 - No history trimming (the native core keeps 5000 messages per contact).
 - No encryption at rest, no export / import (the inventory's open questions). Notifications
   are the app's (a tab in the background; no push).
-- Groups, files, identity rotation: deferred, as in the inventory.
+- Groups, group files, identity rotation: deferred, as in the inventory.
