@@ -29,23 +29,86 @@ fn group_id_is_sha256_of_creator_peer_and_nonce() {
 
 // -- §6 Admin operation signature / version ordering --------------------------
 
+/// An identity: the Ed25519 key and the PeerId it hashes to.
+fn identity(seed: u8) -> (ed25519_dalek::SigningKey, [u8; 32], PeerId) {
+    let key = ed25519_dalek::SigningKey::from_bytes(&[seed; 32]);
+    let public = key.verifying_key().to_bytes();
+    (key, public, PeerId::from_public_key(&public))
+}
+
+/// Two managers holding the same group: the admin's, and a member's that
+/// receives the admin's operations. Returns them with the group id.
+fn admin_and_member_views(admin: PeerId, member: PeerId) -> (GroupManager, GroupManager, GroupId) {
+    use parolnet_protocol::group::{GroupMember, GroupMetadataPayload, GroupRole};
+    let admin_mgr = GroupManager::new();
+    let (gid, _) = admin_mgr.create_group("g".into(), admin, 1000).unwrap();
+    admin_mgr.add_member(&gid, &admin, member, 1001).unwrap();
+    let member_mgr = GroupManager::new();
+    let metadata = GroupMetadataPayload {
+        group_id: gid,
+        version: 2,
+        name: "g".into(),
+        members: vec![
+            GroupMember {
+                peer_id: admin,
+                role: GroupRole::Admin,
+                joined_at: 1000,
+            },
+            GroupMember {
+                peer_id: member,
+                role: GroupRole::Member,
+                joined_at: 1001,
+            },
+        ],
+        created_by: admin,
+        created_at: 1000,
+        max_members: MAX_GROUP_MEMBERS,
+    };
+    member_mgr.join_group(gid, metadata, member).unwrap();
+    (admin_mgr, member_mgr, gid)
+}
+
 #[clause("PNP-009-MUST-024")]
 #[test]
 fn group_operation_version_must_be_monotonically_increasing() {
     // §6.4 + MUST-024: recipients MUST reject ops with version ≤ highest seen.
-    let mut highest_seen: u64 = 0;
-    let accept_ok = |v: u64, hi: &mut u64| -> bool {
-        if v <= *hi {
-            return false;
-        }
-        *hi = v;
-        true
-    };
-    assert!(accept_ok(1, &mut highest_seen));
-    assert!(accept_ok(2, &mut highest_seen));
-    assert!(!accept_ok(2, &mut highest_seen)); // equal rejected
-    assert!(!accept_ok(1, &mut highest_seen)); // lower rejected
-    assert!(accept_ok(3, &mut highest_seen));
+    let (admin_key, admin_pub, admin) = identity(1);
+    let (_, _, member) = identity(2);
+    let (_, _, carol) = identity(3);
+    let (_, _, dave) = identity(4);
+    let (admin_mgr, member_mgr, gid) = admin_and_member_views(admin, member);
+
+    let mut add_carol = admin_mgr.add_member(&gid, &admin, carol, 1002).unwrap();
+    add_carol.sign(&admin_key);
+    assert_eq!(add_carol.version, 3);
+    member_mgr
+        .apply_operation(&add_carol, &admin_pub, 1002)
+        .unwrap();
+
+    // Replayed (equal version), and an older version signed just as validly.
+    assert!(
+        member_mgr
+            .apply_operation(&add_carol, &admin_pub, 1003)
+            .is_err()
+    );
+    let mut stale = add_carol.clone();
+    stale.version = 2;
+    stale.op = parolnet_protocol::group::GroupOpType::AddMember { peer_id: dave };
+    stale.sign(&admin_key);
+    assert!(
+        member_mgr
+            .apply_operation(&stale, &admin_pub, 1003)
+            .is_err()
+    );
+    assert_eq!(member_mgr.get_members(&gid).unwrap().len(), 3);
+
+    // The next version is accepted.
+    let mut add_dave = admin_mgr.add_member(&gid, &admin, dave, 1004).unwrap();
+    add_dave.sign(&admin_key);
+    member_mgr
+        .apply_operation(&add_dave, &admin_pub, 1004)
+        .unwrap();
+    assert_eq!(member_mgr.get_members(&gid).unwrap().len(), 4);
 }
 
 // -- §6.1 Admin invariant -----------------------------------------------------
@@ -433,42 +496,215 @@ fn sender_key_distribution_rides_pairwise_ratchet() {
 
 // -- §6.3 GroupOperation signature + admin verification -----------------------
 
+#[clause("PNP-009-MUST-020")]
+#[test]
+fn group_operation_signature_covers_the_spec_map_with_empty_signature() {
+    use ed25519_dalek::Verifier;
+    use parolnet_protocol::group::{GroupOpType, GroupOperation};
+    let (admin_key, admin_pub, admin) = identity(1);
+    let mut op = GroupOperation {
+        group_id: GroupId([0x11; 32]),
+        version: 7,
+        op: GroupOpType::RemoveMember {
+            peer_id: PeerId([0x22; 32]),
+        },
+        admin_peer_id: admin,
+        signature: Vec::new(),
+        timestamp: 1_700_000_000,
+    };
+
+    // MUST-020: the signed bytes are the CBOR of the §6.2 map with `signature` h''.
+    let mut expected = vec![0xA6];
+    expected.extend_from_slice(b"\x68group_id\x58\x20");
+    expected.extend_from_slice(&[0x11; 32]);
+    expected.extend_from_slice(b"\x67version\x07");
+    expected.extend_from_slice(b"\x67op_type\x6dremove_member");
+    expected.extend_from_slice(b"\x67payload\xa1\x67peer_id\x58\x20");
+    expected.extend_from_slice(&[0x22; 32]);
+    expected.extend_from_slice(b"\x68admin_id\x58\x20");
+    expected.extend_from_slice(&admin.0);
+    expected.extend_from_slice(b"\x69signature\x40");
+    assert_eq!(op.signable_bytes(), expected);
+
+    op.sign(&admin_key);
+    assert_eq!(op.signature.len(), 64);
+    // Signing does not change what is signed, and the signature is over those bytes.
+    assert_eq!(op.signable_bytes(), expected);
+    let sig = ed25519_dalek::Signature::from_slice(&op.signature).unwrap();
+    assert!(admin_key.verifying_key().verify(&expected, &sig).is_ok());
+    assert!(op.verify_signature(&admin_pub).is_ok());
+
+    // Every signed field is covered.
+    let mutations: Vec<Box<dyn Fn(&mut GroupOperation)>> = vec![
+        Box::new(|o| o.group_id.0[0] ^= 1),
+        Box::new(|o| o.version += 1),
+        Box::new(|o| {
+            o.op = GroupOpType::PromoteAdmin {
+                peer_id: PeerId([0x22; 32]),
+            }
+        }),
+        Box::new(|o| {
+            o.op = GroupOpType::RemoveMember {
+                peer_id: PeerId([0x23; 32]),
+            }
+        }),
+        Box::new(|o| o.signature[0] ^= 1),
+    ];
+    for mutate in mutations {
+        let mut tampered = op.clone();
+        mutate(&mut tampered);
+        assert!(tampered.verify_signature(&admin_pub).is_err());
+    }
+}
+
 #[clause(
-    "PNP-009-MUST-020",
     "PNP-009-MUST-021",
     "PNP-009-MUST-022",
     "PNP-009-MUST-023",
     "PNP-009-MUST-071"
 )]
 #[test]
-fn group_operation_signed_and_admin_verified() {
-    use parolnet_protocol::group::{GroupOpType, GroupOperation};
-    // GroupOperation carries a 64-byte Ed25519 signature field.
-    let op = GroupOperation {
-        group_id: GroupId([0u8; 32]),
-        version: 1,
-        op: GroupOpType::AddMember {
-            peer_id: PeerId([1u8; 32]),
-        },
-        admin_peer_id: PeerId([2u8; 32]),
-        signature: vec![0u8; 64],
-        timestamp: 1_700_000_000,
+fn group_operation_applied_only_when_signed_by_a_current_admin() {
+    use parolnet_protocol::group::GroupOpType;
+    let (admin_key, admin_pub, admin) = identity(1);
+    let (member_key, member_pub, member) = identity(2);
+    let (mallory_key, mallory_pub, mallory) = identity(9);
+    let (_, _, carol) = identity(3);
+    let (admin_mgr, member_mgr, gid) = admin_and_member_views(admin, member);
+
+    let unsigned = admin_mgr.add_member(&gid, &admin, carol, 1002).unwrap();
+    let refused = |op: &parolnet_protocol::group::GroupOperation, key: &[u8; 32]| {
+        assert!(member_mgr.apply_operation(op, key, 1002).is_err());
+        assert_eq!(
+            member_mgr.get_members(&gid).unwrap().len(),
+            2,
+            "a refused operation must change nothing (MUST-023)"
+        );
     };
-    assert_eq!(
-        op.signature.len(),
-        64,
-        "MUST-020: Ed25519 signature MUST be 64 bytes"
+
+    // MUST-023 / MUST-071: unsigned.
+    refused(&unsigned, &admin_pub);
+
+    // MUST-022: signed by someone else under the admin's name.
+    let mut forged = unsigned.clone();
+    forged.sign(&mallory_key);
+    refused(&forged, &admin_pub);
+    // ... and offered with the forger's own key: it is not the key of `admin_peer_id`.
+    refused(&forged, &mallory_pub);
+
+    // MUST-021: correctly signed by a non-member, and by a member who is not an admin.
+    for (key, public, peer) in [
+        (&mallory_key, mallory_pub, mallory),
+        (&member_key, member_pub, member),
+    ] {
+        let mut op = unsigned.clone();
+        op.admin_peer_id = peer;
+        op.sign(key);
+        assert!(op.verify_signature(&public).is_ok());
+        refused(&op, &public);
+    }
+
+    // MUST-022: a signed operation altered afterwards.
+    let mut signed = unsigned.clone();
+    signed.sign(&admin_key);
+    let mut altered = signed.clone();
+    altered.op = GroupOpType::AddMember { peer_id: mallory };
+    refused(&altered, &admin_pub);
+
+    // MUST-025: a group we are not in.
+    let mut elsewhere = signed.clone();
+    elsewhere.group_id = GroupId([0xEE; 32]);
+    elsewhere.sign(&admin_key);
+    assert!(
+        member_mgr
+            .apply_operation(&elsewhere, &admin_pub, 1002)
+            .is_err()
     );
-    // MUST-021/022/023/071: unsigned ops (empty sig) MUST be discarded.
-    let unsigned = GroupOperation {
-        signature: vec![],
-        ..op.clone()
+
+    // The genuine operation is applied.
+    assert!(
+        member_mgr
+            .apply_operation(&signed, &admin_pub, 1002)
+            .unwrap()
+            .is_none()
+    );
+    let members = member_mgr.get_members(&gid).unwrap();
+    assert!(members.iter().any(|m| m.peer_id == carol));
+}
+
+#[clause("PNP-009-MUST-019", "PNP-009-MUST-026")]
+#[test]
+fn received_operations_keep_an_admin_and_rotate_on_removal() {
+    use parolnet_protocol::group::{GroupOpType, GroupOperation, GroupRole};
+    let (admin_key, admin_pub, admin) = identity(1);
+    let (_, _, member) = identity(2);
+    let (_, _, carol) = identity(3);
+    let (admin_mgr, member_mgr, gid) = admin_and_member_views(admin, member);
+    let before = member_mgr.get_our_distribution(&gid).unwrap();
+
+    let op = |version: u64, op: GroupOpType| {
+        let mut op = GroupOperation {
+            group_id: gid,
+            version,
+            op,
+            admin_peer_id: admin,
+            signature: Vec::new(),
+            timestamp: 0,
+        };
+        op.sign(&admin_key);
+        op
     };
-    assert_eq!(
-        unsigned.signature.len(),
-        0,
-        "MUST-023: unsigned op MUST be rejected"
+
+    // MUST-019: the only admin can be neither removed nor demoted, locally or by operation.
+    assert!(admin_mgr.remove_member(&gid, &admin, &admin, 1002).is_err());
+    for last_admin_op in [
+        GroupOpType::RemoveMember { peer_id: admin },
+        GroupOpType::DemoteAdmin { peer_id: admin },
+    ] {
+        assert!(
+            member_mgr
+                .apply_operation(&op(3, last_admin_op), &admin_pub, 1002)
+                .is_err()
+        );
+    }
+    let members = member_mgr.get_members(&gid).unwrap();
+    assert!(
+        members
+            .iter()
+            .any(|m| m.peer_id == admin && m.role == GroupRole::Admin)
     );
+
+    // With a second admin, the first may be demoted.
+    let promote = op(3, GroupOpType::PromoteAdmin { peer_id: member });
+    member_mgr
+        .apply_operation(&promote, &admin_pub, 1003)
+        .unwrap();
+    let add = op(4, GroupOpType::AddMember { peer_id: carol });
+    assert!(
+        member_mgr
+            .apply_operation(&add, &admin_pub, 1004)
+            .unwrap()
+            .is_none()
+    );
+
+    // MUST-026: a removal makes the remaining member rotate, signing key included, and
+    // hands back the distribution to send.
+    let remove = op(5, GroupOpType::RemoveMember { peer_id: carol });
+    let after = member_mgr
+        .apply_operation(&remove, &admin_pub, 1005)
+        .unwrap()
+        .expect("a removal rotates our sender key");
+    assert_ne!(before.chain_key, after.chain_key);
+    assert_ne!(before.signing_public_key, after.signing_public_key);
+    assert_eq!(member_mgr.get_members(&gid).unwrap().len(), 2);
+
+    let demote = op(6, GroupOpType::DemoteAdmin { peer_id: admin });
+    member_mgr
+        .apply_operation(&demote, &admin_pub, 1006)
+        .unwrap();
+    // ... after which the demoted admin's operations are refused (MUST-021).
+    let late = op(7, GroupOpType::UpdateName { name: "x".into() });
+    assert!(member_mgr.apply_operation(&late, &admin_pub, 1007).is_err());
 }
 
 // -- §6.4 GroupOperations ride gossip 0x04 (members only) ---------------------
