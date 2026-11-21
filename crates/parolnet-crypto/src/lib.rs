@@ -65,9 +65,9 @@ pub trait KdfChain: Zeroize + Send {
 /// bind additional context (e.g., a serialized cleartext envelope header)
 /// into the AEAD authentication tag. Callers that have no external context
 /// to bind pass an empty slice. The internal AAD becomes
-/// `header.ratchet_key || extra_aad` so both the ratchet-key binding required
-/// for nonce-derivation integrity and the external context are authenticated
-/// by the same tag.
+/// `ratchet_key || previous_chain_length (u32 BE) || message_number (u32 BE) || extra_aad`
+/// so the complete ratchet header (PNP-002-MUST-042) and the external context are
+/// authenticated by the same tag.
 pub trait RatchetSession: Send {
     fn encrypt(
         &mut self,

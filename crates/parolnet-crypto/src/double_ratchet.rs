@@ -9,12 +9,27 @@ use crate::aead::ChaCha20Poly1305Cipher;
 use crate::kdf::hkdf_sha256;
 use crate::{Aead, CryptoError, RatchetHeader, RatchetSession};
 use rand::rngs::OsRng;
-use std::collections::HashMap;
+use std::collections::VecDeque;
 use x25519_dalek::{PublicKey, StaticSecret};
-use zeroize::Zeroize;
+use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
-/// Maximum number of skipped message keys to store.
+/// Maximum number of skipped message keys one received message may make the receiver derive
+/// (PNP-002-MUST-043). It bounds the work a message costs before its AEAD tag is checked.
 const MAX_SKIP: u32 = 1000;
+
+/// Maximum number of skipped message keys a session stores (PNP-002-MUST-044). Storing one
+/// more deletes the oldest, so the stored keys never make the session refuse a message.
+const MAX_STORED_SKIPPED: usize = 2000;
+
+/// The key of a message that was skipped over, kept until that message arrives or the key is
+/// evicted.
+#[derive(Zeroize, ZeroizeOnDrop)]
+struct SkippedKey {
+    /// Ratchet public key of the chain the message belongs to.
+    ratchet_key: [u8; 32],
+    message_number: u32,
+    message_key: [u8; 32],
+}
 
 /// State for an active Double Ratchet session.
 #[derive(Zeroize)]
@@ -37,9 +52,10 @@ pub struct DoubleRatchetSession {
     recv_n: u32,
     /// Number of messages in previous sending chain.
     previous_send_n: u32,
-    /// Skipped message keys: (ratchet_pubkey, message_number) -> message_key
+    /// Skipped message keys in the order they were stored, oldest first. At most
+    /// `MAX_STORED_SKIPPED`; entries leave only through [`Self::erase_skipped`].
     #[zeroize(skip)]
-    skipped_keys: HashMap<([u8; 32], u32), [u8; 32]>,
+    skipped_keys: VecDeque<SkippedKey>,
 }
 
 impl DoubleRatchetSession {
@@ -79,7 +95,7 @@ impl DoubleRatchetSession {
             send_n: 0,
             recv_n: 0,
             previous_send_n: 0,
-            skipped_keys: HashMap::new(),
+            skipped_keys: VecDeque::new(),
         })
     }
 
@@ -99,7 +115,7 @@ impl DoubleRatchetSession {
             send_n: 0,
             recv_n: 0,
             previous_send_n: 0,
-            skipped_keys: HashMap::new(),
+            skipped_keys: VecDeque::new(),
         })
     }
 
@@ -117,6 +133,9 @@ impl DoubleRatchetSession {
     ///   || dh_remote_flag(1) [|| dh_remote(32)] || send_n(4) || recv_n(4)
     ///   || previous_send_n(4) || skipped_count(4)
     ///   || [ratchet_key(32) || msg_num(4) || msg_key(32)]...
+    ///
+    /// The skipped keys are written oldest first: their order is the eviction order
+    /// (PNP-002-MUST-044) and survives a round trip.
     pub fn export_bytes(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(200);
         out.push(0x01); // version
@@ -157,10 +176,10 @@ impl DoubleRatchetSession {
 
         let count = self.skipped_keys.len() as u32;
         out.extend_from_slice(&count.to_be_bytes());
-        for ((rk, n), mk) in &self.skipped_keys {
-            out.extend_from_slice(rk);
-            out.extend_from_slice(&n.to_be_bytes());
-            out.extend_from_slice(mk);
+        for key in &self.skipped_keys {
+            out.extend_from_slice(&key.ratchet_key);
+            out.extend_from_slice(&key.message_number.to_be_bytes());
+            out.extend_from_slice(&key.message_key);
         }
 
         out
@@ -238,16 +257,17 @@ impl DoubleRatchetSession {
         let previous_send_n = read_4(&mut pos)?;
 
         let skip_count = read_4(&mut pos)? as usize;
-        if skip_count > MAX_SKIP as usize {
+        if skip_count > MAX_STORED_SKIPPED {
             return Err(err());
         }
 
-        let mut skipped_keys = HashMap::with_capacity(skip_count);
+        let mut skipped_keys = VecDeque::with_capacity(skip_count);
         for _ in 0..skip_count {
-            let rk = read_32(&mut pos)?;
-            let n = read_4(&mut pos)?;
-            let mk = read_32(&mut pos)?;
-            skipped_keys.insert((rk, n), mk);
+            skipped_keys.push_back(SkippedKey {
+                ratchet_key: read_32(&mut pos)?,
+                message_number: read_4(&mut pos)?,
+                message_key: read_32(&mut pos)?,
+            });
         }
 
         Ok(Self {
@@ -261,48 +281,6 @@ impl DoubleRatchetSession {
             previous_send_n,
             skipped_keys,
         })
-    }
-
-    /// Perform a DH ratchet step when receiving a new ratchet public key.
-    fn dh_ratchet(&mut self, new_remote_key: &[u8; 32]) -> Result<(), CryptoError> {
-        let dh_remote = PublicKey::from(*new_remote_key);
-
-        // Derive receiving chain key from current DH
-        if let Some(ref dh_self) = self.dh_self {
-            let dh_output = dh_self.diffie_hellman(&dh_remote);
-            let kdf_out = hkdf_sha256(
-                &self.root_key,
-                dh_output.as_bytes(),
-                b"ParolNet_ratchet_v1",
-                64,
-            )?;
-            self.root_key.copy_from_slice(&kdf_out[..32]);
-            let mut recv_ck = [0u8; 32];
-            recv_ck.copy_from_slice(&kdf_out[32..64]);
-            self.recv_chain_key = Some(recv_ck);
-        }
-
-        self.dh_remote = Some(dh_remote);
-
-        // Generate new DH keypair for sending
-        let new_dh_self = StaticSecret::random_from_rng(OsRng);
-        let dh_output = new_dh_self.diffie_hellman(&dh_remote);
-        let kdf_out = hkdf_sha256(
-            &self.root_key,
-            dh_output.as_bytes(),
-            b"ParolNet_ratchet_v1",
-            64,
-        )?;
-        self.root_key.copy_from_slice(&kdf_out[..32]);
-        let mut send_ck = [0u8; 32];
-        send_ck.copy_from_slice(&kdf_out[32..64]);
-        self.send_chain_key = Some(send_ck);
-        self.dh_self = Some(new_dh_self);
-        self.previous_send_n = self.send_n;
-        self.send_n = 0;
-        self.recv_n = 0;
-
-        Ok(())
     }
 
     /// Derive the next message key from a chain key (symmetric ratchet step).
@@ -331,26 +309,173 @@ impl DoubleRatchetSession {
         nonce
     }
 
+    /// Delete the stored skipped key at `index` (0 is the oldest), keeping the order of the
+    /// others.
+    ///
+    /// The key is zeroized where it lies and then moved to the front with swaps before it is
+    /// popped, so no copy of it, or of a neighbour shifted over it, stays behind in the
+    /// buffer.
+    fn erase_skipped(&mut self, index: usize) {
+        let Some(key) = self.skipped_keys.get_mut(index) else {
+            return;
+        };
+        key.zeroize();
+        for i in (1..=index).rev() {
+            self.skipped_keys.swap(i, i - 1);
+        }
+        self.skipped_keys.pop_front();
+    }
+
+    /// Store a skipped key as the newest, evicting the oldest ones while the session is at
+    /// `MAX_STORED_SKIPPED` (PNP-002-MUST-044).
+    fn store_skipped(&mut self, key: SkippedKey) {
+        while self.skipped_keys.len() >= MAX_STORED_SKIPPED {
+            self.erase_skipped(0);
+        }
+        self.skipped_keys.push_back(key);
+    }
+}
+
+/// The state one received message may change, worked on apart from the session.
+///
+/// `decrypt` runs the DH ratchet step, the skipped-key derivation and the chain step on this
+/// copy and writes it back with [`ReceiveAttempt::commit`] only once the AEAD tag has
+/// verified (PNP-002-MUST-041). A message that does not authenticate drops the attempt, which
+/// zeroizes every key in it, and the session keeps the state it had. The session's stored
+/// skipped keys are never copied, and none is evicted before the commit: the keys this
+/// message makes the receiver skip wait in `new_skipped`, and the session's own DH secret is
+/// only read.
+#[derive(Zeroize, ZeroizeOnDrop)]
+struct ReceiveAttempt {
+    root_key: [u8; 32],
+    send_chain_key: Option<[u8; 32]>,
+    recv_chain_key: Option<[u8; 32]>,
+    /// The sending ratchet key generated by a DH ratchet step; `None` without one.
+    new_dh_self: Option<StaticSecret>,
+    /// Public.
+    #[zeroize(skip)]
+    dh_remote: Option<PublicKey>,
+    send_n: u32,
+    recv_n: u32,
+    previous_send_n: u32,
+    /// Skipped keys derived for this message, in derivation order. At most `MAX_SKIP`.
+    new_skipped: Vec<SkippedKey>,
+}
+
+impl ReceiveAttempt {
+    fn begin(session: &DoubleRatchetSession) -> Self {
+        Self {
+            root_key: session.root_key,
+            send_chain_key: session.send_chain_key,
+            recv_chain_key: session.recv_chain_key,
+            new_dh_self: None,
+            dh_remote: session.dh_remote,
+            send_n: session.send_n,
+            recv_n: session.recv_n,
+            previous_send_n: session.previous_send_n,
+            new_skipped: Vec::new(),
+        }
+    }
+
+    /// Perform a DH ratchet step when receiving a new ratchet public key.
+    ///
+    /// `dh_self` is the session's current ratchet secret.
+    fn dh_ratchet(
+        &mut self,
+        dh_self: Option<&StaticSecret>,
+        new_remote_key: &[u8; 32],
+    ) -> Result<(), CryptoError> {
+        let dh_remote = PublicKey::from(*new_remote_key);
+
+        // Derive receiving chain key from current DH
+        if let Some(dh_self) = dh_self {
+            let dh_output = dh_self.diffie_hellman(&dh_remote);
+            let kdf_out = hkdf_sha256(
+                &self.root_key,
+                dh_output.as_bytes(),
+                b"ParolNet_ratchet_v1",
+                64,
+            )?;
+            self.root_key.copy_from_slice(&kdf_out[..32]);
+            let mut recv_ck = [0u8; 32];
+            recv_ck.copy_from_slice(&kdf_out[32..64]);
+            self.recv_chain_key = Some(recv_ck);
+            recv_ck.zeroize();
+        }
+
+        self.dh_remote = Some(dh_remote);
+
+        // Generate new DH keypair for sending
+        let new_dh_self = StaticSecret::random_from_rng(OsRng);
+        let dh_output = new_dh_self.diffie_hellman(&dh_remote);
+        let kdf_out = hkdf_sha256(
+            &self.root_key,
+            dh_output.as_bytes(),
+            b"ParolNet_ratchet_v1",
+            64,
+        )?;
+        self.root_key.copy_from_slice(&kdf_out[..32]);
+        let mut send_ck = [0u8; 32];
+        send_ck.copy_from_slice(&kdf_out[32..64]);
+        self.send_chain_key = Some(send_ck);
+        send_ck.zeroize();
+        self.new_dh_self = Some(new_dh_self);
+        self.previous_send_n = self.send_n;
+        self.send_n = 0;
+        self.recv_n = 0;
+
+        Ok(())
+    }
+
     /// Skip message keys for out-of-order delivery.
+    ///
+    /// One message may skip at most `MAX_SKIP` keys, the previous chain's and the new chain's
+    /// together (PNP-002-MUST-043). How many keys the session already stores plays no part.
     fn skip_message_keys(&mut self, remote_key: &[u8; 32], until: u32) -> Result<(), CryptoError> {
         if let Some(ref mut ck) = self.recv_chain_key {
             while self.recv_n < until {
-                if self.skipped_keys.len() >= MAX_SKIP as usize {
+                if self.new_skipped.len() >= MAX_SKIP as usize {
                     return Err(CryptoError::RatchetError {
                         reason: "too many skipped message keys".into(),
                     });
                 }
-                let mk = Self::chain_ratchet(ck)?;
-                self.skipped_keys.insert((*remote_key, self.recv_n), mk);
+                let mut mk = DoubleRatchetSession::chain_ratchet(ck)?;
+                self.new_skipped.push(SkippedKey {
+                    ratchet_key: *remote_key,
+                    message_number: self.recv_n,
+                    message_key: mk,
+                });
+                mk.zeroize();
                 self.recv_n += 1;
             }
         }
         Ok(())
     }
+
+    /// Write the attempt back to the session. Called only after the AEAD tag verified.
+    ///
+    /// Dropping `self` afterwards zeroizes this copy (the whole buffer the skipped keys were
+    /// moved out of included); the session's previous ratchet secret zeroizes itself when it
+    /// is replaced.
+    fn commit(mut self, session: &mut DoubleRatchetSession) {
+        session.root_key = self.root_key;
+        session.send_chain_key = self.send_chain_key;
+        session.recv_chain_key = self.recv_chain_key;
+        if let Some(new_dh_self) = self.new_dh_self.take() {
+            session.dh_self = Some(new_dh_self);
+        }
+        session.dh_remote = self.dh_remote;
+        session.send_n = self.send_n;
+        session.recv_n = self.recv_n;
+        session.previous_send_n = self.previous_send_n;
+        for key in self.new_skipped.drain(..) {
+            session.store_skipped(key);
+        }
+    }
 }
 
 /// Manual `Drop` to zeroize key material that `#[zeroize(skip)]` excludes:
-/// - `skipped_keys`: HashMap values contain message keys (secret material).
+/// - `skipped_keys`: the entries hold message keys (secret material).
 /// - `dh_remote`: `PublicKey` does not implement `Zeroize`; we manually wipe its bytes.
 /// - `dh_self`: `StaticSecret` implements `ZeroizeOnDrop` natively, so the skip is safe.
 impl Drop for DoubleRatchetSession {
@@ -358,9 +483,9 @@ impl Drop for DoubleRatchetSession {
         // Zeroize the derive-Zeroize fields (root_key, chain keys, etc.)
         self.zeroize();
 
-        // Zeroize all skipped message keys (HashMap is #[zeroize(skip)])
-        for value in self.skipped_keys.values_mut() {
-            value.zeroize();
+        // Zeroize all skipped message keys in place (the queue is #[zeroize(skip)])
+        for key in self.skipped_keys.iter_mut() {
+            key.zeroize();
         }
         self.skipped_keys.clear();
 
@@ -373,17 +498,26 @@ impl Drop for DoubleRatchetSession {
     }
 }
 
+/// Length of the encoded ratchet header that starts the associated data.
+const HEADER_AAD_LEN: usize = 32 + 4 + 4;
+
 /// Build the AEAD additional-authenticated-data for the Double Ratchet
-/// session AEAD (PNP-001-MUST-007).
+/// session AEAD (PNP-002-MUST-042, PNP-001-MUST-007):
 ///
-/// The ratchet public key is bound for nonce-derivation integrity, and the
-/// optional `extra_aad` (typically the serialized cleartext envelope header)
-/// is concatenated after it so wire-level header tampering is detected by
-/// the AEAD tag. Concatenation is unambiguous here because the ratchet-key
-/// prefix is always exactly 32 bytes.
-fn build_aad(ratchet_key: &[u8; 32], extra_aad: &[u8]) -> Vec<u8> {
-    let mut aad = Vec::with_capacity(32 + extra_aad.len());
-    aad.extend_from_slice(ratchet_key);
+/// ```text
+/// ratchet_key (32) || previous_chain_length (u32 BE) || message_number (u32 BE) || extra_aad
+/// ```
+///
+/// The whole ratchet header is bound, so no field of it can be changed in transit: the
+/// receiver acts on all three before it can check the tag. The optional `extra_aad`
+/// (typically the serialized cleartext envelope header) follows, so wire-level header
+/// tampering is detected by the AEAD tag as well. Concatenation is unambiguous because the
+/// header prefix is always exactly 40 bytes.
+fn build_aad(header: &RatchetHeader, extra_aad: &[u8]) -> Vec<u8> {
+    let mut aad = Vec::with_capacity(HEADER_AAD_LEN + extra_aad.len());
+    aad.extend_from_slice(&header.ratchet_key);
+    aad.extend_from_slice(&header.previous_chain_length.to_be_bytes());
+    aad.extend_from_slice(&header.message_number.to_be_bytes());
     aad.extend_from_slice(extra_aad);
     aad
 }
@@ -418,7 +552,7 @@ impl RatchetSession for DoubleRatchetSession {
         // Encrypt with ChaCha20-Poly1305
         let cipher = ChaCha20Poly1305Cipher::new(&message_key)?;
         let nonce = Self::build_nonce(&ratchet_pub, self.send_n);
-        let aad = build_aad(&header.ratchet_key, extra_aad);
+        let aad = build_aad(&header, extra_aad);
         let ciphertext = cipher.encrypt(&nonce, plaintext, &aad)?;
 
         self.send_n += 1;
@@ -426,22 +560,30 @@ impl RatchetSession for DoubleRatchetSession {
         Ok((header, ciphertext))
     }
 
+    /// Decrypt one message. All-or-nothing (PNP-002-MUST-041): when this returns `Err` the
+    /// session, skipped keys included, is exactly what it was before the call.
     fn decrypt(
         &mut self,
         header: &RatchetHeader,
         ciphertext: &[u8],
         extra_aad: &[u8],
     ) -> Result<Vec<u8>, CryptoError> {
-        // Check for skipped message key
-        if let Some(mk) = self
-            .skipped_keys
-            .remove(&(header.ratchet_key, header.message_number))
-        {
-            let cipher = ChaCha20Poly1305Cipher::new(&mk)?;
-            let nonce = Self::build_nonce(&header.ratchet_key, header.message_number);
-            let aad = build_aad(&header.ratchet_key, extra_aad);
-            return cipher.decrypt(&nonce, ciphertext, &aad);
+        let nonce = Self::build_nonce(&header.ratchet_key, header.message_number);
+        let aad = build_aad(header, extra_aad);
+
+        // Check for skipped message key. It is consumed only by a message that authenticates.
+        // (The lookup compares public header values; at most `MAX_STORED_SKIPPED` entries.)
+        if let Some(index) = self.skipped_keys.iter().position(|k| {
+            k.ratchet_key == header.ratchet_key && k.message_number == header.message_number
+        }) {
+            let plaintext = ChaCha20Poly1305Cipher::new(&self.skipped_keys[index].message_key)?
+                .decrypt(&nonce, ciphertext, &aad)?;
+            self.erase_skipped(index);
+            return Ok(plaintext);
         }
+
+        // Everything below runs on a copy; `self` changes only in `commit`.
+        let mut attempt = ReceiveAttempt::begin(self);
 
         // Check if we need a DH ratchet step
         let need_dh_ratchet = self
@@ -452,31 +594,32 @@ impl RatchetSession for DoubleRatchetSession {
 
         if need_dh_ratchet {
             // Skip any remaining messages in the current receiving chain
-            if self.dh_remote.is_some() && self.recv_chain_key.is_some() {
-                let remote_key = *self.dh_remote.as_ref().unwrap().as_bytes();
-                self.skip_message_keys(&remote_key, header.previous_chain_length)?;
+            if let Some(remote) = self.dh_remote.as_ref()
+                && self.recv_chain_key.is_some()
+            {
+                attempt.skip_message_keys(remote.as_bytes(), header.previous_chain_length)?;
             }
-            self.dh_ratchet(&header.ratchet_key)?;
+            attempt.dh_ratchet(self.dh_self.as_ref(), &header.ratchet_key)?;
         }
 
         // Skip to the correct message number
-        self.skip_message_keys(&header.ratchet_key, header.message_number)?;
+        attempt.skip_message_keys(&header.ratchet_key, header.message_number)?;
 
         // Derive the message key
-        let recv_ck = self
+        let recv_ck = attempt
             .recv_chain_key
             .as_mut()
             .ok_or(CryptoError::RatchetError {
                 reason: "no receiving chain key".into(),
             })?;
-        let message_key = Self::chain_ratchet(recv_ck)?;
-        self.recv_n += 1;
+        let message_key = Zeroizing::new(Self::chain_ratchet(recv_ck)?);
+        attempt.recv_n += 1;
 
-        // Decrypt
-        let cipher = ChaCha20Poly1305Cipher::new(&message_key)?;
-        let nonce = Self::build_nonce(&header.ratchet_key, header.message_number);
-        let aad = build_aad(&header.ratchet_key, extra_aad);
-        cipher.decrypt(&nonce, ciphertext, &aad)
+        // Decrypt, and only then commit
+        let plaintext =
+            ChaCha20Poly1305Cipher::new(&message_key[..])?.decrypt(&nonce, ciphertext, &aad)?;
+        attempt.commit(self);
+        Ok(plaintext)
     }
 }
 
@@ -622,5 +765,666 @@ mod tests {
         assert!(DoubleRatchetSession::import_bytes(&[]).is_err());
         assert!(DoubleRatchetSession::import_bytes(&[0x02]).is_err()); // wrong version
         assert!(DoubleRatchetSession::import_bytes(&[0x01]).is_err()); // truncated
+    }
+
+    // ── Atomic decrypt (PNP-002-MUST-041) ──────────────────────────────
+    //
+    // A decrypt that fails leaves the session exactly as it was.
+
+    /// Every field of the session, skipped keys in their stored order.
+    fn snapshot(s: &DoubleRatchetSession) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(&s.root_key);
+        for ck in [&s.send_chain_key, &s.recv_chain_key] {
+            out.push(ck.is_some() as u8);
+            out.extend_from_slice(&ck.unwrap_or_default());
+        }
+        out.push(s.dh_self.is_some() as u8);
+        out.extend_from_slice(&s.dh_self.as_ref().map(|k| k.to_bytes()).unwrap_or_default());
+        out.push(s.dh_remote.is_some() as u8);
+        out.extend_from_slice(&s.dh_remote.map(|k| *k.as_bytes()).unwrap_or_default());
+        for n in [s.send_n, s.recv_n, s.previous_send_n] {
+            out.extend_from_slice(&n.to_be_bytes());
+        }
+        for key in &s.skipped_keys {
+            out.extend_from_slice(&key.ratchet_key);
+            out.extend_from_slice(&key.message_number.to_be_bytes());
+            out.extend_from_slice(&key.message_key);
+        }
+        out
+    }
+
+    /// Feed a message that must not decrypt and check nothing moved.
+    fn assert_rejected_unchanged(
+        s: &mut DoubleRatchetSession,
+        header: &RatchetHeader,
+        ct: &[u8],
+        aad: &[u8],
+    ) {
+        let before = snapshot(s);
+        let exported = s.export_bytes();
+        assert!(s.decrypt(header, ct, aad).is_err());
+        assert!(
+            snapshot(s) == before,
+            "a failed decrypt changed the session (header {header:?})"
+        );
+        assert_eq!(s.export_bytes(), exported);
+    }
+
+    /// Both directions still work, including across a DH ratchet step each way.
+    fn assert_conversation_continues(
+        alice: &mut DoubleRatchetSession,
+        bob: &mut DoubleRatchetSession,
+    ) {
+        for round in 0..3u8 {
+            let (h, ct) = alice.encrypt(&[b'a', round], b"aad").unwrap();
+            assert_eq!(bob.decrypt(&h, &ct, b"aad").unwrap(), [b'a', round]);
+            let (h, ct) = bob.encrypt(&[b'b', round], b"aad").unwrap();
+            assert_eq!(alice.decrypt(&h, &ct, b"aad").unwrap(), [b'b', round]);
+        }
+    }
+
+    /// A pair that has talked in both directions (so both have every chain).
+    fn established_pair() -> (DoubleRatchetSession, DoubleRatchetSession) {
+        let (mut alice, mut bob) = setup_session_pair();
+        assert_conversation_continues(&mut alice, &mut bob);
+        (alice, bob)
+    }
+
+    #[test]
+    fn failed_decrypt_random_ciphertext_under_current_header() {
+        let (mut alice, mut bob) = established_pair();
+        let (h, ct) = alice.encrypt(b"genuine", b"aad").unwrap();
+        let (h2, ct2) = alice.encrypt(b"genuine 2", b"aad").unwrap();
+
+        let garbage = vec![0xA5u8; ct.len()];
+        assert_rejected_unchanged(&mut bob, &h, &garbage, b"aad");
+        // The genuine ciphertext under other associated data (an envelope of another session).
+        assert_rejected_unchanged(&mut bob, &h, &ct, b"other");
+        // Too short to carry a tag.
+        assert_rejected_unchanged(&mut bob, &h, &[1, 2, 3], b"aad");
+
+        assert_eq!(bob.decrypt(&h, &ct, b"aad").unwrap(), b"genuine");
+        assert_eq!(bob.decrypt(&h2, &ct2, b"aad").unwrap(), b"genuine 2");
+        assert_conversation_continues(&mut alice, &mut bob);
+    }
+
+    #[test]
+    fn failed_decrypt_fresh_responder_session() {
+        // Bob has received nothing yet: no remote key, no chains.
+        let (mut alice, mut bob) = setup_session_pair();
+        let (h, ct) = alice.encrypt(b"first", &[]).unwrap();
+
+        let mut forged = h.clone();
+        forged.ratchet_key = [0x77; 32];
+        assert_rejected_unchanged(&mut bob, &forged, &ct, &[]);
+        let mut tampered = ct.clone();
+        tampered[0] ^= 1;
+        assert_rejected_unchanged(&mut bob, &h, &tampered, &[]);
+
+        assert_eq!(bob.decrypt(&h, &ct, &[]).unwrap(), b"first");
+        assert_conversation_continues(&mut alice, &mut bob);
+    }
+
+    #[test]
+    fn failed_decrypt_new_random_ratchet_key() {
+        let (mut alice, mut bob) = established_pair();
+        let (h, ct) = alice.encrypt(b"genuine", b"aad").unwrap();
+
+        for (key, pn, n) in [
+            ([0x99u8; 32], 0u32, 0u32),
+            ([0x5Au8; 32], 2, 0),
+            ([0x01u8; 32], 700, 3),
+            ([0x02u8; 32], 5000, 0),
+            ([0x03u8; 32], 0, 5000),
+            ([0x04u8; 32], u32::MAX, u32::MAX),
+        ] {
+            let forged = RatchetHeader {
+                ratchet_key: key,
+                previous_chain_length: pn,
+                message_number: n,
+            };
+            assert_rejected_unchanged(&mut bob, &forged, &ct, b"aad");
+            assert_rejected_unchanged(&mut alice, &forged, &ct, b"aad");
+        }
+
+        assert_eq!(bob.decrypt(&h, &ct, b"aad").unwrap(), b"genuine");
+        assert_conversation_continues(&mut alice, &mut bob);
+    }
+
+    #[test]
+    fn failed_decrypt_huge_message_number() {
+        let (mut alice, mut bob) = established_pair();
+        let (h, ct) = alice.encrypt(b"genuine", b"aad").unwrap();
+        let skipped_before = bob.skipped_keys.len();
+
+        // Within the skip limit (repeated, so the limit would be passed if any were stored),
+        // at it, and beyond it.
+        for n in [
+            h.message_number + 1,
+            h.message_number + 600,
+            h.message_number + 600,
+            h.message_number + MAX_SKIP - 1,
+            h.message_number + MAX_SKIP,
+            h.message_number + MAX_SKIP + 1,
+            5000,
+            u32::MAX,
+        ] {
+            let mut forged = h.clone();
+            forged.message_number = n;
+            assert_rejected_unchanged(&mut bob, &forged, &ct, b"aad");
+            assert_eq!(bob.skipped_keys.len(), skipped_before);
+        }
+
+        assert_eq!(bob.decrypt(&h, &ct, b"aad").unwrap(), b"genuine");
+        assert_conversation_continues(&mut alice, &mut bob);
+    }
+
+    #[test]
+    fn failed_decrypt_replay_of_consumed_message() {
+        let (mut alice, mut bob) = established_pair();
+        let (h1, ct1) = alice.encrypt(b"one", b"aad").unwrap();
+        let (h2, ct2) = alice.encrypt(b"two", b"aad").unwrap();
+        let (h3, ct3) = alice.encrypt(b"three", b"aad").unwrap();
+
+        assert_eq!(bob.decrypt(&h1, &ct1, b"aad").unwrap(), b"one");
+        assert_rejected_unchanged(&mut bob, &h1, &ct1, b"aad");
+        assert_rejected_unchanged(&mut bob, &h1, &ct1, b"aad");
+
+        // Out of order, then replays of both the skipped-key message and the in-order one.
+        assert_eq!(bob.decrypt(&h3, &ct3, b"aad").unwrap(), b"three");
+        assert_rejected_unchanged(&mut bob, &h3, &ct3, b"aad");
+        assert_eq!(bob.decrypt(&h2, &ct2, b"aad").unwrap(), b"two");
+        assert_rejected_unchanged(&mut bob, &h2, &ct2, b"aad");
+
+        // A replay from the previous receiving chain, after a DH ratchet step.
+        assert_conversation_continues(&mut alice, &mut bob);
+        assert_rejected_unchanged(&mut bob, &h1, &ct1, b"aad");
+        assert_conversation_continues(&mut alice, &mut bob);
+    }
+
+    #[test]
+    fn failed_decrypt_keeps_the_skipped_key() {
+        let (mut alice, mut bob) = established_pair();
+        let (h1, ct1) = alice.encrypt(b"one", b"aad").unwrap();
+        let (h2, ct2) = alice.encrypt(b"two", b"aad").unwrap();
+        let (h3, ct3) = alice.encrypt(b"three", b"aad").unwrap();
+
+        // Bob gets the third first: the keys of the first two are stored as skipped.
+        assert_eq!(bob.decrypt(&h3, &ct3, b"aad").unwrap(), b"three");
+        assert_eq!(bob.skipped_keys.len(), 2);
+
+        let mut tampered = ct1.clone();
+        *tampered.last_mut().unwrap() ^= 0x80;
+        assert_rejected_unchanged(&mut bob, &h1, &tampered, b"aad");
+        assert_rejected_unchanged(&mut bob, &h2, &ct2, b"wrong aad");
+        assert_eq!(bob.skipped_keys.len(), 2);
+
+        assert_eq!(bob.decrypt(&h1, &ct1, b"aad").unwrap(), b"one");
+        assert_eq!(bob.decrypt(&h2, &ct2, b"aad").unwrap(), b"two");
+        // Used once, then gone.
+        assert!(bob.skipped_keys.is_empty());
+        assert_rejected_unchanged(&mut bob, &h1, &ct1, b"aad");
+        assert_conversation_continues(&mut alice, &mut bob);
+    }
+
+    #[test]
+    fn failed_decrypt_keeps_skipped_keys_of_the_previous_chain() {
+        let (mut alice, mut bob) = established_pair();
+        let (h, ct) = alice.encrypt(b"a", b"aad").unwrap();
+        bob.decrypt(&h, &ct, b"aad").unwrap();
+        let (h_old, ct_old) = alice.encrypt(b"late", b"aad").unwrap();
+        let (_, _) = alice.encrypt(b"never delivered", b"aad").unwrap();
+        // A full round trip moves Alice to a new sending chain.
+        let (h, ct) = bob.encrypt(b"b", b"aad").unwrap();
+        alice.decrypt(&h, &ct, b"aad").unwrap();
+        let (h_new, ct_new) = alice.encrypt(b"new chain", b"aad").unwrap();
+        assert_ne!(h_new.ratchet_key, h_old.ratchet_key);
+
+        // Forgeries against the new-chain header: Bob must not step his DH ratchet for them.
+        let mut tampered = ct_new.clone();
+        tampered[0] ^= 1;
+        assert_rejected_unchanged(&mut bob, &h_new, &tampered, b"aad");
+        let mut forged = h_new.clone();
+        forged.previous_chain_length = 900;
+        assert_rejected_unchanged(&mut bob, &forged, &tampered, b"aad");
+
+        assert_eq!(bob.decrypt(&h_new, &ct_new, b"aad").unwrap(), b"new chain");
+        // The late message of the previous chain is now behind a skipped key.
+        let mut tampered = ct_old.clone();
+        tampered[0] ^= 1;
+        assert_rejected_unchanged(&mut bob, &h_old, &tampered, b"aad");
+        assert_eq!(bob.decrypt(&h_old, &ct_old, b"aad").unwrap(), b"late");
+        assert_conversation_continues(&mut alice, &mut bob);
+    }
+
+    #[test]
+    fn skip_limit_still_enforced() {
+        let (mut alice, mut bob) = established_pair();
+        let mut last = None;
+        for _ in 0..=MAX_SKIP + 1 {
+            last = Some(alice.encrypt(b"x", &[]).unwrap());
+        }
+        let (h, ct) = last.unwrap();
+        // A genuine message more than MAX_SKIP ahead is refused, and stores nothing.
+        assert_rejected_unchanged(&mut bob, &h, &ct, &[]);
+        assert!(bob.skipped_keys.is_empty());
+    }
+
+    /// Garbage and genuine messages interleaved, both directions, any delivery order.
+    #[test]
+    fn interleaved_garbage_never_disturbs_genuine_traffic() {
+        use rand::rngs::StdRng;
+        use rand::{Rng, SeedableRng};
+
+        struct Flight {
+            header: RatchetHeader,
+            ct: Vec<u8>,
+            pt: Vec<u8>,
+        }
+
+        fn garbage(rng: &mut StdRng, known: &[&Flight]) -> (RatchetHeader, Vec<u8>, Vec<u8>) {
+            // Mostly small counters (cheap to reject), now and then far past the skip limit.
+            let counter = |rng: &mut StdRng| {
+                if rng.gen_ratio(1, 12) {
+                    rng.r#gen::<u32>()
+                } else {
+                    rng.gen_range(0..40)
+                }
+            };
+            let random_header = |rng: &mut StdRng| RatchetHeader {
+                ratchet_key: rng.r#gen(),
+                previous_chain_length: counter(rng),
+                message_number: counter(rng),
+            };
+            let mut random_ct = vec![0u8; rng.gen_range(0..80)];
+            rng.fill(&mut random_ct[..]);
+            if known.is_empty() {
+                return (random_header(rng), random_ct, b"aad".to_vec());
+            }
+            let base = known[rng.gen_range(0..known.len())];
+            let mut header = base.header.clone();
+            let mut ct = base.ct.clone();
+            let mut aad = b"aad".to_vec();
+            match rng.gen_range(0..6) {
+                0 => return (random_header(rng), random_ct, aad),
+                1 => {
+                    let i = rng.gen_range(0..ct.len());
+                    ct[i] ^= 1 << rng.gen_range(0..8);
+                }
+                2 => {
+                    header.message_number =
+                        header.message_number.wrapping_add(1 + counter(rng) / 2);
+                }
+                3 => header.ratchet_key = rng.r#gen(),
+                4 => {
+                    header.ratchet_key = rng.r#gen();
+                    header.previous_chain_length = counter(rng);
+                }
+                _ => aad = b"other".to_vec(),
+            }
+            (header, ct, aad)
+        }
+
+        for seed in 0..8u64 {
+            let mut rng = StdRng::seed_from_u64(seed);
+            let (mut alice, mut bob) = setup_session_pair();
+            // In flight to Bob / to Alice, and what each has already consumed.
+            let mut flights: [Vec<Flight>; 2] = [Vec::new(), Vec::new()];
+            let mut consumed: [Vec<Flight>; 2] = [Vec::new(), Vec::new()];
+            let mut counter = 0u32;
+
+            for step in 0..500 {
+                let draining = step >= 420;
+                let to_bob = rng.gen_bool(0.5);
+                let dir = if to_bob { 0 } else { 1 };
+                let (sender, receiver) = if to_bob {
+                    (&mut alice, &mut bob)
+                } else {
+                    (&mut bob, &mut alice)
+                };
+                match rng.gen_range(0..10) {
+                    0..=3 if !draining => {
+                        counter += 1;
+                        let pt = counter.to_be_bytes().to_vec();
+                        // Bob cannot send before he has received anything.
+                        if let Ok((header, ct)) = sender.encrypt(&pt, b"aad") {
+                            flights[dir].push(Flight { header, ct, pt });
+                        }
+                    }
+                    4..=6 => {
+                        let known: Vec<&Flight> =
+                            flights[dir].iter().chain(consumed[dir].iter()).collect();
+                        let (header, ct, aad) = garbage(&mut rng, &known);
+                        assert_rejected_unchanged(receiver, &header, &ct, &aad);
+                    }
+                    _ => {
+                        if flights[dir].is_empty() {
+                            continue;
+                        }
+                        // Any in-flight message: out-of-order delivery included.
+                        let i = rng.gen_range(0..flights[dir].len());
+                        let f = flights[dir].swap_remove(i);
+                        assert_eq!(
+                            receiver.decrypt(&f.header, &f.ct, b"aad").unwrap(),
+                            f.pt,
+                            "seed {seed} step {step}"
+                        );
+                        // And a replay of it right away.
+                        assert_rejected_unchanged(receiver, &f.header, &f.ct, b"aad");
+                        consumed[dir].push(f);
+                    }
+                }
+            }
+            for (dir, receiver) in [(0, &mut bob), (1, &mut alice)] {
+                while let Some(f) = flights[dir].pop() {
+                    assert_eq!(receiver.decrypt(&f.header, &f.ct, b"aad").unwrap(), f.pt);
+                }
+            }
+            assert_conversation_continues(&mut alice, &mut bob);
+        }
+    }
+
+    // ── The whole ratchet header is authenticated (PNP-002-MUST-042) ───
+
+    #[test]
+    fn aad_is_the_encoded_header_then_the_extra_aad() {
+        let header = RatchetHeader {
+            ratchet_key: [0xAB; 32],
+            previous_chain_length: 0x0102_0304,
+            message_number: 0x0A0B_0C0D,
+        };
+        let aad = build_aad(&header, b"extra");
+        assert_eq!(aad.len(), HEADER_AAD_LEN + 5);
+        assert_eq!(aad[..32], [0xAB; 32]);
+        assert_eq!(aad[32..36], [0x01, 0x02, 0x03, 0x04]);
+        assert_eq!(aad[36..40], [0x0A, 0x0B, 0x0C, 0x0D]);
+        assert_eq!(&aad[40..], b"extra");
+        assert_eq!(build_aad(&header, &[]).len(), HEADER_AAD_LEN);
+    }
+
+    /// Alice's first message of a new sending chain, with a late message of her previous
+    /// chain still in flight: `(late, first_of_new_chain)`. The new header's
+    /// `previous_chain_length` is 3 and Bob has received one message of that chain.
+    #[allow(clippy::type_complexity)]
+    fn new_chain_with_a_late_message(
+        alice: &mut DoubleRatchetSession,
+        bob: &mut DoubleRatchetSession,
+    ) -> ((RatchetHeader, Vec<u8>), (RatchetHeader, Vec<u8>)) {
+        let (h, ct) = alice.encrypt(b"a0", b"aad").unwrap();
+        bob.decrypt(&h, &ct, b"aad").unwrap();
+        let _lost = alice.encrypt(b"a1", b"aad").unwrap();
+        let late = alice.encrypt(b"late", b"aad").unwrap();
+        let (h, ct) = bob.encrypt(b"b", b"aad").unwrap();
+        alice.decrypt(&h, &ct, b"aad").unwrap();
+        let first = alice.encrypt(b"new chain", b"aad").unwrap();
+        assert_ne!(first.0.ratchet_key, late.0.ratchet_key);
+        assert_eq!(first.0.previous_chain_length, 3);
+        assert_eq!(first.0.message_number, 0);
+        (late, first)
+    }
+
+    #[test]
+    fn altered_previous_chain_length_is_rejected() {
+        let (mut alice, mut bob) = established_pair();
+        let ((h_late, ct_late), (h_new, ct_new)) =
+            new_chain_with_a_late_message(&mut alice, &mut bob);
+
+        // Raised: Bob would derive and store keys for messages that do not exist. Lowered:
+        // he would close the previous chain early and lose the late message.
+        for pn in [4, 5, 900, MAX_SKIP, u32::MAX, 2, 1, 0] {
+            let mut altered = h_new.clone();
+            altered.previous_chain_length = pn;
+            assert_rejected_unchanged(&mut bob, &altered, &ct_new, b"aad");
+        }
+        assert!(bob.skipped_keys.is_empty());
+
+        assert_eq!(bob.decrypt(&h_new, &ct_new, b"aad").unwrap(), b"new chain");
+        // Exactly the two messages of the previous chain Bob has not seen.
+        assert_eq!(bob.skipped_keys.len(), 2);
+        assert_eq!(bob.decrypt(&h_late, &ct_late, b"aad").unwrap(), b"late");
+        assert_conversation_continues(&mut alice, &mut bob);
+    }
+
+    #[test]
+    fn altered_message_number_or_ratchet_key_is_rejected() {
+        let (mut alice, mut bob) = established_pair();
+        let (_, (h_new, ct_new)) = new_chain_with_a_late_message(&mut alice, &mut bob);
+
+        for n in [1, 2, 700, u32::MAX] {
+            let mut altered = h_new.clone();
+            altered.message_number = n;
+            assert_rejected_unchanged(&mut bob, &altered, &ct_new, b"aad");
+        }
+        for byte in [0, 7, 8, 31] {
+            let mut altered = h_new.clone();
+            altered.ratchet_key[byte] ^= 0x01;
+            assert_rejected_unchanged(&mut bob, &altered, &ct_new, b"aad");
+        }
+
+        assert_eq!(bob.decrypt(&h_new, &ct_new, b"aad").unwrap(), b"new chain");
+        assert_conversation_continues(&mut alice, &mut bob);
+    }
+
+    #[test]
+    fn altered_header_of_a_skipped_message_is_rejected() {
+        let (mut alice, mut bob) = established_pair();
+        let (h1, ct1) = alice.encrypt(b"one", b"aad").unwrap();
+        let (h2, ct2) = alice.encrypt(b"two", b"aad").unwrap();
+        assert_eq!(bob.decrypt(&h2, &ct2, b"aad").unwrap(), b"two");
+        assert_eq!(bob.skipped_keys.len(), 1);
+
+        // The stored key is found by (ratchet key, message number) alone; the previous chain
+        // length must still be the sender's.
+        for pn in [
+            h1.previous_chain_length + 1,
+            h1.previous_chain_length.wrapping_sub(1),
+            u32::MAX,
+        ] {
+            let mut altered = h1.clone();
+            altered.previous_chain_length = pn;
+            assert_rejected_unchanged(&mut bob, &altered, &ct1, b"aad");
+        }
+        assert_eq!(bob.skipped_keys.len(), 1);
+
+        assert_eq!(bob.decrypt(&h1, &ct1, b"aad").unwrap(), b"one");
+        assert!(bob.skipped_keys.is_empty());
+        assert_conversation_continues(&mut alice, &mut bob);
+    }
+
+    // ── Skipped message keys: bounded, oldest evicted (PNP-002-MUST-043, -044) ──
+
+    /// Alice sends `gap` messages that never arrive and one that does, so Bob stores `gap`
+    /// skipped keys. Returns the lost messages.
+    fn lose(
+        alice: &mut DoubleRatchetSession,
+        bob: &mut DoubleRatchetSession,
+        gap: u32,
+    ) -> Vec<(RatchetHeader, Vec<u8>)> {
+        let lost: Vec<_> = (0..gap)
+            .map(|_| alice.encrypt(b"lost", &[]).unwrap())
+            .collect();
+        let (h, ct) = alice.encrypt(b"arrives", &[]).unwrap();
+        assert_eq!(bob.decrypt(&h, &ct, &[]).unwrap(), b"arrives");
+        lost
+    }
+
+    #[test]
+    fn stored_skipped_keys_never_make_the_session_refuse_a_message() {
+        let (mut alice, mut bob) = established_pair();
+        let first = lose(&mut alice, &mut bob, MAX_SKIP);
+        assert_eq!(bob.skipped_keys.len(), MAX_SKIP as usize);
+
+        // A full MAX_SKIP gap again, with MAX_SKIP keys already stored.
+        let second = lose(&mut alice, &mut bob, MAX_SKIP);
+        assert_eq!(bob.skipped_keys.len(), MAX_STORED_SKIPPED);
+
+        // At the cap: every further skipped key evicts the oldest one.
+        let third = lose(&mut alice, &mut bob, 3);
+        assert_eq!(bob.skipped_keys.len(), MAX_STORED_SKIPPED);
+        for (h, ct) in &first[..3] {
+            assert_rejected_unchanged(&mut bob, h, ct, &[]);
+        }
+        let (h, ct) = &first[3];
+        assert_eq!(bob.decrypt(h, ct, &[]).unwrap(), b"lost");
+        for (h, ct) in [&first[999], &second[0], &second[999], &third[0], &third[2]] {
+            assert_eq!(bob.decrypt(h, ct, &[]).unwrap(), b"lost");
+        }
+        assert_eq!(bob.skipped_keys.len(), MAX_STORED_SKIPPED - 6);
+        assert_conversation_continues(&mut alice, &mut bob);
+    }
+
+    #[test]
+    fn eviction_takes_the_oldest_key_first_across_chains() {
+        let (mut alice, mut bob) = established_pair();
+        let old_chain = lose(&mut alice, &mut bob, 600);
+        // A round trip: Alice moves to a new sending chain.
+        let (h, ct) = bob.encrypt(b"b", &[]).unwrap();
+        alice.decrypt(&h, &ct, &[]).unwrap();
+        let mid_chain = lose(&mut alice, &mut bob, 900);
+        assert_ne!(mid_chain[0].0.ratchet_key, old_chain[0].0.ratchet_key);
+        let (h, ct) = bob.encrypt(b"b", &[]).unwrap();
+        alice.decrypt(&h, &ct, &[]).unwrap();
+        let new_chain = lose(&mut alice, &mut bob, 900);
+
+        // 2400 keys were skipped: the 400 oldest, all of the oldest chain, are gone.
+        assert_eq!(bob.skipped_keys.len(), MAX_STORED_SKIPPED);
+        let stored: Vec<_> = bob
+            .skipped_keys
+            .iter()
+            .map(|k| (k.ratchet_key, k.message_number))
+            .collect();
+        let expected: Vec<_> = old_chain[400..]
+            .iter()
+            .chain(&mid_chain)
+            .chain(&new_chain)
+            .map(|(h, _)| (h.ratchet_key, h.message_number))
+            .collect();
+        assert!(stored == expected, "stored keys are not oldest-first");
+
+        let (h, ct) = &old_chain[399];
+        assert_rejected_unchanged(&mut bob, h, ct, &[]);
+        for (h, ct) in [&old_chain[400], &mid_chain[0], &new_chain[899]] {
+            assert_eq!(bob.decrypt(h, ct, &[]).unwrap(), b"lost");
+        }
+        assert_conversation_continues(&mut alice, &mut bob);
+    }
+
+    #[test]
+    fn export_import_keeps_the_eviction_order() {
+        let (mut alice, mut bob) = established_pair();
+        let first = lose(&mut alice, &mut bob, MAX_SKIP);
+        let (h, ct) = bob.encrypt(b"b", &[]).unwrap();
+        alice.decrypt(&h, &ct, &[]).unwrap();
+        let second = lose(&mut alice, &mut bob, MAX_SKIP);
+        assert_eq!(bob.skipped_keys.len(), MAX_STORED_SKIPPED);
+
+        let exported = bob.export_bytes();
+        let mut restored = DoubleRatchetSession::import_bytes(&exported).unwrap();
+        assert!(snapshot(&restored) == snapshot(&bob));
+        assert_eq!(restored.export_bytes(), exported);
+
+        // The restored session evicts the same key the original would: the oldest.
+        let third = lose(&mut alice, &mut restored, 1);
+        assert_eq!(restored.skipped_keys.len(), MAX_STORED_SKIPPED);
+        let (h, ct) = &first[0];
+        assert_rejected_unchanged(&mut restored, h, ct, &[]);
+        for (h, ct) in [&first[1], &second[999], &third[0]] {
+            assert_eq!(restored.decrypt(h, ct, &[]).unwrap(), b"lost");
+        }
+        assert_conversation_continues(&mut alice, &mut restored);
+    }
+
+    #[test]
+    fn import_refuses_more_skipped_keys_than_the_cap() {
+        let (mut alice, mut bob) = established_pair();
+        lose(&mut alice, &mut bob, MAX_SKIP);
+        lose(&mut alice, &mut bob, MAX_SKIP);
+        let exported = bob.export_bytes();
+        const ENTRY: usize = 32 + 4 + 32;
+        let count_at = exported.len() - MAX_STORED_SKIPPED * ENTRY - 4;
+        assert_eq!(
+            exported[count_at..count_at + 4],
+            (MAX_STORED_SKIPPED as u32).to_be_bytes()
+        );
+
+        // One well-formed entry too many.
+        let mut over = exported.clone();
+        over.extend_from_slice(&[0x55; ENTRY]);
+        over[count_at..count_at + 4]
+            .copy_from_slice(&(MAX_STORED_SKIPPED as u32 + 1).to_be_bytes());
+        assert!(DoubleRatchetSession::import_bytes(&over).is_err());
+        assert!(DoubleRatchetSession::import_bytes(&exported).is_ok());
+    }
+
+    fn skipped(n: u32) -> SkippedKey {
+        SkippedKey {
+            ratchet_key: [n as u8; 32],
+            message_number: n,
+            message_key: [0xC0 | n as u8; 32],
+        }
+    }
+
+    fn stored_numbers(s: &DoubleRatchetSession) -> Vec<u32> {
+        s.skipped_keys.iter().map(|k| k.message_number).collect()
+    }
+
+    #[test]
+    fn erase_skipped_keeps_the_order_of_the_others() {
+        let (_, mut bob) = setup_session_pair();
+        for n in 1..=6 {
+            bob.store_skipped(skipped(n));
+        }
+        bob.erase_skipped(2);
+        assert_eq!(stored_numbers(&bob), [1, 2, 4, 5, 6]);
+        bob.erase_skipped(4);
+        assert_eq!(stored_numbers(&bob), [1, 2, 4, 5]);
+        bob.erase_skipped(0);
+        assert_eq!(stored_numbers(&bob), [2, 4, 5]);
+        bob.erase_skipped(3); // out of range: nothing to erase
+        assert_eq!(stored_numbers(&bob), [2, 4, 5]);
+        // The survivors still carry their own keys.
+        for key in &bob.skipped_keys {
+            let n = key.message_number;
+            assert_eq!(key.ratchet_key, [n as u8; 32]);
+            assert_eq!(key.message_key, [0xC0 | n as u8; 32]);
+        }
+    }
+
+    #[test]
+    fn store_skipped_evicts_the_oldest_at_the_cap() {
+        let (_, mut bob) = setup_session_pair();
+        for n in 0..MAX_STORED_SKIPPED as u32 + 5 {
+            bob.store_skipped(skipped(n));
+        }
+        assert_eq!(bob.skipped_keys.len(), MAX_STORED_SKIPPED);
+        assert_eq!(bob.skipped_keys.front().unwrap().message_number, 5);
+        assert_eq!(
+            bob.skipped_keys.back().unwrap().message_number,
+            MAX_STORED_SKIPPED as u32 + 4
+        );
+    }
+
+    #[test]
+    fn erased_skipped_key_is_zeroized_in_place() {
+        let mut key = skipped(9);
+        key.zeroize();
+        assert_eq!(key.ratchet_key, [0; 32]);
+        assert_eq!(key.message_number, 0);
+        assert_eq!(key.message_key, [0; 32]);
+
+        // The slot an evicted key occupied holds zeros afterwards, not the key.
+        const SIZE: usize = std::mem::size_of::<SkippedKey>();
+        let (_, mut bob) = setup_session_pair();
+        for n in 1..=4 {
+            bob.store_skipped(skipped(n));
+        }
+        let slot = bob.skipped_keys.front().unwrap() as *const SkippedKey as *const [u8; SIZE];
+        // SAFETY: the slot stays inside the queue's allocation (erasing never reallocates)
+        // and any byte pattern is a valid `[u8; SIZE]`.
+        assert_ne!(unsafe { std::ptr::read_volatile(slot) }, [0u8; SIZE]);
+        bob.erase_skipped(0);
+        assert_eq!(unsafe { std::ptr::read_volatile(slot) }, [0u8; SIZE]);
+        assert_eq!(stored_numbers(&bob), [2, 3, 4]);
     }
 }
