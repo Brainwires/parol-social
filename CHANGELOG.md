@@ -23,6 +23,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `SenderKeyState::decrypt` (and `GroupManager::decrypt_group_text` through it) removed the skipped key it was about to try and advanced the chain before the AEAD check. The Ed25519 signature gates this, but it proves the sender, not the chain: a validly signed message of another chain of the same sender (after `rotate`, which keeps the signing key) consumed keys of the chain the receiver held and moved it forward. The receive now works on a copy and commits after the tag verifies, as the Double Ratchet does. This corrects the note below that found the sender keys sound.
 
 ### Fixed
+- `parolnet-app`: the relay reconnect backoff starts over as soon as a socket got registered, however that socket ends. Before, only a clean close reset it, so a long-lived client whose sockets ended in errors or by the 40 s silence limit drifted to the 30 s maximum.
 - `parolnet-core`: `SessionManager::peer_ids()`. `trial_decrypt` (WASM) and the CLI listed the peers through `export_all()`, which serialized every session's keys into buffers that were never zeroized.
 
 ### Security — Double Ratchet decrypt is all-or-nothing (PNP-002 v0.5 §5.7, MUST-041)
