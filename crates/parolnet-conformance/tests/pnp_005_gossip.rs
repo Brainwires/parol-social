@@ -224,6 +224,36 @@ fn signable_bytes_covers_all_other_fields() {
     }
 }
 
+/// MUST-003 has the signature cover `ttl`; MUST-020 has every hop decrement
+/// `ttl` and increment `hops`. The bytes a receiver verifies against are the
+/// originator's, at every hop.
+#[clause("PNP-005-MUST-003", "PNP-005-MUST-020")]
+#[test]
+fn origin_signable_bytes_survive_forwarding() {
+    let origin = sample_envelope();
+    let signed = origin.signable_bytes();
+    assert_eq!(origin.origin_signable_bytes().as_deref(), Some(&signed[..]));
+
+    let mut forwarded = origin.clone();
+    for _ in 0..origin.ttl {
+        forwarded.ttl -= 1;
+        forwarded.hops += 1;
+        forwarded.seen[usize::from(forwarded.hops)] ^= 0xFF;
+        assert_eq!(
+            forwarded.origin_signable_bytes().as_deref(),
+            Some(&signed[..])
+        );
+    }
+
+    // A raised ttl is a different signed value (MUST-027), and a sum no
+    // originator may set has none.
+    let mut raised = forwarded.clone();
+    raised.ttl += 1;
+    assert_ne!(raised.origin_signable_bytes().as_deref(), Some(&signed[..]));
+    raised.hops = 255;
+    assert_eq!(raised.origin_signable_bytes(), None);
+}
+
 // -- §3.1 Message ID length ---------------------------------------------------
 
 #[clause("PNP-005-MUST-011")]

@@ -455,6 +455,48 @@ fn file_hash_verify_rejects_mismatch_via_constant_time() {
     assert!(!eq_bad);
 }
 
+/// The body of `fn name` in a source file, up to the next item at the same depth.
+fn fn_body<'a>(src: &'a str, signature: &str) -> &'a str {
+    let start = src.find(signature).expect("function present");
+    let rest = &src[start..];
+    let end = rest.find("\n    }\n").expect("function end");
+    &rest[..end]
+}
+
+#[clause("PNP-007-MUST-060", "PNP-007-MUST-061", "PNP-007-MUST-062")]
+#[test]
+fn file_receiver_compares_the_hash_in_constant_time() {
+    use parolnet_core::file_transfer::{FileTransferReceiver, FileTransferSender};
+
+    // MUST-060 / MUST-061 on the implementation: a wrong hash is refused.
+    let data = vec![0x5Au8; 3000];
+    let mut sender = FileTransferSender::new(data.clone(), "f.bin".into(), None);
+    let mut offer = sender.offer.clone();
+    let mut chunks = Vec::new();
+    while let Some(c) = sender.next() {
+        chunks.push(c);
+    }
+    let mut good = FileTransferReceiver::new(offer.clone());
+    for (h, d) in &chunks {
+        good.receive_chunk(h, d.clone()).unwrap();
+    }
+    assert_eq!(good.assemble().unwrap(), data);
+    offer.sha256[31] ^= 1;
+    let mut bad = FileTransferReceiver::new(offer);
+    for (h, d) in &chunks {
+        bad.receive_chunk(h, d.clone()).unwrap();
+    }
+    assert!(bad.assemble().is_err());
+
+    // MUST-062: the comparison in `assemble` is `subtle`'s, not `==` / `!=`.
+    let body = fn_body(
+        include_str!("../../parolnet-core/src/file_transfer.rs"),
+        "pub fn assemble(&self)",
+    );
+    assert!(body.contains("ct_eq"), "assemble must compare with subtle");
+    assert!(!body.contains("computed !=") && !body.contains("computed =="));
+}
+
 #[clause("PNP-007-MUST-062")]
 #[test]
 fn constant_time_hash_comparison_is_available() {

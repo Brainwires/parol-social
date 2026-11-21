@@ -230,13 +230,38 @@ impl GossipEnvelope {
         self.src == PeerId([0u8; 32]) && self.src_pubkey.is_empty()
     }
 
-    /// Bytes to sign/verify (everything except the signature field).
+    /// Bytes the originator signs (everything except the signature field).
     ///
     /// Excludes `hops` and `seen` because these fields are modified by relays
     /// during gossip propagation (hops is incremented, seen bloom filter is
     /// updated). Including them would cause signature verification to fail
     /// after the first relay hop.
+    ///
+    /// `ttl` is covered, and a relay decrements it (PNP-005 §5.2), so these
+    /// bytes match the signature only while the envelope is as its originator
+    /// built it. A node verifying a received envelope uses
+    /// [`Self::origin_signable_bytes`].
     pub fn signable_bytes(&self) -> Vec<u8> {
+        self.signable_bytes_with_ttl(self.ttl)
+    }
+
+    /// Bytes to verify the originator's signature against on a received
+    /// envelope, at any hop.
+    ///
+    /// The signature covers `ttl` as the originator set it (PNP-005-MUST-003
+    /// leaves out only `sig`, `seen` and `hops`). Every forwarding node
+    /// decrements `ttl` and increments `hops` together (PNP-005-MUST-020), so
+    /// the originator's value is `ttl + hops`. `None` when that sum is not a
+    /// `ttl` an originator may set (above [`MAX_TTL`]): no signature covers it.
+    pub fn origin_signable_bytes(&self) -> Option<Vec<u8>> {
+        let origin_ttl = self.ttl.checked_add(self.hops)?;
+        if origin_ttl > MAX_TTL {
+            return None;
+        }
+        Some(self.signable_bytes_with_ttl(origin_ttl))
+    }
+
+    fn signable_bytes_with_ttl(&self, ttl: u8) -> Vec<u8> {
         use sha2::{Digest, Sha256};
         let mut hasher = Sha256::new();
         hasher.update([self.v]);
@@ -245,7 +270,7 @@ impl GossipEnvelope {
         hasher.update(&self.src_pubkey);
         hasher.update(self.ts.to_be_bytes());
         hasher.update(self.exp.to_be_bytes());
-        hasher.update([self.ttl]);
+        hasher.update([ttl]);
         // NOTE: hops and seen are intentionally excluded — they are modified
         // by relays after the sender signs the envelope.
         hasher.update(&self.pow);

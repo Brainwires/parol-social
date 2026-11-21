@@ -2,6 +2,9 @@
 
 use crate::address::PeerId;
 use crate::file::FileOffer;
+use ciborium::Value;
+use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
+use parolnet_crypto::CryptoError;
 use serde::{Deserialize, Serialize};
 
 /// Maximum number of members in a group.
@@ -86,6 +89,31 @@ pub enum GroupOpType {
     RotateKeys,
 }
 
+impl GroupOpType {
+    /// The `op_type` string and `payload` map of PNP-009 §6.2.1.
+    fn wire(&self) -> (&'static str, Value) {
+        let peer = |p: &PeerId| (Value::Text("peer_id".into()), Value::Bytes(p.0.to_vec()));
+        let (op_type, payload) = match self {
+            GroupOpType::AddMember { peer_id } => (
+                "add_member",
+                vec![
+                    peer(peer_id),
+                    (Value::Text("role".into()), Value::Text("member".into())),
+                ],
+            ),
+            GroupOpType::RemoveMember { peer_id } => ("remove_member", vec![peer(peer_id)]),
+            GroupOpType::PromoteAdmin { peer_id } => ("promote_admin", vec![peer(peer_id)]),
+            GroupOpType::DemoteAdmin { peer_id } => ("demote_admin", vec![peer(peer_id)]),
+            GroupOpType::UpdateName { name } => (
+                "update_name",
+                vec![(Value::Text("name".into()), Value::Text(name.clone()))],
+            ),
+            GroupOpType::RotateKeys => ("rotate_keys", Vec::new()),
+        };
+        (op_type, Value::Map(payload))
+    }
+}
+
 /// A signed group operation authorized by an admin.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct GroupOperation {
@@ -95,10 +123,65 @@ pub struct GroupOperation {
     pub op: GroupOpType,
     /// The admin peer who authorized this operation.
     pub admin_peer_id: PeerId,
-    /// 64-byte Ed25519 signature over the operation.
+    /// 64-byte Ed25519 signature by the admin's identity key over
+    /// [`Self::signable_bytes`]. Empty until [`Self::sign`] fills it.
     pub signature: Vec<u8>,
-    /// Unix timestamp in seconds.
+    /// Unix timestamp in seconds. Not a field of the PNP-009 §6.2 map and
+    /// not covered by the signature: informational, never to be relied on.
     pub timestamp: u64,
+}
+
+impl GroupOperation {
+    /// The bytes the admin signs (PNP-009-MUST-020): the CBOR encoding of the
+    /// PNP-009 §6.2 GroupOperation map, fields in the order the spec lists
+    /// them, with `signature` a zero-length byte string.
+    ///
+    /// Built from the fields, not taken from received bytes, so signer and
+    /// verifier agree whatever encoding carried the operation.
+    pub fn signable_bytes(&self) -> Vec<u8> {
+        let (op_type, payload) = self.op.wire();
+        let field = |name: &str, value: Value| (Value::Text(name.into()), value);
+        let map = Value::Map(vec![
+            field("group_id", Value::Bytes(self.group_id.0.to_vec())),
+            field("version", Value::Integer(self.version.into())),
+            field("op_type", Value::Text(op_type.into())),
+            field("payload", payload),
+            field("admin_id", Value::Bytes(self.admin_peer_id.0.to_vec())),
+            field("signature", Value::Bytes(Vec::new())),
+        ]);
+        let mut out = Vec::new();
+        ciborium::into_writer(&map, &mut out).expect("CBOR encoding to a Vec cannot fail");
+        out
+    }
+
+    /// Sign the operation with the admin's Ed25519 identity key
+    /// (PNP-009-MUST-020, MUST-071). The caller makes sure the key is the
+    /// one `admin_peer_id` names; [`Self::verify_signature`] refuses otherwise.
+    pub fn sign(&mut self, admin_signing_key: &SigningKey) {
+        self.signature = admin_signing_key
+            .sign(&self.signable_bytes())
+            .to_bytes()
+            .to_vec();
+    }
+
+    /// Verify the signature against the admin's known Ed25519 public key
+    /// (PNP-009-MUST-022). The key must be the one `admin_peer_id` is the
+    /// hash of. Whether that peer is an admin of the group is the group
+    /// state's question (MUST-021), not this one's.
+    pub fn verify_signature(&self, admin_public_key: &[u8; 32]) -> Result<(), CryptoError> {
+        if PeerId::from_public_key(admin_public_key) != self.admin_peer_id {
+            return Err(CryptoError::SignatureVerificationFailed);
+        }
+        let signature: [u8; 64] = self
+            .signature
+            .as_slice()
+            .try_into()
+            .map_err(|_| CryptoError::SignatureVerificationFailed)?;
+        VerifyingKey::from_bytes(admin_public_key)
+            .map_err(|_| CryptoError::SignatureVerificationFailed)?
+            .verify(&self.signable_bytes(), &Signature::from_bytes(&signature))
+            .map_err(|_| CryptoError::SignatureVerificationFailed)
+    }
 }
 
 /// Signal types for group voice/video calls.

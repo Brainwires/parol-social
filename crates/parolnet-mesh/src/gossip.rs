@@ -465,7 +465,11 @@ impl StandardGossip {
                 .map_err(|_| MeshError::ValidationFailed("invalid signature length".into()))?;
             let signature = Signature::from_bytes(&sig_bytes);
 
-            let signable = gossip_env.signable_bytes();
+            // The originator signed its own `ttl`; hops since then have
+            // decremented it (step 9), so verify over the originator's value.
+            let signable = gossip_env.origin_signable_bytes().ok_or_else(|| {
+                MeshError::ValidationFailed("ttl + hops exceeds the maximum ttl".into())
+            })?;
             verifying_key
                 .verify(&signable, &signature)
                 .map_err(|_| MeshError::ValidationFailed("invalid Ed25519 signature".into()))?;

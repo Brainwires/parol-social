@@ -15,6 +15,7 @@ rand.workspace = true
 serde.workspace = true
 ciborium.workspace = true
 sha2.workspace = true
+subtle.workspace = true
 hmac.workspace = true
 hkdf.workspace = true
 thiserror.workspace = true

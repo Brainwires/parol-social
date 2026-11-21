@@ -4,6 +4,7 @@
 //! Application glue lives in `main.rs`.
 
 pub mod authority_keys;
+pub mod challenge;
 pub mod frames;
 pub mod identity;
 pub mod policy;
