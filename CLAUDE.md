@@ -79,7 +79,12 @@ parolnet-rtc (native only; drives the sans-I/O `rtc` engine; no workspace deps)
   v
 parolnet-app (native; headless client core: crypto + protocol + core (no default features) + rtc)
 
-apps/desktop (own workspace; GPUI; depends on parolnet-app and parolnet-rtc)
+parolnet-media (native only; call media; no workspace deps. Default features are pure Rust
+  (Opus, AEC3, conversion); `vpx` (system libvpx), `audio-io` (cpal) and `camera` (nokhwa) are
+  opt-in and must stay out of the default set: the workspace's CI installs no system libraries)
+
+apps/desktop (own workspace; GPUI; depends on parolnet-app, parolnet-rtc and parolnet-media
+  with `vpx`, `audio-io`, `camera`)
 ```
 
 `parolnet-core` features: `native` (default), `mesh` (default; store-forward and LAN discovery),

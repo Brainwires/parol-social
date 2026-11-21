@@ -1,6 +1,6 @@
 # M1: headless core, desktop chat and calls, PWA interop
 
-Status of M1 after its second slice (plan: `plans/parolnet-gpui.md` M1, revised for the
+Status of M1 after its third slice (plan: `plans/parolnet-gpui.md` M1, revised for the
 signaling-only relay). What runs, how it is tested, what it does not do yet.
 
 ## What runs end to end
@@ -33,8 +33,12 @@ signaling-only relay). What runs, how it is tested, what it does not do yet.
   multicast and no LAN address is used).
 - **The desktop app's call media** (`parolnet-desktop --call-check`, `apps/desktop/interop/
   desktop-call.mjs`, in the `desktop-spike` workflow): the window's call session without a window
-  video-calls the bot; it decoded every VP8 frame of the bot's test pattern (310 in 10 s, no
-  decode errors) and 8 s of Opus, and the bot received the desktop's libvpx-encoded test pattern.
+  video-calls the bot with synthetic media (the test pattern as a 720p YUYV camera through
+  conversion, scaling and libvpx; a tone through the audio path with AEC3 and Opus; playback into
+  nothing); it decoded every VP8 frame of the bot's test pattern (309 in 10 s, no decode errors)
+  and 8 s of Opus, sent 247 video frames and 410 Opus packets, and the bot received the desktop's
+  VP8. `parolnet-desktop --media-check` (same workflow) runs the echo measurement below and the
+  synthetic camera through libvpx with no network.
 - **Desktop UI** (default mode): contact list with path badges, pairing screen, chat view with
   delivery state, rename, retry, Verify (the safety number), Call / Video call when the path is
   direct, the incoming-call banner (Accept / Decline) and the call panel (status, the remote video
@@ -64,10 +68,66 @@ wasm build.
 A call runs on its own WebRTC connection (as the PWA's `call.js`), set up by `CALL_SIGNAL`
 envelopes in the PWA's JSON (`offer` / `answer` / `ice` / `hangup` / `reject`) on the verified data
 channel. The core does no capture or decoding: the client feeds encoded frames to a `FrameSink`
-and receives RTP. The desktop sends a synthetic test pattern (640x360, 30 fps) through a libvpx
-VP8 encoder (a C shim compiled against the system's headers, `apps/desktop/src/vp8enc.c`) and the
-default microphone through opus-rs (48 kHz mono, 20 ms); it plays the contact's Opus through cpal
-and shows its video in the call panel.
+and receives RTP. The desktop's side of that line is `parolnet-media` (`crates/parolnet-media`)
+driven by `apps/desktop/src/call.rs`:
+
+- **Video out.** The camera through `nokhwa` when the machine has one, in the mode closest to
+  the send size (640x360 at 30 fps; `PAROLNET_VIDEO=720p` sends 1280x720), converted to I420
+  (NV12, YUYV, MJPEG, RGB), cropped and scaled, encoded by libvpx (the C shim
+  `crates/parolnet-media/src/vp8/vp8enc.c`, compiled against the system's headers). Capture runs
+  on its own thread into a latest-frame slot: an encoder that falls behind skips pictures. With
+  no camera, or with synthetic media (`--call-check`, `PAROLNET_SYNTHETIC_MEDIA=1`), the test
+  pattern stands in, delivered as a 720p YUYV camera would so the same conversion runs.
+  **Camera off** releases the device and sends one black frame a second; a camera that fails or
+  is refused does the same and says why in the call panel.
+- **Audio.** One thread runs both directions in 10 ms frames at 48 kHz
+  (`parolnet_media::duplex`): microphone → resample → `process_capture` → 20 ms Opus frames, and
+  the contact's Opus → playout buffer (40 ms prebuffer after an underrun, trimmed to 80 ms past
+  300 ms) → `process_render` → resample → speakers. The render side is pulled by the output
+  queue, so each frame passes the processor's reverse stream just before it is played, and the
+  stream delay told to the processor is the output queue plus the device latencies plus the
+  capture backlog. The processor is WebRTC's AEC3, noise suppression and AGC2 in the pure-Rust
+  port `sonora`. The sound card's callbacks only move samples through wait-free rings. **Mute**
+  sends silence and keeps the microphone running through the processor.
+- **Devices.** Camera, microphone and speaker menus in the call panel, switchable mid-call; the
+  choice holds for later calls in the same run. A device that goes away is closed and reported;
+  audio then tries the system default once.
+
+### Echo cancellation, measured
+
+`parolnet_media::selftest` plays speech-shaped noise as the far end, feeds the microphone its
+echo through three reflections (42, 55 and 71 ms; the strongest 6 dB down), and after 9 s adds
+a near-end 1 kHz tone. No device and no clock are involved, so the result is the same on every
+run.
+
+| | far end alone (ERLE) | double talk (ERLE) | near-end tone |
+| --- | --- | --- | --- |
+| AEC3, `sonora` 0.3.0, direct 10 ms frames | 67.5 dB | 8.6 dB | -1.9 dB |
+| the same through the duplex path, devices at 44.1 kHz | 67.4 dB | 6.8 dB | -2.2 dB |
+| the same, devices at 48 kHz | 67.7 dB | 7.6 dB | -2.1 dB |
+| reference: WebRTC's C++ module (`webrtc-audio-processing` 2.1.0, macOS arm64), direct | 53.2 dB | 7.7 dB | -1.7 dB |
+| passthrough | 0 dB | 0 dB | 0 dB |
+
+The tests require 30 dB, 5 dB and ±4 dB. During double talk AEC3 holds its suppressor back to
+keep the near-end voice, so only the linear filter's share is left; the C++ module behaves the
+same. `cargo test -p parolnet-media` and `parolnet-desktop --media-check` run it.
+
+### Manual checklist (nothing below runs in CI or on the dev machine)
+
+CI has no camera, microphone, speakers or (outside the spike workflow) screen, and the dev Mac
+opens none of them. Before a release, on each OS:
+
+1. Video call with a built-in and a USB camera: the picture is upright, in colour, not
+   stretched; the self-view matches. macOS asks for camera access once and shows the usage
+   string. (macOS is the riskiest: `nokhwa`'s AVFoundation backend is used through its packed
+   4:2:2 path only, see `crates/parolnet-media/src/camera.rs`.)
+2. Camera off and on; switch cameras mid-call; unplug the camera mid-call (black, a reason in
+   the panel, no crash).
+3. Voice call on laptop speakers, both sides talking: no echo of the contact's voice comes
+   back; switch microphone and speaker mid-call; unplug a headset mid-call.
+4. A 44.1 kHz output device and a 16 kHz Bluetooth headset microphone.
+5. The device menus, the Camera button and the self-view tile look right (they were built
+   without opening a window).
 
 ## Known gaps
 
@@ -77,8 +137,18 @@ and shows its video in the call panel.
   pair, so media stopped after about a second. `webrtc-rs-rtc` `v0.22.0+brainwires.5` follows the
   later nomination; interop case 6 (the PWA video-calls the desktop) and case 7 (a data channel
   the PWA offers while it holds camera and microphone permission) run by default.
-- Camera capture (nokhwa / platform capture), echo cancellation (AEC3), device menus, camera on /
-  off mid-call (renegotiation, E1), call stats in the UI.
+- Camera, microphone and speaker paths are unverified on real devices (the checklist above);
+  the call panel's new controls are unverified on screen.
+- Adding or removing a track mid-call (an audio call that becomes a video call): camera off /
+  on keeps the video track and sends black. The engine at `v0.22.0+brainwires.5` has
+  `RTCRtpTransceiver::set_direction` with negotiation-needed and re-binds a sender after a
+  renegotiation; what is missing is on our side: `parolnet-rtc` exposes no renegotiation, the
+  call signals carry one offer and one answer, and the PWA does not renegotiate either.
+- The playout buffer is a fixed prebuffer, not an adaptive jitter buffer (no time stretching,
+  no packet-loss concealment beyond Opus's own); Opus in-band FEC and DTX are not switched on.
+  Call stats in the UI.
+- A device chosen in the call panel is not remembered across restarts (the settings screen).
+- No macOS app bundle yet: the usage strings are embedded in the executable.
 - TURN candidates for a user-supplied TURN server (`rtc-turn`); IPv6 host candidates and several
   sockets; ICE restart on network change (E9).
 - `parolnet-store` (SQLCipher, key in the OS keychain); today's JSON state file is owner-only but
@@ -86,8 +156,8 @@ and shows its video in the call panel.
 
 ## Next slice
 
-1. Camera capture and AEC3 in a `parolnet-media` crate (the libvpx encoder / decoder and the test
-   pattern move there), camera toggle mid-call.
+1. The manual media checklist on the three OSes; device choices in the settings screen; an
+   adaptive jitter buffer and Opus FEC / DTX; audio-to-video upgrade by renegotiation.
 2. `parolnet-store` behind the same `Store` interface; settings screen with the user's TURN server
    once `parolnet-rtc` gathers TURN candidates.
 3. Interop in Firefox and WebKit.
