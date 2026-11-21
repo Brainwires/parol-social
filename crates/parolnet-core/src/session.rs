@@ -130,6 +130,28 @@ impl SessionManager {
             .collect()
     }
 
+    /// Export one session's state for persistence, `None` without a session for the peer.
+    ///
+    /// The bytes are secret key material.
+    pub fn export_session(&self, peer_id: &PeerId) -> Option<Vec<u8>> {
+        let sessions = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
+        sessions.get(peer_id).map(|s| s.ratchet.export_bytes())
+    }
+
+    /// Import one session exported by [`Self::export_session`] (or one entry of
+    /// [`Self::export_all`]), replacing any session held for the peer. Nothing changes when
+    /// the bytes do not parse.
+    pub fn import_session(
+        &self,
+        peer_id: PeerId,
+        session_bytes: &[u8],
+    ) -> Result<(), crate::CoreError> {
+        let ratchet =
+            DoubleRatchetSession::import_bytes(session_bytes).map_err(crate::CoreError::Crypto)?;
+        self.add_session(peer_id, ratchet);
+        Ok(())
+    }
+
     /// Import sessions from exported pairs.
     pub fn import_all(&self, data: Vec<([u8; 32], Vec<u8>)>) -> Result<usize, crate::CoreError> {
         let mut sessions = self.sessions.lock().unwrap_or_else(|e| e.into_inner());

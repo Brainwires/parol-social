@@ -297,6 +297,55 @@ pub fn try_bootstrap_and_decrypt(
     seed: &[u8; 32],
     our_ratchet_secret: &[u8; 32],
 ) -> Result<DecryptedEnvelope, CoreError> {
+    bootstrap_and_decrypt(
+        sessions,
+        envelope_bytes,
+        None,
+        our_ik,
+        seed,
+        our_ratchet_secret,
+    )
+    .map(|(_, decoded)| decoded)
+}
+
+/// [`try_bootstrap_and_decrypt`] bound to one expected sender.
+///
+/// For a receiver that already knows which peer the envelope came from (the peer at the
+/// other end of the connection it arrived on): the envelope is refused, before any key is
+/// derived, unless the identity key in its cleartext `source_hint` hashes to
+/// `expected_sender`. Returns that identity key with the decrypted envelope.
+///
+/// As with [`try_bootstrap_and_decrypt`], the session is committed only once the AEAD tag
+/// has verified; on any failure `sessions` (a session already held for the sender included)
+/// is untouched.
+pub fn try_bootstrap_and_decrypt_from(
+    sessions: &SessionManager,
+    envelope_bytes: &[u8],
+    expected_sender: &PeerId,
+    our_ik: &[u8; 32],
+    seed: &[u8; 32],
+    our_ratchet_secret: &[u8; 32],
+) -> Result<([u8; 32], DecryptedEnvelope), CoreError> {
+    bootstrap_and_decrypt(
+        sessions,
+        envelope_bytes,
+        Some(expected_sender),
+        our_ik,
+        seed,
+        our_ratchet_secret,
+    )
+}
+
+/// Shared body of the bootstrap decrypts: returns the sender's identity key and the
+/// decrypted envelope, and commits the responder session only after the AEAD tag verified.
+fn bootstrap_and_decrypt(
+    sessions: &SessionManager,
+    envelope_bytes: &[u8],
+    expected_sender: Option<&PeerId>,
+    our_ik: &[u8; 32],
+    seed: &[u8; 32],
+    our_ratchet_secret: &[u8; 32],
+) -> Result<([u8; 32], DecryptedEnvelope), CoreError> {
     use x25519_dalek::StaticSecret;
 
     if !BUCKET_SIZES.contains(&envelope_bytes.len()) {
@@ -314,6 +363,12 @@ pub fn try_bootstrap_and_decrypt(
         CoreError::BootstrapFailed("envelope has no source_hint; cannot bootstrap".into())
     })?;
     let their_ik = their_ik_peer.0;
+    let scanner_peer_id = PeerId::from_public_key(&their_ik);
+    if expected_sender.is_some_and(|expected| *expected != scanner_peer_id) {
+        return Err(CoreError::BootstrapFailed(
+            "bootstrap envelope is not from the expected sender".into(),
+        ));
+    }
 
     let bs = crate::bootstrap::derive_bootstrap_secret(seed, our_ik, &their_ik)?;
 
@@ -332,15 +387,17 @@ pub fn try_bootstrap_and_decrypt(
         .map_err(CoreError::Crypto)?;
 
     // AEAD verified → commit session keyed by PeerId(SHA-256(their_ik)).
-    let scanner_peer_id = PeerId::from_public_key(&their_ik);
     sessions.add_session(scanner_peer_id, candidate);
 
-    Ok(DecryptedEnvelope {
-        source_hint: Some(scanner_peer_id),
-        msg_type: envelope.cleartext_header.msg_type,
-        plaintext,
-        timestamp: envelope.cleartext_header.timestamp,
-    })
+    Ok((
+        their_ik,
+        DecryptedEnvelope {
+            source_hint: Some(scanner_peer_id),
+            msg_type: envelope.cleartext_header.msg_type,
+            plaintext,
+            timestamp: envelope.cleartext_header.timestamp,
+        },
+    ))
 }
 
 #[cfg(test)]
@@ -380,5 +437,262 @@ mod tests {
         // header (it sits at the front of the CBOR encoding).
         env[10] ^= 0x01;
         assert!(decrypt_from_envelope(&mut bob, &env).is_err());
+    }
+
+    // ── A failed decrypt leaves every session as it was (PNP-002-MUST-041) ──
+
+    const NOW: u64 = 1_700_000_000;
+
+    fn pid(n: u8) -> PeerId {
+        PeerId([n; 32])
+    }
+
+    /// Our session manager holding one session per peer, and each peer's own end.
+    fn manager_with_peers(peers: &[u8]) -> (SessionManager, Vec<(PeerId, DoubleRatchetSession)>) {
+        let sessions = SessionManager::new();
+        let mut remote = Vec::new();
+        for &n in peers {
+            let (theirs, ours) = session_pair();
+            sessions.add_session(pid(n), ours);
+            remote.push((pid(n), theirs));
+        }
+        (sessions, remote)
+    }
+
+    /// The same envelope with one bit of its ciphertext flipped.
+    fn corrupt_payload(envelope_bytes: &[u8]) -> Vec<u8> {
+        let mut envelope = CborCodec.decode(envelope_bytes).unwrap();
+        envelope.encrypted_payload[0] ^= 0x01;
+        CborCodec.encode(&envelope).unwrap()
+    }
+
+    fn sorted_export(sessions: &SessionManager) -> Vec<([u8; 32], Vec<u8>)> {
+        let mut all = sessions.export_all();
+        all.sort();
+        all
+    }
+
+    /// One message each way between us and `peer`.
+    fn assert_round_trip(
+        sessions: &SessionManager,
+        peer: &PeerId,
+        theirs: &mut DoubleRatchetSession,
+    ) {
+        let me = pid(0xEE);
+        let env = encrypt_into_envelope(theirs, &me, 0x01, b"to us", NOW, None).unwrap();
+        assert_eq!(
+            decrypt_for_peer(sessions, peer, &env).unwrap().plaintext,
+            b"to us"
+        );
+        let env = encrypt_for_peer(sessions, peer, 0x01, b"to them", NOW, None).unwrap();
+        assert_eq!(
+            decrypt_from_envelope(theirs, &env).unwrap().plaintext,
+            b"to them"
+        );
+    }
+
+    #[test]
+    fn envelope_from_a_third_identity_leaves_the_session_working() {
+        let (sessions, mut remote) = manager_with_peers(&[0xB0]);
+        let (bob, bob_session) = &mut remote[0];
+        assert_round_trip(&sessions, bob, bob_session);
+
+        // Carol has her own session with us under another key, and her envelopes get
+        // delivered as if they were Bob's.
+        let (mut carol, _) = session_pair();
+        let before = sorted_export(&sessions);
+        for i in 0..5u8 {
+            let env =
+                encrypt_into_envelope(&mut carol, &pid(0xEE), 0x01, &[i; 40], NOW, None).unwrap();
+            assert!(decrypt_for_peer(&sessions, bob, &env).is_err());
+            assert_eq!(sorted_export(&sessions), before);
+        }
+        // A genuine envelope of Bob's, corrupted in transit.
+        let genuine =
+            encrypt_into_envelope(bob_session, &pid(0xEE), 0x01, b"hello", NOW, None).unwrap();
+        let corrupted = corrupt_payload(&genuine);
+        assert!(decrypt_for_peer(&sessions, bob, &corrupted).is_err());
+        assert_eq!(sorted_export(&sessions), before);
+
+        assert_eq!(
+            decrypt_for_peer(&sessions, bob, &genuine)
+                .unwrap()
+                .plaintext,
+            b"hello"
+        );
+        for _ in 0..3 {
+            assert_round_trip(&sessions, bob, bob_session);
+        }
+    }
+
+    #[test]
+    fn trial_decrypt_leaves_the_other_sessions_untouched() {
+        let (sessions, mut remote) = manager_with_peers(&[1, 2, 3, 4]);
+        for (peer, theirs) in remote.iter_mut() {
+            assert_round_trip(&sessions, peer, theirs);
+        }
+
+        // Sealed-sender receive: try the envelope against every session.
+        let trial = |env: &[u8]| {
+            let mut hit = None;
+            for (peer, _) in sorted_export(&sessions) {
+                if let Ok(d) = decrypt_for_peer(&sessions, &PeerId(peer), env) {
+                    assert!(hit.is_none(), "one envelope decrypted under two sessions");
+                    hit = Some((PeerId(peer), d));
+                }
+            }
+            hit
+        };
+
+        // An envelope no session of ours can open changes none of them.
+        let (mut stranger, _) = session_pair();
+        let before = sorted_export(&sessions);
+        let env = encrypt_into_envelope(&mut stranger, &pid(0xEE), 0x01, b"?", NOW, None).unwrap();
+        assert!(trial(&env).is_none());
+        assert_eq!(sorted_export(&sessions), before);
+
+        // An envelope from one peer changes only that peer's session.
+        for round in 0..3u8 {
+            for i in 0..remote.len() {
+                let before = sorted_export(&sessions);
+                let (peer, theirs) = &mut remote[i];
+                let env =
+                    encrypt_into_envelope(theirs, &pid(0xEE), 0x01, &[round, i as u8], NOW, None)
+                        .unwrap();
+                let (from, d) = trial(&env).expect("the sender's session decrypts");
+                assert_eq!(from, *peer);
+                assert_eq!(d.plaintext, [round, i as u8]);
+                for (b, a) in before.iter().zip(sorted_export(&sessions).iter()) {
+                    assert_eq!(b == a, PeerId(b.0) != *peer);
+                }
+                // Our reply moves the peer to a new sending chain for the next round.
+                let reply = encrypt_for_peer(&sessions, peer, 0x01, b"ack", NOW, None).unwrap();
+                decrypt_from_envelope(theirs, &reply).unwrap();
+            }
+        }
+    }
+
+    /// A presenter's pending pairing and the scanner's side of it.
+    struct Pairing {
+        our_ik: [u8; 32],
+        seed: [u8; 32],
+        ratchet_secret: [u8; 32],
+        scanner_ik: [u8; 32],
+        scanner: DoubleRatchetSession,
+    }
+
+    fn pairing() -> Pairing {
+        let our_ik = [0x0A; 32];
+        let scanner_ik = [0x0B; 32];
+        let qr = crate::bootstrap::generate_qr_payload_with_ratchet(&our_ik, None).unwrap();
+        let rk = *PublicKey::from(&StaticSecret::from(qr.ratchet_secret)).as_bytes();
+        let bs = crate::bootstrap::derive_bootstrap_secret(&qr.seed, &our_ik, &scanner_ik).unwrap();
+        Pairing {
+            our_ik,
+            seed: qr.seed,
+            ratchet_secret: qr.ratchet_secret,
+            scanner_ik,
+            scanner: DoubleRatchetSession::initialize_initiator(bs, &rk).unwrap(),
+        }
+    }
+
+    fn bootstrap_envelope(p: &mut Pairing) -> Vec<u8> {
+        let hint = Some(PeerId(p.scanner_ik));
+        encrypt_into_envelope(&mut p.scanner, &pid(0xEE), 0x01, b"paired", NOW, hint).unwrap()
+    }
+
+    #[test]
+    fn bootstrap_bound_to_the_sender_returns_its_identity_key() {
+        let mut p = pairing();
+        let scanner = PeerId::from_public_key(&p.scanner_ik);
+        let env = bootstrap_envelope(&mut p);
+        let sessions = SessionManager::new();
+
+        // Not the peer we expect: refused, nothing created.
+        let err = try_bootstrap_and_decrypt_from(
+            &sessions,
+            &env,
+            &pid(0x33),
+            &p.our_ik,
+            &p.seed,
+            &p.ratchet_secret,
+        );
+        assert!(matches!(err, Err(CoreError::BootstrapFailed(_))));
+        assert_eq!(sessions.session_count(), 0);
+
+        let (ik, decoded) = try_bootstrap_and_decrypt_from(
+            &sessions,
+            &env,
+            &scanner,
+            &p.our_ik,
+            &p.seed,
+            &p.ratchet_secret,
+        )
+        .unwrap();
+        assert_eq!(ik, p.scanner_ik);
+        assert_eq!(decoded.plaintext, b"paired");
+        assert_eq!(decoded.source_hint, Some(scanner));
+        assert!(sessions.has_session(&scanner));
+        assert_round_trip(&sessions, &scanner, &mut p.scanner);
+    }
+
+    #[test]
+    fn failed_bootstrap_does_not_replace_a_good_session() {
+        let mut p = pairing();
+        let scanner = PeerId::from_public_key(&p.scanner_ik);
+        // We already hold a working session with the scanner's identity.
+        let sessions = SessionManager::new();
+        let (mut theirs, ours) = session_pair();
+        sessions.add_session(scanner, ours);
+        assert_round_trip(&sessions, &scanner, &mut theirs);
+        let before = sorted_export(&sessions);
+
+        // A bootstrap envelope naming that identity that does not authenticate: made for
+        // another pairing code, or corrupted.
+        let wrong_seed = [0x5E; 32];
+        let genuine = bootstrap_envelope(&mut p);
+        let corrupted = corrupt_payload(&genuine);
+        for (env, seed) in [(&genuine, &wrong_seed), (&corrupted, &p.seed)] {
+            assert!(
+                try_bootstrap_and_decrypt(&sessions, env, &p.our_ik, seed, &p.ratchet_secret)
+                    .is_err()
+            );
+            assert!(
+                try_bootstrap_and_decrypt_from(
+                    &sessions,
+                    env,
+                    &scanner,
+                    &p.our_ik,
+                    seed,
+                    &p.ratchet_secret
+                )
+                .is_err()
+            );
+            assert_eq!(sorted_export(&sessions), before);
+        }
+        assert_round_trip(&sessions, &scanner, &mut theirs);
+
+        // The pending pairing is still good for the genuine envelope.
+        try_bootstrap_and_decrypt(&sessions, &genuine, &p.our_ik, &p.seed, &p.ratchet_secret)
+            .unwrap();
+        assert_round_trip(&sessions, &scanner, &mut p.scanner);
+    }
+
+    #[test]
+    fn one_session_export_import_round_trip() {
+        let (sessions, mut remote) = manager_with_peers(&[1, 2]);
+        let (peer, theirs) = &mut remote[0];
+        assert_round_trip(&sessions, peer, theirs);
+        assert!(sessions.export_session(&pid(9)).is_none());
+
+        let blob = sessions.export_session(peer).unwrap();
+        let other = sorted_export(&sessions)[1].clone();
+        let restored = SessionManager::new();
+        restored.import_session(*peer, &blob).unwrap();
+        assert!(restored.import_session(pid(9), &blob[..40]).is_err());
+        assert_eq!(restored.session_count(), 1);
+        assert_round_trip(&restored, peer, theirs);
+        // The other session was not involved.
+        assert_eq!(sorted_export(&sessions)[1], other);
     }
 }
