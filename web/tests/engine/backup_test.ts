@@ -109,7 +109,7 @@ function sample(history: boolean): BackupContents {
     sessions: JSON.stringify({ [peer]: "00ff" }),
     contacts: [{
       peerId: peer,
-      name: "Bo",
+      name: "Bo Backup",
       identityKey: "22".repeat(32),
       addedMs: 5,
       verified: "compared",
@@ -117,7 +117,7 @@ function sample(history: boolean): BackupContents {
     }],
     settings: [{
       key: "turn",
-      value: { uri: "turn:x", username: "u", password: "p", relayOnly: true },
+      value: { uri: "turn:x.example", username: "u", password: "p", relayOnly: true },
     }],
     history: history
       ? {
@@ -151,7 +151,7 @@ Deno.test("backup file: round trip, with and without history", async () => {
     assertEquals(await decodeBackup(c, PASS, file), contents);
     // Nothing of the contents is readable in the file.
     const text = new TextDecoder("latin1").decode(file);
-    for (const secret of ["11".repeat(32), "Bo", "turn:x", "b".repeat(64)]) {
+    for (const secret of ["11".repeat(32), "Bo Backup", "turn:x.example", "b".repeat(64)]) {
       assertEquals(text.includes(secret), false, secret);
     }
   }

@@ -52,7 +52,7 @@ async function plaintextDatabase(): Promise<MemoryStorage> {
     {
       op: "put",
       store: "identity",
-      value: { id: "pairing", code: "ab", expiresAtMs: 5, pendingHex: "feed" },
+      value: { id: "pairing", code: "ab", expiresAtMs: 5, pendingHex: "feedfacefeedface" },
     },
     { op: "put", store: "sessions", value: { id: "blob", json: '{"x":"ratchet-state"}' } },
     { op: "put", store: "contacts", value: contact(PEER_B, "Bo Plaintext") },
@@ -238,7 +238,7 @@ Deno.test("migration: a plaintext database is sealed in place, nothing lost", as
     const secret of [
       SECRET,
       "ratchet-state",
-      "feed",
+      "feedface",
       "turn-secret",
       "Ana Plaintext",
       "first words",
@@ -264,7 +264,7 @@ Deno.test("migration: a plaintext database is sealed in place, nothing lost", as
     const secret of [
       SECRET,
       "ratchet-state",
-      "feed",
+      "feedface",
       "turn-secret",
       "Plaintext",
       "words",

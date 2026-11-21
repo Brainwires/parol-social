@@ -468,7 +468,7 @@ test("right to left mirrors the thread and the line; Arabic loads on demand", as
   await page.getByTestId("lab-locale-ar").click();
   await expect(page.locator("html")).toHaveAttribute("dir", "rtl");
   await expect(page.locator("html")).toHaveAttribute("lang", "ar");
-  await expect(frame.getByTestId("line")).toHaveText("في انتظار اتصال Tomasz");
+  await expect(frame.getByTestId("line")).toHaveText("في انتظار أن يصبح Tomasz متصلًا");
   await expect(frame.getByTestId("thread-caption")).toHaveText(
     "في الانتظار على هذا الجهاز",
   );
@@ -806,12 +806,12 @@ test("settings: five groups, a typed confirmation before everything is deleted",
   await page.getByTestId("theme-system").click();
   await page.getByTestId("settings-language").selectOption("de");
   await expect(page.locator("html")).toHaveAttribute("lang", "de");
-  // Translated where the old app had the words, English where it did not (per key).
+  // Every catalogue is complete: nothing on the screen stays in English.
   await expect(page.getByTestId("settings-screen-title")).toHaveText(
     "Einstellungen",
   );
   await expect(page.getByTestId("settings-wipe")).toHaveText(
-    "Delete all data on this device",
+    "Alle Daten auf diesem Gerät löschen",
   );
   await page.getByTestId("settings-language").selectOption("en");
 

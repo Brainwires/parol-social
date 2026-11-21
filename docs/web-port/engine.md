@@ -23,7 +23,10 @@ this engine is in [app.md](app.md).
 | `reconnect.ts` | The soft-offline probe schedule (a port of `reconnect.rs`) |
 | `wire.ts` | Relay frames, data-channel frames, call signals, the initiator rule |
 | `bytes.ts` | Hex, UTF-8, and the CBOR reader for a pairing code's public fields and an envelope's `source_hint` |
-| `storage.ts` | The schema, `IdbStorage`, `MemoryStorage` |
+| `storage.ts` | The schema, and the two places rows are kept as given (`RawStorage`): `IdbStorage`, `MemoryStorage` |
+| `vault.ts` | Encryption at rest: the storage keys, the sealed form of a row, the passphrase lock ([at-rest.md](at-rest.md)) |
+| `sealed-storage.ts` | `SealedStorage`: the engine's `Storage` over a `RawStorage`, sealing every row |
+| `backup.ts` | The backup file and what a restored device starts with ([backup.md](backup.md)) |
 | `browser.ts` | The browser implementations of the platform interfaces. The only module that touches browser globals, each at call time |
 | `test-hooks.ts` | The optional `__parolnetTest` contract ([interop.md](interop.md) §11.4) |
 
@@ -155,14 +158,19 @@ instead of "could not connect".
 
 ## Storage schema
 
-Database `parolnet-web`, version 1. Nothing is migrated from the old PWA's `parolnet` database.
+Database `parolnet-web`, version 2. Nothing is migrated from the old PWA's `parolnet` database.
+
+This is the schema the engine sees through `Storage`. In the browser every row is sealed
+before it is stored (`SealedStorage`), text keys are replaced by tags, and a `vault` store
+(new in version 2) holds the keys: [at-rest.md](at-rest.md) has the stored form and the
+migration from version 1.
 
 | Store | Key | Index | Row |
 |---|---|---|---|
 | `identity` | `id` = `"self"` | | `{ id, secretHex }` |
 | `identity` | `id` = `"pairing"` | | `{ id, code, expiresAtMs, pendingHex }`: the code on screen and its pending bootstrap (secret, kept like `secretHex`; deleted on use, expiry, cancel and wipe) |
 | `sessions` | `id` = `"blob"` | | `{ id, json }`: the wasm `export_sessions()` output, one row |
-| `contacts` | `peerId` | | `{ peerId, name, identityKey, addedMs, verified, verifiedMs }` |
+| `contacts` | `peerId` | | `{ peerId, name, identityKey, addedMs, verified, verifiedMs, restoredMs? }` (`restoredMs`: it came out of a backup and no connection has proven its session since) |
 | `messages` | `id` (number, allocated by the engine) | `peerId` | `{ id, peerId, direction, text, timestampMs, state, editedMs? }` |
 | `outbox` | `id` (number, increasing) | `peerId` | `{ id, peerId, kind: "text", messageId, text, createdMs }` or `{ id, peerId, kind: "bootstrap", envelopeHex, createdMs }` |
 | `contactState` | `peerId` | | `{ peerId, lastActivityMs, unread }` |
@@ -176,20 +184,19 @@ row it creates); the index is `peerId` alone (rows come back in key order, which
 Every state change is one transaction (`Storage.write`): a received message and the ratchet
 state that decrypted it are saved together, before anything is shown.
 
-Nothing is encrypted at rest in this phase (the inventory's open question on the passphrase
-store). The identity secret, the sessions and the TURN password are plain rows; `wipe()` deletes
-the database and clears the wasm state.
+`wipe()` deletes the database, the storage keys with it, and clears the wasm state.
 
 ## Design decisions
 
 **The mailbox.** One serial queue runs every command, relay frame, WebRTC callback and timer, so
 the logic reads like the native actor. SDP work and media capture run outside it and re-enter it.
 
-**Queued messages are plaintext at rest and encrypted when they are flushed.** The old PWA and
+**Queued messages are kept as text and encrypted for the contact when they are flushed.** The old PWA and
 the native core queue ready-made envelopes; the ratchet has then already advanced, so a queued
 message can be neither edited nor removed without leaving a gap or re-encrypting out of order.
 Here a queued text is an `outbox` row holding the text. `editQueued` and `takeBack` only touch
-storage. This adds no exposure: the same text is in `messages` anyway. A side effect: queued
+storage. This adds no exposure: the same text is in `messages` anyway, and both rows are
+sealed at rest like every other ([at-rest.md](at-rest.md)). A side effect: queued
 texts survive a re-pairing (the native core drops them, because its queued envelopes belong to
 the old session).
 
@@ -276,6 +283,13 @@ accepted; the engine stops the tracks it obtained when the call ends ("The end o
 doubling to 5 min (waited-for) or 15 min (idle) under a 12 + 1/min budget; queue 30 days, 500
 per contact, 2000 in total.
 
+**A contact restored from a backup.** Its row carries `restoredMs` ([backup.md](backup.md),
+"Sessions in a backup go stale"). The engine removes the mark when a verified connection to
+the contact is still open `RESTORED_PROVEN_MS` (10 s) after its binding verified, and when
+the contact is paired with again. Verifying their binding alone is not proof: a stale
+session usually still reads what they send, while they cannot read what we send and close
+the connection at once.
+
 ## Deviations from the old PWA
 
 | Old PWA | Engine | Reference |
@@ -323,6 +337,8 @@ The engine works with today's `crates/parolnet-wasm`, but these would make it si
 6. **Per-session export** (`export_session(peer_id)`): the engine re-exports every session after
    every envelope.
 7. `envelope_decode` is marked "unused" in the inventory; the engine depends on it.
+8. ~~A memory-hard function for passphrases.~~ Now `argon2id` in the core
+   (`parolnet_crypto::kdf::argon2id`); the passphrase lock and the backup file use it.
 
 Editing queued messages needed no wasm change (plaintext outbox).
 
@@ -399,6 +415,7 @@ both in job `pwa-interop`.
 ## Not done in this phase
 
 - No history trimming (the native core keeps 5000 messages per contact).
-- No encryption at rest, no export / import (the inventory's open questions). Notifications
-  are the app's (a tab in the background; no push).
+- Notifications are the app's (a tab in the background; no push).
+- No automatic lock after a time of inactivity (the passphrase is asked for at start and
+  after "Lock now").
 - Groups, files, identity rotation: deferred, as in the inventory.

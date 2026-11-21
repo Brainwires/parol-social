@@ -1083,6 +1083,16 @@ test("settings: a relay server of one's own is kept, its password never shown; d
   expect(await ana.page.evaluate(() => Object.keys(localStorage))).toEqual([]);
   await expectClean(ana.problems);
 });
+/**
+ * Go to another screen of the app the way a link does: by the hash. (`page.goto` with the
+ * URL the page already has is a reload in WebKit, and a reload of a locked app ends at the
+ * passphrase.)
+ */
+async function go(page: Page, hash: string): Promise<void> {
+  await page.evaluate((hash) => {
+    location.hash = hash;
+  }, hash);
+}
 
 /**
  * Everything a copy of the page's database would show: every row of every store as text
@@ -1152,7 +1162,7 @@ test("at rest: nothing readable in the database; a passphrase locks ParolNet, wi
   const ben = await person(browser, live);
   await start(ana.page);
   await start(ben.page);
-  await pairByPaste(ana.page, ben.page, { presenter: "Ana", scanner: "Ben" });
+  await pairByPaste(ana.page, ben.page, { presenter: "Ana", scanner: "Benedikt" });
   await openLine(ana.page, ben.page);
   await send(ana.page, "kept under lock and key");
   await expect(bubble(ben.page, "kept under lock and key")).toHaveAttribute(
@@ -1167,7 +1177,7 @@ test("at rest: nothing readable in the database; a passphrase locks ParolNet, wi
   // Without a passphrase: the keys are objects the browser will not export, and no name,
   // message, contact id or store key is readable in what the database keeps.
   const plainWords = [
-    "Ben",
+    "Benedikt",
     "lock and key",
     "other side",
     ben_id,
@@ -1181,7 +1191,7 @@ test("at rest: nothing readable in the database; a passphrase locks ParolNet, wi
   for (const word of plainWords) expect(before.text, word).not.toContain(word);
 
   // Set a passphrase: too short and mismatched are said in words; then it is set.
-  await ana.page.goto(live.url + "#/settings");
+  await go(ana.page, "#/settings");
   await expect(ana.page.getByTestId("settings-lock")).toHaveAttribute("data-on", "false");
   await ana.page.getByTestId("lock-set").click();
   await expect(ana.page.getByTestId("lock-forgotten")).toContainText("nobody can recover it");
@@ -1218,7 +1228,7 @@ test("at rest: nothing readable in the database; a passphrase locks ParolNet, wi
   await expect(ana.page.getByTestId("locked")).toBeVisible();
   const took = await unlock(ana.page, "tidal copper lantern verse");
   console.log(`unlock (Argon2id 64 MiB, 3 passes, and the start of the engine): ${took} ms`);
-  await ana.page.goto(live.url + `#/c/${ben_id}`);
+  await go(ana.page, `#/c/${ben_id}`);
   await expect(bubble(ana.page, "kept under lock and key")).toBeVisible();
   await expect(bubble(ana.page, "and read on the other side")).toBeVisible();
   await openLine(ana.page);
@@ -1226,7 +1236,7 @@ test("at rest: nothing readable in the database; a passphrase locks ParolNet, wi
   await expect(bubble(ben.page, "after unlocking")).toHaveAttribute("data-kind", "received");
 
   // Lock now; three wrong tries make the next one wait, and the wait is counted down.
-  await ana.page.goto(live.url + "#/settings");
+  await go(ana.page, "#/settings");
   await ana.page.getByTestId("lock-now").click();
   await expect(ana.page.getByTestId("locked")).toBeVisible({ timeout: 20_000 });
   for (let i = 0; i < 3; i++) {
@@ -1246,7 +1256,7 @@ test("at rest: nothing readable in the database; a passphrase locks ParolNet, wi
   await unlock(ana.page, "tidal copper lantern verse");
 
   // Change it (the current one is asked for), then remove it.
-  await ana.page.goto(live.url + "#/settings");
+  await go(ana.page, "#/settings");
   await ana.page.getByTestId("lock-change").click();
   await ana.page.getByTestId("lock-current").fill("not the passphrase");
   await ana.page.getByTestId("lock-new").fill("marble orchard seven kites");
@@ -1260,7 +1270,7 @@ test("at rest: nothing readable in the database; a passphrase locks ParolNet, wi
   await expect(ana.page.getByTestId("toast")).toHaveText("Passphrase changed", { timeout: 60_000 });
   await ana.page.reload();
   await unlock(ana.page, "marble orchard seven kites");
-  await ana.page.goto(live.url + "#/settings");
+  await go(ana.page, "#/settings");
   await ana.page.getByTestId("lock-remove").click();
   await ana.page.getByTestId("lock-current").fill("marble orchard seven kites");
   await ana.page.getByTestId("lock-submit").click();
@@ -1269,7 +1279,7 @@ test("at rest: nothing readable in the database; a passphrase locks ParolNet, wi
   await ana.page.reload();
   await expect(ana.page.getByTestId("app")).toBeVisible({ timeout: 20_000 });
   expect((await databaseAsKept(ana.page)).keys).toBe("device:true:false:false");
-  await ana.page.goto(live.url + `#/c/${ben_id}`);
+  await go(ana.page, `#/c/${ben_id}`);
   await expect(bubble(ana.page, "after unlocking")).toBeVisible();
   await allClean(ana, ben);
 });
@@ -1278,7 +1288,7 @@ test("locked and the passphrase forgotten: delete everything and start again", a
   test.setTimeout(180_000);
   const ana = await person(browser, live);
   await start(ana.page);
-  await ana.page.goto(live.url + "#/settings");
+  await go(ana.page, "#/settings");
   await ana.page.getByTestId("lock-set").click();
   await ana.page.getByTestId("lock-new").fill("soon to be forgotten");
   await ana.page.getByTestId("lock-again").fill("soon to be forgotten");
@@ -1304,7 +1314,7 @@ test(
     const ben = await person(browser, live);
     await start(ana.page);
     await start(ben.page);
-    await pairByPaste(ana.page, ben.page, { presenter: "Ana", scanner: "Ben" });
+    await pairByPaste(ana.page, ben.page, { presenter: "Ana", scanner: "Benedikt" });
     await openLine(ana.page, ben.page);
     await send(ana.page, "written by Ana first");
     await expect(bubble(ben.page, "written by Ana first")).toHaveAttribute("data-kind", "received");
@@ -1313,7 +1323,7 @@ test(
     const ben_id = await peerIdOf(ana.page);
 
     // With a contact and no backup, the list suggests one, and blocks nothing.
-    await ana.page.goto(live.url + "#/");
+    await go(ana.page, "#/");
     await expect(ana.page.getByTestId("backup-hint")).toContainText("Make a backup");
     await ana.page.getByTestId("backup-hint-action").click();
     await expect(ana.page.getByTestId("backup-last")).toHaveText(
@@ -1339,16 +1349,16 @@ test(
     expect(bytes.subarray(0, 8).toString("latin1")).toBe("PNBACKUP");
     expect(bytes[8]).toBe(1);
     const text = bytes.toString("latin1");
-    for (const word of ["Ben", "written by Ana first", ben_id, "secretHex"]) {
+    for (const word of ["Benedikt", "written by Ana first", ben_id, "secretHex"]) {
       expect(text, word).not.toContain(word);
     }
     await ana.page.getByTestId("sheet-backup-close").click();
     await expect(ana.page.getByTestId("backup-last")).toContainText("Last backup:");
-    await ana.page.goto(live.url + "#/");
+    await go(ana.page, "#/");
     await expect(ana.page.getByTestId("backup-hint")).toHaveCount(0);
 
     // Delete all data: first run, nothing left.
-    await ana.page.goto(live.url + "#/settings");
+    await go(ana.page, "#/settings");
     await ana.page.getByTestId("settings-wipe").click();
     await ana.page.getByTestId("wipe-input").fill("delete");
     await ana.page.getByTestId("wipe-confirm").click();
@@ -1390,8 +1400,8 @@ test(
     await expect(ana.page.getByTestId("app")).toBeVisible({ timeout: 60_000 });
 
     // The same person: Ben is there by name, with the history, and marked as restored.
-    await ana.page.goto(live.url + `#/c/${ben_id}`);
-    await expect(ana.page.getByTestId("conversation-name")).toHaveText("Ben");
+    await go(ana.page, `#/c/${ben_id}`);
+    await expect(ana.page.getByTestId("conversation-name")).toHaveText("Benedikt");
     await expect(bubble(ana.page, "written by Ana first")).toBeVisible();
     await expect(bubble(ana.page, "an answer from Ben")).toBeVisible();
     // Still paired: the line opens without adding each other again, and they can chat.
@@ -1407,12 +1417,12 @@ test(
     await expect(ana.page.getByTestId("restored-note")).toHaveCount(0, { timeout: 30_000 });
     // The restored database is sealed like any other.
     const kept = await databaseAsKept(ana.page);
-    for (const word of ["Ben", "written by Ana first", ben_id]) {
+    for (const word of ["Benedikt", "written by Ana first", ben_id]) {
       expect(kept.text, word).not.toContain(word);
     }
 
     // In Settings a restore replaces what is here, so a word has to be typed first.
-    await ana.page.goto(live.url + "#/settings");
+    await go(ana.page, "#/settings");
     await ana.page.getByTestId("restore-open").click();
     await expect(ana.page.getByTestId("restore-replaces")).toContainText("cannot be undone");
     await expect(ana.page.getByTestId("restore-submit")).toBeDisabled();
@@ -1496,7 +1506,7 @@ test("a database of the earlier version, kept in plaintext, is sealed at the fir
   await ana.page.reload();
   // No first run: the identity that was there is the one that starts.
   await expect(ana.page.getByTestId("app")).toBeVisible({ timeout: 20_000 });
-  await ana.page.goto(live.url + `#/c/${friend}`);
+  await go(ana.page, `#/c/${friend}`);
   await expect(ana.page.getByTestId("conversation-name")).toHaveText("Old Friend");
   await expect(bubble(ana.page, "written before the update")).toBeVisible();
   await expect(bubble(ana.page, "and so was this")).toBeVisible();
@@ -1518,7 +1528,7 @@ test("a database of the earlier version, kept in plaintext, is sealed at the fir
   }
   // And it stays that way across another start.
   await ana.page.reload();
-  await ana.page.goto(live.url + `#/c/${friend}`);
+  await go(ana.page, `#/c/${friend}`);
   await expect(bubble(ana.page, "and so was this")).toBeVisible({ timeout: 20_000 });
   await expectClean(ana.problems);
 });
