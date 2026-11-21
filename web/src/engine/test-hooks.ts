@@ -1,0 +1,173 @@
+// The `window.__parolnetTest` contract of docs/web-port/interop.md §11.4, for test builds
+// only. Nothing installs it by default: the app calls `installTestHooks(engine)` when it was
+// built for tests. It exposes nothing the UI does not already show (no keys, no session
+// state, no TURN credential).
+import type { Engine } from "./engine.ts";
+import type { IceServer } from "./platform.ts";
+import type { AppEvent, DeliveryState, Direction, PathState } from "./types.ts";
+
+export type TestPathState =
+  | "offline"
+  | "connecting"
+  | "direct"
+  | "failed"
+  | "binding-failed";
+export type TestCallState =
+  | "idle"
+  | "outgoing"
+  | "incoming"
+  | "connecting"
+  | "active";
+
+export interface ParolnetTestHooks {
+  version: 1;
+  ready(): Promise<{ peerId: string }>;
+  relayRegistered(): boolean;
+  showPairingCode(): Promise<string>;
+  pairWithCode(code: string): Promise<void>;
+  contacts(): Promise<string[]>;
+  messages(
+    peerId: string,
+  ): Promise<
+    { direction: "sent" | "received"; text: string; state: DeliveryState }[]
+  >;
+  sendText(peerId: string, text: string): Promise<{ state: DeliveryState }>;
+  pathState(peerId: string): TestPathState;
+  incomingCall(): { peerId: string; callId: string; video: boolean } | null;
+  acceptCall(): Promise<void>;
+  rejectCall(): Promise<void>;
+  startCall(peerId: string, video: boolean): Promise<void>;
+  hangup(): Promise<void>;
+  callState(): TestCallState;
+  iceServers(): IceServer[];
+  /** Not in §11.4: the engine's own path vocabulary, for tests that need `NoDirectPath`. */
+  rawPathState(peerId: string): PathState;
+  /** Not in §11.4: take the hooks away again. */
+  uninstall(): void;
+}
+
+function testPath(path: PathState): TestPathState {
+  switch (path) {
+    case "Direct":
+      return "direct";
+    case "Connecting":
+      return "connecting";
+    case "NoDirectPath":
+      return "failed";
+    case "BindingFailed":
+      return "binding-failed";
+    default:
+      return "offline";
+  }
+}
+
+interface HookTarget {
+  __parolnetTest?: ParolnetTestHooks;
+  dispatchEvent?(ev: unknown): boolean;
+  CustomEvent?: new (type: string, init: { detail: unknown }) => unknown;
+}
+
+/**
+ * Install `__parolnetTest` on `target` (default `globalThis`) and announce state changes as
+ * `parolnet:test` events (`detail: {kind:'relay', state}`, `{kind:'path', peerId, state}`,
+ * `{kind:'message', peerId}`, `{kind:'call', state}`).
+ */
+export function installTestHooks(
+  engine: Engine,
+  target: HookTarget = globalThis as HookTarget,
+): ParolnetTestHooks {
+  const announce = (detail: Record<string, unknown>) => {
+    if (
+      typeof target.CustomEvent === "function" &&
+      typeof target.dispatchEvent === "function"
+    ) {
+      target.dispatchEvent(new target.CustomEvent("parolnet:test", { detail }));
+    }
+  };
+  const callState = (): TestCallState => {
+    const call = engine.snapshot().call;
+    return call ? (call.state.kind.toLowerCase() as TestCallState) : "idle";
+  };
+  const unsubscribe = engine.subscribe((ev: AppEvent) => {
+    switch (ev.kind) {
+      case "Relay":
+        announce({
+          kind: "relay",
+          state: ev.state.kind === "Registered" ? "registered" : "disconnected",
+        });
+        break;
+      case "Path":
+        announce({
+          kind: "path",
+          peerId: ev.peerId,
+          state: testPath(ev.state),
+        });
+        break;
+      case "Message":
+        announce({ kind: "message", peerId: ev.message.peerId });
+        break;
+      case "Call":
+        announce({
+          kind: "call",
+          state: ev.call.state.kind === "Ended" ? "idle" : callState(),
+        });
+        break;
+    }
+  });
+  const pathOf = (peerId: string): PathState =>
+    engine.snapshot().contacts.find((c) => c.contact.peerId === peerId)?.path ??
+      "Unknown";
+  const currentCall = () => engine.snapshot().call;
+  const lower = (d: Direction) => (d === "Sent" ? "sent" : "received") as "sent" | "received";
+
+  const hooks: ParolnetTestHooks = {
+    version: 1,
+    ready: () => Promise.resolve({ peerId: engine.peerId }),
+    relayRegistered: () => engine.snapshot().relay.kind === "Registered",
+    showPairingCode: async () => (await engine.createPairingCode()).code,
+    pairWithCode: async (code) => {
+      await engine.pairWithCode(code, { via: "paste" });
+    },
+    contacts: () => Promise.resolve(engine.snapshot().contacts.map((c) => c.contact.peerId)),
+    messages: async (peerId) =>
+      (await engine.messages(peerId)).map((m) => ({
+        direction: lower(m.direction),
+        text: m.text,
+        state: m.state,
+      })),
+    sendText: async (peerId, text) => ({
+      state: (await engine.sendText(peerId, text)).state,
+    }),
+    pathState: (peerId) => testPath(pathOf(peerId)),
+    rawPathState: pathOf,
+    incomingCall: () => {
+      const c = currentCall();
+      return c && c.state.kind === "Incoming"
+        ? { peerId: c.peerId, callId: c.callId, video: c.video }
+        : null;
+    },
+    acceptCall: async () => {
+      const c = currentCall();
+      if (c) await engine.acceptCall(c.callId);
+    },
+    rejectCall: async () => {
+      const c = currentCall();
+      if (c) await engine.rejectCall(c.callId);
+    },
+    startCall: async (peerId, video) => {
+      await engine.startCall(peerId, video);
+    },
+    hangup: async () => {
+      const c = currentCall();
+      if (c) await engine.hangup(c.callId);
+    },
+    callState,
+    iceServers: () => engine.iceServers(),
+    uninstall: () => {
+      unsubscribe();
+      if (target.__parolnetTest === hooks) delete target.__parolnetTest;
+    },
+  };
+  target.__parolnetTest = hooks;
+  return hooks;
+}
