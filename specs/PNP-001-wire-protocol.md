@@ -1,12 +1,18 @@
 # PNP-001: ParolNet Wire Protocol
 
 ### Status: CANDIDATE
-### Version: 0.14
+### Version: 0.15
 ### Date: 2026-11-21
 
 ---
 
 ## Changelog
+
+**v0.15 (2026-11-21) — `N-SESSION` is the nonce the Double Ratchet uses (text correction, no wire change)**
+
+- §3.3 and the §9 catalog described the session nonce as `chain_index (4 bytes) || seq_number (8 bytes)`, built from the `chain` and `seq` values of the plaintext map. No implementation ever built that nonce: the session AEAD is the Double Ratchet's (PNP-002 §5.7), whose nonce is the first 8 bytes of the message's `ratchet_public_key` followed by its `msg_number` as 4 bytes big-endian, both taken from the ratchet header that travels in the clear. PNP-002 v0.6 §5.7 already states this construction; PNP-001 now states the same one. **PNP-001-MUST-006** is restated (same clause ID), and the `N-SESSION` row of §9 and the first sentence of §6 item 2 follow.
+- Nothing changes on the wire: v0.14 implementations already produce this nonce. The old text could not have been implemented as written, since the receiver needs the nonce before it can decrypt the map that carried `chain` and `seq`.
+- Uniqueness of a (key, nonce) pair (**PNP-001-MUST-041**) does not rest on the nonce alone: every message is encrypted under its own message key, derived from the chain key and used once. MUST count unchanged: 82.
 
 **v0.14 (2026-11-21) — The whole ratchet header is associated data (wire-incompatible)**
 
@@ -209,13 +215,15 @@ Flags bitfield:
 | 3 | `is_final_fragment`: 1 if this is the last fragment |
 | 4-7 | Reserved, MUST be 0 **PNP-001-MUST-005** |
 
-The AEAD nonce for the session layer MUST be constructed per scheme `N-SESSION` defined in §9:
+The AEAD nonce for the session layer MUST be constructed per scheme `N-SESSION` defined in §9, from two fields of the message's own ratchet header (§3.1, PNP-002 §5.7):
 
 ```
-nonce (12 bytes) = chain_index (4 bytes, big-endian) || seq_number (8 bytes, big-endian)
+nonce (12 bytes) = ratchet_public_key[0..8] (the first 8 bytes) || msg_number (4 bytes, big-endian)
 ```
 
 **PNP-001-MUST-006**
+
+The receiver builds the nonce from the ratchet header as it arrived, for a message decrypted with a stored skipped message key as for any other. Both fields are also part of the AAD below, so a header altered in transit fails verification whichever of the two it touches.
 
 The AEAD additional authenticated data (AAD) MUST be the concatenation of the encoded Double Ratchet header of the message (all three fields of the wire ratchet header, in the fixed 40-byte encoding of PNP-002 §5.7) followed by the serialized CBOR bytes of the cleartext header:
 
@@ -448,7 +456,7 @@ QR-code freshness (30 minutes) is defined in PNP-003 §5.1.6 and is unrelated to
 
 1. **Indistinguishability**: The bucket padding scheme ensures that message lengths do not leak content type or size. Implementations MUST NOT compress payloads before encryption, as compression ratios can leak information about plaintext content (CRIME/BREACH-style attacks). **PNP-001-MUST-040**
 
-2. **Nonce Reuse**: The nonce construction from chain_index and sequence_number guarantees uniqueness within a Double Ratchet session. Implementations MUST NOT reuse a (key, nonce) pair. **PNP-001-MUST-041** If the sequence number overflows 2^64, the session MUST be rekeyed. **PNP-001-MUST-042**
+2. **Nonce Reuse**: Every message is encrypted under its own message key (the Double Ratchet derives one per message from the chain key and uses it once), and within one sending chain the nonce differs from message to message through `msg_number` (§3.3), so no (key, nonce) pair repeats within a Double Ratchet session. Implementations MUST NOT reuse a (key, nonce) pair. **PNP-001-MUST-041** If the sequence number overflows 2^64, the session MUST be rekeyed. **PNP-001-MUST-042**
 
 3. **Replay Protection**: The combination of message_id uniqueness checking and timestamp windowing prevents replay attacks. The seen-message cache MUST be persisted across brief restarts (up to 60 minutes of downtime). **PNP-001-MUST-043**
 
@@ -492,7 +500,7 @@ Multiple independently scoped AEAD contexts exist in the ParolNet stack. Each us
 
 | Scheme | Context | Construction | Size | Defined |
 |--------|---------|--------------|------|---------|
-| `N-SESSION` | Session-layer envelope AEAD (§3.3) | `chain_index (4B BE) \|\| seq_number (8B BE)` | 12 bytes | PNP-001 §3.3 |
+| `N-SESSION` | Session-layer envelope AEAD (§3.3) | `ratchet_public_key[0..8] \|\| msg_number (4B BE)` | 12 bytes | PNP-001 §3.3, PNP-002 §5.7 |
 | `N-HANDSHAKE` | PNP-002 X3DH-derived handshake AEAD | HKDF-SHA-256 of shared secret with context label | 12 bytes | PNP-002 §5.2 |
 | `N-ONION` | PNP-004 onion-layer AEAD (per hop) | `nonce_seed (12B) XOR counter (12B BE)` | 12 bytes | PNP-004 §5.1.5 |
 | `N-SENDERKEY` | PNP-009 group sender-key AEAD | `SHA-256(signing_public_key)[0..4] \|\| chain_index (8B BE)` | 12 bytes | PNP-009 §5.4 |

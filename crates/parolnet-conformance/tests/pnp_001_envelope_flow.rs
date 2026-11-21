@@ -62,7 +62,7 @@ fn envelope_flow_round_trip_hits_every_bucket() {
 
 // -- §3.2 — timestamp coarsening ----------------------------------------------
 
-#[clause("PNP-001-MUST-006")]
+#[clause("PNP-001-MUST-027")]
 #[test]
 fn envelope_flow_coarsens_timestamp_to_300s_boundary() {
     let (mut alice, mut bob) = session_pair();
@@ -72,7 +72,7 @@ fn envelope_flow_coarsens_timestamp_to_300s_boundary() {
     let decoded = decrypt_from_envelope(&mut bob, &wire).unwrap();
     assert_eq!(
         decoded.timestamp, 1_700_000_100,
-        "MUST-006: timestamp MUST be floor(now/300)*300"
+        "MUST-027: timestamp MUST be floor(now/300)*300"
     );
     assert_eq!(decoded.timestamp % 300, 0);
 }
