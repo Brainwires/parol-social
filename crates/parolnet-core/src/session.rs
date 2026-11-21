@@ -38,8 +38,8 @@ impl SessionManager {
 
     /// Encrypt a message for a peer using their Double Ratchet session.
     ///
-    /// `extra_aad` is bound into the AEAD additional-authenticated-data alongside
-    /// the ratchet public key. Callers with no external context (e.g., simple
+    /// `extra_aad` is bound into the AEAD additional-authenticated-data after
+    /// the ratchet header. Callers with no external context (e.g., simple
     /// session-layer encrypts that do not ride inside a PNP-001 envelope) pass
     /// an empty slice. The envelope helpers pass the serialized cleartext
     /// header bytes (PNP-001-MUST-007).
@@ -121,13 +121,50 @@ impl SessionManager {
         }
     }
 
+    /// The peers a session is held for, in no particular order.
+    ///
+    /// For callers that only need to know who the sessions are with: unlike
+    /// [`Self::export_all`] it serializes no key material.
+    pub fn peer_ids(&self) -> Vec<PeerId> {
+        self.sessions
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .keys()
+            .copied()
+            .collect()
+    }
+
     /// Export all sessions as (peer_id_bytes, session_bytes) pairs.
+    ///
+    /// The bytes are secret key material.
     pub fn export_all(&self) -> Vec<([u8; 32], Vec<u8>)> {
         let sessions = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
         sessions
             .iter()
             .map(|(pid, session)| (pid.0, session.ratchet.export_bytes()))
             .collect()
+    }
+
+    /// Export one session's state for persistence, `None` without a session for the peer.
+    ///
+    /// The bytes are secret key material.
+    pub fn export_session(&self, peer_id: &PeerId) -> Option<Vec<u8>> {
+        let sessions = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
+        sessions.get(peer_id).map(|s| s.ratchet.export_bytes())
+    }
+
+    /// Import one session exported by [`Self::export_session`] (or one entry of
+    /// [`Self::export_all`]), replacing any session held for the peer. Nothing changes when
+    /// the bytes do not parse.
+    pub fn import_session(
+        &self,
+        peer_id: PeerId,
+        session_bytes: &[u8],
+    ) -> Result<(), crate::CoreError> {
+        let ratchet =
+            DoubleRatchetSession::import_bytes(session_bytes).map_err(crate::CoreError::Crypto)?;
+        self.add_session(peer_id, ratchet);
+        Ok(())
     }
 
     /// Import sessions from exported pairs.
@@ -150,5 +187,27 @@ impl SessionManager {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .len()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn peer_ids_lists_every_session_and_nothing_else() {
+        let sessions = SessionManager::new();
+        assert!(sessions.peer_ids().is_empty());
+        for n in [3u8, 1, 2] {
+            let ratchet = DoubleRatchetSession::initialize_initiator([n; 32], &[0x09; 32]).unwrap();
+            sessions.add_session(PeerId([n; 32]), ratchet);
+        }
+        let mut ids = sessions.peer_ids();
+        ids.sort_by_key(|p| p.0);
+        assert_eq!(ids, [PeerId([1; 32]), PeerId([2; 32]), PeerId([3; 32])]);
+
+        sessions.remove_session(&PeerId([2; 32]));
+        assert_eq!(sessions.peer_ids().len(), 2);
+        assert!(!sessions.peer_ids().contains(&PeerId([2; 32])));
     }
 }

@@ -16,7 +16,7 @@ use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use rand::rngs::OsRng;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
-use zeroize::{Zeroize, ZeroizeOnDrop};
+use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 /// Maximum number of skipped message keys to store.
 const MAX_SKIP: u32 = 1000;
@@ -170,7 +170,9 @@ impl SenderKeyState {
 
     /// Decrypt a sender key message.
     ///
-    /// Handles out-of-order delivery by storing skipped message keys.
+    /// Handles out-of-order delivery by storing skipped message keys. All-or-nothing: when
+    /// this returns `Err` the state, skipped keys included, is exactly what it was before
+    /// the call.
     pub fn decrypt(&mut self, msg: &SenderKeyMessage) -> Result<Vec<u8>, CryptoError> {
         // Verify Ed25519 signature
         let verifying_key = VerifyingKey::from_bytes(&self.signing_public_key).map_err(|_| {
@@ -195,63 +197,67 @@ impl SenderKeyState {
             .verify(&signed_data, &signature)
             .map_err(|_| CryptoError::SignatureVerificationFailed)?;
 
-        // Handle message ordering
+        let nonce = Self::build_nonce(&self.signing_public_key, msg.chain_index);
+
+        // All-or-nothing from here: the signature proves who sent the message, not that it
+        // belongs to the chain this state holds (the same signing key signs every chain of a
+        // sender, before and after `rotate`). Nothing below is written back before the AEAD
+        // tag has verified.
         if msg.chain_index < self.chain_index {
-            // Look up in skipped keys
+            // A stored key is consumed only by a message that authenticates under it.
             let mk = self
                 .skipped_keys
-                .remove(&msg.chain_index)
+                .get(&msg.chain_index)
                 .ok_or(CryptoError::MessageKeyExhausted)?;
-            let nonce = Self::build_nonce(&self.signing_public_key, msg.chain_index);
-            let cipher = ChaCha20Poly1305Cipher::new(&mk)?;
-            return cipher.decrypt(&nonce, &msg.ciphertext, &[]);
+            let plaintext =
+                ChaCha20Poly1305Cipher::new(mk)?.decrypt(&nonce, &msg.ciphertext, &[])?;
+            if let Some(mut used) = self.skipped_keys.remove(&msg.chain_index) {
+                used.zeroize();
+            }
+            return Ok(plaintext);
         }
 
-        if msg.chain_index > self.chain_index {
-            // Ratchet forward, storing skipped keys
-            let skip_count = msg.chain_index - self.chain_index;
-            if skip_count > MAX_SKIP {
-                return Err(CryptoError::SenderKeyError {
-                    reason: "too many skipped message keys".into(),
-                });
-            }
-            for idx in self.chain_index..msg.chain_index {
-                if self.skipped_keys.len() >= MAX_SKIP as usize {
-                    return Err(CryptoError::SenderKeyError {
-                        reason: "too many skipped message keys".into(),
-                    });
-                }
-                let mk_bytes =
-                    hkdf_sha256(&self.chain_key, &[0x01], b"ParolNet_sender_key_v1", 32)?;
-                let mut mk = [0u8; 32];
-                mk.copy_from_slice(&mk_bytes);
-                self.skipped_keys.insert(idx, mk);
-
-                let ck_bytes =
-                    hkdf_sha256(&self.chain_key, &[0x02], b"ParolNet_sender_chain_v1", 32)?;
-                self.chain_key.copy_from_slice(&ck_bytes);
-            }
-            self.chain_index = msg.chain_index;
+        // Ratchet a copy of the chain forward, collecting the keys of the skipped messages.
+        let skip_count = msg.chain_index - self.chain_index;
+        if skip_count > MAX_SKIP
+            || self.skipped_keys.len() + skip_count as usize > MAX_SKIP as usize
+        {
+            return Err(CryptoError::SenderKeyError {
+                reason: "too many skipped message keys".into(),
+            });
         }
+        let mut chain_key = Zeroizing::new(self.chain_key);
+        let mut new_skipped = Zeroizing::new(Vec::with_capacity(skip_count as usize));
+        for _ in 0..skip_count {
+            let mut mk = Self::chain_step(&mut chain_key)?;
+            new_skipped.push(mk);
+            mk.zeroize();
+        }
+        let message_key = Zeroizing::new(Self::chain_step(&mut chain_key)?);
 
-        // msg.chain_index == self.chain_index: derive message key and decrypt
-        let mk_bytes = hkdf_sha256(&self.chain_key, &[0x01], b"ParolNet_sender_key_v1", 32)?;
+        let plaintext =
+            ChaCha20Poly1305Cipher::new(&message_key[..])?.decrypt(&nonce, &msg.ciphertext, &[])?;
+
+        // Commit. The copies above zeroize themselves when they drop.
+        for (idx, mk) in (self.chain_index..msg.chain_index).zip(new_skipped.iter()) {
+            self.skipped_keys.insert(idx, *mk);
+        }
+        self.chain_key = *chain_key;
+        self.chain_index = msg.chain_index + 1;
+
+        Ok(plaintext)
+    }
+
+    /// One symmetric ratchet step: returns the message key and advances `chain_key`.
+    fn chain_step(chain_key: &mut [u8; 32]) -> Result<[u8; 32], CryptoError> {
+        let mk_bytes = hkdf_sha256(chain_key, &[0x01], b"ParolNet_sender_key_v1", 32)?;
         let mut message_key = [0u8; 32];
         message_key.copy_from_slice(&mk_bytes);
 
-        // Advance chain key
-        let ck_bytes = hkdf_sha256(&self.chain_key, &[0x02], b"ParolNet_sender_chain_v1", 32)?;
-        self.chain_key.copy_from_slice(&ck_bytes);
-        self.chain_index += 1;
+        let ck_bytes = hkdf_sha256(chain_key, &[0x02], b"ParolNet_sender_chain_v1", 32)?;
+        chain_key.copy_from_slice(&ck_bytes);
 
-        let nonce = Self::build_nonce(&self.signing_public_key, msg.chain_index);
-        let cipher = ChaCha20Poly1305Cipher::new(&message_key)?;
-        let plaintext = cipher.decrypt(&nonce, &msg.ciphertext, &[])?;
-
-        // Zeroize message key after use
-        message_key.zeroize();
-
-        Ok(plaintext)
+        Ok(message_key)
     }
 
     /// Rotate the sender key chain. Generates a new random chain key and resets the index.
@@ -411,5 +417,112 @@ mod tests {
             }
             other => panic!("unexpected error: {other:?}"),
         }
+    }
+
+    // ── Atomic decrypt ──────────────────────────────────────────────────
+    //
+    // A message that passes the signature check but not the AEAD check (signed by the same
+    // sender for another chain) changes nothing.
+
+    #[allow(clippy::type_complexity)]
+    fn snapshot(s: &SenderKeyState) -> (Vec<u8>, u32, Vec<(u32, [u8; 32])>) {
+        let mut skipped: Vec<_> = s.skipped_keys.iter().map(|(n, k)| (*n, *k)).collect();
+        skipped.sort();
+        (s.chain_key.to_vec(), s.chain_index, skipped)
+    }
+
+    fn assert_rejected_unchanged(s: &mut SenderKeyState, msg: &SenderKeyMessage) {
+        let before = snapshot(s);
+        assert!(s.decrypt(msg).is_err());
+        assert!(
+            snapshot(s) == before,
+            "a failed decrypt changed the sender key state (index {})",
+            msg.chain_index
+        );
+    }
+
+    /// A receiver of the sender's first chain, six messages of that chain, and eight
+    /// validly signed messages of the chain the sender rotated to afterwards.
+    fn receiver_with_messages_of_two_chains()
+    -> (SenderKeyState, Vec<SenderKeyMessage>, Vec<SenderKeyMessage>) {
+        let mut sender = SenderKeyState::new();
+        let receiver =
+            SenderKeyState::from_distribution(&sender.create_distribution([0x42; 32])).unwrap();
+        let genuine = (0..6u8).map(|i| sender.encrypt(&[i]).unwrap()).collect();
+        sender.rotate();
+        let other = (0..8u8).map(|i| sender.encrypt(&[i]).unwrap()).collect();
+        (receiver, genuine, other)
+    }
+
+    #[test]
+    fn failed_decrypt_keeps_the_skipped_key() {
+        let (mut receiver, genuine, other) = receiver_with_messages_of_two_chains();
+        // The third arrives first: the keys of the first two are stored as skipped.
+        assert_eq!(receiver.decrypt(&genuine[2]).unwrap(), [2]);
+        assert_eq!(receiver.skipped_keys.len(), 2);
+
+        assert_rejected_unchanged(&mut receiver, &other[0]);
+        assert_rejected_unchanged(&mut receiver, &other[1]);
+        assert_eq!(receiver.skipped_keys.len(), 2);
+
+        assert_eq!(receiver.decrypt(&genuine[0]).unwrap(), [0]);
+        assert_eq!(receiver.decrypt(&genuine[1]).unwrap(), [1]);
+        // Used once, then gone.
+        assert!(receiver.skipped_keys.is_empty());
+        assert_rejected_unchanged(&mut receiver, &genuine[0]);
+    }
+
+    #[test]
+    fn failed_decrypt_does_not_advance_the_chain() {
+        let (mut receiver, genuine, other) = receiver_with_messages_of_two_chains();
+        assert_eq!(receiver.decrypt(&genuine[0]).unwrap(), [0]);
+
+        // The next index, and indexes ahead of the chain (which ask for skipped keys).
+        assert_rejected_unchanged(&mut receiver, &other[1]);
+        assert_rejected_unchanged(&mut receiver, &other[5]);
+        assert_rejected_unchanged(&mut receiver, &other[7]);
+        assert!(receiver.skipped_keys.is_empty());
+        assert_eq!(receiver.chain_index, 1);
+
+        // In order, out of order, and late: the genuine chain is intact.
+        assert_eq!(receiver.decrypt(&genuine[1]).unwrap(), [1]);
+        assert_eq!(receiver.decrypt(&genuine[5]).unwrap(), [5]);
+        assert_rejected_unchanged(&mut receiver, &other[3]);
+        assert_eq!(receiver.decrypt(&genuine[3]).unwrap(), [3]);
+        assert_eq!(receiver.decrypt(&genuine[2]).unwrap(), [2]);
+        assert_eq!(receiver.decrypt(&genuine[4]).unwrap(), [4]);
+        assert!(receiver.skipped_keys.is_empty());
+    }
+
+    #[test]
+    fn rejected_before_the_aead_check_changes_nothing() {
+        let (mut receiver, genuine, _) = receiver_with_messages_of_two_chains();
+        assert_eq!(receiver.decrypt(&genuine[2]).unwrap(), [2]);
+
+        // Bad signature, on a stored skipped key's index and ahead of the chain.
+        for i in [0, 4] {
+            let mut forged = genuine[i].clone();
+            forged.signature[0] ^= 0x01;
+            assert_rejected_unchanged(&mut receiver, &forged);
+            let mut forged = genuine[i].clone();
+            forged.ciphertext[0] ^= 0x01;
+            assert_rejected_unchanged(&mut receiver, &forged);
+        }
+        // Replay of a consumed message.
+        assert_rejected_unchanged(&mut receiver, &genuine[2]);
+
+        // Past the skip limit.
+        let mut sender = SenderKeyState::new();
+        let mut far =
+            SenderKeyState::from_distribution(&sender.create_distribution([0x42; 32])).unwrap();
+        let mut last = None;
+        for _ in 0..=MAX_SKIP + 1 {
+            last = Some(sender.encrypt(b"x").unwrap());
+        }
+        assert_rejected_unchanged(&mut far, &last.unwrap());
+        assert!(far.skipped_keys.is_empty());
+
+        assert_eq!(receiver.decrypt(&genuine[0]).unwrap(), [0]);
+        assert_eq!(receiver.decrypt(&genuine[4]).unwrap(), [4]);
     }
 }

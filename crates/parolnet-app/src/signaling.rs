@@ -24,10 +24,48 @@ pub enum SigEvent {
     Disconnected { reason: String },
 }
 
-/// Keepalive interval (the relay closes sockets idle for 60 s).
-const PING_EVERY: Duration = Duration::from_secs(25);
+/// Keepalive timing of one relay socket (PNP-001 §10.3).
+#[derive(Clone, Copy, Debug)]
+struct Keepalive {
+    /// A `ping` goes out this often while the socket is open (PNP-001-MUST-065).
+    ping_every: Duration,
+    /// The socket is dead after this long without any frame from the relay
+    /// (PNP-001-MUST-066): torn down, then reconnected with the usual backoff.
+    dead_after: Duration,
+}
+
+/// 20 s pings; dead after 40 s of silence (two ping intervals; the relay itself closes
+/// sockets idle for 60 s).
+const KEEPALIVE: Keepalive = Keepalive {
+    ping_every: Duration::from_secs(20),
+    dead_after: Duration::from_secs(40),
+};
 const BACKOFF_MIN: Duration = Duration::from_secs(1);
 const BACKOFF_MAX: Duration = Duration::from_secs(30);
+
+/// The reconnect delay: doubles from `BACKOFF_MIN` to `BACKOFF_MAX` while attempts fail and
+/// starts over once a socket got registered.
+struct Backoff {
+    next: Duration,
+}
+
+impl Backoff {
+    fn new() -> Self {
+        Self { next: BACKOFF_MIN }
+    }
+
+    /// How long to wait before the next attempt, given whether the socket that just ended
+    /// got registered. A registration proves the relay is reachable, however the socket
+    /// ended afterwards (a close, an error, the silence limit), so the delay starts over.
+    fn delay_after(&mut self, registered: bool) -> Duration {
+        if registered {
+            self.next = BACKOFF_MIN;
+        }
+        let delay = self.next;
+        self.next = (delay * 2).min(BACKOFF_MAX);
+        delay
+    }
+}
 
 pub struct SigHandle {
     tx: mpsc::UnboundedSender<ClientFrame>,
@@ -52,7 +90,15 @@ pub fn spawn(
     events: mpsc::UnboundedSender<SigEvent>,
 ) -> SigHandle {
     let (tx, rx) = mpsc::unbounded_channel();
-    let task = tokio::spawn(run(url, peer_id, public_key_hex, signer, events, rx));
+    let task = tokio::spawn(run(
+        url,
+        peer_id,
+        public_key_hex,
+        signer,
+        events,
+        rx,
+        KEEPALIVE,
+    ));
     SigHandle { tx, task }
 }
 
@@ -63,10 +109,12 @@ async fn run(
     signer: Signer,
     events: mpsc::UnboundedSender<SigEvent>,
     mut outgoing: mpsc::UnboundedReceiver<ClientFrame>,
+    keepalive: Keepalive,
 ) {
-    let mut backoff = BACKOFF_MIN;
+    let mut backoff = Backoff::new();
     loop {
         let _ = events.send(SigEvent::Connecting);
+        let mut registered = false;
         let reason = match session(
             &url,
             &peer_id,
@@ -74,17 +122,15 @@ async fn run(
             &signer,
             &events,
             &mut outgoing,
+            keepalive,
+            &mut registered,
         )
         .await
         {
-            Ok(registered) => {
-                if registered {
-                    backoff = BACKOFF_MIN;
-                }
-                "closed".to_owned()
-            }
+            Ok(()) => "closed".to_owned(),
             Err(e) => e,
         };
+        let delay = backoff.delay_after(registered);
         if events
             .send(SigEvent::Disconnected {
                 reason: reason.clone(),
@@ -93,9 +139,9 @@ async fn run(
         {
             return;
         }
-        tracing::debug!(%reason, ?backoff, "relay socket down; reconnecting");
+        tracing::debug!(%reason, ?delay, "relay socket down; reconnecting");
         // Drop frames given while down: signaling is never queued.
-        let sleep = tokio::time::sleep(backoff);
+        let sleep = tokio::time::sleep(delay);
         tokio::pin!(sleep);
         loop {
             tokio::select! {
@@ -103,11 +149,12 @@ async fn run(
                 f = outgoing.recv() => if f.is_none() { return },
             }
         }
-        backoff = (backoff * 2).min(BACKOFF_MAX);
     }
 }
 
-/// One socket's life. Returns whether it got registered.
+/// One socket's life. `registered` is set as soon as the relay registers the socket, so the
+/// caller knows it however the socket ends.
+#[allow(clippy::too_many_arguments)]
 async fn session(
     url: &str,
     peer_id: &str,
@@ -115,7 +162,9 @@ async fn session(
     signer: &Signer,
     events: &mpsc::UnboundedSender<SigEvent>,
     outgoing: &mut mpsc::UnboundedReceiver<ClientFrame>,
-) -> Result<bool, String> {
+    keepalive: Keepalive,
+    registered: &mut bool,
+) -> Result<(), String> {
     crate::install_crypto_provider();
     let (ws, _) = tokio::time::timeout(
         Duration::from_secs(15),
@@ -136,22 +185,30 @@ async fn session(
     .await
     .map_err(|e| format!("send: {e}"))?;
 
-    let mut registered = false;
-    let mut ping = tokio::time::interval(PING_EVERY);
+    let mut ping = tokio::time::interval(keepalive.ping_every);
+    // A late ping is sent once, at once, and the cadence restarts from it: no burst.
+    ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     ping.tick().await;
+    // Fires when the relay has sent nothing for `dead_after`; every frame from it re-arms it.
+    let silence = tokio::time::sleep(keepalive.dead_after);
+    tokio::pin!(silence);
     loop {
         tokio::select! {
             msg = stream.next() => {
                 let msg = match msg {
                     Some(Ok(m)) => m,
                     Some(Err(e)) => return Err(format!("read: {e}")),
-                    None => return Ok(registered),
+                    None => return Ok(()),
                 };
                 let text = match msg {
                     Message::Text(t) => t.to_string(),
-                    Message::Close(_) => return Ok(registered),
+                    Message::Close(_) => return Ok(()),
                     _ => continue,
                 };
+                // Any frame of the relay shows it is alive, not only a pong.
+                silence
+                    .as_mut()
+                    .reset(tokio::time::Instant::now() + keepalive.dead_after);
                 let Some(frame) = ServerFrame::parse(&text) else { continue };
                 match frame {
                     ServerFrame::Challenge { nonce } => {
@@ -167,7 +224,7 @@ async fn session(
                         .map_err(|e| format!("send: {e}"))?;
                     }
                     ServerFrame::Registered { profile, .. } => {
-                        registered = true;
+                        *registered = true;
                         let _ = events.send(SigEvent::Registered {
                             profile: profile.unwrap_or_else(|| "relay".into()),
                         });
@@ -179,9 +236,9 @@ async fn session(
                 }
             }
             frame = outgoing.recv() => {
-                let Some(frame) = frame else { return Ok(registered) };
+                let Some(frame) = frame else { return Ok(()) };
                 // Only register / ping may precede registration (PNP-001 §10.6).
-                if !registered && !matches!(frame, ClientFrame::Ping { .. }) {
+                if !*registered && !matches!(frame, ClientFrame::Ping { .. }) {
                     tracing::debug!("dropping a frame given before registration");
                     continue;
                 }
@@ -192,6 +249,276 @@ async fn session(
                     .await
                     .map_err(|e| format!("send: {e}"))?;
             }
+            _ = &mut silence => {
+                // Dropping the socket tears it down; `run` reconnects after its backoff.
+                return Err(format!(
+                    "no frame from the relay for {} s",
+                    keepalive.dead_after.as_secs_f32()
+                ));
+            }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use tokio::net::TcpListener;
+    use tokio::time::Instant;
+
+    #[test]
+    fn keepalive_is_what_the_spec_requires() {
+        // PNP-001-MUST-065 / MUST-066.
+        assert_eq!(KEEPALIVE.ping_every, Duration::from_secs(20));
+        assert_eq!(KEEPALIVE.dead_after, Duration::from_secs(40));
+    }
+
+    /// What the test relay saw.
+    #[derive(Default)]
+    struct Seen {
+        connections: AtomicUsize,
+        pings: AtomicUsize,
+    }
+
+    /// A relay that registers every client without a challenge and answers pings while
+    /// `answering` is set; when it is not, the socket stays open and silent.
+    async fn relay(answering: Arc<AtomicBool>) -> (String, Arc<Seen>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("ws://{}", listener.local_addr().unwrap());
+        let seen = Arc::new(Seen::default());
+        let counters = seen.clone();
+        tokio::spawn(async move {
+            while let Ok((tcp, _)) = listener.accept().await {
+                let (answering, seen) = (answering.clone(), counters.clone());
+                tokio::spawn(async move {
+                    let Ok(mut ws) = tokio_tungstenite::accept_async(tcp).await else {
+                        return;
+                    };
+                    seen.connections.fetch_add(1, Ordering::SeqCst);
+                    while let Some(Ok(msg)) = ws.next().await {
+                        let Message::Text(text) = msg else { continue };
+                        let reply = if text.contains("\"register\"") {
+                            r#"{"type":"registered","peer_id":"00"}"#
+                        } else if text.contains("\"ping\"") {
+                            seen.pings.fetch_add(1, Ordering::SeqCst);
+                            r#"{"type":"pong"}"#
+                        } else {
+                            continue;
+                        };
+                        if answering.load(Ordering::SeqCst) {
+                            let _ = ws.send(Message::Text(reply.into())).await;
+                        }
+                    }
+                });
+            }
+        });
+        (url, seen)
+    }
+
+    fn client(
+        url: String,
+        keepalive: Keepalive,
+    ) -> (
+        mpsc::UnboundedReceiver<SigEvent>,
+        mpsc::UnboundedSender<ClientFrame>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let (events_tx, events) = mpsc::unbounded_channel();
+        let (tx, rx) = mpsc::unbounded_channel();
+        let signer: Signer = Arc::new(|_| [0u8; 64]);
+        let task = tokio::spawn(run(
+            url,
+            "00".repeat(32),
+            "00".repeat(32),
+            signer,
+            events_tx,
+            rx,
+            keepalive,
+        ));
+        (events, tx, task)
+    }
+
+    async fn next_event(events: &mut mpsc::UnboundedReceiver<SigEvent>) -> SigEvent {
+        tokio::time::timeout(Duration::from_secs(10), events.recv())
+            .await
+            .expect("an event in time")
+            .expect("the signaling task is running")
+    }
+
+    const FAST: Keepalive = Keepalive {
+        ping_every: Duration::from_millis(100),
+        dead_after: Duration::from_millis(400),
+    };
+
+    #[tokio::test]
+    async fn pings_on_schedule_and_stays_up_while_the_relay_answers() {
+        let (url, seen) = relay(Arc::new(AtomicBool::new(true))).await;
+        let (mut events, _tx, task) = client(url, FAST);
+        assert!(matches!(
+            next_event(&mut events).await,
+            SigEvent::Connecting
+        ));
+        assert!(matches!(
+            next_event(&mut events).await,
+            SigEvent::Registered { .. }
+        ));
+
+        // Several times the silence limit: the pongs keep the socket alive.
+        tokio::time::sleep(FAST.dead_after * 4).await;
+        assert!(
+            events.try_recv().is_err(),
+            "no disconnect while pongs arrive"
+        );
+        assert_eq!(seen.connections.load(Ordering::SeqCst), 1);
+        // 1.6 s at one ping per 100 ms; wide bounds for a loaded machine.
+        let pings = seen.pings.load(Ordering::SeqCst);
+        assert!((8..=17).contains(&pings), "{pings} pings in 1.6 s");
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn silent_relay_is_dropped_and_reconnected() {
+        let answering = Arc::new(AtomicBool::new(true));
+        let (url, seen) = relay(answering.clone()).await;
+        let (mut events, _tx, task) = client(url, FAST);
+        assert!(matches!(
+            next_event(&mut events).await,
+            SigEvent::Connecting
+        ));
+        assert!(matches!(
+            next_event(&mut events).await,
+            SigEvent::Registered { .. }
+        ));
+
+        // The relay stops sending but keeps the socket open: no error, no close.
+        tokio::time::sleep(FAST.ping_every * 3 / 2).await;
+        answering.store(false, Ordering::SeqCst);
+        let silent_from = Instant::now();
+        match next_event(&mut events).await {
+            SigEvent::Disconnected { reason } => {
+                assert!(reason.starts_with("no frame from the relay"), "{reason}")
+            }
+            other => panic!("expected a disconnect, got {other:?}"),
+        }
+        let waited = silent_from.elapsed();
+        // Its last frame came at most one ping interval before it went silent, so the limit
+        // runs out between `dead_after - ping_every` and `dead_after` from here (bounds
+        // widened for a loaded machine).
+        assert!(
+            waited >= FAST.dead_after / 2 && waited < FAST.dead_after * 3,
+            "declared dead after {waited:?}"
+        );
+
+        // Reconnects after the backoff, on a new socket.
+        answering.store(true, Ordering::SeqCst);
+        assert!(matches!(
+            next_event(&mut events).await,
+            SigEvent::Connecting
+        ));
+        assert!(matches!(
+            next_event(&mut events).await,
+            SigEvent::Registered { .. }
+        ));
+        assert_eq!(seen.connections.load(Ordering::SeqCst), 2);
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn any_relay_frame_counts_as_life() {
+        // The relay never answers pings, but pushes another frame now and then.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("ws://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
+            let registered = r#"{"type":"registered","peer_id":"00"}"#;
+            loop {
+                if ws.send(Message::Text(registered.into())).await.is_err() {
+                    return;
+                }
+                tokio::time::sleep(FAST.dead_after / 2).await;
+            }
+        });
+        let (mut events, _tx, task) = client(url, FAST);
+        let until = Instant::now() + FAST.dead_after * 3;
+        while let Ok(event) = tokio::time::timeout_at(until, events.recv()).await {
+            assert!(
+                !matches!(event, Some(SigEvent::Disconnected { .. }) | None),
+                "dropped a relay that was sending frames"
+            );
+        }
+        task.abort();
+    }
+
+    #[test]
+    fn backoff_doubles_while_attempts_fail_and_starts_over_after_a_registration() {
+        let secs = |b: &mut Backoff, registered| b.delay_after(registered).as_secs();
+        let mut backoff = Backoff::new();
+        // The relay cannot be reached: 1, 2, 4, ... up to the maximum.
+        let failing: Vec<u64> = (0..7).map(|_| secs(&mut backoff, false)).collect();
+        assert_eq!(failing, [1, 2, 4, 8, 16, 30, 30]);
+        // A socket that got registered: the minimum again, however it ended.
+        assert_eq!(secs(&mut backoff, true), 1);
+        assert_eq!(secs(&mut backoff, false), 2);
+        // A long-lived client whose registered sockets keep ending never drifts upwards.
+        for _ in 0..50 {
+            assert_eq!(backoff.delay_after(true), BACKOFF_MIN);
+        }
+    }
+
+    #[tokio::test]
+    async fn registered_socket_that_ends_in_an_error_reconnects_at_the_minimum_backoff() {
+        // The relay registers every client and then drops the TCP connection without a
+        // WebSocket close: the client's read fails.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("ws://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            while let Ok((tcp, _)) = listener.accept().await {
+                let Ok(mut ws) = tokio_tungstenite::accept_async(tcp).await else {
+                    continue;
+                };
+                let registered = r#"{"type":"registered","peer_id":"00"}"#;
+                let _ = ws.next().await;
+                let _ = ws.send(Message::Text(registered.into())).await;
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        });
+        let (mut events, _tx, task) = client(url, FAST);
+
+        async fn registered_then_failed(events: &mut mpsc::UnboundedReceiver<SigEvent>) {
+            assert!(matches!(
+                next_event(events).await,
+                SigEvent::Registered { .. }
+            ));
+            match next_event(events).await {
+                SigEvent::Disconnected { reason } => {
+                    assert_ne!(reason, "closed", "the socket must end in an error")
+                }
+                other => panic!("expected a disconnect, got {other:?}"),
+            }
+        }
+
+        // Three sockets in a row get registered and end in an error. Doubling would wait
+        // 1 s and then 2 s; a registration resets it, so both waits are the minimum.
+        assert!(matches!(
+            next_event(&mut events).await,
+            SigEvent::Connecting
+        ));
+        registered_then_failed(&mut events).await;
+        for round in 0..2 {
+            let down_from = Instant::now();
+            assert!(matches!(
+                next_event(&mut events).await,
+                SigEvent::Connecting
+            ));
+            let waited = down_from.elapsed();
+            assert!(
+                waited >= BACKOFF_MIN * 9 / 10 && waited < BACKOFF_MIN * 17 / 10,
+                "round {round}: reconnected after {waited:?}"
+            );
+            registered_then_failed(&mut events).await;
+        }
+        task.abort();
     }
 }
