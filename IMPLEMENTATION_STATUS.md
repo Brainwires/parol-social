@@ -37,8 +37,23 @@ The root Cargo workspace has 15 members; the desktop app is a separate workspace
 | `parolnet-rtc` | **New (M0, extended in M1).** Async driver for the sans-I/O `webrtc-rs-rtc` engine |
 | `parolnet-store` | **New (M1).** Encrypted native persistence: SQLite with SQLCipher, key in the OS keychain or a key file; identity, contacts, sessions, messages, queue, settings |
 | `parolnet-app` | **New (M1).** Headless client core: identity, pairing, signaling, direct data channels, 1:1 chat |
+| `parolnet-media` | **New (M1).** Call media for native clients: frames, capture traits and synthetic sources, resampler, Opus, AEC3 / noise suppression / gain (sonora, pure Rust), the audio duplex path; opt-in features for libvpx VP8, cpal, nokhwa |
 | `xtask` | Clause and test-vector tooling |
 | `apps/desktop` (own workspace) | **New (M0/M1).** GPUI client: contacts, pairing, chat (UI v0); the M0 video spike behind `--spike` |
+
+## M1 (in progress): third slice, media
+
+- **`parolnet-media`** (new, root workspace; default features pure Rust, so the workspace's CI
+  jobs need no system library): see the crate's `lib.rs` for the module table. The libvpx VP8
+  encoder / decoder and the test pattern moved here from `apps/desktop`.
+- **Echo cancellation**: WebRTC's AEC3, noise suppression and AGC2 through `sonora`, the
+  pure-Rust port, behind `AudioProcessor`; a deterministic ERLE test (67 dB far end alone, 7 to
+  9 dB in double talk, near-end tone within 2 dB) runs in `cargo test --workspace`.
+- **Desktop**: camera capture with a test-pattern fallback, one audio thread with the render
+  stream as AEC3's reverse stream, device menus, camera off / on, self-view, `--media-check`.
+  **Not verified on real devices or on screen**: the dev machine opens no window, camera or
+  microphone; the camera and device paths compile on macOS arm64 and run with synthetic sources.
+  See the manual checklist in [docs/m1-desktop.md](docs/m1-desktop.md).
 
 ## M1 (in progress): first slice
 

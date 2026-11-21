@@ -12,7 +12,7 @@
 # only for the named crates in `exceptions` below (three, all pulled in by GPUI), never
 # for our own code.
 #
-# C libraries linked from the system (libvpx, libopus, webrtc-audio-processing) are not crates
+# C libraries linked from the system (libvpx) are not crates
 # and are not seen here: their licences are recorded in docs/m0-spike.md and THIRD_PARTY.md
 # lands with packaging in M1.
 

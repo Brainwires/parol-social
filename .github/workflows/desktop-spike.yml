@@ -1,8 +1,10 @@
 name: Desktop spike (M0)
 
-# The GPUI video spike on the five desktop targets: build, a headless decode check (VP8 + an
-# Opus tone from headless Chromium through webrtc-rs-rtc), the desktop's call media against the
-# headless bot (desktop-call.mjs), then a real window that shows the stream and a screenshot. Heavy, so it runs only by hand: dispatched, or once on a pull
+# The GPUI video spike on the five desktop targets: build, the media crate's tests with its
+# device backends compiled in (libvpx, cpal, nokhwa), the media check (echo cancellation ERLE,
+# a synthetic camera through libvpx), a headless decode check (VP8 + an Opus tone from headless
+# Chromium through webrtc-rs-rtc), the desktop's call media against the headless bot
+# (desktop-call.mjs), then a real window that shows the stream and a screenshot. Heavy, so it runs only by hand: dispatched, or once on a pull
 # request by adding the `desktop-spike` label (a workflow file can be dispatched only once it is on
 # the default branch).
 on:
@@ -43,9 +45,11 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
+          # clang / libclang: bindgen generates the V4L2 binding (camera capture, nokhwa).
           sudo apt-get install -y --no-install-recommends \
             pkg-config libvpx-dev libasound2-dev libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev \
             libx11-xcb-dev libxcb1-dev libfontconfig-dev libvulkan1 mesa-vulkan-drivers \
+            clang libclang-dev \
             xvfb imagemagick
           # Ubuntu 24.04 restricts unprivileged user namespaces through AppArmor, which leaves
           # Chrome for Testing "No usable sandbox!"; allow them rather than run it unsandboxed.
@@ -113,6 +117,19 @@ jobs:
       - name: Unit tests
         working-directory: apps/desktop
         run: cargo test --release --locked
+
+      - name: Media crate tests (libvpx, camera and audio backends compiled in)
+        # parolnet-media with the features the desktop enables: the VP8 round trip, pixel
+        # conversion, camera mode selection, the echo-cancellation measurement. No device is
+        # opened.
+        working-directory: apps/desktop
+        run: cargo test --release --locked -p parolnet-media
+
+      - name: Media check (echo cancellation ERLE, synthetic camera through libvpx)
+        run: |
+          bin=apps/desktop/target/release/parolnet-desktop
+          [ -f "$bin.exe" ] && bin="$bin.exe"
+          "$bin" --media-check
 
       - name: Headless decode check
         run: |

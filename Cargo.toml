@@ -16,6 +16,7 @@ members = [
     "crates/parolnet-rtc",
     "crates/parolnet-store",
     "crates/parolnet-app",
+    "crates/parolnet-media",
     "xtask",
 ]
 # The GPUI desktop app is its own workspace: it needs a newer toolchain than the MSRV here and
@@ -39,6 +40,7 @@ parolnet-core = { path = "crates/parolnet-core", default-features = false }
 parolnet-rtc = { path = "crates/parolnet-rtc" }
 parolnet-app = { path = "crates/parolnet-app" }
 parolnet-store = { path = "crates/parolnet-store" }
+parolnet-media = { path = "crates/parolnet-media", default-features = false }
 
 # Realtime engine: Brainwires' fork of webrtc-rs/rtc (sans-I/O), pinned by tag, never a branch.
 # Its DTLS / SRTP provider is ring (C and assembly); the E2EE layer stays pure Rust.

@@ -3,8 +3,9 @@
 The GPUI desktop client. By default it is the M1 client (UI v0 over `parolnet-app`): contacts,
 pairing by QR code or code (compatible with the PWA), safety numbers, 1:1 end-to-end encrypted
 chat over a direct data channel per contact (bound to the session by both DTLS fingerprints),
-the direct-path state, and 1:1 voice / video calls (video sends a test pattern until camera
-capture lands). Status and limits:
+the direct-path state, and 1:1 voice / video calls: camera capture (a test pattern without a
+camera), echo cancellation (AEC3), camera / microphone / speaker menus, camera off, a self-view.
+The media code is `crates/parolnet-media`. Status and limits:
 [docs/m1-desktop.md](../../docs/m1-desktop.md).
 
 With `--spike` (or any spike flag) it is the M0 spike: a window that shows a VP8 stream received
@@ -19,11 +20,15 @@ needs system libraries the root workspace does not.
 | OS | Needs |
 | --- | --- |
 | macOS | Xcode (its Metal compiler; on Xcode 26 install the Metal toolchain component) or build with `--features runtime-shaders`; `brew install libvpx pkgconf` |
-| Linux | `libvpx-dev libasound2-dev pkg-config libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev libx11-xcb-dev libfontconfig-dev libvulkan1` and a Vulkan driver; `perl` and `make` (the store's SQLCipher links an OpenSSL libcrypto built from source) |
+| Linux | `libvpx-dev libasound2-dev clang libclang-dev pkg-config libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev libx11-xcb-dev libfontconfig-dev libvulkan1` and a Vulkan driver; `perl` and `make` (the store's SQLCipher links an OpenSSL libcrypto built from source) |
 | Windows | `vcpkg install libvpx:x64-windows-static-md` (or `arm64-windows-static-md`) with `VCPKG_ROOT` set; Strawberry Perl for the OpenSSL build (from Git Bash set `OPENSSL_SRC_PERL=C:/Strawberry/perl/bin/perl.exe`, its own perl cannot run OpenSSL's Configure) |
 
-`VPX_LIB_DIR` (and `VPX_STATIC=1`, `VPX_INCLUDE_DIR` for the encoder shim `src/vp8enc.c`) points
-the build at a libvpx of your own. A C compiler is needed for that shim.
+`VPX_LIB_DIR` (and `VPX_STATIC=1`, `VPX_INCLUDE_DIR` for the encoder shim
+`crates/parolnet-media/src/vp8/vp8enc.c`) points the build at a libvpx of your own. A C compiler
+is needed for that shim. Echo cancellation, Opus and pixel conversion are pure Rust.
+
+On macOS the executable carries `macos/Info.plist` (camera and microphone usage strings) in its
+`__TEXT,__info_plist` section; an app bundle's `Info.plist` must carry the same two keys.
 
 ```sh
 cargo build --release
@@ -40,7 +45,15 @@ cargo run --release -- [--relay wss://parol.social/ws] [--data-dir DIR] [--key-s
 
 # the call media without a window: pair with a code, video-call, report what decoded
 cargo run --release -- --call-check --relay ws://HOST/ws --code CODE [--video] [--seconds 8]
+
+# the media checks that need no network and no device: echo cancellation (ERLE) and a
+# synthetic camera through conversion, scaling, libvpx encode and decode
+cargo run --release -- --media-check
 ```
+
+Environment: `PAROLNET_SYNTHETIC_MEDIA=1` makes the window's calls use the test pattern, a tone
+and no devices (as `--call-check` always does); `PAROLNET_VIDEO=720p` sends 1280x720 instead of
+640x360; `PAROLNET_AUDIO_PROCESSING=off` bypasses echo cancellation, noise suppression and gain.
 
 `node apps/desktop/interop/desktop-call.mjs target/release/parolnet-desktop` (from the repository
 root, with the relay and the bot built in the root workspace) runs `--call-check` against the

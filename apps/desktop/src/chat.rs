@@ -24,7 +24,7 @@ use parolnet_app::{
     DeliveryState, Direction, PathState, RelayState,
 };
 
-use crate::call::CallSession;
+use crate::call::{CallSession, DeviceLists, MediaOptions};
 use crate::settings::SettingsView;
 use crate::ui::VideoView;
 use tokio::sync::mpsc::UnboundedReceiver;
@@ -138,6 +138,45 @@ pub fn call_status_text(call: &CallInfo, name: &str) -> String {
     }
 }
 
+/// (microphone muted, camera off) of a running call.
+fn muted_or_off(session: &CallSession) -> (bool, bool) {
+    (
+        session.muted(),
+        session.has_video() && !session.camera_enabled(),
+    )
+}
+
+/// The call panel's device line: what is captured and played, and what is muted.
+pub fn media_status_text(
+    status: &crate::call::MediaStatus,
+    (muted, camera_off): (bool, bool),
+) -> String {
+    let mut parts = Vec::new();
+    let or = |s: &str| {
+        if s.is_empty() {
+            "starting…".to_owned()
+        } else {
+            s.to_owned()
+        }
+    };
+    if !status.camera.is_empty() || camera_off {
+        let camera = if camera_off {
+            "off".to_owned()
+        } else {
+            or(&status.camera)
+        };
+        parts.push(format!("Camera: {camera}"));
+    }
+    let mic = or(&status.microphone);
+    parts.push(if muted {
+        format!("Microphone: {mic} (muted)")
+    } else {
+        format!("Microphone: {mic}")
+    });
+    parts.push(format!("Speaker: {}", or(&status.speaker)));
+    parts.join("  ·  ")
+}
+
 /// Why a call ended, for the notice line.
 pub fn call_end_text(why: &CallEnd, name: &str) -> String {
     match why {
@@ -221,6 +260,18 @@ struct UiCall {
     info: CallInfo,
     session: Option<CallSession>,
     video: Option<Entity<VideoView>>,
+    /// What we send (video calls).
+    self_view: Option<Entity<VideoView>>,
+    /// The device menus are open.
+    show_devices: bool,
+}
+
+/// Which kind of device a menu row selects.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DeviceKind {
+    Camera,
+    Microphone,
+    Speaker,
 }
 
 struct ContactRow {
@@ -248,6 +299,10 @@ pub struct ChatView {
     call: Option<UiCall>,
     /// The settings pane (`settings.rs`).
     settings: Entity<SettingsView>,
+    /// The devices calls use (the choice outlives a call; `None` is the system default).
+    call_media: MediaOptions,
+    /// The devices to choose from, once the menus were opened.
+    call_devices: Option<DeviceLists>,
 }
 
 impl ChatView {
@@ -343,6 +398,11 @@ impl ChatView {
             runtime,
             call: None,
             settings,
+            call_media: MediaOptions {
+                synthetic: crate::call::synthetic_from_env(),
+                ..Default::default()
+            },
+            call_devices: None,
             code_input,
             composer,
             name_input,
@@ -462,6 +522,8 @@ impl ChatView {
                     info,
                     session: None,
                     video: None,
+                    self_view: None,
+                    show_devices: false,
                 });
             }
         }
@@ -472,15 +534,162 @@ impl ChatView {
         let Some(call) = self.call.as_mut().filter(|c| c.info.call_id == call_id) else {
             return; // ended meanwhile; dropping `media` is enough
         };
-        let session = CallSession::start(media, call.info.video, true, &self.runtime);
+        let session = CallSession::start(
+            media,
+            call.info.video,
+            self.call_media.clone(),
+            &self.runtime,
+        );
         if call.info.video {
             let (slot, stats) = (session.slot.clone(), session.stats.video.clone());
             call.video = Some(cx.new(|cx| VideoView::new(slot, stats, None, cx)));
-        }
-        if !session.has_audio_devices() {
-            self.notice = Some("No microphone or speakers found: the call has no sound.".into());
+            let self_slot = session.self_slot.clone();
+            call.self_view = Some(cx.new(|cx| VideoView::preview(self_slot, cx)));
         }
         call.session = Some(session);
+        // The device lines (which microphone, a device that went away) change without an
+        // event from the core: repaint the panel twice a second while this call is shown.
+        let id = call_id.to_owned();
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(std::time::Duration::from_millis(500))
+                    .await;
+                let shown = this.update(cx, |view, cx| {
+                    let shown = view.call.as_ref().is_some_and(|c| c.info.call_id == id);
+                    if shown {
+                        cx.notify();
+                    }
+                    shown
+                });
+                if !matches!(shown, Ok(true)) {
+                    break;
+                }
+            }
+        })
+        .detach();
+    }
+
+    /// Open or close the device menus; the lists load off the UI thread.
+    fn toggle_devices(&mut self, cx: &mut Context<Self>) {
+        let Some(call) = self.call.as_mut() else {
+            return;
+        };
+        call.show_devices = !call.show_devices;
+        if !call.show_devices || self.call_media.synthetic {
+            return;
+        }
+        cx.spawn(async move |this, cx| {
+            let lists = cx
+                .background_executor()
+                .spawn(async { crate::call::list_devices() })
+                .await;
+            let _ = this.update(cx, |view, cx| {
+                view.call_devices = Some(lists);
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Use another device, in this call and the next ones (`None`: the system default).
+    fn select_device(&mut self, kind: DeviceKind, id: Option<String>) {
+        let session = self.call.as_ref().and_then(|c| c.session.as_ref());
+        match kind {
+            DeviceKind::Camera => {
+                if let Some(s) = session {
+                    s.select_camera(id.clone());
+                }
+                self.call_media.camera = id;
+            }
+            DeviceKind::Microphone => {
+                if let Some(s) = session {
+                    s.select_microphone(id.clone());
+                }
+                self.call_media.microphone = id;
+            }
+            DeviceKind::Speaker => {
+                if let Some(s) = session {
+                    s.select_speaker(id.clone());
+                }
+                self.call_media.speaker = id;
+            }
+        }
+    }
+
+    /// One device menu: the system default, then every device; the one in use is marked.
+    fn render_device_menu(
+        &self,
+        kind: DeviceKind,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement + use<> {
+        let (title, key, selected, devices) = match kind {
+            DeviceKind::Camera => (
+                "Camera",
+                "cam",
+                &self.call_media.camera,
+                self.call_devices.as_ref().map(|d| &d.cameras),
+            ),
+            DeviceKind::Microphone => (
+                "Microphone",
+                "mic",
+                &self.call_media.microphone,
+                self.call_devices.as_ref().map(|d| &d.microphones),
+            ),
+            DeviceKind::Speaker => (
+                "Speaker",
+                "spk",
+                &self.call_media.speaker,
+                self.call_devices.as_ref().map(|d| &d.speakers),
+            ),
+        };
+        let mut row = div().flex().flex_wrap().items_center().gap_2().child(
+            div()
+                .w(px(90.))
+                .text_xs()
+                .text_color(rgb(0x8b949e))
+                .child(title),
+        );
+        let Some(devices) = devices else {
+            return row.child(
+                div()
+                    .text_xs()
+                    .text_color(rgb(0x8b949e))
+                    .child("Looking for devices…"),
+            );
+        };
+        let mut default = Button::new(SharedString::from(format!("{key}-default")))
+            .label("System default")
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.select_device(kind, None);
+                cx.notify();
+            }));
+        if selected.is_none() {
+            default = default.primary();
+        }
+        row = row.child(default);
+        for (i, device) in devices.iter().enumerate() {
+            let id = device.id.clone();
+            let mut button = Button::new(SharedString::from(format!("{key}-{i}")))
+                .label(device.name.clone())
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.select_device(kind, Some(id.clone()));
+                    cx.notify();
+                }));
+            if selected.as_deref() == Some(device.id.as_str()) {
+                button = button.primary();
+            }
+            row = row.child(button);
+        }
+        if devices.is_empty() {
+            row = row.child(
+                div()
+                    .text_xs()
+                    .text_color(rgb(0x8b949e))
+                    .child("none found"),
+            );
+        }
+        row
     }
 
     fn start_call(&mut self, peer: String, video: bool, cx: &mut Context<Self>) {
@@ -548,22 +757,48 @@ impl ChatView {
                     ));
         } else {
             let muted = call.session.as_ref().is_some_and(CallSession::muted);
-            controls = controls
-                .child(
-                    Button::new("mute")
-                        .label(if muted { "Unmute" } else { "Mute" })
+            controls = controls.child(
+                Button::new("mute")
+                    .label(if muted { "Unmute" } else { "Mute" })
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        if let Some(s) = this.call.as_ref().and_then(|c| c.session.as_ref()) {
+                            s.set_muted(!s.muted());
+                        }
+                        cx.notify();
+                    })),
+            );
+            if let Some(session) = call.session.as_ref().filter(|s| s.has_video()) {
+                let on = session.camera_enabled();
+                controls = controls.child(
+                    Button::new("camera")
+                        .label(if on { "Camera off" } else { "Camera on" })
                         .on_click(cx.listener(|this, _, _, cx| {
                             if let Some(s) = this.call.as_ref().and_then(|c| c.session.as_ref()) {
-                                s.set_muted(!s.muted());
+                                s.set_camera_enabled(!s.camera_enabled());
                             }
                             cx.notify();
                         })),
-                )
-                .child(
-                    Button::new("hang-up")
-                        .label("Hang up")
-                        .on_click(cx.listener(move |this, _, _, _| this.app.hangup(&id))),
                 );
+            }
+            if call.session.is_some() {
+                controls = controls.child(
+                    Button::new("devices")
+                        .label(if call.show_devices {
+                            "Hide devices"
+                        } else {
+                            "Devices"
+                        })
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.toggle_devices(cx);
+                            cx.notify();
+                        })),
+                );
+            }
+            controls = controls.child(
+                Button::new("hang-up")
+                    .label("Hang up")
+                    .on_click(cx.listener(move |this, _, _, _| this.app.hangup(&id))),
+            );
         }
         let mut panel = div()
             .flex()
@@ -586,8 +821,45 @@ impl ChatView {
                     )
                     .child(controls),
             );
+        if let Some(session) = &call.session {
+            panel = panel.child(
+                div()
+                    .text_xs()
+                    .text_color(rgb(0x8b949e))
+                    .child(media_status_text(&session.status(), muted_or_off(session))),
+            );
+        }
+        if call.show_devices && call.session.is_some() {
+            if self.call_media.synthetic {
+                panel = panel.child(div().text_xs().text_color(rgb(0x8b949e)).child(
+                    "Synthetic media is selected (PAROLNET_SYNTHETIC_MEDIA): no devices are used.",
+                ));
+            } else {
+                if call.info.video {
+                    panel = panel.child(self.render_device_menu(DeviceKind::Camera, cx));
+                }
+                panel = panel
+                    .child(self.render_device_menu(DeviceKind::Microphone, cx))
+                    .child(self.render_device_menu(DeviceKind::Speaker, cx));
+            }
+        }
         if let Some(video) = &call.video {
-            panel = panel.child(div().h(px(300.)).child(video.clone()));
+            let mut tiles = div()
+                .h(px(300.))
+                .flex()
+                .gap_2()
+                .child(div().flex_1().h_full().child(video.clone()));
+            if let Some(self_view) = &call.self_view {
+                tiles = tiles.child(
+                    div()
+                        .w(px(200.))
+                        .h(px(113.))
+                        .border_1()
+                        .border_color(rgb(0x30363d))
+                        .child(self_view.clone()),
+                );
+            }
+            panel = panel.child(tiles);
         }
         Some(panel)
     }
@@ -1170,6 +1442,24 @@ mod tests {
         assert_eq!(path_badge(PathState::NoDirectPath).0, "no path");
         assert!(path_text(PathState::BindingFailed, "Pat", 0).contains("end-to-end check"));
         assert_eq!(path_badge(PathState::BindingFailed).0, "check failed");
+    }
+
+    #[test]
+    fn media_status_lines() {
+        let mut status = crate::call::MediaStatus::default();
+        assert_eq!(
+            media_status_text(&status, (false, false)),
+            "Microphone: starting…  ·  Speaker: starting…"
+        );
+        status.camera = "FaceTime HD Camera".into();
+        status.microphone = "MacBook Pro Microphone".into();
+        status.speaker = "No speakers".into();
+        assert_eq!(
+            media_status_text(&status, (true, false)),
+            "Camera: FaceTime HD Camera  ·  Microphone: MacBook Pro Microphone (muted)  ·  \
+             Speaker: No speakers"
+        );
+        assert!(media_status_text(&status, (false, true)).starts_with("Camera: off  ·  "));
     }
 
     #[test]
