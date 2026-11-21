@@ -22,7 +22,11 @@ export function previewOf(last: ChatMessage | undefined): string {
     : attachment.kind === "file"
     ? t("list.preview.file", { name: attachment.name })
     : t(attachment.media === "video" ? "message.videoInvite" : "message.voiceInvite");
-  return last.direction === "Sent" ? t("list.preview.you", { text }) : text;
+  // What the person wrote keeps its own direction inside "You: …" (an isolate), so an
+  // English message under an Arabic prefix keeps its full stop at its end.
+  return last.direction === "Sent"
+    ? t("list.preview.you", { text: attachment ? text : `\u2068${text}\u2069` })
+    : text;
 }
 
 /** What the app has to say on its own: storage failed, or the person's relay server did. */

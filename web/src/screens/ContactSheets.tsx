@@ -8,6 +8,7 @@ import { showToast } from "../components/Toast.tsx";
 import { type MessageKey, t } from "../i18n/index.ts";
 import { useStore } from "../state/context.ts";
 import type { ContactView, Verification } from "../state/model.ts";
+import { shownName } from "../state/names.ts";
 import { errorText } from "./errors.ts";
 
 const VERIFIED: Record<Verification, MessageKey> = {
@@ -88,7 +89,7 @@ export function VerifySheet({ view, onClose, onRemoved }: {
 }) {
   const store = useStore();
   const { contact } = view;
-  const name = contact.name;
+  const name = shownName(contact);
   const [mismatch, setMismatch] = useState(false);
   const [problem, setProblem] = useState<string | null>(null);
   const digits = store.safetyNumber(contact.peerId);
@@ -163,7 +164,7 @@ export function RemoveContactSheet({ view, onClose, onRemoved }: {
   onRemoved: () => void;
 }) {
   const store = useStore();
-  const name = view.contact.name;
+  const name = shownName(view.contact);
   const [problem, setProblem] = useState<string | null>(null);
 
   const remove = async () => {

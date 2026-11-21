@@ -87,6 +87,10 @@ class FakeEngine implements EnginePort {
     this.calls.push("createPairingCode");
     return Promise.resolve({ code: "c0de", expiresAtMs: 1 });
   }
+  cancelPairing() {
+    this.calls.push("cancelPairing");
+    return Promise.resolve();
+  }
   pairWithCode(code: string, how: { via: "scan" | "paste" }) {
     this.calls.push(`pair:${code}:${how.via}`);
     return Promise.resolve(contact(ALICE, "New contact"));
@@ -379,6 +383,8 @@ Deno.test("store: intents become engine commands; a refusal reaches the screen",
   await h.store.edit(8, "changed");
   h.store.connect(ALICE);
   h.store.markRead(ALICE);
+  await h.store.createPairingCode();
+  await h.store.cancelPairing();
   await h.store.pair("c0de", "scan");
   await h.store.rename(ALICE, "Ally");
   await h.store.setCompared(ALICE, true);
@@ -390,6 +396,8 @@ Deno.test("store: intents become engine commands; a refusal reaches the screen",
     "edit:8:changed",
     "connect:a1",
     "markRead:a1",
+    "createPairingCode",
+    "cancelPairing",
     "pair:c0de:scan",
     "rename:Ally",
     "verify:compared",

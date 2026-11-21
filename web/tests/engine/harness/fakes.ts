@@ -4,6 +4,7 @@
 import type {
   Clock,
   DataChannel,
+  DtlsTransport,
   IceCandidateInit,
   MediaStreamLike,
   MediaTrack,
@@ -378,6 +379,19 @@ export class FakeDc implements DataChannel {
   }
 }
 
+/** A DTLS transport, exposed to the engine only when `FakeRtc.exposeTransports` is set. */
+export class FakeDtls implements DtlsTransport {
+  state = "new";
+  private listeners: (() => void)[] = [];
+  addEventListener(_type: "statechange", listener: () => void): void {
+    this.listeners.push(listener);
+  }
+  set(state: string): void {
+    this.state = state;
+    for (const l of this.listeners) l();
+  }
+}
+
 export class FakePc implements PeerConnection {
   private static next = 1;
   readonly id = FakePc.next++;
@@ -395,6 +409,7 @@ export class FakePc implements PeerConnection {
   remoteCandidates: IceCandidateInit[] = [];
   senders: { track: MediaTrack; stream: MediaStreamLike }[] = [];
   peer: FakePc | null = null;
+  readonly dtls = new FakeDtls();
 
   constructor(readonly rtc: FakeRtc, readonly config: PeerConfig) {}
 
@@ -468,7 +483,9 @@ export class FakePc implements PeerConnection {
   }
 
   getSenders(): RtpSender[] {
+    const transport = this.rtc.exposeTransports ? this.dtls : undefined;
     return this.senders.map((sender) => ({
+      transport,
       get track() {
         return sender.track;
       },
@@ -512,6 +529,13 @@ export class FakeRtc {
   neverFinishGathering = false;
   /** Relay-only connections gather no candidate at all. */
   turnUnreachable = false;
+  /** Senders expose their DTLS transport (`RtpSender.transport`). */
+  exposeTransports = false;
+  /**
+   * Linux WebKit's defect: on a call connection the offerer's transport connects but its
+   * `connectionState` stays "connecting".
+   */
+  offererStateStuck = false;
   /** Return true to lose a data-channel frame in flight. */
   dropFrame: ((from: FakePc, data: string) => boolean) | null = null;
 
@@ -543,7 +567,10 @@ export class FakeRtc {
       }
       offerer.peer = answerer;
       answerer.peer = offerer;
-      offerer.setState("connected");
+      offerer.dtls.set("connected");
+      answerer.dtls.set("connected");
+      if (this.offererStateStuck && offerer.senders.length > 0) offerer.setState("connecting");
+      else offerer.setState("connected");
       answerer.setState("connected");
       for (const dc of offerer.channels) {
         const mirror = new FakeDc(answerer, dc.label);

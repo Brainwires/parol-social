@@ -33,6 +33,7 @@ import type {
   IdentityRow,
   MessageRow,
   OutboxRow,
+  PendingPairingRow,
   SessionsRow,
   SettingRow,
 } from "./storage.ts";
@@ -353,6 +354,7 @@ export class Engine {
       }
     }
     if (this.cfg.stunServers) this.stun = [...this.cfg.stunServers];
+    await this.restorePairing();
     // Entries that outlived the queue's age limit while the app was closed.
     const ops = await this.dropOps(this.expired(clock.now()));
     if (ops.length > 0) await storage.write(ops);
@@ -793,11 +795,12 @@ export class Engine {
   /**
    * Show this to a contact (as a QR code or text). A new call replaces the previous code.
    * While it is valid, offers from strangers are accepted; the window closes when the code
-   * expires, when someone pairs with it, or on `cancelPairing`. The pending half lives in
-   * wasm memory only, so a reload invalidates the code (the snapshot then has no `pairing`).
+   * expires, when someone pairs with it, or on `cancelPairing`. Where the core can export its
+   * pending half, it is stored with the code, so the code survives a reload within its
+   * lifetime; otherwise a reload invalidates it (the snapshot then has no `pairing`).
    */
   createPairingCode(): Promise<PairingCode> {
-    return this.post(() => {
+    return this.post(async () => {
       let code: string;
       try {
         code = this.p.wasm.generate_qr_payload(this.publicKey, null)
@@ -812,12 +815,11 @@ export class Engine {
       // The scanner measures the code's age from its own timestamp, which is floored to
       // 300 s: the window is exactly as long as the code can still be scanned.
       const expiresAtMs = (payload.ts + PAIRING_CODE_LIFETIME_SECS) * 1000;
-      this.closePairing(false);
-      const timer = this.after(
-        expiresAtMs - this.p.clock.now(),
-        () => this.closePairing(true),
-      );
-      this.pairing = { code, expiresAtMs, timer };
+      // The new pending half has replaced the old one in wasm; the stored row is replaced
+      // below.
+      this.closePairing(false, false);
+      await this.storePairing(code, expiresAtMs);
+      this.openPairing(code, expiresAtMs);
       const pairing = this.currentPairing()!;
       this.emit({ kind: "Pairing", pairing });
       return pairing;
@@ -829,7 +831,64 @@ export class Engine {
     return this.post(() => this.closePairing(true));
   }
 
-  private closePairing(announce: boolean): void {
+  private openPairing(code: string, expiresAtMs: number): void {
+    const timer = this.after(
+      expiresAtMs - this.p.clock.now(),
+      () => this.closePairing(true),
+    );
+    this.pairing = { code, expiresAtMs, timer };
+  }
+
+  /** Keep the code and its pending half for a reload, where the core can export it. */
+  private async storePairing(code: string, expiresAtMs: number): Promise<void> {
+    const { wasm } = this.p;
+    if (typeof wasm.export_pending_bootstrap !== "function") return;
+    const pendingHex = wasm.export_pending_bootstrap();
+    if (typeof pendingHex !== "string") return;
+    await this.save([{
+      op: "put",
+      store: "identity",
+      value: { id: "pairing", code, expiresAtMs, pendingHex } satisfies PendingPairingRow,
+    }]);
+  }
+
+  /** A code stored before a reload, still within its lifetime: show it again. */
+  private async restorePairing(): Promise<void> {
+    const { wasm, storage, clock } = this.p;
+    const row = await storage.get<PendingPairingRow>("identity", "pairing");
+    if (!row) return;
+    if (
+      typeof wasm.import_pending_bootstrap === "function" &&
+      typeof row.pendingHex === "string" && typeof row.code === "string" &&
+      clock.now() < row.expiresAtMs
+    ) {
+      try {
+        wasm.import_pending_bootstrap(row.pendingHex);
+        this.openPairing(row.code, row.expiresAtMs);
+        return;
+      } catch {
+        this.p.log.warn("[Engine] the stored pairing code is unreadable; a new one is needed");
+      }
+    }
+    await storage.write([{ op: "delete", store: "identity", key: "pairing" }]);
+  }
+
+  /**
+   * Close the pairing window. `forget` (every case but a new code replacing this one and the
+   * engine stopping) also clears the pending half from wasm memory and from storage, so the
+   * code cannot be used however the page goes on.
+   */
+  private closePairing(announce: boolean, forget = true): void {
+    if (forget) {
+      try {
+        this.p.wasm.clear_pending_bootstrap?.();
+      } catch { /* nothing pending */ }
+      if (typeof this.p.wasm.export_pending_bootstrap === "function") {
+        this.p.storage.write([{ op: "delete", store: "identity", key: "pairing" }]).catch(
+          () => this.p.log.warn("[Engine] could not delete the stored pairing code"),
+        );
+      }
+    }
     if (!this.pairing) return;
     this.cancel(this.pairing.timer);
     this.pairing = null;
@@ -2327,7 +2386,8 @@ export class Engine {
     this.stopped = true;
     for (const peer of [...this.peers.keys()]) this.dropConn(peer);
     for (const t of [...this.timers]) this.cancel(t);
-    this.closePairing(false);
+    // Stopping (a reload, another tab taking over) keeps a stored code for the next start.
+    this.closePairing(false, false);
     this.relay.stop();
   }
 

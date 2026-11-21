@@ -113,7 +113,15 @@ function seedContacts(): Contact[] {
   }));
 }
 
-const FAKE_CODE = "a4".repeat(20) + "7c".repeat(20) + "19".repeat(24);
+// As long as the longest real code (about 170 bytes), so the lab shows the real layout.
+const FAKE_CODE =
+  "d606ec3b56b70ae22e4c0ebacc3d86fa6442c75a4e7ad57c4e3e5d7718cf89ecc77f4da6a8f4c05e" +
+  "b26ddcdcd0b521c0e9c567b8ded3adbe28d64f0013f03b5f723a0bfac6e6505f05d16a809879611e" +
+  "3cd756615268194fed484666e6e7f08ed09f7380b17d4c63881100ac75bec091ed2f637de928e906" +
+  "987a4d604a365cc80d5832a3aaeaf85ddbb19af07196447e6b6134a0cda4f9ea5386f8a9c9c93391" +
+  "d76b05bfa4fdae88d44083af";
+/** Who "used this device's code" in the lab. */
+export const USED_CODE_PEER = "c3".repeat(32);
 const FAKE_SAFETY_NUMBER = "385729104466271839500471626839157203948561027384951620";
 
 export interface FakeStoreOptions {
@@ -269,6 +277,11 @@ export function createFakeStore(options: FakeStoreOptions = {}): AppStore & Fake
       return Promise.resolve(code);
     },
 
+    cancelPairing() {
+      pairing.value = null;
+      return Promise.resolve();
+    },
+
     pair(code, via) {
       const clean = code.replace(/[^0-9a-f]/gi, "").toLowerCase();
       if (clean.length < 64) {
@@ -276,7 +289,7 @@ export function createFakeStore(options: FakeStoreOptions = {}): AppStore & Fake
       }
       const contact: Contact = {
         peerId: clean.slice(0, 64),
-        name: "New contact",
+        name: "",
         identityKey: null,
         addedMs: Date.now(),
         verified: via === "scan" ? "in-person" : "no",
@@ -390,6 +403,24 @@ export function createFakeStore(options: FakeStoreOptions = {}): AppStore & Fake
         if (online) { for (const c of people.value) flush(c.peerId); }
         else call.value = null;
       });
+    },
+
+    someoneUsedCode() {
+      const contact: Contact = {
+        peerId: USED_CODE_PEER,
+        name: "",
+        identityKey: null,
+        addedMs: Date.now(),
+        verified: "no",
+        verifiedMs: null,
+      };
+      batch(() => {
+        // The code is used up, as a real one is.
+        pairing.value = null;
+        paths.value = new Map(paths.value).set(contact.peerId, "Offline");
+        person((list) => [...list.filter((c) => c.peerId !== contact.peerId), contact]);
+      });
+      return contact.peerId;
     },
 
     clear() {

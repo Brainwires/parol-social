@@ -15,9 +15,11 @@ import { type MessageKey, t } from "../i18n/index.ts";
 import { hrefOf, navigate } from "../router.ts";
 import { useStore } from "../state/context.ts";
 import { type ContactView, type LineState, lineState } from "../state/model.ts";
+import { asksForName, shownName } from "../state/names.ts";
 import { contactOf, messagesOf } from "../state/store.ts";
 import { ContactDetailsSheet, RemoveContactSheet, VerifySheet } from "./ContactSheets.tsx";
 import { errorText } from "./errors.ts";
+import { NamePrompt } from "./NamePrompt.tsx";
 import { type Caption, captionOf, threadItems, useFillSequence } from "./thread.ts";
 
 const CAPTION: Record<Caption, MessageKey> = {
@@ -71,7 +73,9 @@ function Thread({ view, onEdit, onProblem }: {
   if (items.length === 0) {
     return (
       <div className="thread thread--empty" ref={scroller}>
-        <p className="thread__empty">{t("conversation.noMessages", { name: contact.name })}</p>
+        <p className="thread__empty">
+          {t("conversation.noMessages", { name: shownName(contact) })}
+        </p>
       </div>
     );
   }
@@ -125,7 +129,7 @@ function Thread({ view, onEdit, onProblem }: {
                   data-testid="thread-caption"
                   data-caption={caption.caption}
                 >
-                  {t(CAPTION[caption.caption], { name: contact.name })}
+                  {t(CAPTION[caption.caption], { name: shownName(contact) })}
                 </p>
               )}
             </li>
@@ -179,7 +183,7 @@ export function Conversation({ peerId, showBack = true }: { peerId: string; show
   }
 
   const { contact } = view;
-  const name = contact.name;
+  const name = shownName(contact);
   const line = lineState(view.path, store.selfOnline.value);
   const blocker = callBlocker(line);
   const fail = (error: unknown) => setProblem(errorText(error, { name }));
@@ -242,6 +246,7 @@ export function Conversation({ peerId, showBack = true }: { peerId: string; show
       <p className="hint conversation__hint" id={hintId} role="status" data-testid="call-hint">
         {blocker && callHint ? t(blocker, { name }) : ""}
       </p>
+      {asksForName(contact) && <NamePrompt key={peerId} peerId={peerId} />}
       {contact.verified === "no" && (
         <div className="conversation__verify" data-testid="verify-prompt">
           <span>{t("verify.prompt")}</span>

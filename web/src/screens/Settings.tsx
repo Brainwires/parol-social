@@ -22,6 +22,7 @@ import { wasmStatus } from "../platform/wasm.ts";
 import { hrefOf } from "../router.ts";
 import { useStore } from "../state/context.ts";
 import type { RelayState } from "../state/model.ts";
+import { errorText } from "./errors.ts";
 
 function Group(
   { title, testId, children }: { title: string; testId: string; children: ReactNode },
@@ -165,8 +166,8 @@ function OwnRelayServer() {
       setOnly(false);
       setProblem(null);
       showToast(t("toast.turnRemoved"));
-    } catch {
-      setProblem(t("error.generic"));
+    } catch (error) {
+      setProblem(errorText(error, {}, "settings.turn.removeFailed"));
     }
   };
 

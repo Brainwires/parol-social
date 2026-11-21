@@ -144,8 +144,11 @@ instead of "could not connect".
 - Adding a contact is `pairWithCode(code, { via })` and returns the contact; the name comes later
   through `renameContact`. The presenter side gets its contact through `ContactAdded`.
 - "You are offline" is `snapshot().relay.kind !== "Registered"`.
-- A pairing code has an expiry (`PairingCode.expiresAtMs`); after a reload there is none
-  (`snapshot().pairing === null`) and the UI asks for a new one.
+- A pairing code has an expiry (`PairingCode.expiresAtMs`). Where the core exports the
+  pending bootstrap (`export_pending_bootstrap`), the code and that blob are stored, so after a
+  reload within its lifetime the same code is shown and still works; otherwise there is none
+  after a reload (`snapshot().pairing === null`) and the UI asks for a new one. Expiry,
+  `cancelPairing` and use clear it from wasm memory (`clear_pending_bootstrap`) and storage.
 
 ## Storage schema
 
@@ -154,6 +157,7 @@ Database `parolnet-web`, version 1. Nothing is migrated from the old PWA's `paro
 | Store | Key | Index | Row |
 |---|---|---|---|
 | `identity` | `id` = `"self"` | | `{ id, secretHex }` |
+| `identity` | `id` = `"pairing"` | | `{ id, code, expiresAtMs, pendingHex }`: the code on screen and its pending bootstrap (secret, kept like `secretHex`; deleted on use, expiry, cancel and wipe) |
 | `sessions` | `id` = `"blob"` | | `{ id, json }`: the wasm `export_sessions()` output, one row |
 | `contacts` | `peerId` | | `{ peerId, name, identityKey, addedMs, verified, verifiedMs }` |
 | `messages` | `id` (number, allocated by the engine) | `peerId` | `{ id, peerId, direction, text, timestampMs, state, editedMs? }` |
@@ -227,10 +231,10 @@ at most 4 late candidates follow as `rtc_ice`).
 
 **Removing a contact.** One transaction deletes the contact, its state, its messages, its queue
 and its session from the saved sessions; a call with it is hung up first and its connection
-closed. The core has no call to drop one session from wasm memory ("wasm API gaps" #5), so
-without `remove_session` the engine reloads the identity and imports the remaining sessions.
-That drops the pending bootstrap, so a code being shown is closed (`Pairing` with `null`). The
-contact is not told.
+closed. The session leaves wasm memory through `remove_session`, and a code being shown stays.
+On an older core without it the engine reloads the identity and imports the remaining
+sessions, which drops the pending bootstrap, so a code being shown is closed (`Pairing` with
+`null`); the engine tests cover both. The contact is not told.
 
 **Switching cameras.** `replaceCamera` swaps the video sender's track (`replaceTrack`, no
 renegotiation), stops the old video track, and keeps the microphone. The engine owns the new
@@ -240,7 +244,12 @@ stream.
 **Calls.** Per-call `RTCPeerConnection`; `offer` / `answer` carry the SDP with its candidates;
 incoming `ice` is accepted, also before the user accepts; every signal is matched by `callId` and
 by peer; a second call gets `reject`; `reject` and `hangup` tear down both sides; ring 60 s,
-connect 30 s. Capture goes through the injected `MediaDevices` when the call starts or is
+connect 30 s. A call is Active when `connectionState` is "connected" or, where senders
+expose their `RTCDtlsTransport`, when every transport still in use is connected (the spec's
+rule, applied by the engine): Linux WebKit (GStreamer) leaves the offerer's `connectionState`
+at "connecting" after the answer bundles the media lines and the extra transport closes.
+`bundlePolicy: "max-bundle"` would avoid the extra transport, but Firefox then offers
+bundle-only lines, which the desktop engine rejects. Capture goes through the injected `MediaDevices` when the call starts or is
 accepted; the engine stops the tracks it obtained when the call ends.
 
 **Timers and limits.** As the native core: answer 20 s, connect 45 s, offer fallback 10 s + up to
@@ -281,18 +290,17 @@ the desktop pings every 25 s and has no silence timeout (inventory §12.1 #10).
 
 The engine works with today's `crates/parolnet-wasm`, but these would make it simpler or safer:
 
-1. **Export and import of the pending bootstrap** (seed and ratchet secret), or a
-   `pending_bootstrap_export()` / `pending_bootstrap_import()` pair. Without it a reload
-   invalidates a shown code; the engine can only say so (`snapshot().pairing === null`).
-2. **`clear_pending_bootstrap()`.** An expired or cancelled code stays armed in wasm memory until
-   replaced; the engine merely stops calling `trial_decrypt`.
+1. ~~Export and import of the pending bootstrap.~~ Now `export_pending_bootstrap` /
+   `import_pending_bootstrap`; the engine stores the blob with the code (feature-detected).
+2. ~~`clear_pending_bootstrap()`.~~ Now in the core; the engine calls it on expiry, cancel and
+   use.
 3. **`bootstrap_decrypt(envelope, expected_peer_id)`**: the §5.3.1 fallback alone, bound to one
    peer, returning the scanner's identity key. Today the only entry is `trial_decrypt`, which
    first tries every existing session (and damages them, see below) and returns the PeerId where
    `source_hint` should be the key. The engine works around all three.
 4. **A transactional decrypt** in the core (see "Defects found"). The engine's rollback through
    `import_sessions` would then be unnecessary.
-5. **`remove_session(peer_id)`**, for deleting a contact (not implemented in this phase).
+5. ~~`remove_session(peer_id)`.~~ Now in the core; the engine uses it (feature-detected).
 6. **Per-session export** (`export_session(peer_id)`): the engine re-exports every session after
    every envelope.
 7. `envelope_decode` is marked "unused" in the inventory; the engine depends on it.

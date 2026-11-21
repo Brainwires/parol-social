@@ -13,6 +13,7 @@
 import { toHex } from "./bytes.ts";
 import { hasCandidates } from "./ice.ts";
 import type {
+  DtlsTransport,
   IceCandidateInit,
   MediaStreamLike,
   MediaTrack,
@@ -447,6 +448,7 @@ export class CallManager {
         }
       });
       await pc.setLocalDescription(await pc.createAnswer());
+      this.watchTransports(c, pc);
     } else {
       await pc.setLocalDescription(await pc.createOffer());
     }
@@ -495,6 +497,35 @@ export class CallManager {
     });
   }
 
+  /**
+   * The call is up once every DTLS transport still in use is connected: the spec's own
+   * rule for `connectionState`, applied here as well. Linux WebKit (GStreamer) does not
+   * recompute its `connectionState` when the answer bundles the media lines and the
+   * offerer's extra transport closes: the caller's state stays "connecting" with the
+   * bundled transport connected and media flowing, and the call never became Active.
+   * Where the browser does not expose transports, `connectionState` alone decides.
+   */
+  private watchTransports(c: Call, pc: PeerConnection): void {
+    const transports = new Set<DtlsTransport>();
+    for (const sender of pc.getSenders?.() ?? []) {
+      if (sender.transport) transports.add(sender.transport);
+    }
+    if (transports.size === 0) return;
+    const check = () => {
+      const live = [...transports].filter((t) => t.state !== "closed");
+      if (live.length === 0 || !live.every((t) => t.state === "connected")) return;
+      this.host.internal(() => this.connected(c, pc));
+    };
+    for (const t of transports) t.addEventListener("statechange", check);
+    check();
+  }
+
+  private connected(c: Call, pc: PeerConnection): void {
+    if (!this.alive(c) || c.pc !== pc || c.state.kind === "Active") return;
+    this.host.cancel(c.connectTimer);
+    this.setState(c, { kind: "Active" });
+  }
+
   private wire(c: Call, pc: PeerConnection): void {
     const { host } = this;
     pc.onconnectionstatechange = () => {
@@ -502,8 +533,7 @@ export class CallManager {
       host.internal(async () => {
         if (!this.alive(c) || c.pc !== pc) return;
         if (state === "connected") {
-          host.cancel(c.connectTimer);
-          this.setState(c, { kind: "Active" });
+          this.connected(c, pc);
         } else if (state === "failed" || state === "closed") {
           await host.sendSignal(c.peerId, {
             action: "hangup",
@@ -593,6 +623,7 @@ export class CallManager {
         for (const cand of c.pendingIce.splice(0)) {
           void c.pc.addIceCandidate(cand).catch(() => {});
         }
+        this.watchTransports(c, c.pc);
         if (c.state.kind === "Outgoing") {
           this.setState(c, { kind: "Connecting" });
           this.armConnect(c);

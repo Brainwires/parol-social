@@ -13,6 +13,7 @@ import type {
   PathState,
   RelayState,
 } from "./model.ts";
+import { shownName } from "./names.ts";
 
 /** Where the app is in its own life. Everything but `ready` is a full screen. */
 export type Phase =
@@ -90,6 +91,8 @@ export interface AppStore {
 
   /** A fresh code to show; the previous one stops working. */
   createPairingCode(): Promise<PairingCode>;
+  /** The code being shown stops working (the person left the screen that shows it). */
+  cancelPairing(): Promise<void>;
   /** Add the contact whose code this is. `via` says whether it was scanned or pasted. */
   pair(code: string, via: "scan" | "paste"): Promise<Contact>;
   rename(peerId: string, name: string): Promise<void>;
@@ -123,6 +126,8 @@ export interface FakeControls {
   setSelfOnline(online: boolean): void;
   /** Put a call on screen in any state (null: no call). */
   setCall(call: CallInfo | null): void;
+  /** Someone used this device's code: a contact with no name appears. Returns its id. */
+  someoneUsedCode(): string;
   /** Remove every contact and message: the empty state. */
   clear(): void;
   reset(): void;
@@ -136,7 +141,8 @@ export function contactOf(store: AppStore, peerId: string): ContactView | undefi
   return store.contacts.value.find((c) => c.contact.peerId === peerId);
 }
 
-/** The name to show for a contact id (an empty string when it is unknown). */
+/** The name to show for a contact id ("New contact" until named; empty when unknown). */
 export function nameOf(store: AppStore, peerId: string): string {
-  return contactOf(store, peerId)?.contact.name ?? "";
+  const view = contactOf(store, peerId);
+  return view ? shownName(view.contact) : "";
 }

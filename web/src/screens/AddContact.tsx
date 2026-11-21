@@ -2,9 +2,10 @@
 // as text; and two ways to take theirs, the camera or a paste. Whoever was added is then
 // given a name. A scanned code means the two devices were together, so that contact is
 // verified in person; a pasted one is not verified until safety numbers are compared.
-import { useEffect, useRef, useState } from "denext";
+import { useEffect, useId, useRef, useState } from "denext";
 import { Button } from "../components/Button.tsx";
 import { CodeBlock } from "../components/Codes.tsx";
+import { Icon } from "../components/Icon.tsx";
 import { QrCode } from "../components/QrCode.tsx";
 import { Screen } from "../components/Screen.tsx";
 import { showToast } from "../components/Toast.tsx";
@@ -14,6 +15,7 @@ import { keepStorage } from "../platform/install.ts";
 import { type ScanFailure, type Scanner, startScanner } from "../qr/scan.ts";
 import { hrefOf, navigate } from "../router.ts";
 import { useStore } from "../state/context.ts";
+import { rememberAddedHere } from "../state/names.ts";
 import { contactOf } from "../state/store.ts";
 import { errorText } from "./errors.ts";
 
@@ -43,7 +45,8 @@ function OwnCode() {
   const [attempt, setAttempt] = useState(0);
   const making = useRef(false);
 
-  // A code is made when there is none: on arrival, after a reload, and when one expires.
+  // A code is made when there is none: on arrival (leaving the screen closed the last one),
+  // after a reload, when one expires, and after one was used.
   useEffect(() => {
     if (pairing || making.current) return;
     making.current = true;
@@ -64,7 +67,7 @@ function OwnCode() {
   if (!pairing) {
     return (
       <div className="pairing__own" data-testid="pairing-own" data-state="making">
-        <p role="status">{failed ? t("error.generic") : t("add.making")}</p>
+        <p role="status">{failed ? t("add.makeFailed") : t("add.making")}</p>
         {failed && (
           <Button testId="pairing-retry" onClick={() => setAttempt(attempt + 1)}>
             {t("action.tryAgain")}
@@ -95,7 +98,6 @@ function OwnCode() {
     <div className="pairing__own" data-testid="pairing-own" data-state="ready">
       <h2 className="pairing__label">{t("add.yourCode")}</h2>
       <QrCode text={pairing.code} label={t("add.qrLabel")} testId="pairing-qr" />
-      <CodeBlock code={pairing.code} label={t("code.label")} testId="pairing-code" small />
       <p className="pairing__expiry" data-testid="pairing-expiry">
         {t("add.expiry", { minutes })}
       </p>
@@ -105,7 +107,36 @@ function OwnCode() {
           <Button testId="pairing-share" icon="share" onClick={share}>{t("add.share")}</Button>
         )}
       </div>
-      <p className="pairing__help">{t("add.help")}</p>
+      <CodeAsText code={pairing.code} />
+      <p className="pairing__help" data-testid="pairing-help">{t("add.help")}</p>
+    </div>
+  );
+}
+
+/**
+ * The code as text, behind a disclosure: a real code is a few hundred characters, and shown
+ * open it pushes everything else off a phone's screen. It stays in the page while closed, so
+ * Copy and Share (and anything reading it) never need it open.
+ */
+function CodeAsText({ code }: { code: string }) {
+  const [open, setOpen] = useState(false);
+  const region = useId();
+  return (
+    <div className="pairing__text">
+      <button
+        type="button"
+        className="link-btn pairing__disclosure"
+        aria-expanded={open}
+        aria-controls={region}
+        data-testid="pairing-code-toggle"
+        onClick={() => setOpen(!open)}
+      >
+        <Icon name="chevron" />
+        {t("add.showText")}
+      </button>
+      <div id={region} className="pairing__text-region" hidden={!open}>
+        <CodeBlock code={code} label={t("code.label")} testId="pairing-code" small selectable />
+      </div>
     </div>
   );
 }
@@ -304,6 +335,9 @@ function NameContact({ peerId, how }: { peerId: string; how: How }) {
 export function AddContact() {
   const store = useStore();
   const [mode, setMode] = useState<Mode>("code");
+  // A code works only while its owner is looking at it: leaving the screen closes it, and
+  // coming back makes a fresh one.
+  useEffect(() => () => void store.cancelPairing().catch(() => {}), []);
   const [added, setAdded] = useState<{ peerId: string; how: How } | null>(null);
   // Who was already a contact when this screen opened: anyone new after that used our code.
   const known = useRef<Set<string> | null>(null);
@@ -316,6 +350,7 @@ export function AddContact() {
     adding.current = via;
     try {
       const contact = await store.pair(code, via);
+      rememberAddedHere(contact.peerId);
       setAdded({ peerId: contact.peerId, how: via });
     } finally {
       adding.current = null;

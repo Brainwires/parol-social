@@ -15,6 +15,7 @@ export type EnginePort = Pick<
   | "subscribe"
   | "snapshot"
   | "createPairingCode"
+  | "cancelPairing"
   | "pairWithCode"
   | "sendText"
   | "takeBack"
@@ -342,6 +343,7 @@ export function createEngineStore(env: StoreEnv): EngineStore {
     },
 
     createPairingCode: () => live().createPairingCode(),
+    cancelPairing: () => engine?.cancelPairing() ?? Promise.resolve(),
     pair: (code, via) => live().pairWithCode(code, { via }),
     async rename(peerId, name) {
       await live().renameContact(peerId, name);
