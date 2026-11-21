@@ -12,7 +12,8 @@ import { updateReady } from "../platform/service-worker.ts";
 import { hrefOf, navigate, type Route } from "../router.ts";
 import { useStore } from "../state/context.ts";
 import { type ChatMessage, type ContactView, isOnline, sortContacts } from "../state/model.ts";
-import { messagesOf } from "../state/store.ts";
+import { messagesOf, transfersOf } from "../state/store.ts";
+import { type Entry, lastEntry } from "./thread.ts";
 
 export function previewOf(last: ChatMessage | undefined): string {
   if (!last) return t("list.preview.none");
@@ -29,11 +30,39 @@ export function previewOf(last: ChatMessage | undefined): string {
     : text;
 }
 
+/** The row's preview of the newest entry, a message or a file ("File: {name}"). */
+export function previewOfEntry(entry: Entry | undefined): string {
+  if (entry?.type !== "transfer") return previewOf(entry?.message);
+  const { transfer } = entry;
+  const text = t("list.preview.file", { name: transfer.name });
+  return transfer.direction === "Sent" ? t("list.preview.you", { text }) : text;
+}
+
 /** What the app has to say on its own: storage failed, or the person's relay server did. */
 function NoticePanel() {
   const store = useStore();
   const notice = store.notice.value;
   if (!notice) return null;
+  if (notice.code === "Transfer") {
+    return (
+      <div className="list__notice">
+        <Panel
+          tone="red"
+          testId="notice-transfer"
+          title={t("notice.transfer.title")}
+          actions={[
+            {
+              label: t("action.dismiss"),
+              testId: "notice-dismiss",
+              onClick: store.dismissNotice,
+            },
+          ]}
+        >
+          {t("notice.transfer.body")}
+        </Panel>
+      </div>
+    );
+  }
   if (notice.code === "TurnUnusable") {
     return (
       <div className="list__notice">
@@ -84,12 +113,12 @@ export function ConversationList({ current }: { current: Route }) {
 
   const row = (view: ContactView) => {
     const peerId = view.contact.peerId;
-    const messages = messagesOf(store, peerId);
+    const latest = lastEntry(messagesOf(store, peerId), transfersOf(store, peerId));
     return (
       <li key={peerId} data-testid="contact-item" data-peer-id={peerId}>
         <ConversationRow
           view={view}
-          preview={previewOf(messages[messages.length - 1])}
+          preview={previewOfEntry(latest)}
           href={hrefOf({ name: "conversation", peerId })}
           current={current.name === "conversation" && current.peerId === peerId}
         />

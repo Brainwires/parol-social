@@ -7,6 +7,7 @@ import { Bubble, type BubbleKind } from "../components/Bubble.tsx";
 import { Button, IconButton } from "../components/Button.tsx";
 import { CodeBlock, SafetyNumber } from "../components/Codes.tsx";
 import { Composer } from "../components/Composer.tsx";
+import { FileBubble } from "../components/FileBubble.tsx";
 import { ConversationRow, SectionHeader } from "../components/ConversationRow.tsx";
 import { Line } from "../components/Line.tsx";
 import { Panel } from "../components/Panel.tsx";
@@ -18,7 +19,14 @@ import { setTheme, type ThemeChoice, themeChoice } from "../platform/theme.ts";
 import { loadWasm, wasmStatus } from "../platform/wasm.ts";
 import { hrefOf } from "../router.ts";
 import { FAKE_PEERS } from "../state/fake.ts";
-import type { CallEnd, CallInfo, ContactView, LineState, PathState } from "../state/model.ts";
+import type {
+  CallEnd,
+  CallInfo,
+  ContactView,
+  LineState,
+  PathState,
+  TransferInfo,
+} from "../state/model.ts";
 import { shownName } from "../state/names.ts";
 import type { AppStore, FakeControls } from "../state/store.ts";
 import { Conversation } from "./Conversation.tsx";
@@ -138,6 +146,64 @@ function sampleView(seed: string, name: string, path: PathState, queued: number,
     unread,
     lastActivityMs: 0,
   } satisfies ContactView;
+}
+
+/** Every state of a file, from either side, for the "Files" story. */
+const SAMPLE_TRANSFERS: Array<[string, Partial<TransferInfo> & Pick<TransferInfo, "state">]> = [
+  ["sent-offered-pending", { direction: "Sent", state: { kind: "Offered" }, pending: true }],
+  ["sent-offered", { direction: "Sent", state: { kind: "Offered" } }],
+  ["sent-waiting", { direction: "Sent", state: { kind: "Waiting" } }],
+  ["sent-active", { direction: "Sent", state: { kind: "Active" }, bytesDone: 12_000_000 }],
+  ["sent-complete", { direction: "Sent", state: { kind: "Complete" }, bytesDone: 48_000_000 }],
+  ["sent-declined", { direction: "Sent", state: { kind: "Declined" } }],
+  ["sent-reloaded", {
+    direction: "Sent",
+    state: { kind: "Cancelled", byPeer: false, reason: "Unavailable" },
+  }],
+  ["received-offered", { direction: "Received", state: { kind: "Offered" } }],
+  ["received-waiting", { direction: "Received", state: { kind: "Waiting" } }],
+  ["received-active", {
+    direction: "Received",
+    state: { kind: "Active" },
+    bytesDone: 30_500_000,
+  }],
+  ["received-complete", {
+    direction: "Received",
+    state: { kind: "Complete" },
+    bytesDone: 48_000_000,
+    available: true,
+  }],
+  ["received-cancelled", {
+    direction: "Received",
+    state: { kind: "Cancelled", byPeer: true, reason: "User" },
+  }],
+  ["received-integrity", {
+    direction: "Received",
+    state: { kind: "Cancelled", byPeer: false, reason: "Integrity" },
+  }],
+  ["received-unavailable", {
+    direction: "Received",
+    state: { kind: "Cancelled", byPeer: true, reason: "Unavailable" },
+  }],
+];
+
+function sampleTransfer(index: number, fields: Partial<TransferInfo>): TransferInfo {
+  return {
+    id: (index + 1).toString(16).padStart(32, "f"),
+    peerId: "b2".repeat(32),
+    direction: "Sent",
+    name: index % 3 === 0
+      ? "a-rather-long-file-name-from-the-scanner-2026-11-20-final.pdf"
+      : "harbour.jpg",
+    size: 48_000_000,
+    mime: "",
+    state: { kind: "Offered" },
+    bytesDone: 0,
+    pending: false,
+    createdMs: 0,
+    available: false,
+    ...fields,
+  };
 }
 
 const CALL_ENDS: Array<[string, CallEnd, boolean]> = [
@@ -354,6 +420,29 @@ export function Lab({ controls: store }: { controls: AppStore & FakeControls }) 
                 testId="lab-bubble-call"
               />
             </li>
+          </ol>
+        </Story>
+
+        <Story title="Files" id="files">
+          <ol className="thread__list lab__thread">
+            {SAMPLE_TRANSFERS.map(([id, fields], index) => {
+              const transfer = sampleTransfer(index, fields);
+              const sent = transfer.direction === "Sent";
+              return (
+                <li
+                  key={id}
+                  className={`thread__item thread__item--${sent ? "sent" : "received"}`}
+                  data-testid={`lab-transfer-${id}`}
+                >
+                  <FileBubble
+                    transfer={transfer}
+                    name={NAME}
+                    tail={sent ? "end" : "start"}
+                    onAction={() => {}}
+                  />
+                </li>
+              );
+            })}
           </ol>
         </Story>
 
