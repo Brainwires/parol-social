@@ -1,11 +1,11 @@
 # ParolNet Distribution Server
 
-Static HTML landing pages that serve as the distribution point for the ParolNet web app (`web/`, served at `/pwa/`). The pages are intentionally disguised as a calculator app listing to appear innocuous.
+Static HTML landing pages for the ParolNet web app (`web/`, served at `/pwa/`): what ParolNet is, how to add it to a device, and what to know before relying on it.
 
 ## Files
 
-- **`index.html`** (+ `index.css`, `index.js`) — Full app-store-style landing page with app info, install button, instructions, and privacy note.
-- **`install.html`** (+ `install.css`) — Minimal version with just icon, name, and install button. Use this for direct distribution links.
+- **`index.html`** (+ `index.css`, `index.js`) — The front page: one line on what ParolNet is, the "Open ParolNet" button, install steps per platform (`index.js` puts the steps for the visitor's device first; without it all of them show), the facts to know before relying on it, and the licence and source link.
+- **`install.html`** (+ `install.css`, and `index.css`) — Kept so old links keep working: says the install steps are on the front page and links to `/` and `/pwa/`.
 - **`nginx.conf`** — Nginx configuration (signaling-only profile): the web app under `/pwa/` with its cache rules, WASM and manifest MIME types, the service worker, gzip, and the relay endpoints.
 - **`nginx.relay.conf`** — The same for the relay profile (`SIGNALING_ONLY=0`); the entrypoint installs it in place of `nginx.conf`.
 - **`nginx-security-headers.conf`** — The security headers (the Content-Security-Policy among them), included by both configs in the server block and in every location that sets headers of its own.
@@ -58,7 +58,7 @@ The Docker setup serves files at these paths:
 
 ```
 /                  → server/index.html  (distribution landing page)
-/install.html      → server/install.html (minimal install page)
+/install.html      → server/install.html (points to / and /pwa/)
 /pwa/              → web/out/           (the web app, built in the image)
 /pwa/index.html    → web/out/index.html (app shell; no-cache)
 /pwa/sw.js         → web/out/sw.js      (service worker; no-cache)
@@ -66,17 +66,9 @@ The Docker setup serves files at these paths:
 /pwa/wasm/         → web/out/wasm/      (content-hashed wasm core + manifest.json)
 ```
 
-## Customization
-
-To update the version or release date, edit the static values in `index.html`:
-
-- **Version** — Search for `1.0.0`
-- **Release date** — Search for `Apr 2026`
-- **App size** — Search for `~2 MB`
-
 ## Design Decisions
 
 - **No JavaScript frameworks** — Pure static HTML with a stylesheet and (for `index.html`) a small script beside it. No inline script or style: the pages run under the same Content-Security-Policy as the web app.
 - **No external dependencies** — Static assets can be opened from many environments. Full PWA behavior, including Service Worker install and offline caching, requires HTTPS or `localhost`; `file://` is limited-use only.
-- **Innocuous appearance** — The page presents as a calculator utility download. No references to encryption, messaging, security, or ParolNet.
-- **Mobile-first** — Responsive layout, max-width 480px, looks good on phones.
+- **The app's design** — The palette and type of the web app (`web/src/design/tokens.json`, `docs/ux/web-app.md`): ink on cool paper, light and dark from the system, plain words, sentence case. The font is the app's own Atkinson Hyperlegible Next under `/pwa/fonts/` (versioned file names), with a system fallback.
+- **Mobile-first** — Responsive down to 360px, a reading width of 680px on wider screens.

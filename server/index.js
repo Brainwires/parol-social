@@ -1,21 +1,20 @@
-// Privacy overlay
-document.getElementById('privacy-link').addEventListener('click', function(e) {
-  e.preventDefault();
-  document.getElementById('privacy-overlay').classList.add('visible');
-});
-document.getElementById('privacy-close').addEventListener('click', function() {
-  document.getElementById('privacy-overlay').classList.remove('visible');
-});
-document.getElementById('privacy-overlay').addEventListener('click', function(e) {
-  if (e.target === this) this.classList.remove('visible');
-});
+// Install steps: every platform's steps are open in the HTML, so the page is complete without
+// this script. With it, the steps for this device come first and stay open; the others close.
+(function () {
+  var ua = navigator.userAgent;
+  // iPadOS Safari reports itself as a Mac; a touch screen tells them apart.
+  var isIOS = /iPhone|iPad|iPod/.test(ua) || (/Macintosh/.test(ua) && navigator.maxTouchPoints > 1);
+  var isAndroid = /Android/.test(ua);
+  var isFirefox = /Firefox\//.test(ua);
+  var platform = isIOS ? 'ios' : isAndroid ? 'android' : isFirefox ? 'firefox' : 'desktop';
 
-// Platform detection — show the right instructions
-var ua = navigator.userAgent;
-var isIOS = /iPhone|iPad|iPod/.test(ua) && !window.MSStream;
-var isAndroid = /Android/.test(ua);
-var platform = isIOS ? 'ios' : isAndroid ? 'android' : 'desktop';
+  var list = document.getElementById('platforms');
+  var mine = document.getElementById('platform-' + platform);
+  if (!list || !mine) return;
 
-var el = document.getElementById('steps-' + platform);
-if (el) el.classList.add('active');
-else document.getElementById('steps-fallback').classList.add('active');
+  var all = list.querySelectorAll('details.platform');
+  for (var i = 0; i < all.length; i++) {
+    if (all[i] !== mine) all[i].open = false;
+  }
+  list.insertBefore(mine, list.firstChild);
+})();
