@@ -244,6 +244,7 @@ class Bot {
     createInterface({ input: this.child.stdout }).on("line", (line) => {
       try {
         const ev = JSON.parse(line);
+        ev.at = new Date().toISOString().slice(11, 23);
         this.events.push(ev);
         if (verbose) log(`[bot ${name}]`, line);
       } catch {
@@ -356,6 +357,7 @@ class Pwa {
     page.on("console", (msg) => {
       const text = msg.text();
       p.console.push(text);
+      p.consoleAt.push(new Date().toISOString().slice(11, 23));
       if (verbose) log(`[pwa ${name}]`, text);
     });
     page.on("pageerror", (e) => log(`[pwa ${name}] PAGE ERROR`, e.message));
@@ -364,7 +366,9 @@ class Pwa {
       page.evaluate(() => (typeof window._peerId === "string" && window._peerId.length === 64 ? window._peerId : null)),
     );
     await until(`pwa ${name}: registered with the relay`, 30_000, () =>
-      p.console.some((t) => /registered/i.test(t) && !/unregistered/i.test(t)),
+      // Not "SW registered: ...": the relay's own registration, or the desktop's first offer
+      // can find the PWA offline (`peer_offline`).
+      p.console.some((t) => t.startsWith("Registered with relay")),
     );
     log(`pwa ${name} is ${p.peerId.slice(0, 8)}`);
     return p;
@@ -374,6 +378,7 @@ class Pwa {
     this.page = page;
     this.name = name;
     this.console = [];
+    this.consoleAt = [];
     openPwas.add(this);
   }
 
@@ -764,7 +769,8 @@ try {
   for (const p of openPwas) {
     try {
       console.error(`pwa ${p.name} connections: ${JSON.stringify(await p.diag(), null, 1)}`);
-      console.error(`pwa ${p.name} console (last 40):\n  ${p.console.slice(-40).join("\n  ")}`);
+      const lines = p.console.map((t, i) => `[${p.consoleAt[i]}] ${t}`).filter((t) => !t.includes("[DOM]"));
+      console.error(`pwa ${p.name} console (last 40):\n  ${lines.slice(-40).join("\n  ")}`);
     } catch {}
   }
   for (const b of openBots) {
