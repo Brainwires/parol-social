@@ -131,17 +131,20 @@ jobs:
         run: cargo xtask vectors --validate
 
   pwa-interop:
-    name: Desktop <-> PWA interop (Chromium, Firefox, WebKit)
+    name: Desktop <-> PWA and web app interop (Chromium, Firefox, WebKit)
     # The headless desktop core (parolnet-app's bot) against the real PWA in headless Chromium,
     # Firefox and WebKit (Playwright) through the relay binary in its signaling-only profile:
     # pairing both ways, chat both ways, the sender queue, the channel binding, calls both ways.
+    # Then the same seven cases against the web app that replaces the PWA (web/, INTEROP_APP=web),
+    # and the web app's own real flows between pages through the relay (web/tests/e2e/
+    # real.flows.ts). They are steps of this job because they need the same relay and bot.
     # Chromium and Firefox twice each: as shipped (mDNS host candidates the desktop resolves) and
     # with loopback candidates. WebKit once (Playwright's Linux build gathers plain host
     # addresses). One job, browsers in sequence: the Rust build dominates and a browser run takes
     # about a minute, so a matrix would rebuild (or ship ~100 MB of artifacts) three times for
     # nothing. Every browser step runs even when an earlier one failed.
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 75
     env:
       # The interop uses Playwright's browsers; puppeteer's Chrome is not needed here.
       PUPPETEER_SKIP_DOWNLOAD: "1"
@@ -197,6 +200,52 @@ jobs:
       - name: WebKit (host candidates)
         if: ${{ !cancelled() && steps.first.conclusion != 'skipped' }}
         run: INTEROP_BROWSER=webkit INTEROP_ICE=host node apps/desktop/interop/pwa-interop.mjs
+
+      # The web app (web/): its test build for the interop (it has the test hooks), its
+      # production export for its own real flows.
+      - name: Install Denext
+        if: ${{ !cancelled() && steps.first.conclusion != 'skipped' }}
+        run: |
+          curl -fsSL https://denext.dev/install.sh | sh
+          echo "$HOME/.denext/bin" >> "$GITHUB_PATH"
+      - name: Build the web app (wasm core, test build, production export)
+        id: web
+        if: ${{ !cancelled() && steps.first.conclusion != 'skipped' }}
+        working-directory: web
+        run: |
+          denext runtime install
+          denext task build-wasm
+          denext task build:test
+          denext task build
+          (cd tests/e2e && npm ci)
+      - name: Web app, Chromium (mDNS host candidates)
+        if: ${{ !cancelled() && steps.web.conclusion == 'success' }}
+        run: INTEROP_APP=web INTEROP_BROWSER=chromium INTEROP_ICE=mdns node apps/desktop/interop/pwa-interop.mjs
+      - name: Web app, Chromium (loopback host candidates)
+        if: ${{ !cancelled() && steps.web.conclusion == 'success' }}
+        run: INTEROP_APP=web INTEROP_BROWSER=chromium INTEROP_ICE=loopback node apps/desktop/interop/pwa-interop.mjs
+      - name: Web app, Firefox (mDNS host candidates)
+        if: ${{ !cancelled() && steps.web.conclusion == 'success' }}
+        run: INTEROP_APP=web INTEROP_BROWSER=firefox INTEROP_ICE=mdns node apps/desktop/interop/pwa-interop.mjs
+      - name: Web app, Firefox (loopback host candidates)
+        if: ${{ !cancelled() && steps.web.conclusion == 'success' }}
+        run: INTEROP_APP=web INTEROP_BROWSER=firefox INTEROP_ICE=loopback node apps/desktop/interop/pwa-interop.mjs
+      - name: Web app, WebKit (host candidates)
+        if: ${{ !cancelled() && steps.web.conclusion == 'success' }}
+        run: INTEROP_APP=web INTEROP_BROWSER=webkit INTEROP_ICE=host node apps/desktop/interop/pwa-interop.mjs
+      - name: Web app, real flows between pages through the relay (three browsers)
+        if: ${{ !cancelled() && steps.web.conclusion == 'success' }}
+        working-directory: web/tests/e2e
+        env:
+          PAROLNET_RELAY_BIN: ${{ github.workspace }}/target/debug/parolnet-relay
+        run: npx playwright test --project=flows-chromium --project=flows-firefox --project=flows-webkit
+      - name: Upload the web app's report
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: web-flows
+          path: web/tests/e2e/playwright-report/
+          if-no-files-found: ignore
 
   turn-coturn:
     name: User-supplied TURN (coturn)
@@ -256,8 +305,10 @@ jobs:
   web:
     name: Web app (Denext; unit tests, export, Chromium / Firefox / WebKit)
     # web/: the Denext rewrite of the PWA. Builds the wasm core, lints, type-checks, runs the
-    # unit tests, exports the static site and drives it in three browsers under /pwa/ with the
-    # production Content-Security-Policy.
+    # unit tests (the app's and the engine's), exports the static site (the production export,
+    # and the test build that has the state lab) and drives both in three browsers under /pwa/
+    # with the production Content-Security-Policy. What needs a relay or the desktop bot (real
+    # flows, the interop) runs in the `pwa-interop` job, which builds them.
     runs-on: ubuntu-latest
     timeout-minutes: 45
     defaults:
@@ -289,19 +340,19 @@ jobs:
         run: denext task build-wasm
       - name: Lint, format, type-check
         run: denext task lint && denext task fmt:check && denext task check
-      - name: Unit tests
+      - name: Unit tests (the app and the engine)
         run: denext task test
-      - name: Export the static site
-        run: denext task build
+      - name: Export the static site (the test build, then the production export)
+        run: denext task build:test && denext task build
       - uses: actions/setup-node@v6
         with:
           node-version: 22
       - name: Playwright and its browsers
         working-directory: web/tests/e2e
         run: npm ci && npx playwright install --with-deps chromium firefox webkit
-      - name: Browser tests
+      - name: Browser tests (the platform and the design)
         working-directory: web/tests/e2e
-        run: npx playwright test
+        run: npx playwright test --project=chromium --project=firefox --project=webkit
       - name: Upload screenshots and the report
         if: always()
         uses: actions/upload-artifact@v7
