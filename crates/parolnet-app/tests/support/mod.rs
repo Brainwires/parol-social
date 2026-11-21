@@ -89,7 +89,7 @@ pub async fn start_relay() -> Relay {
         .spawn()
         .expect("spawn relay");
     let relay = Relay { child, port, dir };
-    for _ in 0..400 {
+    for _ in 0..1200 {
         if tokio::net::TcpStream::connect(("127.0.0.1", port))
             .await
             .is_ok()
