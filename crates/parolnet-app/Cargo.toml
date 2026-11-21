@@ -10,6 +10,9 @@ description = "Headless ParolNet client core: identity, contacts, pairing, signa
 # The OS keychain as the home of the store's key (`KeyStorage::Keychain`). The desktop app
 # turns it on; headless builds (the bot, CI) keep the key-file provider and leave it off.
 keychain = ["parolnet-store/keychain"]
+# Fault injection for this crate's own integration tests (a record corrupted in flight).
+# Never enabled in a shipped build.
+test-hooks = []
 
 [dependencies]
 # Default features off: no mesh, no audio codecs, no transport stack. The app talks to the
@@ -19,6 +22,8 @@ parolnet-crypto.workspace = true
 parolnet-protocol.workspace = true
 parolnet-rtc.workspace = true
 parolnet-store.workspace = true
+parolnet-transfer.workspace = true
+bytes = "1.12"
 tokio.workspace = true
 tokio-tungstenite = { workspace = true, features = ["rustls-tls-webpki-roots"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
@@ -37,6 +42,8 @@ zeroize.workspace = true
 [dev-dependencies]
 # The in-process TURN server that stands in for the user's own.
 parolnet-rtc = { workspace = true, features = ["test-turn"] }
+parolnet-app = { path = ".", features = ["test-hooks"] }
+sha2.workspace = true
 tokio = { workspace = true, features = ["full", "test-util"] }
 # The bot example's call audio (a tone, Opus-encoded in pure Rust; the M0 interop pin).
 opus-rs = "=0.1.42"

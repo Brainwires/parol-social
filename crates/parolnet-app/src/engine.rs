@@ -2,6 +2,8 @@
 //! connection. Commands from the client, relay frames from the signaling task, connection
 //! events from `parolnet-rtc` tasks and timers all arrive as [`Input`]s.
 
+mod transfers;
+
 use std::collections::{HashMap, VecDeque};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
@@ -93,6 +95,25 @@ pub(crate) enum Input {
         call_id: String,
         event: RtcEvent,
     },
+    /// A data channel under `pn-` opened on a contact's connection (PNP-010).
+    FileChannel {
+        peer: String,
+        epoch: u64,
+        dc: usize,
+        label: String,
+        rx: mpsc::Receiver<crate::transfer::ChannelEvent>,
+    },
+    /// A transfer's worker reports.
+    Transfer {
+        id: String,
+        event: crate::transfer::WorkerEvent,
+    },
+    /// The file of an `offer_file` command has been read for its hash.
+    OfferHashed {
+        peer: String,
+        result: std::io::Result<crate::transfer::Hashed>,
+        reply: tokio::sync::oneshot::Sender<Result<crate::TransferInfo, AppError>>,
+    },
 }
 
 /// Why a connection could not start.
@@ -113,17 +134,48 @@ impl From<RtcError> for StartFailure {
 
 #[derive(Debug)]
 pub(crate) enum Timer {
-    AnswerTimeout { peer: String, epoch: u64 },
-    ConnectTimeout { peer: String, epoch: u64 },
-    DisconnectGrace { peer: String, epoch: u64 },
-    BindingTimeout { peer: String, epoch: u64 },
-    CallRing { call_id: String },
-    CallConnect { call_id: String },
-    OfferFallback { peer: String },
-    OfferSlot { peer: String },
-    Retry { peer: String },
+    AnswerTimeout {
+        peer: String,
+        epoch: u64,
+    },
+    ConnectTimeout {
+        peer: String,
+        epoch: u64,
+    },
+    DisconnectGrace {
+        peer: String,
+        epoch: u64,
+    },
+    BindingTimeout {
+        peer: String,
+        epoch: u64,
+    },
+    CallRing {
+        call_id: String,
+    },
+    CallConnect {
+        call_id: String,
+    },
+    OfferFallback {
+        peer: String,
+    },
+    OfferSlot {
+        peer: String,
+    },
+    Retry {
+        peer: String,
+    },
     // A soft-offline contact is due for a probe (see `reconnect`).
     Probe,
+    /// Open channels for the transfers we receive from this contact (again).
+    TransferPump {
+        peer: String,
+    },
+    /// A transfer channel we asked for should be open by now.
+    TransferOpen {
+        id: String,
+        epoch: u64,
+    },
 }
 
 /// The presenter's half of a QR bootstrap (PNP-003), kept while its code is valid.
@@ -262,6 +314,8 @@ struct Engine {
     probe_wake: Option<Instant>,
     /// When the user was last told their TURN server is unreachable.
     turn_notice_at: Option<Instant>,
+    /// File transfers: workers, progress and limits (see `transfers`).
+    xfer: transfers::Transfers,
 }
 
 pub(crate) async fn start(
@@ -355,6 +409,7 @@ pub(crate) async fn start(
     }
 
     let reconnect = cfg.reconnect.clone();
+    let xfer = transfers::Transfers::new(&cfg);
     let handle = AppHandle {
         tx: input_tx.clone(),
         peer_id: me.clone(),
@@ -385,6 +440,7 @@ pub(crate) async fn start(
         probes: ProbeSchedule::new(reconnect, Instant::now()),
         probe_wake: None,
         turn_notice_at: None,
+        xfer,
     };
     // Messages queued in an earlier run show as queued again.
     let queued: Vec<(String, u64)> = engine
@@ -437,6 +493,19 @@ impl Engine {
                 Input::Tick => self.on_tick(),
                 Input::CallRtcReady { call_id, result } => self.on_call_ready(&call_id, result),
                 Input::CallRtc { call_id, event } => self.on_call_rtc(&call_id, event),
+                Input::FileChannel {
+                    peer,
+                    epoch,
+                    dc,
+                    label,
+                    rx,
+                } => self.on_file_channel(&peer, epoch, dc, &label, rx),
+                Input::Transfer { id, event } => self.on_worker_event(&id, event),
+                Input::OfferHashed {
+                    peer,
+                    result,
+                    reply,
+                } => self.on_offer_hashed(peer, result, reply),
             }
         }
         self.shutdown();
@@ -447,6 +516,7 @@ impl Engine {
         for id in calls {
             self.hangup_call(&id);
         }
+        self.stop_transfers();
         let peers: Vec<String> = self.peers.keys().cloned().collect();
         for p in peers {
             self.drop_conn(&p);
@@ -598,6 +668,7 @@ impl Engine {
                 self.connect(&peer, true);
                 self.arm_probe_wake();
             }
+            Command::Disconnect(peer) => self.conn_failed(&peer, FailReason::Closed),
             Command::StartCall(peer, video, reply) => {
                 let _ = reply.send(self.start_call(&peer, video));
             }
@@ -618,6 +689,19 @@ impl Engine {
             }
             Command::SetTurnSettings(settings, reply) => {
                 let _ = reply.send(self.set_turn(settings));
+            }
+            Command::OfferFile(peer, path, reply) => self.offer_file(peer, path, reply),
+            Command::AcceptTransfer(id, reply) => {
+                let _ = reply.send(self.accept_transfer(&id));
+            }
+            Command::DeclineTransfer(id, reply) => {
+                let _ = reply.send(self.decline_transfer(&id));
+            }
+            Command::CancelTransfer(id, reply) => {
+                let _ = reply.send(self.cancel_transfer(&id));
+            }
+            Command::Transfers(peer, reply) => {
+                let _ = reply.send(self.list_transfers(peer.as_deref()));
             }
             Command::Shutdown(_) => unreachable!("handled in run"),
         }
@@ -1004,6 +1088,7 @@ impl Engine {
                 self.send_binding(peer);
                 self.set_path(peer, PathState::Direct);
                 self.flush_queue(peer);
+                self.transfers_on_verified(peer);
             }
             Err(e) => {
                 tracing::warn!(peer = %crate::short_id(peer), %e, "channel binding refused");
@@ -1064,7 +1149,7 @@ impl Engine {
                     .state
                     .contacts
                     .iter()
-                    .filter(|c| self.state.queued_for(&c.peer_id) > 0)
+                    .filter(|c| self.state.waits_for(&c.peer_id))
                     .map(|c| c.peer_id.clone())
                     .collect();
                 for p in waiting {
@@ -1369,13 +1454,16 @@ impl Engine {
             turn,
             ice_policy,
             data_channel: initiator.then(|| DATA_CHANNEL_LABEL.to_owned()),
+            // No RTP here, and transfer records are 64 KiB each: a short queue, so that a
+            // reader that falls behind holds the connection back instead of filling memory.
+            event_capacity: 64,
             ..Default::default()
         };
         let input = self.input.clone();
         let peer_owned = peer.to_owned();
         tokio::spawn(async move {
             match parolnet_rtc::spawn(config).await {
-                Ok((handle, mut events)) => {
+                Ok((handle, events)) => {
                     let ready = Input::RtcReady {
                         peer: peer_owned.clone(),
                         epoch,
@@ -1384,16 +1472,9 @@ impl Engine {
                     if input.send(ready).is_err() {
                         return;
                     }
-                    while let Some(event) = events.recv().await {
-                        let ev = Input::Rtc {
-                            peer: peer_owned.clone(),
-                            epoch,
-                            event,
-                        };
-                        if input.send(ev).is_err() {
-                            return;
-                        }
-                    }
+                    // Everything goes to the core, except the messages of transfer
+                    // channels, which go to their workers.
+                    crate::transfer::forward_events(events, input, peer_owned, epoch).await;
                 }
                 Err(e) => {
                     let _ = input.send(Input::RtcReady {
@@ -1552,7 +1633,9 @@ impl Engine {
             RtcEvent::IceConnectionState(_)
             | RtcEvent::Track { .. }
             | RtcEvent::Rtp { .. }
-            | RtcEvent::KeyframeRequested => {}
+            | RtcEvent::KeyframeRequested
+            | RtcEvent::DataChannelClose { .. }
+            | RtcEvent::DataChannelBufferedLow { .. } => {}
         }
     }
 
@@ -1733,6 +1816,8 @@ impl Engine {
                 self.probe_wake = None;
                 self.run_probes();
             }
+            Timer::TransferPump { peer } => self.pump_transfers(&peer),
+            Timer::TransferOpen { id, epoch } => self.on_transfer_open_timeout(&id, epoch),
         }
     }
 
@@ -1803,6 +1888,7 @@ impl Engine {
             self.pairing_until = None;
             self.pending_bootstrap = None;
         }
+        self.expire_transfers();
         if !self.registered {
             return;
         }
@@ -1810,7 +1896,7 @@ impl Engine {
             .state
             .contacts
             .iter()
-            .filter(|c| self.state.queued_for(&c.peer_id) > 0)
+            .filter(|c| self.state.waits_for(&c.peer_id))
             .map(|c| c.peer_id.clone())
             .collect();
         for peer in candidates {
@@ -1920,6 +2006,9 @@ impl Engine {
             }
             msg_type::SYSTEM => {}
             msg_type::CHANNEL_BINDING => self.on_binding(peer, &d.plaintext),
+            parolnet_transfer::MSG_TYPE_FILE_TRANSFER => {
+                self.on_transfer_control(peer, &d.plaintext)
+            }
             msg_type::CALL_SIGNAL => match CallSignal::parse(&d.plaintext) {
                 Some(sig) => self.on_call_signal(peer, sig),
                 None => tracing::debug!(peer = %crate::short_id(peer), "malformed call signal"),
@@ -2372,7 +2461,7 @@ impl Engine {
 
 /// The user waits for this contact: messages are queued for it, or they asked to connect.
 fn probe_active(state: &State, peers: &HashMap<String, PeerState>, peer: &str) -> bool {
-    state.queued_for(peer) > 0 || peers.get(peer).is_some_and(|st| st.wanted)
+    state.waits_for(peer) || peers.get(peer).is_some_and(|st| st.wanted)
 }
 
 /// No connection attempt to this contact is under way or scheduled.

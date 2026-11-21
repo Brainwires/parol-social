@@ -125,6 +125,10 @@ pub struct State {
     /// The user's own TURN server ("Relay through my own TURN server"), if they set one.
     #[serde(default)]
     pub turn: Option<crate::TurnSettings>,
+    /// File transfers (PNP-010): offers with their keys, phases and progress, so that a
+    /// transfer survives a lost connection and a restart.
+    #[serde(default)]
+    pub(crate) transfers: Vec<crate::transfer::StoredTransfer>,
     #[serde(skip)]
     changes: Mutex<MessageChanges>,
 }
@@ -185,6 +189,16 @@ impl State {
 
     pub fn queued_for(&self, peer_id: &str) -> usize {
         self.queue.iter().filter(|e| e.peer_id == peer_id).count()
+    }
+
+    /// Something waits on this device for a verified connection to the contact: queued
+    /// messages, or a file transfer that has a message to deliver or records to move.
+    pub fn waits_for(&self, peer_id: &str) -> bool {
+        self.queued_for(peer_id) > 0
+            || self
+                .transfers
+                .iter()
+                .any(|t| t.peer_id == peer_id && t.wants_connection())
     }
 
     fn changes_mut(&mut self) -> &mut MessageChanges {
