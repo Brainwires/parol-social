@@ -7,21 +7,37 @@
     "fmt": "deno fmt --line-width 100 ../../src/engine .",
     "fmt:check": "deno fmt --check --line-width 100 ../../src/engine .",
     "e2e:build": "deno run --allow-read --allow-write --allow-run --allow-env e2e/build.ts",
-    "e2e": "node e2e/run.mjs"
+    "e2e": "cd e2e && npm ci && node run.mjs"
   },
   "compilerOptions": {
     "strict": true,
-    "lib": ["deno.window", "dom", "dom.iterable"]
+    "lib": [
+      "deno.window",
+      "dom",
+      "dom.iterable"
+    ]
   },
   "imports": {
     "@std/assert": "jsr:@std/assert@^1.0.0"
   },
   "fmt": {
     "lineWidth": 100,
-    "exclude": [".pkg/", "e2e/dist/"]
+    "exclude": [
+      ".pkg/",
+      "e2e/dist/",
+      "e2e/node_modules/"
+    ]
   },
   "lint": {
-    "exclude": [".pkg/", "e2e/dist/"]
+    "exclude": [
+      ".pkg/",
+      "e2e/dist/",
+      "e2e/node_modules/"
+    ]
   },
-  "exclude": [".pkg/", "e2e/dist/", "e2e/work/"]
+  "exclude": [
+    ".pkg/",
+    "e2e/dist/",
+    "e2e/node_modules/"
+  ]
 }

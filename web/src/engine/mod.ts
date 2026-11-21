@@ -13,6 +13,7 @@ export {
   browserMedia,
   browserPlatform,
   type BrowserPlatformOptions,
+  requestPersistentStorage,
   sameOriginRelayUrl,
   wasmApi,
 } from "./browser.ts";

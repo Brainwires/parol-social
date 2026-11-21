@@ -1,0 +1,9 @@
+{
+  "name": "parolnet-web-engine-e2e",
+  "private": true,
+  "type": "module",
+  "description": "Playwright driver of the web engine's end-to-end test (see run.mjs).",
+  "devDependencies": {
+    "playwright": "1.65.1"
+  }
+}

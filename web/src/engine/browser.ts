@@ -154,10 +154,6 @@ export async function browserPlatform(
   options: BrowserPlatformOptions,
 ): Promise<Platform> {
   const dbName = options.dbName ?? DB_NAME;
-  // Ask the browser not to evict the database under storage pressure.
-  try {
-    await g.navigator?.storage?.persist?.();
-  } catch { /* best effort */ }
   return {
     wasm: options.wasm,
     storage: await IdbStorage.open(g.indexedDB as IdbFactory, dbName),
@@ -172,6 +168,19 @@ export async function browserPlatform(
       (g.navigator?.mediaDevices ? browserMedia : undefined),
     lock: browserLock(`${dbName}-engine`),
   };
+}
+
+/**
+ * Ask the browser not to evict the database under storage pressure. Firefox answers with a
+ * permission prompt (and only then resolves), so the engine never calls this itself: the UI
+ * does, on a user action. Resolves to whether storage is now persistent.
+ */
+export async function requestPersistentStorage(): Promise<boolean> {
+  try {
+    return (await g.navigator?.storage?.persist?.()) === true;
+  } catch {
+    return false;
+  }
 }
 
 /**
