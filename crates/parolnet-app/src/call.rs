@@ -7,17 +7,131 @@
 //! decoding or playback: the client takes a [`CallMedia`] and feeds encoded frames (VP8,
 //! Opus) to [`FrameSink`], and receives RTP as [`MediaEvent`]s.
 //!
-//! Once the call is set up either side may change it with a `reoffer` / `reanswer` exchange
-//! (PNP-011 section 7): an ICE restart when the network changed, or turning its video on or
+//! The signals, states and rules are PNP-011 (`specs/PNP-011-calls.md`). Once the call is set
+//! up either side may change it with a `reoffer` / `reanswer` exchange (PNP-011 section 7): an ICE restart when the network changed, or turning its video on or
 //! off. Only a peer that listed [`FEATURE_RENEGOTIATE`] in its `offer` or `answer` is sent
 //! one; with any other peer (today's web app and PWA) the call stays as it was set up and a
 //! camera that is turned off sends black.
 
+use std::time::Duration;
+
 use parolnet_rtc::rtc::peer_connection::transport::RTCIceCandidateInit;
-use parolnet_rtc::{ConnectionQuality, FrameSender, MediaKind};
+use parolnet_rtc::{
+    CongestionConfig, ConnectionQuality, FrameSender, MediaConfig, MediaKind, RtcConfig,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::sync::mpsc;
+
+/// An unanswered call rings this long (PNP-011 section 4.3).
+pub const RING_TIMEOUT: Duration = Duration::from_secs(60);
+/// From the answer to media flowing (PNP-011 section 4.3).
+pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+/// A `reoffer` gets this long to be answered; then it is taken back and the call goes on as
+/// it was (PNP-011 section 7.4).
+pub const REOFFER_TIMEOUT: Duration = Duration::from_secs(10);
+/// How often a call reports its connection quality (PNP-011 section 10).
+pub const QUALITY_INTERVAL: Duration = Duration::from_secs(1);
+/// Candidates of `ice` signals kept until the remote description is applied (PNP-011
+/// section 4.4).
+pub const MAX_PENDING_CANDIDATES: usize = 64;
+
+/// The configuration of a call's own connection (PNP-011 section 5), on top of `base` (how
+/// this client binds, its STUN servers, the user's TURN server and policy): Opus both ways,
+/// VP8 both ways for a video call, no data channel, congestion control, de-jittered audio,
+/// a quality digest, and the callee as the side that yields when `reoffer`s cross.
+pub fn connection_config(video: bool, incoming: bool, base: RtcConfig) -> RtcConfig {
+    RtcConfig {
+        media: MediaConfig {
+            recv_opus: true,
+            send_opus: true,
+            recv_vp8: video,
+            send_vp8: video,
+        },
+        data_channel: None,
+        congestion: Some(CongestionConfig::default()),
+        jitter_buffer: true,
+        polite: incoming,
+        quality_interval: Some(QUALITY_INTERVAL),
+        ..base
+    }
+}
+
+/// What to do with an `offer` (PNP-011 section 4.2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OfferDecision {
+    /// A new call: ring.
+    Ring,
+    /// We are in a call: answer `reject`, do not ring.
+    Busy,
+    /// An offer for a call we already know: ignore it.
+    Duplicate,
+}
+
+/// Decide about an `offer`: `known` when its call id is one we hold, `busy` when any call of
+/// ours is not over.
+pub fn on_offer(known: bool, busy: bool) -> OfferDecision {
+    if known {
+        OfferDecision::Duplicate
+    } else if busy {
+        OfferDecision::Busy
+    } else {
+        OfferDecision::Ring
+    }
+}
+
+/// What to do with a `reoffer` (PNP-011 section 7).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReofferDecision {
+    /// Apply it and answer with `reanswer`.
+    Answer,
+    /// It crossed ours and we are the callee: take ours back, then apply it and answer.
+    Yield,
+    /// It crossed ours and we are the caller: drop it; the callee answers ours.
+    KeepOurs,
+    /// Not a call that can be changed (unknown, not set up, over, or we do not renegotiate).
+    Ignore,
+}
+
+/// Decide about a `reoffer` for a call we hold: `renegotiation` is whether we listed the
+/// feature, `established` whether the call's first offer and answer are applied, `ours`
+/// whether a `reoffer` of ours is unanswered, `incoming` whether we are the callee.
+pub fn on_reoffer(
+    renegotiation: bool,
+    established: bool,
+    over: bool,
+    ours: bool,
+    incoming: bool,
+) -> ReofferDecision {
+    if !renegotiation || !established || over {
+        ReofferDecision::Ignore
+    } else if !ours {
+        ReofferDecision::Answer
+    } else if incoming {
+        ReofferDecision::Yield
+    } else {
+        ReofferDecision::KeepOurs
+    }
+}
+
+/// Whether `reoffer`s may be exchanged with a peer: both sides listed
+/// [`FEATURE_RENEGOTIATE`] (`ours` is whether we did).
+pub fn renegotiates(ours: bool, peer_features: &[String]) -> bool {
+    ours && peer_features.iter().any(|f| f == FEATURE_RENEGOTIATE)
+}
+
+/// How turning our video on or off is carried out (PNP-011 section 7.5): by renegotiation
+/// with a peer that renegotiates; otherwise a video call's stream stays as it is (black is
+/// sent for a camera that is off) and an audio call cannot gain video (`None`).
+pub fn video_change(renegotiable: bool, local_video: bool, enabled: bool) -> Option<VideoChange> {
+    if renegotiable {
+        Some(VideoChange::Renegotiating)
+    } else if enabled && !local_video {
+        None
+    } else {
+        Some(VideoChange::Unchanged)
+    }
+}
 
 /// Where a call is.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -436,7 +550,7 @@ fn with_features(mut signal: Value, features: &[String]) -> Value {
 }
 
 /// A new call id: 16 random bytes as hex (the PWA's `start_call` format).
-pub(crate) fn new_call_id() -> String {
+pub fn new_call_id() -> String {
     use rand::RngCore as _;
     let mut b = [0u8; 16];
     rand::thread_rng().fill_bytes(&mut b);

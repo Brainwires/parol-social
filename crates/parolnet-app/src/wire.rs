@@ -31,6 +31,90 @@ pub mod msg_type {
     pub const CHANNEL_BINDING: u8 = 0x14;
 }
 
+/// An ICE restart of a data connection gets this long to be answered and to connect again;
+/// after it the connection is rebuilt (PNP-011 section 8.3).
+pub const RESTART_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// Whether a description belongs to the DTLS session `known` describes: the same
+/// certificate fingerprints (what the channel binding of PNP-001 section 10.5.1 covers),
+/// and at least one.
+pub fn same_dtls_session(known: Option<&str>, sdp: &str) -> bool {
+    use parolnet_protocol::channel_binding::sdp_fingerprints;
+    let Some(known) = known else {
+        return false;
+    };
+    let (mut a, mut b) = (sdp_fingerprints(known), sdp_fingerprints(sdp));
+    a.sort();
+    a.dedup();
+    b.sort();
+    b.dedup();
+    !a.is_empty() && a == b
+}
+
+/// Whether ICE restarts may be exchanged with a peer on a data connection: both sides listed
+/// [`FEATURE_ICE_RESTART`] in their identity frames (`ours` is whether we did).
+pub fn restarts(ours: bool, peer_features: &[String]) -> bool {
+    ours && peer_features.iter().any(|f| f == FEATURE_ICE_RESTART)
+}
+
+/// What to do with an `rtc_offer` from a peer we hold a connection to (PNP-011 section 8.2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RestartOffer {
+    /// An ICE restart of the connection we have: apply it there and answer.
+    Apply,
+    /// It crossed a restart of ours and the peer is the designated initiator: drop ours,
+    /// then apply it and answer.
+    Yield,
+    /// It crossed a restart of ours and we are the designated initiator: drop it.
+    KeepOurs,
+    /// Not a restart of the connection we have: an offer for a new connection, handled as
+    /// before restarts existed.
+    NewConnection,
+}
+
+/// Decide about an `rtc_offer` when a connection to its sender exists: `renegotiation` is
+/// whether we take restarts at all, `verified` whether the connection's channel binding
+/// verified, `same_session` whether the offer carries that connection's DTLS fingerprints
+/// ([`same_dtls_session`]), `ours` whether a restart of ours is unanswered, `designated`
+/// whether we are the pair's designated initiator ([`should_initiate`]).
+pub fn on_restart_offer(
+    renegotiation: bool,
+    verified: bool,
+    same_session: bool,
+    ours: bool,
+    designated: bool,
+) -> RestartOffer {
+    if !renegotiation || !verified || !same_session {
+        RestartOffer::NewConnection
+    } else if !ours {
+        RestartOffer::Apply
+    } else if designated {
+        RestartOffer::KeepOurs
+    } else {
+        RestartOffer::Yield
+    }
+}
+
+/// What to do when a restart's deadline ([`RESTART_TIMEOUT`]) passes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RestartExpiry {
+    /// Answered and connected: nothing to do.
+    Done,
+    /// The path works but the peer never answered: take the offer back and go on.
+    TakeBack,
+    /// No working path: rebuild the connection.
+    Rebuild,
+}
+
+/// Decide at a restart's deadline.
+pub fn on_restart_expiry(connected: bool, answered: bool) -> RestartExpiry {
+    match (connected, answered) {
+        (true, true) => RestartExpiry::Done,
+        (true, false) => RestartExpiry::TakeBack,
+        (false, _) => RestartExpiry::Rebuild,
+    }
+}
+
 /// A frame the client sends to the relay.
 #[derive(Debug, Clone, Serialize, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case")]

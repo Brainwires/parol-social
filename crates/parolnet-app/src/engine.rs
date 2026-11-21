@@ -11,30 +11,30 @@ use parolnet_core::envelope::{decrypt_for_peer, encrypt_for_peer, try_bootstrap_
 use parolnet_core::{ParolNet, ParolNetConfig};
 use parolnet_protocol::PeerId;
 use parolnet_protocol::ProtocolCodec as _;
-use parolnet_protocol::channel_binding::{BindingError, ChannelBinding, sdp_fingerprints};
+use parolnet_protocol::channel_binding::{BindingError, ChannelBinding};
 use parolnet_protocol::codec::CborCodec;
 use parolnet_rtc::rtc::peer_connection::sdp::{RTCSdpType, RTCSessionDescription};
 use parolnet_rtc::rtc::peer_connection::state::RTCPeerConnectionState;
 use parolnet_rtc::rtc::peer_connection::transport::RTCIceCandidateInit;
 use parolnet_rtc::rtc::rtp_transceiver::rtp_sender::RtpCodecKind;
 use parolnet_rtc::{
-    CongestionConfig, Gather, IcePolicy, MediaConfig, MediaKind, NetworkMonitor, RtcConfig,
-    RtcError, RtcEvent, RtcHandle, SystemNetwork, TurnServer,
+    Gather, IcePolicy, MediaKind, NetworkMonitor, RtcConfig, RtcError, RtcEvent, RtcHandle,
+    SystemNetwork, TurnServer,
 };
 use rand::Rng as _;
 use tokio::sync::mpsc;
 use zeroize::Zeroize;
 
 use crate::call::{
-    CallEnd, CallInfo, CallMedia, CallQuality, CallSignal, CallState, FEATURE_RENEGOTIATE,
-    FrameSink, MediaEvent, OutFrame, VideoChange, local_features, new_call_id,
+    CallEnd, CallInfo, CallMedia, CallQuality, CallSignal, CallState, FrameSink, MediaEvent,
+    OfferDecision, OutFrame, ReofferDecision, VideoChange, local_features, new_call_id,
 };
 use crate::reconnect::ProbeSchedule;
 use crate::signaling::{self, SigEvent, SigHandle, Signer};
 use crate::store::{QueuedEnvelope, State, Store};
 use crate::wire::{
-    ClientFrame, DATA_CHANNEL_LABEL, DcFrame, FEATURE_ICE_RESTART, SdpJson, ServerFrame,
-    SignalKind, is_peer_id, msg_type, should_initiate,
+    ClientFrame, DATA_CHANNEL_LABEL, DcFrame, RestartExpiry, RestartOffer, SdpJson, ServerFrame,
+    SignalKind, is_peer_id, msg_type, same_dtls_session, should_initiate,
 };
 use crate::{
     AppConfig, AppError, AppEvent, AppHandle, ChatMessage, Command, Contact, ContactView,
@@ -63,20 +63,14 @@ const PENDING_ICE_MAX: usize = 32;
 /// opens, or the connection is closed.
 const BINDING_TIMEOUT: Duration = Duration::from_secs(20);
 /// An unanswered call rings this long (as the PWA).
-const CALL_RING_TIMEOUT: Duration = Duration::from_secs(60);
+const CALL_RING_TIMEOUT: Duration = crate::call::RING_TIMEOUT;
 /// From accepting (or the answer) to media flowing.
-const CALL_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
-const CALL_PENDING_ICE_MAX: usize = 64;
+const CALL_CONNECT_TIMEOUT: Duration = crate::call::CONNECT_TIMEOUT;
+const CALL_PENDING_ICE_MAX: usize = crate::call::MAX_PENDING_CANDIDATES;
 /// Media events waiting for the client (RTP beyond this is dropped).
 const CALL_MEDIA_CAPACITY: usize = 2048;
-/// An ICE restart of a data connection gets this long to be answered and to connect again;
-/// after it the connection is rebuilt as before restarts existed.
-const RESTART_TIMEOUT: Duration = Duration::from_secs(15);
-/// A call's `reoffer` gets this long to be answered; after it the offer is taken back and
-/// the call goes on as it was.
-const CALL_REOFFER_TIMEOUT: Duration = Duration::from_secs(10);
-/// How often a call reports its connection quality.
-const CALL_QUALITY_INTERVAL: Duration = Duration::from_secs(1);
+const RESTART_TIMEOUT: Duration = crate::wire::RESTART_TIMEOUT;
+const CALL_REOFFER_TIMEOUT: Duration = crate::call::REOFFER_TIMEOUT;
 
 pub(crate) enum Input {
     Command(Command),
@@ -1317,32 +1311,42 @@ impl Engine {
                     tracing::debug!("malformed offer");
                     return;
                 };
+                // An offer for a connection we hold may be an ICE restart of it: the
+                // verified connection, with the certificate its binding covers. It is
+                // applied in place. When it crosses a restart of ours the designated
+                // initiator's stands: that side drops the other's offer, the other side
+                // drops its own and answers. Anything else is an offer for a new connection.
                 let designated = should_initiate(&self.me, from);
-                if self.cfg.renegotiation
-                    && let Some(conn) = self.peers.get_mut(from).and_then(|p| p.conn.as_mut())
-                    && conn.is_verified()
-                    && same_dtls_identity(conn.remote_sdp.as_deref(), &offer.sdp)
-                {
-                    // The verified connection we have, with the certificate its binding
-                    // covers: an ICE restart, applied in place. When it crosses a restart
-                    // of ours, the designated initiator's stands: that side drops the
-                    // other's offer, the other side drops its own and answers.
-                    if conn.restart.is_some() {
-                        if designated {
+                let renegotiation = self.cfg.renegotiation;
+                if let Some(conn) = self.peers.get_mut(from).and_then(|p| p.conn.as_mut()) {
+                    let decision = crate::wire::on_restart_offer(
+                        renegotiation,
+                        conn.is_verified(),
+                        same_dtls_session(conn.remote_sdp.as_deref(), &offer.sdp),
+                        conn.restart.is_some(),
+                        designated,
+                    );
+                    match decision {
+                        RestartOffer::NewConnection => {}
+                        RestartOffer::KeepOurs => {
                             tracing::debug!(peer = %crate::short_id(from), "crossing ICE restarts; keeping ours");
                             return;
                         }
-                        conn.restart = None;
-                        conn.unsent = None;
+                        RestartOffer::Apply | RestartOffer::Yield => {
+                            if decision == RestartOffer::Yield {
+                                conn.restart = None;
+                                conn.unsent = None;
+                            }
+                            tracing::info!(peer = %crate::short_id(from), "ICE restart offered by the contact");
+                            if let Some(h) = conn.handle.as_ref()
+                                && h.set_remote_description(offer).is_ok()
+                            {
+                                conn.peer_restarting = true;
+                            }
+                            self.mark_online(from);
+                            return;
+                        }
                     }
-                    tracing::info!(peer = %crate::short_id(from), "ICE restart offered by the contact");
-                    if let Some(h) = conn.handle.as_ref()
-                        && h.set_remote_description(offer).is_ok()
-                    {
-                        conn.peer_restarting = true;
-                    }
-                    self.mark_online(from);
-                    return;
                 }
                 if let Some(conn) = self.peers.get(from).and_then(|p| p.conn.as_ref()) {
                     if conn.initiator && !conn.remote_set && should_initiate(&self.me, from) {
@@ -1376,7 +1380,7 @@ impl Engine {
                     // The answer to our ICE restart. It has to be the session we hold: an
                     // answer with another certificate comes from a connection the contact
                     // made anew, and ours is rebuilt to meet it.
-                    if !same_dtls_identity(conn.remote_sdp.as_deref(), &answer.sdp) {
+                    if !same_dtls_session(conn.remote_sdp.as_deref(), &answer.sdp) {
                         tracing::info!(peer = %crate::short_id(from), "the restart was answered by another session; rebuilding");
                         self.conn_failed(from, FailReason::Error);
                         return;
@@ -2002,20 +2006,22 @@ impl Engine {
                     return;
                 };
                 let connected = conn.last_state == Some(RTCPeerConnectionState::Connected);
-                if connected {
-                    // The path works. An unanswered offer is taken back (the contact's
-                    // app did not answer; the connection goes on as it was).
-                    if !restart.answered
-                        && let Some(h) = conn.handle.as_ref()
-                    {
-                        let _ = h.rollback();
+                match crate::wire::on_restart_expiry(connected, restart.answered) {
+                    RestartExpiry::Done => conn.restart = None,
+                    RestartExpiry::TakeBack => {
+                        // The path works and the contact's app did not answer: the offer
+                        // is taken back and the connection goes on as it was.
+                        if let Some(h) = conn.handle.as_ref() {
+                            let _ = h.rollback();
+                        }
+                        conn.restart = None;
+                        conn.unsent = None;
                     }
-                    conn.restart = None;
-                    conn.unsent = None;
-                    return;
+                    RestartExpiry::Rebuild => {
+                        tracing::info!(peer = %crate::short_id(&peer), "the ICE restart found no path; rebuilding");
+                        self.conn_failed(&peer, FailReason::Timeout);
+                    }
                 }
-                tracing::info!(peer = %crate::short_id(&peer), "the ICE restart found no path; rebuilding");
-                self.conn_failed(&peer, FailReason::Timeout);
             }
             Timer::CallReoffer {
                 call_id,
@@ -2166,7 +2172,7 @@ impl Engine {
             DcFrame::Identity { peer_id, features } => {
                 let ours = self.cfg.renegotiation;
                 if let Some(conn) = self.peers.get_mut(peer).and_then(|p| p.conn.as_mut()) {
-                    conn.peer_restarts = ours && features.iter().any(|f| f == FEATURE_ICE_RESTART);
+                    conn.peer_restarts = crate::wire::restarts(ours, &features);
                 }
                 if !peer_id.eq_ignore_ascii_case(peer) {
                     tracing::warn!(
@@ -2476,19 +2482,7 @@ impl Engine {
         let polite = c.info.incoming;
         let frames_rx = c.frames_rx.take();
         let media_tx = c.media_tx.clone();
-        let config = RtcConfig {
-            media: MediaConfig {
-                recv_opus: true,
-                send_opus: true,
-                recv_vp8: video,
-                send_vp8: video,
-            },
-            congestion: Some(CongestionConfig::default()),
-            jitter_buffer: true,
-            polite,
-            quality_interval: Some(CALL_QUALITY_INTERVAL),
-            ..self.rtc_base()
-        };
+        let config = crate::call::connection_config(video, polite, self.rtc_base());
         let input = self.input.clone();
         let id = call_id.to_owned();
         tracing::info!(call = %call_id, initiator, video, "starting the call connection");
@@ -2749,21 +2743,21 @@ impl Engine {
         if c.info.is_over() || !c.established {
             return Err(AppError::UnknownCall(call_id.to_owned()));
         }
-        if !c.info.renegotiable {
-            // The contact's app keeps the call as it was set up: a video call's stream
-            // stays (black is sent for a camera that is off), an audio call stays audio.
-            return if enabled && !c.info.local_video {
-                Err(AppError::CannotRenegotiate)
-            } else {
-                Ok(VideoChange::Unchanged)
-            };
+        // With a contact whose app does not renegotiate the call stays as it was set up: a
+        // video call's stream stays (black is sent for a camera that is off), an audio call
+        // stays audio.
+        match crate::call::video_change(c.info.renegotiable, c.info.local_video, enabled) {
+            None => Err(AppError::CannotRenegotiate),
+            Some(VideoChange::Unchanged) => Ok(VideoChange::Unchanged),
+            Some(VideoChange::Renegotiating) => {
+                let Some(h) = c.handle.as_ref() else {
+                    return Err(AppError::UnknownCall(call_id.to_owned()));
+                };
+                h.set_sending(MediaKind::Video, enabled)
+                    .map_err(|_| AppError::UnknownCall(call_id.to_owned()))?;
+                Ok(VideoChange::Renegotiating)
+            }
         }
-        let Some(h) = c.handle.as_ref() else {
-            return Err(AppError::UnknownCall(call_id.to_owned()));
-        };
-        h.set_sending(MediaKind::Video, enabled)
-            .map_err(|_| AppError::UnknownCall(call_id.to_owned()))?;
-        Ok(VideoChange::Renegotiating)
     }
 
     /// The contact's data connection is verified (again): send the call signals that had
@@ -2800,17 +2794,18 @@ impl Engine {
                 features,
                 ..
             } => {
-                if self.calls.contains_key(&call_id) {
-                    return; // a duplicate
-                }
-                if self.busy() {
-                    let _ = self.send_call_signal(peer, &CallSignal::Reject { call_id });
-                    return;
+                match crate::call::on_offer(self.calls.contains_key(&call_id), self.busy()) {
+                    OfferDecision::Duplicate => return,
+                    OfferDecision::Busy => {
+                        let _ = self.send_call_signal(peer, &CallSignal::Reject { call_id });
+                        return;
+                    }
+                    OfferDecision::Ring => {}
                 }
                 self.new_call(call_id.clone(), peer, video, true);
                 if let Some(c) = self.calls.get_mut(&call_id) {
                     c.remote_offer = Some(sdp);
-                    c.info.renegotiable = ours && features.iter().any(|f| f == FEATURE_RENEGOTIATE);
+                    c.info.renegotiable = crate::call::renegotiates(ours, &features);
                 }
                 self.emit_call(&call_id);
             }
@@ -2818,20 +2813,27 @@ impl Engine {
                 let Some(c) = self.calls.get_mut(&call_id) else {
                     return;
                 };
-                // Only for a call that is set up, and only when we said we take them.
-                if !ours || !c.established || c.info.is_over() {
-                    return;
-                }
-                // When it crosses a `reoffer` of ours the caller's stands: the caller drops
-                // the callee's, the callee drops its own and answers (what it wanted is
-                // offered again afterwards by the driver).
-                if c.reoffer.is_some() {
-                    if !c.info.incoming {
+                // Only for a call that is set up, and only when we said we take them. When
+                // it crosses a `reoffer` of ours the caller's stands: the caller drops the
+                // callee's, the callee drops its own and answers (what it wanted is offered
+                // again afterwards by the driver).
+                match crate::call::on_reoffer(
+                    ours,
+                    c.established,
+                    c.info.is_over(),
+                    c.reoffer.is_some(),
+                    c.info.incoming,
+                ) {
+                    ReofferDecision::Ignore => return,
+                    ReofferDecision::KeepOurs => {
                         tracing::debug!(call = %call_id, "crossing reoffers; keeping ours");
                         return;
                     }
-                    c.reoffer = None;
-                    c.unsent = None;
+                    ReofferDecision::Yield => {
+                        c.reoffer = None;
+                        c.unsent = None;
+                    }
+                    ReofferDecision::Answer => {}
                 }
                 if let (Some(h), Ok(desc)) = (c.handle.as_ref(), RTCSessionDescription::offer(sdp))
                 {
@@ -2869,7 +2871,7 @@ impl Engine {
                 }
                 c.remote_set = true;
                 c.established = true;
-                c.info.renegotiable = ours && features.iter().any(|f| f == FEATURE_RENEGOTIATE);
+                c.info.renegotiable = crate::call::renegotiates(ours, &features);
                 if let Some(h) = c.handle.as_ref() {
                     for cand in c.pending_ice.drain(..) {
                         let _ = h.add_remote_candidate(cand);
@@ -2899,20 +2901,6 @@ impl Engine {
             CallSignal::Reject { .. } => self.end_call(&call_id, CallEnd::Rejected),
         }
     }
-}
-
-/// Whether a description is of the DTLS session `known` describes: the same certificate
-/// fingerprints (what the channel binding covers), and at least one.
-fn same_dtls_identity(known: Option<&str>, sdp: &str) -> bool {
-    let Some(known) = known else {
-        return false;
-    };
-    let (mut a, mut b) = (sdp_fingerprints(known), sdp_fingerprints(sdp));
-    a.sort();
-    a.dedup();
-    b.sort();
-    b.dedup();
-    !a.is_empty() && a == b
 }
 
 /// The user waits for this contact: messages are queued for it, or they asked to connect.
