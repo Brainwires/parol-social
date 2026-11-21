@@ -8,6 +8,7 @@ export * from "./types.ts";
 export type * from "./platform.ts";
 export { DEFAULT_RECONNECT, type ReconnectConfig } from "./reconnect.ts";
 export { DB_NAME, DB_VERSION, IdbStorage, MemoryStorage } from "./storage.ts";
+export { MemoryFileStore, OpfsFileStore } from "./files.ts";
 export {
   attachLifecycle,
   browserMedia,

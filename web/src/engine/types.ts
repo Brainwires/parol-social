@@ -117,6 +117,59 @@ export interface CallInfo {
   readonly cameraOff: boolean;
 }
 
+/** Why a transfer was cancelled (PNP-010 §4.4; `CancelReason` in the native core). */
+export type CancelReason =
+  /** The user cancelled. */
+  | "User"
+  /** The sender can no longer read the file. */
+  | "Unavailable"
+  /** A record or the final hash did not verify. */
+  | "Integrity"
+  /** The receiver could not store the file. */
+  | "Storage"
+  /** A limit of the side that cancelled. */
+  | "Limit"
+  | "Other";
+
+/** Where a file transfer is (`TransferState`). */
+export type TransferState =
+  /** Offered; the receiver has not answered. */
+  | { kind: "Offered" }
+  /** Accepted, and waiting for a direct connection or for its turn. */
+  | { kind: "Waiting" }
+  /** Records are flowing. */
+  | { kind: "Active" }
+  /** The whole file arrived and verified. */
+  | { kind: "Complete" }
+  | { kind: "Declined" }
+  | { kind: "Cancelled"; byPeer: boolean; reason: CancelReason };
+
+/** A file transfer as the UI shows it (`TransferInfo`). */
+export interface TransferInfo {
+  /** 32 hex digits. */
+  readonly id: string;
+  readonly peerId: string;
+  /** `Sent`: this device offers the file. `Received`: it was offered to us. */
+  readonly direction: Direction;
+  /** Safe to show and to use as a file name: never a path. */
+  readonly name: string;
+  readonly size: number;
+  /** The sender's claim; may be empty. */
+  readonly mime: string;
+  readonly state: TransferState;
+  readonly bytesDone: number;
+  /** Our latest message about it (offer, answer, cancel) still waits on this device. */
+  readonly pending: boolean;
+  readonly createdMs: number;
+  /** Web-only: a received, complete file is on this device and can be saved (`transferFile`). */
+  readonly available: boolean;
+}
+
+export function transferOver(t: TransferInfo): boolean {
+  return t.state.kind === "Complete" || t.state.kind === "Declined" ||
+    t.state.kind === "Cancelled";
+}
+
 /** A consistent picture of the engine's state (`Snapshot`). Immutable. */
 export interface Snapshot {
   readonly peerId: string;
@@ -163,6 +216,10 @@ export type AppEvent =
    */
   | { kind: "Notice"; code: NoticeCode; text: string; peerId?: string }
   | { kind: "Call"; call: CallInfo }
+  /** A file transfer appeared, changed state or moved on. */
+  | { kind: "Transfer"; transfer: TransferInfo }
+  /** Web-only: a finished transfer was removed from the conversation (`removeTransfer`). */
+  | { kind: "TransferRemoved"; peerId: string; id: string }
   /** Web-only: the local or remote stream of a call changed (see `Engine.callMedia`). */
   | { kind: "CallMedia"; callId: string };
 
@@ -170,9 +227,10 @@ export type AppEvent =
  * What a `Notice` is about:
  * - `Storage`: a write to this device's storage failed;
  * - `BindingFailed`: a direct connection failed its end-to-end check and was closed;
- * - `TurnUnusable`: relay-only is on and the user's TURN server gave no path.
+ * - `TurnUnusable`: relay-only is on and the user's TURN server gave no path;
+ * - `Transfer`: a file transfer was stopped because what arrived did not verify.
  */
-export type NoticeCode = "Storage" | "BindingFailed" | "TurnUnusable";
+export type NoticeCode = "Storage" | "BindingFailed" | "TurnUnusable" | "Transfer";
 
 /** The user's own TURN server. The only TURN server the engine ever uses. */
 export interface TurnSettings {
@@ -196,6 +254,8 @@ export type EngineErrorCode =
   | "NotConnected"
   | "Busy"
   | "UnknownCall"
+  | "UnknownTransfer"
+  | "Transfer"
   | "UnknownMessage"
   | "NotQueued"
   | "TooLong"

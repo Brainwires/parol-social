@@ -117,6 +117,22 @@ const WASM_EXPORTS: readonly (keyof WasmApi)[] = [
   "process_scanned_qr",
   "safety_number",
   "version",
+  "pnp010_new_offer",
+  "pnp010_encode_offer",
+  "pnp010_encode_control",
+  "pnp010_decode_control",
+  "pnp010_on_control",
+  "pnp010_admit_channel",
+  "pnp010_label_id",
+  "pnp010_label",
+  "pnp010_admit_offer",
+  "pnp010_sanitize_file_name",
+  "pnp010_numbered_file_name",
+  "pnp010_limits",
+  "TransferOfferLimiter",
+  "TransferHasher",
+  "TransferSender",
+  "TransferReceiver",
 ];
 
 /**
