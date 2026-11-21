@@ -6,7 +6,8 @@ DOM global and no framework; every platform dependency is injected. It follows t
 [porting inventory](inventory.md), and where the old PWA disagreed with the specs or the native
 core it follows the specs and the native core (the list is in "Deviations from the old PWA").
 
-Tests live in `web/tests/engine` ("Running the tests" below).
+Tests live in `web/tests/engine` ("Running the tests" below). How the app's screens sit on
+this engine is in [app.md](app.md).
 
 ## Modules
 
@@ -72,6 +73,7 @@ class Engine {
 
   // Contacts
   renameContact(peerId: string, name: string): Promise<Contact>; // local only
+  removeContact(peerId: string): Promise<void>; // with its history, queue and session
   setVerification(peerId: string, verified: "compared" | "no"): Promise<Contact>;
   safetyNumber(peerId: string): string | null; // PNP-002 §10, 60 digits
   connect(peerId: string): void; // the user opened the chat or pressed retry
@@ -84,6 +86,7 @@ class Engine {
   callMedia(callId: string): { local: MediaStream | null; remote: MediaStream | null } | null;
   setMuted(callId: string, muted: boolean): void;
   setCameraOff(callId: string, off: boolean): void;
+  replaceCamera(callId: string, stream: MediaStream): Promise<void>; // another camera
 
   // Settings
   turnSettings(): Promise<TurnSettings | null>;
@@ -117,6 +120,15 @@ activity), `CallMedia` (a call's local or remote stream changed).
 
 `sendText` emits one `Message` with the final state (`Sent` or `Queued`); a queued message later
 gets `MessageState` (`Sent` or `Dropped`).
+
+`ContactRemoved` (web-only) follows `removeContact`. A `Notice` carries a `code` beside its
+English `text`, so a UI can use its own words: `Storage` (a write to this device failed),
+`BindingFailed` (with `peerId`: a connection failed its end-to-end check and was closed),
+`TurnUnusable` (relay-only is on and the user's TURN server gave no path).
+
+A call that fails because the microphone or camera could not be used ends with
+`{ kind: "Failed", reason: CALL_FAILED_MEDIA }` (exported by `calls.ts`), so a UI can say that
+instead of "could not connect".
 
 ### What a UI store must match
 
@@ -213,6 +225,18 @@ nowhere else. TURN is only ever the user's own server; `relayOnly` sets
 (`NoDirectPath` plus a notice). Offers and answers are non-trickle (gathering is capped at 3 s;
 at most 4 late candidates follow as `rtc_ice`).
 
+**Removing a contact.** One transaction deletes the contact, its state, its messages, its queue
+and its session from the saved sessions; a call with it is hung up first and its connection
+closed. The core has no call to drop one session from wasm memory ("wasm API gaps" #5), so
+without `remove_session` the engine reloads the identity and imports the remaining sessions.
+That drops the pending bootstrap, so a code being shown is closed (`Pairing` with `null`). The
+contact is not told.
+
+**Switching cameras.** `replaceCamera` swaps the video sender's track (`replaceTrack`, no
+renegotiation), stops the old video track, and keeps the microphone. The engine owns the new
+stream from then on and stops it when the call ends; a refused switch stops the offered
+stream.
+
 **Calls.** Per-call `RTCPeerConnection`; `offer` / `answer` carry the SDP with its candidates;
 incoming `ice` is accepted, also before the user accepts; every signal is matched by `callId` and
 by peer; a second call gets `reject`; `reject` and `hangup` tear down both sides; ring 60 s,
@@ -301,27 +325,30 @@ session and commit on success.
 
 ## Running the tests
 
-```sh
-cd web/tests/engine
-deno task wasm        # wasm-pack build of crates/parolnet-wasm into .pkg/ (once)
-deno task test        # unit tests: real wasm, fake socket / peer connection / clock
-deno task check && deno task lint && deno task fmt:check
+The engine's tests are part of the web app's tooling (`web/deno.json`). From `web/`:
 
-# End to end, in real browsers, against the real relay and the native bot:
+```sh
+denext task build-wasm     # crates/parolnet-wasm into public/wasm and .wasm-pkg (once)
+denext task test:engine    # unit tests: real wasm, fake socket / peer connection / clock
+denext task check && denext task lint && denext task fmt:check   # the app and the engine
+
+# The engine alone in real browsers, against the real relay and the native bot:
 cargo build -p parolnet-relay-server --bin parolnet-relay -p parolnet-app --example bot
-deno task e2e:build
-(cd e2e && npm ci && npx playwright install chromium firefox)
-E2E_BROWSER=chromium node e2e/run.mjs    # or firefox; webkit inside the Playwright Linux image
+denext task engine:e2e:build
+(cd tests/engine/e2e && npm ci && npx playwright install chromium firefox)
+E2E_BROWSER=chromium node tests/engine/e2e/run.mjs   # or firefox; webkit in the Playwright Linux image
 ```
 
 The unit tests run each engine over its own wasm instance, so the crypto, the pairing code and
 the channel binding in them are real. `e2e/run.mjs` documents its scenarios and environment
-variables; it fails if any request leaves `127.0.0.1`.
+variables; it fails if any request leaves `127.0.0.1`. CI runs the unit tests (job `web`); the
+scenarios of `e2e/run.mjs` are covered there through the app instead: `web/tests/e2e/real.flows.ts`
+(web ↔ web) and `apps/desktop/interop/pwa-interop.mjs` with `INTEROP_APP=web` (web ↔ desktop),
+both in job `pwa-interop`.
 
 ## Not done in this phase
 
-- No removal of a contact, no history trimming (the native core keeps 5000 messages per contact).
-- No encryption at rest, no export / import, no notifications (the inventory's open questions).
-- Calls are covered by unit tests with a fake peer connection only; no browser or desktop call
-  has been made with this engine yet.
+- No history trimming (the native core keeps 5000 messages per contact).
+- No encryption at rest, no export / import (the inventory's open questions). Notifications
+  are the app's (a tab in the background; no push).
 - Groups, files, identity rotation: deferred, as in the inventory.

@@ -119,6 +119,17 @@ have seen mDNS answers (`:867-871`).
 
 ### 11.4 Proposed stable test-hook contract for the new app
 
+> **Status.** Implemented: `web/src/engine/test-hooks.ts`, installed only by the test build of
+> the web app (`denext task build:test`; the production export fails its build if the bundle
+> names the hooks). The driver takes `INTEROP_APP=web` to run the same seven cases against the
+> web app; `class Web` in `apps/desktop/interop/pwa-interop.mjs` lists, case by case, what it
+> checks in place of each old-PWA internal. It acts through the interface (first run, the
+> add-a-contact screen, the composer, the call buttons) and reads the app's database
+> (`parolnet-web`) and the hooks; the `data-testid`s below that the app uses are
+> `pairing-code`, `pairing-code-input`, `pairing-code-submit`, `composer-input`,
+> `composer-send`, `incoming-call`, `call-accept`, `call-decline`, `call-hangup`,
+> `contact-item` (with `data-peer-id`) and `message-item` (with `data-direction`).
+
 The aims:
 
 - keep the seven cases runnable with a small driver diff;

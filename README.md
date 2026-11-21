@@ -129,17 +129,23 @@ rebuilds only the wasm. See [GETTING-STARTED.md](GETTING-STARTED.md) and
 
 ### Web app rewrite (`web/`)
 
-The PWA is being rewritten as a [Denext](https://denext.dev) app with a new design
-([docs/ux/web-app.md](docs/ux/web-app.md)). Phase 1 is in `web/`: the platform (static export
-under `/pwa/`, strict CSP, wasm, service worker, offline) and the design system and
-conversation screens on fake state. `pwa/` stays the deployed client until the protocol
-services are ported. See [web/README.md](web/README.md).
+The PWA is rewritten as a [Denext](https://denext.dev) app with a new design
+([docs/ux/web-app.md](docs/ux/web-app.md)). `web/` is the whole client now: a UI-free engine
+(identity, relay, pairing, the bound data channel, chat with its queue, verification, 1:1 calls,
+IndexedDB storage; [docs/web-port/engine.md](docs/web-port/engine.md)) and the screens on it
+(first run, adding a contact by QR code or pasted code, conversations, safety numbers, calls,
+settings; [docs/web-port/app.md](docs/web-port/app.md)), exported as static files that run under
+`/pwa/` behind a strict CSP. It passes the seven desktop ↔ browser interop cases in Chromium,
+Firefox and WebKit. `pwa/` stays the deployed client until what
+[app.md](docs/web-port/app.md#owed-before-this-replaces-the-old-pwa) lists is settled. See
+[web/README.md](web/README.md).
 
 ```bash
 cd web
 denext task build-wasm   # crates/parolnet-wasm -> web/public/wasm
-denext task build        # static site in web/out
-denext task test         # unit tests; `denext task e2e` runs the three browsers
+denext task build:test   # the test build (state lab, test hooks) in web/out-test
+denext task build        # the production export in web/out
+denext task test         # unit tests; `denext task e2e` and `e2e:flows` run the three browsers
 ```
 
 ## Roadmap
