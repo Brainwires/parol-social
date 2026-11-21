@@ -1,12 +1,18 @@
 # PNP-001: ParolNet Wire Protocol
 
 ### Status: CANDIDATE
-### Version: 0.13
+### Version: 0.14
 ### Date: 2026-11-21
 
 ---
 
 ## Changelog
+
+**v0.14 (2026-11-21) — The whole ratchet header is associated data (wire-incompatible)**
+
+- §3.3: the session AEAD's associated data now starts with the complete Double Ratchet header, encoded as `ratchet_public_key (32) || prev_chain_len (u32 big-endian) || msg_number (u32 big-endian)`, in place of the 32-byte ratchet public key alone; the cleartext header bytes follow as before. **PNP-001-MUST-007** is restated accordingly (same clause ID); the rule itself is **PNP-002-MUST-042** (PNP-002 v0.6 §5.7). §3.1, §3.5, §3.6 and §3.9.2 (MUST-057) follow.
+- Before, `prev_chain_len` was authenticated by nothing: whoever relayed the first message of a new sending chain could raise it (the receiver derived and stored keys for messages that do not exist) or lower it (late messages of the previous chain became undecryptable), and the message still verified. `msg_number` was bound only through the nonce.
+- **Wire-incompatible** with v0.13 and earlier: a message protected under one version fails AEAD verification under the other. The `version` field of the cleartext header (§3.2) stays 0x01: no deployed implementation of an earlier revision exists, both reference clients are built from the same crates, and this specification defines no negotiation of envelope versions. MUST count unchanged: 82.
 
 **v0.13 (2026-11-21) — Client ICE policy: TURN is the user's own; re-probing after `peer_offline`**
 
@@ -138,7 +144,7 @@ Envelope = CBOR Array(4 items):
 
 The total envelope (the serialized CBOR array, including its own outer length prefixes) MUST equal exactly one of the bucket sizes: 256, 1024, 4096, or 16384 bytes. **PNP-001-MUST-001**
 
-Using an array (rather than a map) at the outer level keeps the envelope compact enough that small messages still fit in the 256-byte bucket after accounting for the cleartext header, the ratchet header, and AEAD overhead. The ratchet header is carried on the wire so the receiver can advance the Double Ratchet state before AEAD decryption; it is NOT covered by the session AEAD tag but it IS covered through the `ratchet_public_key` component of the AEAD AAD (see §3.3 / MUST-007).
+Using an array (rather than a map) at the outer level keeps the envelope compact enough that small messages still fit in the 256-byte bucket after accounting for the cleartext header, the ratchet header, and AEAD overhead. The ratchet header is carried on the wire so the receiver can advance the Double Ratchet state before AEAD decryption; it is not encrypted, but every field of it is authenticated: the encoded ratchet header is the first component of the AEAD AAD (see §3.3 / MUST-007).
 
 ### 3.2 Cleartext Header
 
@@ -211,15 +217,19 @@ nonce (12 bytes) = chain_index (4 bytes, big-endian) || seq_number (8 bytes, big
 
 **PNP-001-MUST-006**
 
-The AEAD additional authenticated data (AAD) MUST be the concatenation of the sender's current Double Ratchet public key (the `ratchet_public_key` field from the wire ratchet header, 32 bytes) followed by the serialized CBOR bytes of the cleartext header:
+The AEAD additional authenticated data (AAD) MUST be the concatenation of the encoded Double Ratchet header of the message (all three fields of the wire ratchet header, in the fixed 40-byte encoding of PNP-002 §5.7) followed by the serialized CBOR bytes of the cleartext header:
 
 ```
-AAD = ratchet_public_key || CBOR(cleartext_header)
+ratchet_header_bytes (40 bytes) = ratchet_public_key (32 bytes)
+                               || prev_chain_len (4 bytes, big-endian)
+                               || msg_number     (4 bytes, big-endian)
+
+AAD = ratchet_header_bytes || CBOR(cleartext_header)
 ```
 
 **PNP-001-MUST-007**
 
-This construction makes the AEAD tag tamper-evident with respect to (a) every relay-visible field in the cleartext header, and (b) the Double Ratchet identity of the sending state. A relay cannot rewrite `dest_peer_id`, `msg_type`, `message_id`, `timestamp`, `ttl_and_hops`, or `source_hint` without causing AEAD tag verification to fail on the receiver. An attacker cannot attach a stolen ciphertext to a different ratchet public key without the same tag failure. The `ratchet_header` fields `previous_chain_length` and `message_number` are NOT part of AAD; they are used only to drive the receiver's key-derivation step, whose output becomes the AEAD key itself — any tampering there produces a key that does not match the sender and therefore also fails AEAD verification.
+This construction makes the AEAD tag tamper-evident with respect to (a) every relay-visible field in the cleartext header, and (b) the Double Ratchet identity of the sending state. A relay cannot rewrite `dest_peer_id`, `msg_type`, `message_id`, `timestamp`, `ttl_and_hops`, or `source_hint` without causing AEAD tag verification to fail on the receiver. An attacker cannot attach a stolen ciphertext to a different ratchet public key without the same tag failure. The `ratchet_header` fields `prev_chain_len` and `msg_number` are part of the AAD as well (**PNP-002-MUST-042**): the receiver acts on both before it can verify the tag, and `prev_chain_len` in particular selects no key of the message it travels in, so only the AAD binds it. A relay that rewrites any ratchet header field causes AEAD tag verification to fail, and the receiver's session is left unchanged (**PNP-002-MUST-041**).
 
 ### 3.4 Message Types
 
@@ -254,7 +264,7 @@ Implementations MUST treat unrecognized message type codes as DECOY and silently
 
 ### 3.5 MAC
 
-The AEAD tag is the trailing 16 bytes of `encrypted_payload` (produced in-place by ChaCha20-Poly1305 or AES-256-GCM). There is NO separate `mac` field on the wire. The tag authenticates the ciphertext and the AAD defined in §3.3 (`ratchet_public_key || CBOR(cleartext_header)`). **PNP-001-MUST-009**
+The AEAD tag is the trailing 16 bytes of `encrypted_payload` (produced in-place by ChaCha20-Poly1305 or AES-256-GCM). There is NO separate `mac` field on the wire. The tag authenticates the ciphertext and the AAD defined in §3.3 (`ratchet_header_bytes || CBOR(cleartext_header)`). **PNP-001-MUST-009**
 
 ### 3.6 Padding Scheme
 
@@ -269,7 +279,7 @@ Padding is applied to the serialized envelope (wire level), NOT to the plaintext
 The padding procedure is:
 
 1. Serialize the cleartext header to CBOR bytes: `H`.
-2. Encrypt the plaintext map (per §3.3) under the session AEAD using `AAD = ratchet_public_key || H`. Let the ciphertext (including the 16-byte tag) be `C`.
+2. Encrypt the plaintext map (per §3.3) under the session AEAD using `AAD = ratchet_header_bytes || H` (§3.3). Let the ciphertext (including the 16-byte tag) be `C`.
 3. Serialize the envelope `[cleartext_header, ratchet_header, C, bstr(0)]` (empty padding) to CBOR bytes and measure its length `L0`.
 4. Select the smallest bucket size `B` such that `B >= L0`. If `L0` exceeds the largest bucket, the message MUST be fragmented. **PNP-001-MUST-011**
 5. Compute an initial `pad_length = B - L0 - cbor_bstr_header_size(B - L0)` and fill `pad_length` cryptographically random bytes into the `padding` field. **PNP-001-MUST-012**
@@ -315,7 +325,7 @@ Application bodies that would produce an envelope larger than the 16384-byte cei
 
 #### 3.9.2 AAD binding
 
-**PNP-001-MUST-057**: When `is_fragment = 1`, the AEAD AAD defined in §3.3 is extended to `ratchet_public_key || CBOR(cleartext_header) || fragment_id || fragment_seq_be`, where `fragment_seq_be` is the 4-byte big-endian encoding of `fragment_seq`. This prevents a relay from reshuffling fragments across messages or splicing a fragment from one message into another while keeping the AEAD tag valid.
+**PNP-001-MUST-057**: When `is_fragment = 1`, the AEAD AAD defined in §3.3 is extended to `ratchet_header_bytes || CBOR(cleartext_header) || fragment_id || fragment_seq_be`, where `fragment_seq_be` is the 4-byte big-endian encoding of `fragment_seq`. This prevents a relay from reshuffling fragments across messages or splicing a fragment from one message into another while keeping the AEAD tag valid.
 
 #### 3.9.3 Reassembly
 

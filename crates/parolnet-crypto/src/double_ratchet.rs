@@ -446,17 +446,26 @@ impl Drop for DoubleRatchetSession {
     }
 }
 
+/// Length of the encoded ratchet header that starts the associated data.
+const HEADER_AAD_LEN: usize = 32 + 4 + 4;
+
 /// Build the AEAD additional-authenticated-data for the Double Ratchet
-/// session AEAD (PNP-001-MUST-007).
+/// session AEAD (PNP-002-MUST-042, PNP-001-MUST-007):
 ///
-/// The ratchet public key is bound for nonce-derivation integrity, and the
-/// optional `extra_aad` (typically the serialized cleartext envelope header)
-/// is concatenated after it so wire-level header tampering is detected by
-/// the AEAD tag. Concatenation is unambiguous here because the ratchet-key
-/// prefix is always exactly 32 bytes.
-fn build_aad(ratchet_key: &[u8; 32], extra_aad: &[u8]) -> Vec<u8> {
-    let mut aad = Vec::with_capacity(32 + extra_aad.len());
-    aad.extend_from_slice(ratchet_key);
+/// ```text
+/// ratchet_key (32) || previous_chain_length (u32 BE) || message_number (u32 BE) || extra_aad
+/// ```
+///
+/// The whole ratchet header is bound, so no field of it can be changed in transit: the
+/// receiver acts on all three before it can check the tag. The optional `extra_aad`
+/// (typically the serialized cleartext envelope header) follows, so wire-level header
+/// tampering is detected by the AEAD tag as well. Concatenation is unambiguous because the
+/// header prefix is always exactly 40 bytes.
+fn build_aad(header: &RatchetHeader, extra_aad: &[u8]) -> Vec<u8> {
+    let mut aad = Vec::with_capacity(HEADER_AAD_LEN + extra_aad.len());
+    aad.extend_from_slice(&header.ratchet_key);
+    aad.extend_from_slice(&header.previous_chain_length.to_be_bytes());
+    aad.extend_from_slice(&header.message_number.to_be_bytes());
     aad.extend_from_slice(extra_aad);
     aad
 }
@@ -491,7 +500,7 @@ impl RatchetSession for DoubleRatchetSession {
         // Encrypt with ChaCha20-Poly1305
         let cipher = ChaCha20Poly1305Cipher::new(&message_key)?;
         let nonce = Self::build_nonce(&ratchet_pub, self.send_n);
-        let aad = build_aad(&header.ratchet_key, extra_aad);
+        let aad = build_aad(&header, extra_aad);
         let ciphertext = cipher.encrypt(&nonce, plaintext, &aad)?;
 
         self.send_n += 1;
@@ -508,7 +517,7 @@ impl RatchetSession for DoubleRatchetSession {
         extra_aad: &[u8],
     ) -> Result<Vec<u8>, CryptoError> {
         let nonce = Self::build_nonce(&header.ratchet_key, header.message_number);
-        let aad = build_aad(&header.ratchet_key, extra_aad);
+        let aad = build_aad(header, extra_aad);
 
         // Check for skipped message key. It is consumed only by a message that authenticates.
         let skipped_id = (header.ratchet_key, header.message_number);
@@ -1063,5 +1072,112 @@ mod tests {
             }
             assert_conversation_continues(&mut alice, &mut bob);
         }
+    }
+
+    // ── The whole ratchet header is authenticated (PNP-002-MUST-042) ───
+
+    #[test]
+    fn aad_is_the_encoded_header_then_the_extra_aad() {
+        let header = RatchetHeader {
+            ratchet_key: [0xAB; 32],
+            previous_chain_length: 0x0102_0304,
+            message_number: 0x0A0B_0C0D,
+        };
+        let aad = build_aad(&header, b"extra");
+        assert_eq!(aad.len(), HEADER_AAD_LEN + 5);
+        assert_eq!(aad[..32], [0xAB; 32]);
+        assert_eq!(aad[32..36], [0x01, 0x02, 0x03, 0x04]);
+        assert_eq!(aad[36..40], [0x0A, 0x0B, 0x0C, 0x0D]);
+        assert_eq!(&aad[40..], b"extra");
+        assert_eq!(build_aad(&header, &[]).len(), HEADER_AAD_LEN);
+    }
+
+    /// Alice's first message of a new sending chain, with a late message of her previous
+    /// chain still in flight: `(late, first_of_new_chain)`. The new header's
+    /// `previous_chain_length` is 3 and Bob has received one message of that chain.
+    #[allow(clippy::type_complexity)]
+    fn new_chain_with_a_late_message(
+        alice: &mut DoubleRatchetSession,
+        bob: &mut DoubleRatchetSession,
+    ) -> ((RatchetHeader, Vec<u8>), (RatchetHeader, Vec<u8>)) {
+        let (h, ct) = alice.encrypt(b"a0", b"aad").unwrap();
+        bob.decrypt(&h, &ct, b"aad").unwrap();
+        let _lost = alice.encrypt(b"a1", b"aad").unwrap();
+        let late = alice.encrypt(b"late", b"aad").unwrap();
+        let (h, ct) = bob.encrypt(b"b", b"aad").unwrap();
+        alice.decrypt(&h, &ct, b"aad").unwrap();
+        let first = alice.encrypt(b"new chain", b"aad").unwrap();
+        assert_ne!(first.0.ratchet_key, late.0.ratchet_key);
+        assert_eq!(first.0.previous_chain_length, 3);
+        assert_eq!(first.0.message_number, 0);
+        (late, first)
+    }
+
+    #[test]
+    fn altered_previous_chain_length_is_rejected() {
+        let (mut alice, mut bob) = established_pair();
+        let ((h_late, ct_late), (h_new, ct_new)) =
+            new_chain_with_a_late_message(&mut alice, &mut bob);
+
+        // Raised: Bob would derive and store keys for messages that do not exist. Lowered:
+        // he would close the previous chain early and lose the late message.
+        for pn in [4, 5, 900, MAX_SKIP, u32::MAX, 2, 1, 0] {
+            let mut altered = h_new.clone();
+            altered.previous_chain_length = pn;
+            assert_rejected_unchanged(&mut bob, &altered, &ct_new, b"aad");
+        }
+        assert!(bob.skipped_keys.is_empty());
+
+        assert_eq!(bob.decrypt(&h_new, &ct_new, b"aad").unwrap(), b"new chain");
+        // Exactly the two messages of the previous chain Bob has not seen.
+        assert_eq!(bob.skipped_keys.len(), 2);
+        assert_eq!(bob.decrypt(&h_late, &ct_late, b"aad").unwrap(), b"late");
+        assert_conversation_continues(&mut alice, &mut bob);
+    }
+
+    #[test]
+    fn altered_message_number_or_ratchet_key_is_rejected() {
+        let (mut alice, mut bob) = established_pair();
+        let (_, (h_new, ct_new)) = new_chain_with_a_late_message(&mut alice, &mut bob);
+
+        for n in [1, 2, 700, u32::MAX] {
+            let mut altered = h_new.clone();
+            altered.message_number = n;
+            assert_rejected_unchanged(&mut bob, &altered, &ct_new, b"aad");
+        }
+        for byte in [0, 7, 8, 31] {
+            let mut altered = h_new.clone();
+            altered.ratchet_key[byte] ^= 0x01;
+            assert_rejected_unchanged(&mut bob, &altered, &ct_new, b"aad");
+        }
+
+        assert_eq!(bob.decrypt(&h_new, &ct_new, b"aad").unwrap(), b"new chain");
+        assert_conversation_continues(&mut alice, &mut bob);
+    }
+
+    #[test]
+    fn altered_header_of_a_skipped_message_is_rejected() {
+        let (mut alice, mut bob) = established_pair();
+        let (h1, ct1) = alice.encrypt(b"one", b"aad").unwrap();
+        let (h2, ct2) = alice.encrypt(b"two", b"aad").unwrap();
+        assert_eq!(bob.decrypt(&h2, &ct2, b"aad").unwrap(), b"two");
+        assert_eq!(bob.skipped_keys.len(), 1);
+
+        // The stored key is found by (ratchet key, message number) alone; the previous chain
+        // length must still be the sender's.
+        for pn in [
+            h1.previous_chain_length + 1,
+            h1.previous_chain_length.wrapping_sub(1),
+            u32::MAX,
+        ] {
+            let mut altered = h1.clone();
+            altered.previous_chain_length = pn;
+            assert_rejected_unchanged(&mut bob, &altered, &ct1, b"aad");
+        }
+        assert_eq!(bob.skipped_keys.len(), 1);
+
+        assert_eq!(bob.decrypt(&h1, &ct1, b"aad").unwrap(), b"one");
+        assert!(bob.skipped_keys.is_empty());
+        assert_conversation_continues(&mut alice, &mut bob);
     }
 }

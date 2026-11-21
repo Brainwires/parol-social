@@ -1,12 +1,17 @@
 # PNP-002: ParolNet Handshake Protocol
 
 ### Status: CANDIDATE
-### Version: 0.5
+### Version: 0.6
 ### Date: 2026-11-21
 
 ---
 
 ## Changelog
+
+**v0.6 (2026-11-21) — Authenticated ratchet header (wire-incompatible)**
+
+- §5.7 now defines the Double Ratchet header and requires all of it in the AEAD associated data: `ratchet_key (32) || previous_chain_length (u32 big-endian) || message_number (u32 big-endian)`, followed by the caller's associated data. Allocated **PNP-002-MUST-042**. Before, only `ratchet_key` was in the associated data, `message_number` was bound through the nonce alone and `previous_chain_length` was bound to nothing, so whoever relayed the first message of a new sending chain could rewrite it. PNP-001 v0.14 §3.3 (MUST-007) follows.
+- **Wire-incompatible** with v0.5 and earlier: a Double Ratchet message produced under one version does not authenticate under the other, in either direction. Key derivations, the nonce and the session state are unchanged. No version field is bumped and nothing is negotiated (PNP-001 v0.14 changelog): both ends must run v0.6. MUST count: 42.
 
 **v0.5 (2026-11-21) — Atomic receive**
 
@@ -313,7 +318,20 @@ Processing a received Double Ratchet message is all-or-nothing. To find the mess
 
 1. A receiver MUST NOT change session state for a message that fails authentication. **PNP-002-MUST-041** If AEAD verification fails, or processing stops before it for any other reason (for example the skipped-message-key limit), the root key, both chain keys, the DH ratchet keypair, the remote ratchet public key, every counter and the stored skipped message keys are exactly what they were before the message was processed. In particular a skipped message key is deleted only by a message that authenticates under it, and no skipped message key is stored for a message that does not authenticate. The new state is committed only after successful AEAD verification.
 
-Without this rule any party able to deliver one message to a session (a relay, a peer connected under another PeerId before the channel binding of PNP-001 §10.5.1 is verified, or a corrupted frame) could desynchronize it permanently. The same rule covers session creation: a session derived for a first message (PNP-001 §5.3.1) is kept only if that message authenticates, and does not replace an existing session otherwise.
+2. The sender and the receiver MUST include the complete ratchet header of a message in the associated data of its AEAD. **PNP-002-MUST-042** The Double Ratchet header has three fields: `ratchet_key`, the sender's current ratchet public key (32 bytes); `previous_chain_length`, the number of messages the sender sent in its previous sending chain (uint32); and `message_number`, the number of the message in the current sending chain, starting at 0 (uint32). The associated data is the fixed 40-byte encoding of the header followed by the associated data the layer above supplies (for a PNP-001 envelope the CBOR bytes of the cleartext header, PNP-001 §3.3; empty when there is none):
+
+   ```
+   AD = ratchet_key (32 bytes)
+     || previous_chain_length (4 bytes, big-endian)
+     || message_number        (4 bytes, big-endian)
+     || upper_layer_ad
+   ```
+
+   The receiver builds `AD` from the header as it arrived, for a message decrypted with a stored skipped message key as for any other. The nonce is unchanged (the first 8 bytes of `ratchet_key` followed by `message_number`, 4 bytes big-endian). The header prefix has a fixed length, so the concatenation is unambiguous.
+
+   The header travels in the clear and the receiver has to act on it before it can verify anything. `ratchet_key` and `message_number` select the message key, but `previous_chain_length` selects no key of the message that carries it: it only tells the receiver how many keys of the previous chain to keep for late messages. Outside the associated data, whoever relays the first message of a new chain could raise it, making the receiver derive and store keys for messages that were never sent, or lower it, making the receiver close the previous chain early so that its late messages can never be decrypted; the message would still authenticate. With the whole header authenticated, a message whose header was altered in transit fails verification and, by rule 1, changes nothing.
+
+Without rule 1 any party able to deliver one message to a session (a relay, a peer connected under another PeerId before the channel binding of PNP-001 §10.5.1 is verified, or a corrupted frame) could desynchronize it permanently. The same rule covers session creation: a session derived for a first message (PNP-001 §5.3.1) is kept only if that message authenticates, and does not replace an existing session otherwise.
 
 ## 6. Security Considerations
 

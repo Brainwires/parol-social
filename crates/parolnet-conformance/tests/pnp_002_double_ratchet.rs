@@ -3,6 +3,8 @@
 //! PNP-002-MUST-041: a receiver changes no session state for a message that fails
 //! authentication. Session state is compared through the persistence export, which holds
 //! every field of a session.
+//!
+//! PNP-002-MUST-042: the complete ratchet header is in the AEAD associated data.
 
 use parolnet_clause::clause;
 use parolnet_core::envelope::{
@@ -195,4 +197,62 @@ fn first_message_failing_authentication_replaces_no_session() {
             .plaintext,
         b"still here"
     );
+}
+
+// -- §5.7 rule 2 — the whole ratchet header is authenticated ------------------
+
+#[clause("PNP-002-MUST-042")]
+#[test]
+fn ratchet_header_altered_in_transit_fails_authentication() {
+    let (mut alice, mut bob) = session_pair();
+    converse(&mut alice, &mut bob);
+
+    // Alice's previous chain: three messages, of which Bob gets the first only for now.
+    let (h, ct) = alice.encrypt(b"a0", AAD).unwrap();
+    assert_eq!(bob.decrypt(&h, &ct, AAD).unwrap(), b"a0");
+    let (h_skipped, ct_skipped) = alice.encrypt(b"a1", AAD).unwrap();
+    let (h_late, ct_late) = alice.encrypt(b"a2", AAD).unwrap();
+    // A message from Bob moves Alice to a new sending chain.
+    let (h, ct) = bob.encrypt(b"b", AAD).unwrap();
+    assert_eq!(alice.decrypt(&h, &ct, AAD).unwrap(), b"b");
+    let (header, ct) = alice.encrypt(b"first of the new chain", AAD).unwrap();
+    assert_ne!(header.ratchet_key, h_late.ratchet_key);
+    assert_eq!(header.previous_chain_length, 3);
+
+    // previous_chain_length raised (keys for messages never sent) and lowered (the previous
+    // chain closed before its late messages).
+    for pn in [4, 500, 1000, u32::MAX, 2, 1, 0] {
+        let mut altered = header.clone();
+        altered.previous_chain_length = pn;
+        assert_refused_without_effect(&mut bob, &altered, &ct, AAD, "previous_chain_length");
+    }
+    for n in [1, 2, 999, u32::MAX] {
+        let mut altered = header.clone();
+        altered.message_number = n;
+        assert_refused_without_effect(&mut bob, &altered, &ct, AAD, "message_number");
+    }
+    for byte in [0, 8, 31] {
+        let mut altered = header.clone();
+        altered.ratchet_key[byte] ^= 0x01;
+        assert_refused_without_effect(&mut bob, &altered, &ct, AAD, "ratchet_key");
+    }
+
+    // The genuine message decrypts afterwards, and the previous chain's late messages too:
+    // the first through the chain's skipped keys, with its own header checked the same way.
+    assert_eq!(
+        bob.decrypt(&header, &ct, AAD).unwrap(),
+        b"first of the new chain"
+    );
+    let mut altered = h_skipped.clone();
+    altered.previous_chain_length += 1;
+    assert_refused_without_effect(
+        &mut bob,
+        &altered,
+        &ct_skipped,
+        AAD,
+        "previous_chain_length of a skipped message",
+    );
+    assert_eq!(bob.decrypt(&h_skipped, &ct_skipped, AAD).unwrap(), b"a1");
+    assert_eq!(bob.decrypt(&h_late, &ct_late, AAD).unwrap(), b"a2");
+    converse(&mut alice, &mut bob);
 }

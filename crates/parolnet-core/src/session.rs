@@ -38,8 +38,8 @@ impl SessionManager {
 
     /// Encrypt a message for a peer using their Double Ratchet session.
     ///
-    /// `extra_aad` is bound into the AEAD additional-authenticated-data alongside
-    /// the ratchet public key. Callers with no external context (e.g., simple
+    /// `extra_aad` is bound into the AEAD additional-authenticated-data after
+    /// the ratchet header. Callers with no external context (e.g., simple
     /// session-layer encrypts that do not ride inside a PNP-001 envelope) pass
     /// an empty slice. The envelope helpers pass the serialized cleartext
     /// header bytes (PNP-001-MUST-007).
