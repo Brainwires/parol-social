@@ -2136,7 +2136,7 @@ async fn handle_socket(socket: WebSocket, ctx: WsCtx, client_ip: IpAddr, _conn_s
 
     // PNP-001 §10.3 SHOULD-014 + MUST-067: the relay SHOULD close client
     // WebSockets idle ≥60s and MUST reap presence within 60s of close. We
-    // track the wall-clock time of the last inbound frame (any type) and
+    // track the time of the last inbound text or binary frame (any type) and
     // let the idle watchdog break the loop if it's been silent too long.
     // The normal close path below already calls `remove_local`, so breaking
     // the loop on idle suffices to honor both clauses.
@@ -2157,9 +2157,12 @@ async fn handle_socket(socket: WebSocket, ctx: WsCtx, client_ip: IpAddr, _conn_s
                 match msg_opt {
                     Some(Ok(msg @ Message::Text(_))) => { last_inbound = std::time::Instant::now(); msg }
                     Some(Ok(msg @ Message::Binary(_))) => { last_inbound = std::time::Instant::now(); msg }
-                    Some(Ok(Message::Pong(_))) => { last_inbound = std::time::Instant::now(); continue; }
+                    // WebSocket control frames are not client frames: a browser answers our
+                    // pings by itself while the page behind it is suspended, which is the
+                    // zombie SHOULD-014 exists to remove. Only what the client sent counts.
+                    Some(Ok(Message::Pong(_))) => continue,
                     Some(Ok(Message::Close(_))) | None => break,
-                    Some(Ok(_)) => { last_inbound = std::time::Instant::now(); continue; }
+                    Some(Ok(_)) => continue,
                     // Includes a frame over the message-size cap.
                     Some(Err(_)) => break,
                 }
