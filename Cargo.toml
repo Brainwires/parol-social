@@ -14,6 +14,7 @@ members = [
     "crates/parolnet-clause",
     "crates/parolnet-conformance",
     "crates/parolnet-rtc",
+    "crates/parolnet-store",
     "crates/parolnet-app",
     "xtask",
 ]
@@ -37,6 +38,7 @@ parolnet-relay = { path = "crates/parolnet-relay" }
 parolnet-core = { path = "crates/parolnet-core", default-features = false }
 parolnet-rtc = { path = "crates/parolnet-rtc" }
 parolnet-app = { path = "crates/parolnet-app" }
+parolnet-store = { path = "crates/parolnet-store" }
 
 # Realtime engine: Brainwires' fork of webrtc-rs/rtc (sans-I/O), pinned by tag, never a branch.
 # Its DTLS / SRTP provider is ring (C and assembly); the E2EE layer stays pure Rust.
@@ -111,6 +113,12 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-
 
 # DNS (PNP-008 §8.3 bootstrap)
 hickory-resolver = { version = "0.24", default-features = false, features = ["tokio-runtime", "system-config"] }
+
+# Native persistence (parolnet-store): SQLite with SQLCipher; the crypto provider is chosen
+# per target in crates/parolnet-store/Cargo.toml.
+rusqlite = { version = "0.43", default-features = false, features = ["cache"] }
+# OS keychain (macOS Keychain, Windows Credential Manager, Linux Secret Service over zbus).
+keyring = "4"
 
 # Testing
 proptest = "1"

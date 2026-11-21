@@ -1,0 +1,38 @@
+[package]
+name = "parolnet-store"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Encrypted native persistence for ParolNet clients: SQLite with SQLCipher, keyed from the OS keychain (identity, contacts, sessions, messages, sender queue)"
+
+[features]
+# The OS keychain key provider (macOS Keychain, Windows Credential Manager, Linux Secret
+# Service) through the `keyring` crate. Off by default: headless builds (the interop bot, CI)
+# use the key-file provider and do not need the keychain stack.
+keychain = ["dep:keyring"]
+
+[dependencies]
+thiserror.workspace = true
+tracing.workspace = true
+zeroize.workspace = true
+subtle.workspace = true
+hex.workspace = true
+rand.workspace = true
+serde.workspace = true
+# The legacy (slices 1-2) plaintext state file and the store's metadata file are JSON.
+serde_json.workspace = true
+keyring = { workspace = true, optional = true }
+
+# SQLCipher (BSD-3-Clause) is compiled from the bundled amalgamation on every target. Its
+# crypto provider is a C library, which is an at-rest storage concern and not part of the
+# E2EE layer (that stays pure Rust, see CLAUDE.md invariant 6):
+#   - Apple targets: CommonCrypto from the system's Security framework, nothing vendored.
+#   - Everything else: OpenSSL's libcrypto (Apache-2.0), built from source by `openssl-src`
+#     and linked statically, so the shipped binary depends on no system OpenSSL. The build
+#     needs perl and make (nmake on Windows); see docs/m1-desktop.md.
+[target.'cfg(target_vendor = "apple")'.dependencies]
+rusqlite = { workspace = true, features = ["bundled-sqlcipher"] }
+
+[target.'cfg(not(target_vendor = "apple"))'.dependencies]
+rusqlite = { workspace = true, features = ["bundled-sqlcipher-vendored-openssl"] }
