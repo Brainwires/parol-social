@@ -1,0 +1,56 @@
+# cargo-deny: the licence gate (plan section 6) plus sources and advisories.
+#
+#   cargo deny check licenses sources bans
+#
+# The desktop app is its own workspace with its own config: apps/desktop/deny.toml.
+#
+# Everything we ship is MIT OR Apache-2.0, so every dependency must carry a permissive
+# licence. No GPL, LGPL, AGPL, SSPL or other copyleft-on-linking licence is allowed, ever: a
+# crate that needs one is refused, not excepted (libsignal, x264 and Zed's GPL editor crates
+# are the known cases). MPL-2.0 is file-level copyleft (a binary may link it under any licence
+# as long as the MPL files' source stays available, which crates.io provides): it is allowed
+# only for named crates in `exceptions` (today: three, all pulled in by GPUI, in
+# apps/desktop/deny.toml), never for our own code.
+#
+# C libraries linked from the system (libvpx, libopus, webrtc-audio-processing) are not crates
+# and are not seen here: their licences are recorded in docs/m0-spike.md and THIRD_PARTY.md
+# lands with packaging in M1.
+
+[graph]
+all-features = false
+
+[licenses]
+version = 2
+confidence-threshold = 0.9
+allow = [
+    "MIT",
+    "MIT-0",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "CC0-1.0",
+    "Unicode-3.0",
+    "BSL-1.0",
+    "CDLA-Permissive-2.0",
+]
+
+[licenses.private]
+ignore = true
+
+[bans]
+multiple-versions = "allow"
+wildcards = "allow"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-git = [
+    # The realtime engine, pinned by tag (plan section 2.3).
+    "https://github.com/Brainwires/webrtc-rs-rtc",
+]
+
+[advisories]
+version = 2

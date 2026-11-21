@@ -310,5 +310,6 @@
   "notice.ipAvoid": "To hide your IP address, add your own TURN server in Settings and turn on \"Relay through my own TURN server\".",
   "notice.ipOpenSettings": "Open Settings",
   "notice.ipOk": "I understand",
-  "toast.callMediaTimeout": "Media never connected — ICE/TURN may be blocked."
+  "toast.callMediaTimeout": "Media never connected — ICE/TURN may be blocked.",
+  "toast.channelBindingFailed": "{name} との直接接続はエンドツーエンドの検証に失敗したため閉じられました。リレーなど、間にいる誰かが干渉している可能性があります。"
 }

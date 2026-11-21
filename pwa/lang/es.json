@@ -310,5 +310,6 @@
   "notice.ipAvoid": "Para ocultar tu dirección IP, añade tu propio servidor TURN en Ajustes y activa \"Retransmitir por mi propio servidor TURN\".",
   "notice.ipOpenSettings": "Abrir Ajustes",
   "notice.ipOk": "Entendido",
-  "toast.callMediaTimeout": "Media never connected — ICE/TURN may be blocked."
+  "toast.callMediaTimeout": "Media never connected — ICE/TURN may be blocked.",
+  "toast.channelBindingFailed": "La conexión directa con {name} no superó la verificación de extremo a extremo y se cerró. Alguien entre ustedes, como el relé, podría estar interfiriendo."
 }

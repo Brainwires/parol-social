@@ -2,3 +2,4 @@ target/
 .git/
 coverage/
 node_modules/
+apps/desktop/target/

@@ -310,5 +310,6 @@
   "notice.ipAvoid": "Pour masquer ton adresse IP, ajoute ton propre serveur TURN dans les Paramètres et active « Relayer via mon propre serveur TURN ».",
   "notice.ipOpenSettings": "Ouvrir les Paramètres",
   "notice.ipOk": "J'ai compris",
-  "toast.callMediaTimeout": "Media never connected — ICE/TURN may be blocked."
+  "toast.callMediaTimeout": "Media never connected — ICE/TURN may be blocked.",
+  "toast.channelBindingFailed": "La connexion directe avec {name} a échoué à la vérification de bout en bout et a été fermée. Quelqu'un entre vous, comme le relais, interfère peut-être."
 }

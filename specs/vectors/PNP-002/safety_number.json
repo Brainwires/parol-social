@@ -1,0 +1,11 @@
+{
+  "clause": "PNP-002-MUST-040",
+  "description": "Safety number of PeerIds 0x11*32 and 0x22*32 (either order): SHA-256(lo || hi), six 5-byte big-endian groups mod 10^10, 10 digits each.",
+  "input": {
+    "peer_id_a": "1111111111111111111111111111111111111111111111111111111111111111",
+    "peer_id_b": "2222222222222222222222222222222222222222222222222222222222222222"
+  },
+  "expected": {
+    "safety_number": "0203903273 2487506436 7022175877 9751782849 2461095953 2148788959"
+  }
+}

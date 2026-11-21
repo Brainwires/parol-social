@@ -955,10 +955,10 @@ function handleScannedQR(data) {
                 // envelope is queued and rides the data channel once it
                 // opens (connectToPeer below; the presenter accepts our
                 // offer while its add-contact screen is open).
-                const result = await sendRawEnvelope(peerId, envelope);
+                const result = await sendRawEnvelope(peerId, envelope, { bootstrap: true });
                 if (!result.ok) {
                     console.log('[Bootstrap] not sent yet — queued for later send:', result.reason);
-                    if (!result.queued) queueMessage(peerId, envelope);
+                    if (!result.queued) queueMessage(peerId, envelope, { bootstrap: true });
                 } else {
                     console.log('[Bootstrap] envelope handed to relay');
                 }
@@ -1101,6 +1101,15 @@ export function connectViaPassphrase() {
 
     let clean = raw.replace(/[\s\n\r"']/g, '');
     console.log('[AddContact] Input cleaned:', clean.slice(0, 80), 'length:', clean.length);
+
+    // A full pairing code (the hex QR payload from the contact's "Show QR"
+    // screen, or a desktop's pairing code) pairs exactly like a camera scan:
+    // establish the encrypted session, send the bootstrap envelope, connect.
+    if (/^[0-9a-fA-F]+$/.test(clean) && clean.length > 64) {
+        if (input) input.value = '';
+        handleScannedQR(clean);
+        return;
+    }
 
     let peerId = null;
 

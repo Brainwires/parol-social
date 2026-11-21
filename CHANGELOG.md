@@ -7,6 +7,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added — 1:1 voice and video calls (M1, second slice)
+- `parolnet-app`: calls on their own WebRTC connection, set up by `CALL_SIGNAL` envelopes (`offer` / `answer` / `ice` / `hangup` / `reject`, the PWA's JSON) on the verified data channel, so the call's DTLS fingerprints are end-to-end authenticated. `start_call` / `accept_call` / `reject_call` / `hangup` / `take_call_media`; `AppEvent::Call` with ringing, connecting, active and ended states (hung up, declined, busy, no answer after 60 s, failed). The client feeds encoded VP8 / Opus frames to a `FrameSink` and receives RTP as `MediaEvent`s.
+- `parolnet-rtc`: send tracks (`MediaConfig::send_vp8` / `send_opus`, `RtcHandle::send_frame`, a cloneable `FrameSender`): frames are packetized with the negotiated payload type and SSRC; `RtcEvent::KeyframeRequested` on a PLI / FIR; `request_keyframes`.
+- Desktop: Call and Video call buttons, an incoming-call banner (Accept / Decline), the call panel with the remote video tile (the M0 decode and render path), Mute and Hang up. Video sends a synthetic test pattern (colour bars, moving box, frame counter) through a libvpx VP8 encoder (a C shim compiled against the system headers); audio is the default microphone through opus-rs, playback through cpal (camera capture and echo cancellation are still to come). `parolnet-desktop --call-check` runs the same call media headless.
+- Interop: the desktop video-calls the PWA in Chromium (fake devices) and the PWA video-calls the desktop, and both decode each other's VP8 and Opus; a data channel the PWA offers while it holds camera and microphone permission carries chat after Chromium renominates its ICE pair; `apps/desktop/interop/desktop-call.mjs` checks the desktop's call media against the bot.
+- Engine pin `v0.22.0+brainwires.5`: the controlled ICE agent follows a later USE-CANDIDATE nomination (libwebrtc's renomination), so Chromium switching pairs a moment after connecting no longer stops the PWA's calls to the desktop.
+
+### Security — Direct data-channel binding (PNP-001 v0.12 §10.5.1), safety numbers (PNP-002 v0.4 §10)
+- A hostile signaling relay could swap the plaintext SDP's DTLS fingerprints and sit on the "direct" connection. Each side now sends a CHANNEL_BINDING envelope (new message type 0x14) inside the ratchet session, on the channel, naming its own DTLS fingerprints and the ones it received; the receiver compares them with its own view and closes the connection on a mismatch or when no binding arrives within 20 s. Until then the path is not shown as direct and only the QR bootstrap envelope may cross; queued content and call signals wait. Desktop and PWA (through `parolnet-wasm`) run the same `parolnet-protocol` code. New clauses MUST-079..081, SHOULD-018; conformance tests in `pnp_001_channel_binding.rs`.
+- Safety numbers are specified (60 digits from both PeerIds, the PWA's existing derivation) with a test vector; the desktop shows them under Verify.
+
+### Added — Desktop ↔ PWA interop test (`apps/desktop/interop/pwa-interop.mjs`, CI job `pwa-interop`)
+- The bot against the real PWA in headless Chromium through the relay binary: PWA code → desktop, desktop code → the PWA's Paste Code tab, the sender queue across a PWA restart, a refused tampered binding, and a video call, in two ICE modes (Chromium's mDNS host candidates, and loopback).
+- `parolnet-rtc` resolves remote mDNS (`*.local`) host candidates: the driver opens the `224.0.0.251:5353` socket on the first `.local` candidate and routes the engine's queries and answers.
+- PWA: Paste Code with a full pairing code pairs like a camera scan (session, bootstrap envelope, connect).
+
+### Added — `parolnet-app`, the headless client core (M1, first slice)
+- Identity load / create in a data directory; contacts; PWA-compatible pairing: the presenter's code is the PWA's QR payload (hex), the scanner establishes the Double Ratchet session and sends the bootstrap envelope (PNP-001 §5.3.1, `source_hint` = its identity key) as the first frame on the data channel; the presenter accepts offers from strangers only while its code is valid (30 minutes).
+- Signaling-only relay client: challenge-response `register`, keepalive, reconnect with backoff, `watch` / `presence`, non-trickle `rtc_offer` / `rtc_answer` (browser `RTCSessionDescription` JSON), `rtc_ice`; `peer_offline` and `rate_limited` handling; the PWA's deterministic initiator, offer stagger, glare rule and retry backoff.
+- One direct WebRTC connection per contact through `parolnet-rtc` with the PWA's `parolnet` data channel and JSON frames (`identity`, `chat` with a hex PNP-001 envelope); 1:1 chat as TEXT envelopes; a sender-side queue with the PWA's limits (30 days, 500 per contact, 2000 total) flushed when the channel opens; path states including "no direct path". STUN comes from the relay's `/turn-credentials` (TURN URIs from a relay are ignored); user ICE servers are passed through.
+- State (contacts, sessions, queue, history) is one JSON file written atomically with owner-only permissions; it is not encrypted at rest yet (`parolnet-store` replaces it).
+- `examples/bot.rs`: a headless peer for scripts and interop tests. Tests: wire-format and store unit tests, and an end-to-end test with two app instances against the relay binary (pairing, chat both ways, queue across a restart with presence push, offers from strangers ignored).
+
+### Changed — `parolnet-rtc`
+- Server-reflexive candidates: `RtcConfig::stun_servers` (`stun:` URIs or `host:port`) are asked for the socket's mapped address before the connection loop starts (`stun_timeout`, default 1.5 s). Text data-channel messages (`RtcHandle::send_text`); `RtcEvent::DataChannelOpen` carries the label; `default_local_ip()` and `stun_host_port()` helpers. Engine pin `v0.22.0+brainwires.3`.
+
+### Added — Desktop chat UI v0 (`apps/desktop`)
+- Contact list with direct-path badges, pairing screen (QR code and text of our code, code entry), chat view with delivery state, rename, retry and the "No direct path to <name>. Either side can add a TURN server in Settings." state; `--relay` and `--data-dir` flags. The M0 video spike stays behind `--spike` (and its existing flags).
+
 ### Changed — Relay defaults to the signaling-only profile (PNP-001 v0.11 §10.5)
 - `parolnet-relay-server` now runs the **signaling-only** profile unless `SIGNALING_ONLY=0`: it accepts only `register`, `ping`, `rtc_offer` / `rtc_answer` / `rtc_ice` between two online registered peers, and `watch`; it keeps no store-and-forward mailbox, mints no Privacy Pass tokens, starts no mesh supernode, refuses `message` / `gossip` frames (`error` code `signaling_only`) and closes the socket on binary frames. `/tokens/issue`, `/telemetry`, `/endorse`, `/directory/push`, `/federation/v1` and `/stats` are not served; `/turn-credentials` returns only the STUN URIs from `STUN_URIS`; `/bootstrap` returns an empty list. No user content transits or is stored on such a relay. The previous behaviour is the **relay profile**, an explicit operator opt-in.
 - `registered` frames and `/turn-credentials` carry `profile` (`signaling-only` or `relay`). Error frames carry a machine-readable `code`.
@@ -35,6 +64,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed — Specs: signaling-only relay profile
 - PNP-001 v0.11: §10.5 "Signaling-Only Relay Profile" and §10.6 "Resource Bounds" (MUST-070 … MUST-078, SHOULD-016, SHOULD-017). PNP-005 v0.3 §5.10 (MUST-049, SHOULD-017), PNP-006 v0.3 §4.7 (MUST-045, SHOULD-015), PNP-007 v0.3 §7.8 (MUST-090, SHOULD-013).
+
+### Changed — Repositioning (M0): general-purpose E2EE calls, messages, files and data
+- ParolNet is now a general-purpose, decentralized, end-to-end encrypted communication system with Rust crates, a federated relay, GPUI desktop clients and the PWA. README rewritten; CLAUDE.md updated (invariant 3: messages are padded, media and bulk transfer are not; invariant 6 scoped to the E2EE layer; licence and pinning policy).
+- THREAT_MODEL.md 1.0 (outline): in-scope adversaries (network observer, compromised relay / TURN / SFU, malicious group member, stolen linked device, update channel and supply chain), explicit non-goals of the default mode, an exact metadata statement, and the experimental `hardened` mode in an appendix. Version 0.2, ROADMAP.md and STRATEGIES.md moved to `docs/archive/`.
+
+### Added — `parolnet-rtc` (M0 skeleton)
+- Async driver for the sans-I/O `rtc` engine (`Brainwires/webrtc-rs-rtc`, pinned by tag `v0.22.0+brainwires.1`): one tokio task per connection owning its UDP socket and timers, a command channel (offer, answer, remote candidates, data, keyframe requests, stats) and an event channel. Host candidates only for now. A loopback test connects two drivers over ICE + DTLS + SCTP and exchanges data-channel messages.
+
+### Added — Desktop spike (`apps/desktop`, own workspace)
+- A GPUI window (`gpui-pre =0.3.12`, `gpui-component =0.10.0`) shows a VP8 stream received from headless Chromium through `parolnet-rtc`, decoded with libvpx; macOS draws an NV12 IOSurface `CVPixelBuffer` with `gpui::surface()`, other platforms a BGRA `RenderImage`. A headless mode checks decoded video and an Opus tone decoded by opus-rs. `desktop-spike.yml` runs it on five desktop targets with a screenshot (dispatch or the `desktop-spike` PR label). Findings and go / no-go notes in `docs/m0-spike.md`.
+
+### Added — Licence gate
+- `cargo-deny` (`deny.toml`, `apps/desktop/deny.toml`) in CI: permissive licences only, no GPL / LGPL / AGPL, MPL-2.0 only for three named GPUI dependencies; git sources limited to the engine fork. `parolnet-cli` and `parolnet-authority-cli` now declare `MIT OR Apache-2.0`.
+
+### Changed — Codec2 is opt-in; `mesh` is a feature
+- The `codec2` crate is LGPL-2.1, so `parolnet-core` builds Codec2 only with the opt-in `codec2` feature; without it `AudioConfig::low_bandwidth()` encoders and decoders return `CodecInit`. Codec2 tests run under the feature. PNP-011 removes Codec2 in M1.
+- `parolnet-core`'s `parolnet-mesh` dependency is behind a new `mesh` feature (default on; `parolnet-cli` and `parolnet-conformance` enable it).
 
 ### Fixed — PWA QR pairing regression: lookup-null falls through to home relay
 - Reverts the narrow "lookup-null without cache confirmation → persist to `pending_sends`" branch introduced in the prior "durable cross-relay sends" fix. That branch broke QR pairing: first-contact bootstrap envelopes legitimately have no presence-cache entry and often see a null `peer_lookup` result if the provider's presence hasn't propagated yet, so the bootstrap was silently queued instead of sent. The scanner's UI reported "connected" (the scan itself succeeded) while the provider never received the envelope.

@@ -315,9 +315,8 @@ parolnet/
 ├── rust-toolchain.toml            # Rust toolchain (stable channel)
 ├── CLAUDE.md                      # AI assistant instructions
 ├── CONTRIBUTING.md                # Contributor guide
-├── THREAT_MODEL.md                # STRIDE security analysis
-├── STRATEGIES.md                  # Adoption and distribution playbook
-├── ROADMAP.md                     # Development roadmap
+├── THREAT_MODEL.md                # Threat model 1.0
+├── docs/                          # Milestone notes (m0-spike.md) and archive/
 ├── CHANGELOG.md                   # Version history
 ├── IMPLEMENTATION_STATUS.md       # Current code vs protocol design target
 └── README.md                      # Project overview
@@ -501,8 +500,8 @@ If you are contributing code, these rules are non-negotiable. Every pull request
 
 - [README.md](README.md) -- Project overview, architecture diagram, security model
 - [CONTRIBUTING.md](CONTRIBUTING.md) -- How to submit pull requests, coding conventions, review process
-- [THREAT_MODEL.md](THREAT_MODEL.md) -- STRIDE security analysis
-- [STRATEGIES.md](STRATEGIES.md) -- Adoption and distribution strategy
-- [ROADMAP.md](ROADMAP.md) -- Development roadmap and milestones
+- [THREAT_MODEL.md](THREAT_MODEL.md) -- Threat model (version 1.0)
+- [docs/m0-spike.md](docs/m0-spike.md) -- M0 spike findings and go / no-go notes
+- [docs/archive/](docs/archive/) -- The earlier strategy, roadmap and threat model (0.2)
 - [IMPLEMENTATION_STATUS.md](IMPLEMENTATION_STATUS.md) -- What the current code actually implements
 - [specs/](specs/) -- Protocol specifications (PNP-001 through PNP-009), the design target for wire formats and behavior

@@ -17,12 +17,13 @@
 // 10 minutes. So connection setup is non-trickle (the offer / answer carries
 // the gathered candidates in its SDP), new offers are staggered, retries back
 // off exponentially and stop while the peer is known to be offline.
-import { currentView, currentPeerId } from './state.js';
-import { showToast } from './utils.js';
+import { currentView, currentPeerId, wasm } from './state.js';
+import { showToast, showErrorToast } from './utils.js';
 import { dbGet, dbPut, dbDelete } from './db.js';
 import { telemetry } from './telemetry.js';
-import { connMgr, flushMessageQueue } from './connection.js';
-import { onIncomingMessage } from './messaging.js';
+import { connMgr, flushMessageQueue, flushBootstrapQueue } from './connection.js';
+import { onIncomingMessage, persistSessions } from './messaging.js';
+import { MSG_TYPE_CHANNEL_BINDING } from './protocol-constants.js';
 import { t } from './i18n.js';
 import {
     shouldInitiate, nextRetryDelayMs, rateLimitBackoffMs, takeOfferSlot,
@@ -31,7 +32,7 @@ import {
 } from './relay-profile.js';
 
 // ── WebRTC Peer Connections ────────────────────────────────
-export const rtcConnections = {}; // peerId -> { pc, dc, status, isInitiator, descSent, lateIce, pendingIce }
+export const rtcConnections = {}; // peerId -> { pc, dc, status, isInitiator, descSent, lateIce, pendingIce, bindingSent, verified, bindingTimer }
 
 // No third-party STUN by default. Contacting public STUN (e.g. Google) leaks
 // the client IP to the STUN operator. STUN comes from the relay we use
@@ -286,6 +287,8 @@ const OFFER_FALLBACK_MS = 10_000;
 const ANSWER_TIMEOUT_MS = 20_000;
 const GATHER_TIMEOUT_MS = 3_000;
 const DISCONNECT_GRACE_MS = 5_000;
+// PNP-001-MUST-081: the peer's channel binding must verify this long after the channel opens.
+const BINDING_TIMEOUT_MS = 20_000;
 const USER_INTENT_WINDOW_MS = 10 * 60_000;
 
 function ps(peerId) {
@@ -462,7 +465,8 @@ export async function initWebRTC(peerId, isInitiator) {
 
     const pc = new RTCPeerConnection(getRtcConfig());
     const conn = { pc, dc: null, status: 'connecting', isInitiator: !!isInitiator,
-                   descSent: false, lateIce: 0, pendingIce: [] };
+                   descSent: false, lateIce: 0, pendingIce: [],
+                   bindingSent: false, verified: false, bindingTimer: null };
     rtcConnections[peerId] = conn;
     const relayOnly = isRelayOnlyActive();
 
@@ -542,14 +546,22 @@ function setupDataChannel(peerId, dc, conn) {
         } catch(e) {}
         conn.status = 'open';
         const st = ps(pid);
-        st.attempt = 0;
         st.online = true;
         clearTimer(st, 'retryTimer');
         clearTimer(st, 'waitTimer');
         clearTimer(st, 'answerTimer');
-        updatePeerConnectionUI(pid, 'direct');
-        emitPath(pid, 'open');
-        flushMessageQueue({ peerId: pid });
+        // PNP-001 §10.5.1: the scanner's bootstrap envelope first, then our binding. The
+        // channel counts as direct (and the queue flushes) only once the peer's binding
+        // verifies; without one in BINDING_TIMEOUT_MS the connection closes.
+        flushBootstrapQueue(pid, (payload) => sendOnChannel(conn, payload));
+        maybeSendChannelBinding(pid);
+        conn.bindingTimer = setTimeout(() => {
+            conn.bindingTimer = null;
+            const key = keyOf();
+            if (conn.verified || rtcConnections[key] !== conn) return;
+            console.warn('[WebRTC] no channel binding from', key.slice(0, 8), '- closing');
+            connectionFailed(key, conn.pc, conn);
+        }, BINDING_TIMEOUT_MS);
     };
 
     dc.onclose = () => {
@@ -684,9 +696,71 @@ export async function handleRTCIce(fromPeerId, candidateJson) {
     await pc.addIceCandidate(new RTCIceCandidate(candidate));
 }
 
+function sendOnChannel(conn, payload) {
+    if (!conn || !conn.dc || conn.dc.readyState !== 'open') return false;
+    try {
+        conn.dc.send(JSON.stringify({ type: 'chat', payload: payload }));
+        return true;
+    } catch (e) {
+        console.warn('[WebRTC] dc.send failed:', e && e.message);
+        return false;
+    }
+}
+
+/// PNP-001-MUST-079: send our CHANNEL_BINDING on `peerId`'s open data channel once we hold
+/// a session with them (a presenter: after the scanner's bootstrap envelope). Once per
+/// connection.
+export function maybeSendChannelBinding(peerId) {
+    const conn = rtcConnections[peerId];
+    if (!conn || conn.bindingSent || !conn.dc || conn.dc.readyState !== 'open') return;
+    if (!wasm || !wasm.channel_binding_body || !wasm.has_session || !wasm.has_session(peerId)) return;
+    const local = conn.pc.localDescription && conn.pc.localDescription.sdp;
+    const remote = conn.pc.remoteDescription && conn.pc.remoteDescription.sdp;
+    if (!local || !remote) return;
+    try {
+        const body = wasm.channel_binding_body(local, remote);
+        const nowSecs = BigInt(Math.floor(Date.now() / 1000));
+        const env = wasm.envelope_encode(peerId, MSG_TYPE_CHANNEL_BINDING, body, nowSecs);
+        if (sendOnChannel(conn, env)) {
+            conn.bindingSent = true;
+            persistSessions();
+        }
+    } catch (e) {
+        console.warn('[WebRTC] channel binding not sent:', e && e.message);
+    }
+}
+
+/// PNP-001-MUST-080: the peer's CHANNEL_BINDING. A match makes the channel direct (and
+/// flushes the queue); anything else closes the connection and tells the user.
+export function handleChannelBinding(fromPeerId, plaintext) {
+    const conn = rtcConnections[fromPeerId];
+    if (!conn || conn.verified || !conn.dc || conn.dc.readyState !== 'open') return;
+    const local = conn.pc.localDescription && conn.pc.localDescription.sdp;
+    const remote = conn.pc.remoteDescription && conn.pc.remoteDescription.sdp;
+    const ok = !!(local && remote && wasm && wasm.channel_binding_verify &&
+                  wasm.channel_binding_verify(plaintext, local, remote));
+    if (!ok) {
+        console.warn('[WebRTC] channel binding from', fromPeerId.slice(0, 8), 'does not match - closing');
+        showErrorToast(t('toast.channelBindingFailed', { name: fromPeerId.slice(0, 8) }));
+        if (conn.bindingTimer) { clearTimeout(conn.bindingTimer); conn.bindingTimer = null; }
+        cleanupRTC(fromPeerId);
+        emitPath(fromPeerId, 'binding-failed');
+        scheduleRetry(fromPeerId, conn);
+        return;
+    }
+    conn.verified = true;
+    if (conn.bindingTimer) { clearTimeout(conn.bindingTimer); conn.bindingTimer = null; }
+    console.log('[WebRTC] direct channel verified with', fromPeerId.slice(0, 8));
+    maybeSendChannelBinding(fromPeerId);
+    ps(fromPeerId).attempt = 0;
+    updatePeerConnectionUI(fromPeerId, 'direct');
+    emitPath(fromPeerId, 'open');
+    flushMessageQueue({ peerId: fromPeerId });
+}
+
 export function sendViaWebRTC(peerId, payload) {
     const conn = rtcConnections[peerId];
-    if (conn && conn.dc && conn.dc.readyState === 'open') {
+    if (conn && conn.verified && conn.dc && conn.dc.readyState === 'open') {
         try {
             conn.dc.send(JSON.stringify({ type: 'chat', payload: payload }));
             return true;
@@ -734,6 +808,7 @@ export function cleanupRTC(peerId) {
     const conn = rtcConnections[peerId];
     if (conn) {
         conn.status = 'closed';
+        if (conn.bindingTimer) { clearTimeout(conn.bindingTimer); conn.bindingTimer = null; }
         if (conn.dc) try { conn.dc.close(); } catch(e) {}
         if (conn.pc) try { conn.pc.close(); } catch(e) {}
     }
@@ -752,9 +827,11 @@ export function updatePeerConnectionUI(peerId, type) {
     }
 }
 
+/// An open data channel whose channel binding verified (PNP-001 §10.5.1). Content, call
+/// signals and the "direct" status wait for it.
 export function hasDirectConnection(peerId) {
     const conn = rtcConnections[peerId];
-    return !!(conn && conn.dc && conn.dc.readyState === 'open');
+    return !!(conn && conn.verified && conn.dc && conn.dc.readyState === 'open');
 }
 
 // ── WebRTC Gossip Mesh ─────────────────────────────────────

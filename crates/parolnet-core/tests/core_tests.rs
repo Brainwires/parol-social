@@ -491,6 +491,7 @@ fn test_opus_encode_decode_roundtrip() {
 }
 
 #[test]
+#[cfg(feature = "codec2")]
 fn test_codec2_encode_decode_roundtrip() {
     use parolnet_core::audio::{AudioConfig, AudioDecoder, AudioEncoder};
 
@@ -800,6 +801,7 @@ fn test_pnp007_opus_frame_samples_320() {
 }
 
 #[test]
+#[cfg(feature = "codec2")]
 fn test_pnp007_codec2_frame_samples_160() {
     use parolnet_core::audio::{AudioConfig, AudioEncoder};
     let config = AudioConfig::low_bandwidth();
@@ -1058,6 +1060,7 @@ fn test_opus_encode_sine_wave() {
 }
 
 #[test]
+#[cfg(feature = "codec2")]
 fn test_codec2_encode_sine_wave() {
     use parolnet_core::audio::{AudioConfig, AudioDecoder, AudioEncoder};
     let config = AudioConfig::low_bandwidth();
@@ -1094,6 +1097,7 @@ fn test_opus_multiple_frames() {
 }
 
 #[test]
+#[cfg(feature = "codec2")]
 fn test_codec2_multiple_frames() {
     use parolnet_core::audio::{AudioConfig, AudioDecoder, AudioEncoder};
     let config = AudioConfig::low_bandwidth();
@@ -1129,6 +1133,7 @@ fn test_opus_compressed_size_reasonable() {
 }
 
 #[test]
+#[cfg(feature = "codec2")]
 fn test_codec2_compressed_size_tiny() {
     use parolnet_core::audio::{AudioConfig, AudioEncoder};
     let config = AudioConfig::low_bandwidth();
@@ -1153,8 +1158,13 @@ fn test_audio_encoder_codec_type_field() {
     let opus_enc = AudioEncoder::new(&AudioConfig::default()).unwrap();
     assert_eq!(opus_enc.codec_type, AudioCodec::Opus);
 
-    let c2_enc = AudioEncoder::new(&AudioConfig::low_bandwidth()).unwrap();
-    assert_eq!(c2_enc.codec_type, AudioCodec::Codec2);
+    #[cfg(feature = "codec2")]
+    {
+        let c2_enc = AudioEncoder::new(&AudioConfig::low_bandwidth()).unwrap();
+        assert_eq!(c2_enc.codec_type, AudioCodec::Codec2);
+    }
+    #[cfg(not(feature = "codec2"))]
+    assert!(AudioEncoder::new(&AudioConfig::low_bandwidth()).is_err());
 }
 
 #[test]
@@ -1165,8 +1175,13 @@ fn test_audio_decoder_codec_type_field() {
     let opus_dec = AudioDecoder::new(&AudioConfig::default()).unwrap();
     assert_eq!(opus_dec.codec_type, AudioCodec::Opus);
 
-    let c2_dec = AudioDecoder::new(&AudioConfig::low_bandwidth()).unwrap();
-    assert_eq!(c2_dec.codec_type, AudioCodec::Codec2);
+    #[cfg(feature = "codec2")]
+    {
+        let c2_dec = AudioDecoder::new(&AudioConfig::low_bandwidth()).unwrap();
+        assert_eq!(c2_dec.codec_type, AudioCodec::Codec2);
+    }
+    #[cfg(not(feature = "codec2"))]
+    assert!(AudioDecoder::new(&AudioConfig::low_bandwidth()).is_err());
 }
 
 #[test]

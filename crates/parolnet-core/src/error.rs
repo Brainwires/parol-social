@@ -40,7 +40,7 @@ pub enum CoreError {
     #[error("relay error: {0}")]
     Relay(#[from] parolnet_relay::RelayError),
 
-    #[cfg(feature = "native")]
+    #[cfg(feature = "mesh")]
     #[error("mesh error: {0}")]
     Mesh(#[from] parolnet_mesh::MeshError),
 }
@@ -65,7 +65,7 @@ impl CoreError {
             CoreError::Transport(_) => "transport error",
             #[cfg(feature = "native")]
             CoreError::Relay(_) => "relay error",
-            #[cfg(feature = "native")]
+            #[cfg(feature = "mesh")]
             CoreError::Mesh(_) => "mesh error",
         }
     }

@@ -1,0 +1,54 @@
+[workspace]
+# Its own workspace: see the root Cargo.toml's `exclude`.
+
+[package]
+name = "parolnet-desktop"
+version = "0.0.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+publish = false
+description = "ParolNet desktop client (GPUI): M1 chat UI v0, plus the M0 video spike"
+
+[dependencies]
+parolnet-rtc = { path = "../../crates/parolnet-rtc" }
+parolnet-app = { path = "../../crates/parolnet-app" }
+
+# GPUI: exact pins, Cargo.lock committed; upgrades are their own train. gpui-pre is the
+# snapshot of zed@main that gpui-component publishes against (docs/m0-spike.md, "GPUI pin").
+gpui = { package = "gpui-pre", version = "=0.3.12" }
+gpui-platform = { package = "gpui-pre-platform", version = "=0.3.12", features = ["font-kit", "x11", "wayland"] }
+gpui-component = { version = "=0.10.0", default-features = false }
+
+tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "sync", "time", "macros"] }
+anyhow = "1"
+# Pairing QR code (the PWA scans the same hex payload).
+qrcode = { version = "0.14", default-features = false }
+image = { version = "0.25", default-features = false, features = ["png"] }
+yuv = "0.8"
+# M0 interop check of the pure-Rust Opus decoder against Chromium's libopus (docs/m0-spike.md).
+opus-rs = "=0.1.42"
+# Call audio: microphone and speakers.
+cpal = "0.18"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2-core-foundation = { version = "0.3.2", features = ["CFDictionary", "CFString"] }
+objc2-core-video = { version = "0.3.2", features = ["CVBase", "CVBuffer", "CVImageBuffer", "CVPixelBuffer", "CVReturn"] }
+
+[build-dependencies]
+cc = "1"
+pkg-config = "0.3"
+vcpkg = "0.2"
+
+[profile.dev]
+# The VP8 decoder and colour conversion are unusable at opt-level 0.
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3
+
+[features]
+# Compile GPUI's Metal shaders at launch instead of with Xcode's `metal` tool at build time
+# (for machines with only the Command Line Tools).
+runtime-shaders = ["gpui-platform/runtime_shaders"]

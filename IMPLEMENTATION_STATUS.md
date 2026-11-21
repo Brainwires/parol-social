@@ -1,19 +1,25 @@
 # ParolNet Implementation Status
 
 ### Document Status: CURRENT CODE SNAPSHOT
-### Date: 2026-04-15
+### Date: 2026-11-20 (milestone M0)
 
-This document records what the repository currently implements versus what the protocol specifications describe. The `specs/` directory remains the design target for the protocol suite, but not every specification is fully wired into the browser app or relay server yet.
+This document records what the repository implements today versus what the protocol
+specifications and the plan describe. The `specs/` directory is the design target; not every
+specification is wired into the PWA, the relay server or the desktop client yet.
 
 ## Summary
 
-ParolNet currently contains a working Rust workspace, a browser PWA shell, a relay server, and substantial protocol primitives. It should be treated as an active prototype, not as a production-ready safety tool for high-risk users.
+ParolNet is being repositioned (M0) from a censorship-circumvention messenger into a general-purpose,
+decentralized, end-to-end encrypted communication system: calls, messages, files and data channels,
+with Rust crates, a federated relay, GPUI desktop clients and the PWA. See [README.md](README.md) and
+[THREAT_MODEL.md](THREAT_MODEL.md) (version 1.0).
 
-The current user-facing PWA sends encrypted messages over a direct WebSocket relay and optional WebRTC data channels. It does not yet route normal PWA chat traffic through completed 3-hop onion circuits with constant-rate cover traffic.
+It is pre-release and unaudited. The PWA sends end-to-end encrypted messages over the relay
+WebSocket and WebRTC data channels; native clients do not exist yet beyond the M0 video spike.
 
 ## Workspace
 
-The Cargo workspace currently has 9 members:
+The root Cargo workspace has 14 members; the desktop app is a separate workspace.
 
 | Crate | Current role |
 |------|--------------|
@@ -21,11 +27,57 @@ The Cargo workspace currently has 9 members:
 | `parolnet-protocol` | Wire types, CBOR codec, padding, gossip/message/address types |
 | `parolnet-transport` | Native TLS and WebSocket transport building blocks |
 | `parolnet-mesh` | Gossip, peer manager, store-forward, UDP broadcast discovery |
-| `parolnet-relay` | Relay cells, circuit primitives, onion encryption helpers, relay directory |
+| `parolnet-relay` | Relay cells, circuit primitives, onion encryption helpers, relay directory, federation |
 | `parolnet-core` | Client/session/bootstrap APIs, media/file/group helpers, panic wipe helpers |
 | `parolnet-wasm` | Browser bindings for crypto/session/bootstrap/core functions |
 | `parolnet-relay-server` | Axum WebSocket relay. Default signaling-only profile (registration, SDP/ICE between online peers, presence push, directory read, STUN URIs; resource bounds per PNP-001 §10.6); opt-in relay profile adds store-forward, tokens, onion cells, gossip, TURN credentials, federation |
 | `parolnet-authority-cli` | Authority key and relay endorsement CLI |
+| `parolnet-cli` | Headless test client (QR bootstrap, messaging over the relay) |
+| `parolnet-clause`, `parolnet-conformance` | Spec-clause attribute and the conformance suite |
+| `parolnet-rtc` | **New (M0, extended in M1).** Async driver for the sans-I/O `webrtc-rs-rtc` engine |
+| `parolnet-app` | **New (M1).** Headless client core: identity, pairing, signaling, direct data channels, 1:1 chat |
+| `xtask` | Clause and test-vector tooling |
+| `apps/desktop` (own workspace) | **New (M0/M1).** GPUI client: contacts, pairing, chat (UI v0); the M0 video spike behind `--spike` |
+
+## M1 (in progress): first slice
+
+See [docs/m1-desktop.md](docs/m1-desktop.md) for what runs end to end, the tests and the next slice.
+
+- **`parolnet-app`** (new): identity load / create, the PWA's QR / code pairing (PNP-003 +
+  PNP-001 §5.3.1), the relay's signaling-only profile (register by challenge, `watch` /
+  `presence`, non-trickle `rtc_offer` / `rtc_answer`, `rtc_ice`), one direct WebRTC connection per
+  contact with the PWA's `parolnet` data channel and JSON frames, 1:1 chat as PNP-001 TEXT
+  envelopes, a sender-side queue (PWA limits) flushed when the channel opens, and the
+  "no direct path" state. State is a JSON file in the data directory, **not yet encrypted at
+  rest** (`parolnet-store` replaces it).
+- **`parolnet-rtc`**: server-reflexive candidates from STUN (binding request on the connection's
+  socket before its loop starts), text data-channel messages, the channel label on open,
+  `default_local_ip`. Engine pin `v0.22.0+brainwires.5` (was `.3`; `.5` follows ICE renomination).
+- **Desktop**: chat UI v0 (contact list with path badges, pairing screen with QR code and code
+  entry, chat view with delivery state, rename, retry, the no-path message).
+
+## M0
+
+- **`parolnet-rtc` skeleton.** One tokio task per peer connection owns its UDP socket and the
+  engine's timers; commands in (offer, answer, remote candidates, data, keyframe requests, stats),
+  events out (local description, states, tracks, RTP, data-channel messages). Host candidates on
+  the bound socket only; srflx / TURN gathering, multiple sockets and the virtual-time mode are M1.
+  A loopback test connects two drivers and exchanges data-channel messages.
+- **Engine pin.** `rtc` from `Brainwires/webrtc-rs-rtc` tag `v0.22.0+brainwires.1` (git dependency).
+- **Desktop spike** (`apps/desktop`). A GPUI window shows a VP8 stream that headless Chromium sends
+  through `webrtc-rs-rtc`; libvpx decodes it; macOS draws an IOSurface-backed NV12 `CVPixelBuffer`
+  with `gpui::surface()`, other platforms a BGRA `RenderImage`. Verified on macOS arm64 (headless
+  decode and the pixel-buffer path); the window and the other four targets run in the dispatched
+  `desktop-spike.yml` workflow. Findings and go / no-go notes: [docs/m0-spike.md](docs/m0-spike.md).
+- **Licence gate.** `cargo-deny` (`deny.toml`, `apps/desktop/deny.toml`) runs in CI: permissive
+  licences only, MPL-2.0 only for three named crates GPUI brings, no GPL / LGPL / AGPL.
+- **Codec2 is opt-in.** The `codec2` crate is LGPL-2.1, so `parolnet-core` builds it only with the
+  `codec2` feature (off by default); PNP-011 removes Codec2 in M1.
+- **`mesh` feature.** `parolnet-core`'s dependency on `parolnet-mesh` sits behind a `mesh` feature
+  (on by default, so nothing changes for existing users; the desktop client will build without it).
+  A `hardened` feature for the onion circuit / bridge / traffic-shaping modules is **not** in yet:
+  the relay node's handshake and pool are built on the onion module, so separating them needs a
+  design pass (M1).
 
 ## Current User-Facing Path
 
@@ -87,6 +139,13 @@ This path provides end-to-end content encryption when a Double Ratchet session e
 - mDNS `_parolnet._tcp` discovery. Current code uses UDP broadcast with an HMAC-derived tag and masked PeerId.
 - Full domain fronting with HTTP/2 DATA frame wrapping (current bridge mode uses standard WebSocket over CDN proxy).
 - Certificate pinning.
+
+## Known Dependency Advisories
+
+`cargo deny check advisories` reports advisories on the existing tree (for example
+`hickory-proto` 0.24, `crypto-bigint` 0.5, `anyhow` 1.0.102) and unmaintained crates in GPUI's
+graph. CI gates licences, sources and bans today; advisories become a gate once these are updated
+(M1 dependency train).
 
 ## Documentation Rule
 

@@ -310,5 +310,6 @@
   "notice.ipAvoid": "Чтобы скрыть свой IP-адрес, добавьте свой TURN-сервер в Настройках и включите «Ретрансляция через мой TURN-сервер».",
   "notice.ipOpenSettings": "Открыть Настройки",
   "notice.ipOk": "Понятно",
-  "toast.callMediaTimeout": "Media never connected — ICE/TURN may be blocked."
+  "toast.callMediaTimeout": "Media never connected — ICE/TURN may be blocked.",
+  "toast.channelBindingFailed": "Прямое соединение с {name} не прошло сквозную проверку и было закрыто. Кто-то между вами, например ретранслятор, может вмешиваться."
 }

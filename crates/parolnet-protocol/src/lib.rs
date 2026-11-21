@@ -14,6 +14,7 @@
 //! This crate has no async runtime dependency and compiles to WASM.
 
 pub mod address;
+pub mod channel_binding;
 pub mod codec;
 pub mod envelope;
 pub mod ephemeral;
