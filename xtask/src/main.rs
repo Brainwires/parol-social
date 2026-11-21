@@ -1,9 +1,15 @@
 //! xtask — workspace tooling.
 //!
 //! Current commands:
-//!   * `clauses` — compute spec-clause coverage across PNP-001..PNP-009.
-//!   * `clauses --check` — fail if MUST coverage < threshold. Used in CI.
-//!   * `clauses --report` — rewrite the coverage column of specs/SPEC-INDEX.md.
+//!   * `clauses` — compute spec-clause coverage across the PNP specs: for each level, how
+//!     many clauses have a `#[clause(...)]` test in `crates/parolnet-conformance`.
+//!   * `clauses --check` — fail unless every MUST and every SHOULD clause has a test and
+//!     every `#[clause]` id is one a spec publishes. MAY clauses are reported, not required.
+//!     Clauses marked `[DEPRECATED]` in a spec are not counted. Used in CI.
+//!   * `clauses --report` — regenerate the registry table of specs/SPEC-INDEX.md (versions,
+//!     statuses, clause counts, coverage) and its date.
+//!   * `clauses --check-index` — fail if `--report` would change specs/SPEC-INDEX.md. Used
+//!     in CI.
 //!   * `vectors --validate` — parse every specs/vectors/PNP-XXX/*.json and
 //!     ensure its declared `clause` field references a real clause ID.
 
@@ -25,12 +31,15 @@ struct Cli {
 enum Cmd {
     /// Compute spec-clause coverage.
     Clauses {
-        /// Fail with exit code 1 if any MUST clause is uncovered.
+        /// Fail with exit code 1 unless every MUST and every SHOULD clause has a test.
         #[arg(long)]
         check: bool,
-        /// Rewrite the coverage column of specs/SPEC-INDEX.md.
+        /// Regenerate the registry table of specs/SPEC-INDEX.md.
         #[arg(long)]
         report: bool,
+        /// Fail with exit code 1 if specs/SPEC-INDEX.md is not what `--report` writes.
+        #[arg(long)]
+        check_index: bool,
     },
     /// Validate that every specs/vectors/PNP-XXX/*.json parses and
     /// references a real clause ID.
@@ -57,18 +66,26 @@ fn workspace_root() -> PathBuf {
 fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.cmd {
-        Cmd::Clauses { check, report } => run_clauses(check, report),
+        Cmd::Clauses {
+            check,
+            report,
+            check_index,
+        } => run_clauses(check, report, check_index),
         Cmd::Vectors { validate } => run_vectors(validate),
     }
 }
 
 // ---- clause coverage ------------------------------------------------------
 
+/// The normative clauses of one spec, by level.
 #[derive(Debug, Default, Clone)]
 struct ClauseSet {
     must: BTreeSet<String>,
     should: BTreeSet<String>,
     may: BTreeSet<String>,
+    /// Clauses marked `[DEPRECATED]` in the spec text: still published (ids are never
+    /// recycled), no longer normative, so not counted and not required to have a test.
+    deprecated: BTreeSet<String>,
 }
 
 impl ClauseSet {
@@ -81,9 +98,20 @@ impl ClauseSet {
             self.may.insert(id.to_string());
         }
     }
-    #[allow(dead_code)]
-    fn total(&self) -> usize {
-        self.must.len() + self.should.len() + self.may.len()
+
+    fn retire(&mut self, id: &str) {
+        self.must.remove(id);
+        self.should.remove(id);
+        self.may.remove(id);
+        self.deprecated.insert(id.to_string());
+    }
+
+    fn all(&self) -> impl Iterator<Item = &String> {
+        self.must
+            .iter()
+            .chain(&self.should)
+            .chain(&self.may)
+            .chain(&self.deprecated)
     }
 }
 
@@ -91,29 +119,102 @@ fn clause_regex() -> Regex {
     Regex::new(r"\bPNP-(\d{3})-(MUST|SHOULD|MAY)-(\d{3})\b").unwrap()
 }
 
-fn collect_spec_clauses(root: &Path) -> Result<BTreeMap<String, ClauseSet>> {
+/// `**PNP-001-MUST-042** [DEPRECATED]` (the bold markers are optional): the marker follows
+/// the clause id directly, as SPEC-INDEX.md's "Clause ID Grammar" prescribes.
+fn deprecated_regex() -> Regex {
+    Regex::new(r"\b(PNP-\d{3}-(?:MUST|SHOULD|MAY)-\d{3})\b\**\s*\[DEPRECATED\]").unwrap()
+}
+
+/// Version, status and date as a spec's header states them.
+#[derive(Debug, Default, Clone)]
+struct SpecMeta {
+    heading: String,
+    version: String,
+    status: String,
+    date: String,
+}
+
+fn parse_meta(text: &str) -> SpecMeta {
+    // Two header styles are in use: `### Version: 0.14` and `**Version:** 0.7`; the date is
+    // `Date` or `Last-Updated`. Only the header (the lines before the first `---` or `## `)
+    // is searched.
+    let field =
+        Regex::new(r"^(?:###\s*|\*\*)(Status|Version|Date|Last-Updated):\**\s*(.+?)\s*$").unwrap();
+    let mut meta = SpecMeta::default();
+    for line in text.lines() {
+        if line.starts_with("---") || line.starts_with("## ") {
+            break;
+        }
+        if let Some(h) = line.strip_prefix("# ") {
+            let title = h.split_once(':').map(|(_, t)| t).unwrap_or(h);
+            meta.heading = title.trim().to_string();
+        } else if let Some(c) = field.captures(line) {
+            let value = c[2].to_string();
+            match &c[1] {
+                "Status" => meta.status = value,
+                "Version" => meta.version = value,
+                _ => meta.date = value,
+            }
+        }
+    }
+    meta
+}
+
+struct Spec {
+    clauses: ClauseSet,
+    meta: SpecMeta,
+}
+
+fn collect_specs(root: &Path) -> Result<BTreeMap<String, Spec>> {
     let re = clause_regex();
-    let mut out: BTreeMap<String, ClauseSet> = BTreeMap::new();
+    let dep = deprecated_regex();
+    let name_re = Regex::new(r"^(PNP-\d{3})-").unwrap();
+    let mut clauses: BTreeMap<String, ClauseSet> = BTreeMap::new();
+    let mut metas: BTreeMap<String, SpecMeta> = BTreeMap::new();
+    let mut retired: Vec<String> = Vec::new();
     let specs = root.join("specs");
-    for e in WalkDir::new(&specs).max_depth(1) {
+    for e in WalkDir::new(&specs).max_depth(1).sort_by_file_name() {
         let e = e?;
         let path = e.path();
         if path.extension().and_then(|s| s.to_str()) != Some("md") {
             continue;
         }
         let fname = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
-        if !fname.starts_with("PNP-") {
+        let Some(own) = name_re.captures(fname).map(|c| c[1].to_string()) else {
             continue;
-        }
+        };
         let text =
             std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
+        metas.insert(own.clone(), parse_meta(&text));
+        clauses.entry(own).or_default();
+        // A clause id belongs to the spec its number names, wherever it is mentioned.
         for cap in re.captures_iter(&text) {
             let spec = format!("PNP-{}", &cap[1]);
-            let id = cap[0].to_string();
-            out.entry(spec).or_default().insert(&id);
+            clauses.entry(spec).or_default().insert(&cap[0]);
+        }
+        for cap in dep.captures_iter(&text) {
+            retired.push(cap[1].to_string());
         }
     }
-    Ok(out)
+    for id in &retired {
+        if let Some(set) = clauses.get_mut(&id[..7]) {
+            set.retire(id);
+        }
+    }
+    Ok(clauses
+        .into_iter()
+        .map(|(name, set)| {
+            let meta = metas.remove(&name).unwrap_or_default();
+            (name, Spec { clauses: set, meta })
+        })
+        .collect())
+}
+
+fn collect_spec_clauses(root: &Path) -> Result<BTreeMap<String, ClauseSet>> {
+    Ok(collect_specs(root)?
+        .into_iter()
+        .map(|(name, spec)| (name, spec.clauses))
+        .collect())
 }
 
 fn collect_conformance_clauses(root: &Path) -> Result<BTreeSet<String>> {
@@ -149,186 +250,285 @@ fn collect_conformance_clauses(root: &Path) -> Result<BTreeSet<String>> {
     Ok(out)
 }
 
+/// Covered / total for one level.
+#[derive(Clone, Copy, Default)]
+struct Tally {
+    covered: usize,
+    total: usize,
+}
+
+impl Tally {
+    fn of(ids: &BTreeSet<String>, covered: &BTreeSet<String>) -> Tally {
+        Tally {
+            covered: ids.iter().filter(|id| covered.contains(*id)).count(),
+            total: ids.len(),
+        }
+    }
+
+    fn pct(self) -> f64 {
+        if self.total == 0 {
+            100.0
+        } else {
+            100.0 * self.covered as f64 / self.total as f64
+        }
+    }
+
+    fn add(&mut self, other: Tally) {
+        self.covered += other.covered;
+        self.total += other.total;
+    }
+}
+
+impl std::fmt::Display for Tally {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}/{}", self.covered, self.total)
+    }
+}
+
 struct Coverage {
     spec: String,
-    must_total: usize,
-    must_covered: usize,
-    should_total: usize,
-    should_covered: usize,
-    may_total: usize,
-    may_covered: usize,
+    meta: SpecMeta,
+    must: Tally,
+    should: Tally,
+    may: Tally,
+    deprecated: usize,
 }
 
-impl Coverage {
-    fn must_pct(&self) -> f64 {
-        if self.must_total == 0 {
-            100.0
-        } else {
-            100.0 * self.must_covered as f64 / self.must_total as f64
-        }
+fn coverage_rows(specs: &BTreeMap<String, Spec>, covered: &BTreeSet<String>) -> Vec<Coverage> {
+    specs
+        .iter()
+        .map(|(name, spec)| Coverage {
+            spec: name.clone(),
+            meta: spec.meta.clone(),
+            must: Tally::of(&spec.clauses.must, covered),
+            should: Tally::of(&spec.clauses.should, covered),
+            may: Tally::of(&spec.clauses.may, covered),
+            deprecated: spec.clauses.deprecated.len(),
+        })
+        .collect()
+}
+
+fn totals(rows: &[Coverage]) -> (Tally, Tally, Tally) {
+    let mut t = (Tally::default(), Tally::default(), Tally::default());
+    for r in rows {
+        t.0.add(r.must);
+        t.1.add(r.should);
+        t.2.add(r.may);
     }
-    fn should_pct(&self) -> f64 {
-        if self.should_total == 0 {
-            100.0
-        } else {
-            100.0 * self.should_covered as f64 / self.should_total as f64
-        }
+    t
+}
+
+fn print_ids(label: &str, ids: &[&String]) {
+    if ids.is_empty() {
+        return;
+    }
+    let full = std::env::var("XTASK_FULL").is_ok();
+    let shown = if full { ids.len() } else { ids.len().min(40) };
+    eprintln!("{label} ({}):", ids.len());
+    for id in &ids[..shown] {
+        eprintln!("  {id}");
+    }
+    if shown < ids.len() {
+        eprintln!(
+            "  ... {} more (set XTASK_FULL=1 to see all)",
+            ids.len() - shown
+        );
     }
 }
 
-fn run_clauses(check: bool, report: bool) -> Result<()> {
+fn run_clauses(check: bool, report: bool, check_index: bool) -> Result<()> {
     let root = workspace_root();
-    let spec = collect_spec_clauses(&root)?;
+    let specs = collect_specs(&root)?;
     let covered = collect_conformance_clauses(&root)?;
-
-    let mut rows: Vec<Coverage> = Vec::new();
-    for (spec_name, set) in &spec {
-        let must_covered = set.must.iter().filter(|id| covered.contains(*id)).count();
-        let should_covered = set.should.iter().filter(|id| covered.contains(*id)).count();
-        let may_covered = set.may.iter().filter(|id| covered.contains(*id)).count();
-        rows.push(Coverage {
-            spec: spec_name.clone(),
-            must_total: set.must.len(),
-            must_covered,
-            should_total: set.should.len(),
-            should_covered,
-            may_total: set.may.len(),
-            may_covered,
-        });
-    }
-    rows.sort_by(|a, b| a.spec.cmp(&b.spec));
+    let rows = coverage_rows(&specs, &covered);
 
     println!(
-        "{:<10}  {:>12}  {:>14}  {:>11}",
+        "{:<10}  {:>14}  {:>14}  {:>12}",
         "Spec", "MUST", "SHOULD", "MAY"
     );
-    println!("{}", "-".repeat(54));
-    let mut total_must = 0usize;
-    let mut total_must_cov = 0usize;
-    let mut total_should = 0usize;
-    let mut total_should_cov = 0usize;
-    let mut uncovered_must: Vec<String> = Vec::new();
+    println!("{}", "-".repeat(58));
     for r in &rows {
         println!(
-            "{:<10}  {:>4}/{:<4} {:>4.0}%  {:>4}/{:<4} {:>4.0}%  {:>2}/{:<2} {:>4.0}%",
+            "{:<10}  {:>9} {:>3.0}%  {:>9} {:>3.0}%  {:>7} {:>3.0}%",
             r.spec,
-            r.must_covered,
-            r.must_total,
-            r.must_pct(),
-            r.should_covered,
-            r.should_total,
-            r.should_pct(),
-            r.may_covered,
-            r.may_total,
-            if r.may_total == 0 {
-                100.0
-            } else {
-                100.0 * r.may_covered as f64 / r.may_total as f64
-            }
+            r.must.to_string(),
+            r.must.pct().floor(),
+            r.should.to_string(),
+            r.should.pct().floor(),
+            r.may.to_string(),
+            r.may.pct().floor(),
         );
-        total_must += r.must_total;
-        total_must_cov += r.must_covered;
-        total_should += r.should_total;
-        total_should_cov += r.should_covered;
-        if let Some(cs) = spec.get(&r.spec) {
-            for id in &cs.must {
-                if !covered.contains(id) {
-                    uncovered_must.push(id.clone());
-                }
-            }
-        }
     }
-    println!("{}", "-".repeat(54));
-    let must_pct = if total_must == 0 {
-        100.0
-    } else {
-        100.0 * total_must_cov as f64 / total_must as f64
-    };
-    let should_pct = if total_should == 0 {
-        100.0
-    } else {
-        100.0 * total_should_cov as f64 / total_should as f64
-    };
+    println!("{}", "-".repeat(58));
+    let (must, should, may) = totals(&rows);
     println!(
-        "TOTAL       {:>4}/{:<4} {:>4.0}%  {:>4}/{:<4} {:>4.0}%",
-        total_must_cov, total_must, must_pct, total_should_cov, total_should, should_pct
+        "{:<10}  {:>9} {:>3.0}%  {:>9} {:>3.0}%  {:>7} {:>3.0}%",
+        "TOTAL",
+        must.to_string(),
+        must.pct().floor(),
+        should.to_string(),
+        should.pct().floor(),
+        may.to_string(),
+        may.pct().floor(),
     );
+    let deprecated: usize = rows.iter().map(|r| r.deprecated).sum();
+    if deprecated > 0 {
+        println!("({deprecated} clause(s) marked [DEPRECATED] are not counted)");
+    }
+
+    let uncovered = |pick: fn(&ClauseSet) -> &BTreeSet<String>| -> Vec<&String> {
+        specs
+            .values()
+            .flat_map(|s| pick(&s.clauses).iter())
+            .filter(|id| !covered.contains(*id))
+            .collect()
+    };
+    let uncovered_must = uncovered(|c| &c.must);
+    let uncovered_should = uncovered(|c| &c.should);
+    let uncovered_may = uncovered(|c| &c.may);
+    // A test pinned to an id no spec publishes proves nothing about any clause.
+    let published: BTreeSet<&String> = specs.values().flat_map(|s| s.clauses.all()).collect();
+    let unknown: Vec<&String> = covered
+        .iter()
+        .filter(|id| !published.contains(id))
+        .collect();
+
+    if !uncovered_may.is_empty() {
+        // Informational: an implementation need not take an option, and an option it does not
+        // take has nothing to test.
+        println!(
+            "\nMAY clauses without a test ({}): {}",
+            uncovered_may.len(),
+            uncovered_may
+                .iter()
+                .map(|s| s.as_str())
+                .collect::<Vec<_>>()
+                .join(" ")
+        );
+    }
 
     if report {
-        rewrite_spec_index(&root, &rows)?;
-        println!("\nRewrote specs/SPEC-INDEX.md coverage column.");
+        let p = root.join("specs/SPEC-INDEX.md");
+        let text = std::fs::read_to_string(&p)?;
+        std::fs::write(&p, render_spec_index(&text, &rows))?;
+        println!("\nRewrote specs/SPEC-INDEX.md (registry table and date).");
+    }
+
+    let mut failed = false;
+    if check_index {
+        let p = root.join("specs/SPEC-INDEX.md");
+        let text = std::fs::read_to_string(&p)?;
+        if render_spec_index(&text, &rows) != text {
+            eprintln!(
+                "\nindex check FAILED: specs/SPEC-INDEX.md is out of date; run \
+                 `cargo xtask clauses --report` and commit the result"
+            );
+            failed = true;
+        } else {
+            println!("\nindex check PASSED");
+        }
     }
 
     if check {
-        if total_must_cov < total_must {
-            eprintln!(
-                "\nclause check FAILED: {} MUST clauses uncovered",
-                uncovered_must.len()
+        // The gate: every MUST and every SHOULD has a conformance test, and every test names
+        // a published clause. MAY coverage is reported above, never required.
+        if uncovered_must.is_empty() && uncovered_should.is_empty() && unknown.is_empty() {
+            println!("\nclause check PASSED");
+        } else {
+            eprintln!("\nclause check FAILED");
+            print_ids("MUST clauses without a conformance test", &uncovered_must);
+            print_ids(
+                "SHOULD clauses without a conformance test",
+                &uncovered_should,
             );
-            let limit = std::env::var("XTASK_FULL").is_ok();
-            let shown = if limit {
-                uncovered_must.len()
-            } else {
-                20.min(uncovered_must.len())
-            };
-            for id in uncovered_must.iter().take(shown) {
-                eprintln!("  uncovered: {id}");
-            }
-            if !limit && uncovered_must.len() > 20 {
-                eprintln!(
-                    "  ... {} more (set XTASK_FULL=1 to see all)",
-                    uncovered_must.len() - 20
-                );
-            }
-            std::process::exit(1);
+            print_ids("#[clause] ids that no spec publishes", &unknown);
+            failed = true;
         }
-        if should_pct < 80.0 {
-            eprintln!("\nclause check FAILED: SHOULD coverage {should_pct:.1}% < 80% threshold");
-            std::process::exit(1);
-        }
-        println!("\nclause check PASSED");
     }
-
+    if failed {
+        std::process::exit(1);
+    }
     Ok(())
 }
 
-fn rewrite_spec_index(root: &Path, rows: &[Coverage]) -> Result<()> {
-    let p = root.join("specs/SPEC-INDEX.md");
-    let text = std::fs::read_to_string(&p)?;
-    let mut out_lines: Vec<String> = Vec::new();
-    for line in text.lines() {
-        if let Some(spec) = line_spec(line)
-            && let Some(r) = rows.iter().find(|r| r.spec == spec)
-        {
-            out_lines.push(update_row_line(line, r));
-            continue;
-        }
-        out_lines.push(line.to_string());
-    }
-    let mut out = out_lines.join("\n");
-    if !out.ends_with('\n') {
-        out.push('\n');
-    }
-    std::fs::write(&p, out)?;
-    Ok(())
-}
+// ---- SPEC-INDEX.md --------------------------------------------------------
 
-fn line_spec(line: &str) -> Option<String> {
+fn registry_spec(line: &str) -> Option<String> {
     let re = Regex::new(r"^\|\s*(PNP-\d{3})\s*\|").unwrap();
     re.captures(line).map(|c| c[1].to_string())
 }
 
-fn update_row_line(line: &str, r: &Coverage) -> String {
-    let cols: Vec<&str> = line.split('|').collect();
-    if cols.len() < 11 {
-        return line.to_string();
+fn coverage_cell(must: Tally, should: Tally, may: Tally) -> String {
+    format!("M {must} · S {should} · MAY {may}")
+}
+
+/// The index with its generated parts rewritten: the `Last-Updated` line (the newest spec
+/// date, so the output depends on the specs and the tests alone) and the registry table
+/// (one row per spec file, then the totals). Titles are kept from the existing rows; a spec
+/// with no row yet takes its own heading. Everything else is prose and is left alone.
+fn render_spec_index(text: &str, rows: &[Coverage]) -> String {
+    let mut titles: BTreeMap<String, String> = BTreeMap::new();
+    for line in text.lines() {
+        if let Some(spec) = registry_spec(line) {
+            let cols: Vec<&str> = line.split('|').collect();
+            if let Some(title) = cols.get(2) {
+                titles.insert(spec, title.trim().to_string());
+            }
+        }
     }
-    let cov_pct = r.must_pct();
-    let cov = format!(" {:.0}% M / {:.0}% S ", cov_pct, r.should_pct());
-    let mut new_cols: Vec<String> = cols.iter().map(|s| s.to_string()).collect();
-    let last = new_cols.len() - 2;
-    new_cols[last] = cov;
-    new_cols.join("|")
+    let newest = rows
+        .iter()
+        .map(|r| r.meta.date.as_str())
+        .max()
+        .unwrap_or_default();
+    let mut table: Vec<String> = rows
+        .iter()
+        .map(|r| {
+            let title = titles
+                .get(&r.spec)
+                .cloned()
+                .unwrap_or_else(|| r.meta.heading.clone());
+            format!(
+                "| {} | {} | {} | {} | {} | {} | {} | {} | {} |",
+                r.spec,
+                title,
+                r.meta.version,
+                r.meta.status,
+                r.must.total,
+                r.should.total,
+                r.may.total,
+                r.must.total + r.should.total + r.may.total,
+                coverage_cell(r.must, r.should, r.may),
+            )
+        })
+        .collect();
+    let (must, should, may) = totals(rows);
+    table.push(format!(
+        "| **Totals** | — | — | — | **{}** | **{}** | **{}** | **{}** | **{}** |",
+        must.total,
+        should.total,
+        may.total,
+        must.total + should.total + may.total,
+        coverage_cell(must, should, may),
+    ));
+
+    let mut out: Vec<String> = Vec::new();
+    let mut table_written = false;
+    for line in text.lines() {
+        if line.starts_with("**Last-Updated:**") {
+            out.push(format!("**Last-Updated:** {newest}"));
+        } else if registry_spec(line).is_some() || line.starts_with("| **Totals** |") {
+            if !table_written {
+                out.append(&mut table);
+                table_written = true;
+            }
+        } else {
+            out.push(line.to_string());
+        }
+    }
+    let mut out = out.join("\n");
+    out.push('\n');
+    out
 }
 
 // ---- vectors --------------------------------------------------------------
@@ -342,7 +542,13 @@ fn run_vectors(_validate: bool) -> Result<()> {
     }
     let clause_ids: BTreeSet<String> = collect_spec_clauses(&root)?
         .into_values()
-        .flat_map(|cs| cs.must.into_iter().chain(cs.should).chain(cs.may))
+        .flat_map(|cs| {
+            cs.must
+                .into_iter()
+                .chain(cs.should)
+                .chain(cs.may)
+                .chain(cs.deprecated)
+        })
         .collect();
 
     let mut count = 0usize;
