@@ -48,10 +48,10 @@ lock of a streaming thread that is itself waiting in a sink. Neither lets go.
 
 ## What avoids it
 
-Take the stream away from every element first (`pause()`, `srcObject = null`), and only then stop
-tracks and close the connection. Measured in the container (arm64, `--cpus 4`, the machine otherwise
-busy), three pages at a time, three calls per page, with a second microphone capture held by the
-page (`hold=1`) as the flows do:
+Take the stream away from every element first (`srcObject = null`), and only then stop tracks and
+close the connection. Measured in the container (arm64, `--cpus 4`, the machine otherwise busy),
+three pages at a time, three calls per page, with a second microphone capture held by the page
+(`hold=1`) as the flows do:
 
 | `order`        | what it does                                                                                                   | pages frozen            |
 | -------------- | -------------------------------------------------------------------------------------------------------------- | ----------------------- |
@@ -62,31 +62,39 @@ page (`hold=1`) as the flows do:
 | `camera-only`  | no connection at all: a camera playing in an element, `track.stop()` while it plays                            | 1 of 30 (5 rounds each) |
 
 `pause()` before `srcObject = null` is not what helps: `deferred` with `REPRO_PAUSE=0` (no
-`pause()`) also froze 0 of 30, and that is what the app does (below, why it does not pause).
+`pause()`) also froze 0 of 30, and that is what the app does.
 
-The app's order is `deferred`: `src/engine/calls.ts` publishes the end of the call first, the store
-detaches every element in the same turn (`src/platform/playback.ts`), and the engine stops the
-capture and closes the connection in later tasks.
+The app's order is `deferred` without the pause: `src/engine/calls.ts` publishes the end of the call
+first, the store detaches every element in the same turn (`src/platform/playback.ts`), and the
+engine stops the capture and closes the connection in later tasks.
 
-## A second freeze, which no order avoids
+## A second freeze: detaching a stream around a camera switch
 
 `camera-off` ends no track at all: the camera is switched off (`enabled = false`), its element is
-detached, and the same stream is attached again 300 ms later. The page sometimes stops while the
-stream is attached again (once, in `srcObject = null`). The main thread is inside a state change of
-the element's pipeline, waiting on a condition inside WebKit, while a streaming thread of the
-capture (an `appsink` handing a sample to WebKit) is in an object's destruction, also waiting on a
-condition inside WebKit.
+detached, and the same stream is attached again 300 ms later. The page sometimes stops for good
+while the stream is attached again (once, in `srcObject = null`). The main thread is inside a state
+change of the element's pipeline, waiting on a condition inside WebKit, while a streaming thread of
+the capture (an `appsink` handing a sample to WebKit) is in an object's destruction, also waiting on
+a condition inside WebKit.
 
-| how the element is detached        | pages frozen, 5 rounds each | 30 rounds each |
-| ---------------------------------- | --------------------------- | -------------- |
-| `pause()`, then `srcObject = null` | 6 of 40                     | 16 of 20       |
-| `srcObject = null` alone           | 1 of 40                     | 16 of 20       |
+| `order`         | what it does                                                                       | pages frozen                             |
+| --------------- | ---------------------------------------------------------------------------------- | ---------------------------------------- |
+| `camera-off`    | `enabled = false`, `srcObject = null`, attach again; 5 rounds a page               | 1 of 40 (6 of 40 with `pause()` first)   |
+| `camera-off`    | the same, 30 rounds a page                                                         | 16 of 20 (the same with `pause()` first) |
+| `camera-toggle` | `enabled = false`, then `true`; the element keeps the stream; 10 rounds a page     | 0 of 37                                  |
+| `camera-end`    | off and on with the element attached, `srcObject = null` 200 ms later; once a page | 0 of 150 (0 of 146 hidden meanwhile)     |
 
-Pausing first makes it more likely, so the app does not pause. This is the shape of "turn camera
-off, turn it on again" in the app (the self view goes away and comes back), which the app does the
-way it did before the change above (`srcObject = null` when the self view goes away). In the call
-flow it shows up as a stall at that step, rarely. Nothing in the app avoids it yet; `camera-toggle`
-is the same loop with the element left attached.
+(The two five-round `camera-off` runs were made one after the other on a machine whose load kept
+changing, so "more often with `pause()`" is a hint and no more. Pages that never got their capture
+while other containers were being stopped answered and are not counted.)
+
+This is the app's "Turn camera off": the self view goes away, and comes back with "Turn camera on".
+In the call flow the page of the person who pressed the button froze there in 2 of 45 runs on a busy
+machine. Leaving the self view attached and hidden (`camera-toggle`) was tried in the app: the
+button no longer froze the page (0 of 43 runs), but the same person's page then froze once in those
+43 runs at the end of the call, in the detaching of the elements, which it had not done in 260 runs
+before. One freeze for another: the app was left as it was, and the flow names this freeze as the
+one it expects (`KNOWN_WEBKIT_FREEZE` in `real.flows.ts`).
 
 ## Running it
 

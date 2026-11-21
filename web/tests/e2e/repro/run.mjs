@@ -15,7 +15,7 @@ const server = createServer((_request, response) => {
 });
 await new Promise((done) => server.listen(0, "127.0.0.1", done));
 // REPRO_PAUSE=0: detach with `srcObject = null` alone, without `pause()` first.
-const pause = process.env.REPRO_PAUSE === "0" ? "&pause=0" : "";
+const pause = (process.env.REPRO_PAUSE === "0" ? "&pause=0" : "") + (process.env.REPRO_QUERY ?? "");
 const url =
   `http://localhost:${server.address().port}/?order=${order}&rounds=${rounds}&hold=1${pause}`;
 
@@ -32,6 +32,8 @@ async function one(index) {
   const lines = [];
   let lastAt = Date.now();
   page.on("console", (message) => {
+    // Only the page's own lines: the browser adds warnings of its own after the last one.
+    if (!message.text().startsWith("[repro]")) return;
     lines.push(message.text());
     lastAt = Date.now();
   });

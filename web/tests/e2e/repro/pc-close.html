@@ -13,6 +13,8 @@
     ?order=deferred       pause + srcObject = null; a task later track.stop(); a task later pc.close()
     ?order=camera-only    no connection: a camera playing in an element, track.stop() while it plays
     ?order=camera-off     no connection: the camera is disabled and its element detached; no track ends
+    ?order=camera-end     camera off and on with the element attached (&hide=1: hidden meanwhile),
+                          then the element is detached &after= ms later
     ?order=camera-toggle  as camera-off, but the element stays attached: only `enabled` changes
     &pause=0              detach with srcObject = null alone, without pause() first
     &rounds=N             calls to make (default 1)
@@ -59,6 +61,29 @@ async function cameraOff(round, local) {
   if (pauseFirst) timed("self-a pause", () => self.pause());
   timed("self-a srcObject = null", () => (self.srcObject = null));
   for (const track of local.getVideoTracks()) track.enabled = true;
+  say(`round ${round}: done`);
+}
+
+// The camera is switched off and on with the element attached all the while (`&hide=1`:
+// and hidden meanwhile), and the element is detached `&after=` ms later (default 200).
+async function cameraEnd(round, local) {
+  const self = document.getElementById("self-a");
+  const hide = q.get("hide") === "1";
+  const after = Number(q.get("after") || 200);
+  self.srcObject = local;
+  self.play().catch(() => {});
+  await playing(self);
+  await new Promise((done) => setTimeout(done, 300));
+  say(`round ${round}: camera playing; off and on (hide=${hide}), detach after ${after} ms`);
+  if (hide) self.hidden = true;
+  for (const track of local.getVideoTracks()) {
+    timed("enabled = false", () => (track.enabled = false));
+  }
+  await new Promise((done) => setTimeout(done, 200));
+  for (const track of local.getVideoTracks()) timed("enabled = true", () => (track.enabled = true));
+  if (hide) self.hidden = false;
+  await new Promise((done) => setTimeout(done, after));
+  timed("self-a srcObject = null", () => (self.srcObject = null));
   say(`round ${round}: done`);
 }
 
@@ -175,11 +200,16 @@ async function call(round) {
         audio: true,
       });
     }
-    const camera = order === "camera-off" || order === "camera-toggle"
+    const cameraRounds = {
+      "camera-off": cameraOff,
+      "camera-toggle": cameraToggle,
+      "camera-end": cameraEnd,
+    }[order];
+    const camera = cameraRounds
       ? await navigator.mediaDevices.getUserMedia({ audio: true, video: true })
       : null;
     for (let round = 1; round <= rounds; round++) {
-      if (camera) await (order === "camera-off" ? cameraOff : cameraToggle)(round, camera);
+      if (camera) await cameraRounds(round, camera);
       else await (order === "camera-only" ? cameraOnly(round) : call(round));
     }
     say("ALL DONE");
