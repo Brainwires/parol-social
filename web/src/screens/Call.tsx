@@ -49,13 +49,15 @@ function endedText(call: CallInfo, name: string): string {
 }
 
 /** Plays a stream. `srcObject` is set through the element: there is no attribute for it. */
-function Media({ stream, muted, className, label, sinkId, testId }: {
+function Media({ stream, muted, className, label, sinkId, testId, hidden }: {
   stream: MediaStream | null;
   muted: boolean;
   className: string;
   label: string;
   sinkId?: string;
   testId: string;
+  /** Not shown, but still attached to its stream. */
+  hidden?: boolean;
 }) {
   const element = useRef<HTMLVideoElement>(null);
   useEffect(() => {
@@ -84,6 +86,7 @@ function Media({ stream, muted, className, label, sinkId, testId }: {
       playsInline
       aria-label={label}
       data-testid={testId}
+      hidden={hidden === true}
     />
   );
 }
@@ -241,18 +244,23 @@ function CallScreen({ call, name }: { call: CallInfo; name: string }) {
             <Avatar name={name} />
           </div>
         )}
+        {!ended && call.video && media.local && call.cameraOff && (
+          <p className="call__self call__self--off">{t("call.cameraIsOff")}</p>
+        )}
+        {
+          /* While the camera is off the self view is hidden, not taken away: in WebKit on
+            Linux, detaching a stream from an element and attaching it again a moment later
+            can freeze the page (tests/e2e/repro, `camera-off`). */
+        }
         {!ended && call.video && media.local && (
-          call.cameraOff
-            ? <p className="call__self call__self--off">{t("call.cameraIsOff")}</p>
-            : (
-              <Media
-                stream={media.local}
-                muted
-                className="call__self"
-                label={t("call.selfView")}
-                testId="call-self"
-              />
-            )
+          <Media
+            stream={media.local}
+            muted
+            className="call__self"
+            label={t("call.selfView")}
+            testId="call-self"
+            hidden={call.cameraOff}
+          />
         )}
       </div>
 

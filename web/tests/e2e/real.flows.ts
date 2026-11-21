@@ -812,8 +812,10 @@ test("a video call: ring, accept, controls, end; and a declined call", async ({ 
     await expect(ben.page.getByTestId("call-camera")).toHaveAccessibleName(
       "Turn camera on",
     );
-    await expect(ben.page.getByTestId("call-self")).toHaveCount(0);
+    // The self view is hidden while the camera is off, and back when it is on again.
+    await expect(ben.page.getByTestId("call-self")).toBeHidden();
     await ben.page.getByTestId("call-camera").click();
+    await expect(ben.page.getByTestId("call-self")).toBeVisible();
     await ben.page.getByTestId("call-mute").click();
   }, 30_000);
 
