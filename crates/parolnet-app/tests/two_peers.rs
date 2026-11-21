@@ -796,6 +796,14 @@ async fn relay_only_without_a_reachable_turn_server_shows_no_path() {
         PathState::NoDirectPath
     );
 
+    // Fixing the settings (here: removing the server) retries at once.
+    bob.clear_turn_settings().await.unwrap();
+    path(&mut bob_rx, "direct after the fix", 30, PathState::Direct).await;
+    wait_for(&mut alice_rx, "paired after the fix", 30, |e| {
+        matches!(e, AppEvent::ContactAdded(_))
+    })
+    .await;
+
     alice.shutdown().await;
     bob.shutdown().await;
     let _ = std::fs::remove_dir_all(&dir);

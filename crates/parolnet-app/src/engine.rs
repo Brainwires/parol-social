@@ -665,8 +665,8 @@ impl Engine {
 
     /// Store (or with `None` clear) the user's TURN server. It applies to every connection
     /// made from now on; data connections that exist are replaced at once so that turning
-    /// relay-only on (or off) takes effect now. A contact in a call keeps its connections
-    /// until the next reconnect.
+    /// relay-only on (or off) takes effect now, and contacts that had no path are tried
+    /// again. A contact in a call keeps its connections until the next reconnect.
     fn set_turn(&mut self, settings: Option<TurnSettings>) -> Result<(), AppError> {
         let settings = settings.map(TurnSettings::validated).transpose()?;
         if self.state.turn == settings {
@@ -693,6 +693,27 @@ impl Engine {
             if st.online == Some(false) {
                 continue; // a probe was under way; the next one uses the new settings
             }
+            st.attempt = 0;
+            st.failures = 0;
+            self.set_path(&peer, PathState::Connecting);
+            self.connect(&peer, true);
+        }
+        // Contacts that had no path (and may have run out of retries) get a fresh try.
+        let stuck: Vec<String> = self
+            .state
+            .contacts
+            .iter()
+            .map(|c| c.peer_id.clone())
+            .filter(|p| {
+                self.peers.get(p).is_some_and(|st| {
+                    st.conn.is_none()
+                        && st.online != Some(false)
+                        && st.path == PathState::NoDirectPath
+                })
+            })
+            .collect();
+        for peer in stuck {
+            let st = self.peer_mut(&peer);
             st.attempt = 0;
             st.failures = 0;
             self.set_path(&peer, PathState::Connecting);
