@@ -1130,3 +1130,121 @@ test("a contact added here and left without a name is asked for in its conversat
     "Give this contact a name.",
   );
 });
+
+test("the passphrase lock, the backup and the restore, from the keyboard", async ({ page, server }) => {
+  const problems = await watch(page, server);
+  await open(page, server, "#/settings");
+  await expect(page.getByTestId("settings-lock")).toHaveAttribute("data-on", "false");
+
+  // Set a passphrase: the sheet takes focus, says what cannot be undone, and refuses a
+  // short one and a pair that differs, each in words.
+  await page.getByTestId("lock-set").focus();
+  await page.keyboard.press("Enter");
+  await expect(page.getByTestId("sheet-lock-set")).toBeVisible();
+  await expect(page.getByTestId("lock-forgotten")).toContainText("nobody can recover it");
+  await page.getByTestId("lock-new").fill("seven77");
+  await page.keyboard.press("Enter");
+  await expect(page.getByTestId("lock-problem")).toHaveText("That passphrase is too short.");
+  await page.getByTestId("lock-new").fill("eight888 or more");
+  await page.getByTestId("lock-again").fill("eight888 or mor");
+  await page.keyboard.press("Enter");
+  await expect(page.getByTestId("lock-problem")).toHaveText(
+    "The two passphrases are not the same.",
+  );
+  for (const id of ["lock-new", "lock-again"]) {
+    await expect(page.getByTestId(id)).toHaveAttribute("type", "password");
+    await expect(page.getByTestId(id)).toHaveAttribute("autocomplete", "new-password");
+  }
+  await page.getByTestId("lock-again").fill("eight888 or more");
+  await page.keyboard.press("Enter");
+  await expect(page.getByTestId("toast")).toHaveText("Passphrase set");
+  await expect(page.getByTestId("sheet-lock-set")).toHaveCount(0);
+  await expect(page.getByTestId("settings-lock")).toHaveAttribute("data-on", "true");
+  await expect(page.getByTestId("settings-lock-on")).toBeVisible();
+
+  // Lock now: the passphrase field has focus; a wrong one is said under it; Escape does
+  // not get past it.
+  await page.getByTestId("lock-now").click();
+  await expect(page.getByTestId("locked")).toBeVisible();
+  await expect(page.getByTestId("unlock-passphrase")).toBeFocused();
+  await expect(page.getByTestId("app")).toHaveCount(0);
+  await page.keyboard.press("Escape");
+  await expect(page.getByTestId("locked")).toBeVisible();
+  await page.keyboard.type("wrong");
+  await page.keyboard.press("Enter");
+  await expect(page.getByTestId("unlock-problem")).toHaveText("That is not the passphrase.");
+  await expect(page.getByTestId("unlock-passphrase")).toHaveValue("");
+  await page.getByTestId("unlock-forgot").click();
+  await expect(page.getByTestId("sheet-forget")).toContainText("cannot be recovered");
+  await expect(page.getByTestId("forget-confirm")).toBeDisabled();
+  await page.keyboard.press("Escape");
+  await page.getByTestId("unlock-passphrase").fill("anything else");
+  await page.keyboard.press("Enter");
+  await expect(page.getByTestId("app")).toBeVisible();
+
+  // Remove it again: the current passphrase is asked for.
+  await page.getByTestId("lock-remove").click();
+  await page.getByTestId("lock-current").fill("wrong");
+  await page.keyboard.press("Enter");
+  await expect(page.getByTestId("lock-problem")).toHaveText("That is not the passphrase.");
+  await page.getByTestId("lock-current").fill("the current one");
+  await page.keyboard.press("Enter");
+  await expect(page.getByTestId("toast")).toHaveText("Passphrase removed");
+  await expect(page.getByTestId("settings-lock")).toHaveAttribute("data-on", "false");
+
+  // Back up: history is off unless asked for; the file is a link to press, with a name.
+  await expect(page.getByTestId("backup-last")).toHaveText(
+    "No backup has been made on this device.",
+  );
+  await page.getByTestId("backup-open").click();
+  await expect(page.getByTestId("backup-history")).not.toBeChecked();
+  await page.getByTestId("backup-new").fill("four random words here");
+  await page.getByTestId("backup-again").fill("four random words here");
+  await page.getByTestId("backup-make").click();
+  const save = page.getByTestId("backup-save");
+  await expect(save).toHaveAttribute("href", /^blob:/);
+  await expect(save).toHaveAttribute("download", /^parolnet-backup-\d{4}-\d{2}-\d{2}\.pnbackup$/);
+  await expect(page.getByTestId("sheet-backup")).toContainText(
+    "Use a backup on one device at a time",
+  );
+  await page.keyboard.press("Escape");
+  await expect(page.getByTestId("backup-last")).toContainText("Last backup:");
+
+  // Restore, where there is something to replace: a word is typed first.
+  await page.getByTestId("restore-open").click();
+  await expect(page.getByTestId("restore-replaces")).toContainText("It cannot be undone.");
+  await expect(page.getByTestId("restore-submit")).toBeDisabled();
+  await page.getByTestId("restore-confirm-input").fill("Replace ");
+  await expect(page.getByTestId("restore-submit")).toBeEnabled();
+  await page.getByTestId("restore-submit").click();
+  await expect(page.getByTestId("restore-problem")).toHaveText("Choose the backup file first.");
+  await page.keyboard.press("Escape");
+
+  // First run offers the restore too, with nothing to confirm.
+  await go(page, "#/lab");
+  await page.getByTestId("lab-phase-first-run").click();
+  await go(page, "#/");
+  await page.getByTestId("first-run-restore").click();
+  await expect(page.getByTestId("sheet-restore")).toBeVisible();
+  await expect(page.getByTestId("restore-replaces")).toHaveCount(0);
+  await expect(page.getByTestId("restore-submit")).toBeEnabled();
+  await expectClean(problems);
+});
+
+test("the list suggests a backup once there is a contact, and can be told not now", async ({ page, server }) => {
+  await open(page, server, "#/");
+  await expect(page.getByTestId("backup-hint")).toContainText("Make a backup");
+  await page.getByTestId("backup-hint-later").click();
+  await expect(page.getByTestId("backup-hint")).toHaveCount(0);
+  await page.reload();
+  await expect(page.getByTestId("conversation-list")).toBeVisible();
+  await expect(page.getByTestId("backup-hint")).toHaveCount(0);
+  // With no one to lose there is nothing to suggest.
+  await page.evaluate(() => localStorage.clear());
+  await page.reload();
+  await go(page, "#/lab");
+  await page.getByTestId("lab-clear").click();
+  await go(page, "#/");
+  await expect(page.getByTestId("list-empty")).toBeVisible();
+  await expect(page.getByTestId("backup-hint")).toHaveCount(0);
+});
