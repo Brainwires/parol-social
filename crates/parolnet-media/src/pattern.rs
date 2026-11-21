@@ -1,5 +1,5 @@
 //! A synthetic camera: colour bars, a moving box and a frame counter, drawn straight into
-//! I420. Calls send it while real camera capture is still to come (and CI has no camera).
+//! I420. Calls send it when there is no camera (CI has none), and the bot's IVF is made of it.
 
 use crate::frame::I420Frame;
 

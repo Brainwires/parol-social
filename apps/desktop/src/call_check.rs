@@ -1,7 +1,9 @@
 //! `parolnet-desktop --call-check`: the desktop's call media without a window, for scripts and
 //! CI. It pairs with a contact's code, waits for the verified direct path, places a call and
-//! runs the same [`CallSession`] the window uses (test pattern through libvpx, Opus; no audio
-//! devices), then reports what it sent and decoded.
+//! runs the same [`CallSession`] the window uses with synthetic media (the test pattern as a
+//! 720p YUYV camera through conversion, scaling and libvpx; a tone through the audio path
+//! with echo cancellation and Opus; playback into nothing), then reports what it sent and
+//! decoded.
 //!
 //! ```text
 //! parolnet-desktop --call-check --relay ws://HOST/ws --data-dir DIR --code CODE
@@ -9,7 +11,7 @@
 //! ```
 //!
 //! Prints `call-check ...` and exits 0 when the contact's media arrived and decoded (VP8
-//! frames for a video call, Opus samples always).
+//! frames for a video call, Opus samples always) and our own was sent.
 
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
@@ -18,7 +20,7 @@ use std::time::Duration;
 use anyhow::{Context as _, bail};
 use parolnet_app::{AppConfig, AppEvent, CallState, PathState};
 
-use crate::call::CallSession;
+use crate::call::{CallSession, MediaOptions};
 
 struct Args {
     relay: String,
@@ -94,7 +96,11 @@ async fn run(args: Args, runtime: tokio::runtime::Handle) -> anyhow::Result<()> 
     }
     let call = app.start_call(&peer, args.video).await?;
     let media = app.take_call_media(&call.call_id).await?;
-    let session = CallSession::start(media, args.video, false, &runtime);
+    let options = MediaOptions {
+        synthetic: true,
+        ..Default::default()
+    };
+    let session = CallSession::start(media, args.video, options, &runtime);
     let deadline = wait(60);
     loop {
         match tokio::time::timeout_at(deadline, events.recv()).await {
@@ -109,17 +115,19 @@ async fn run(args: Args, runtime: tokio::runtime::Handle) -> anyhow::Result<()> 
     }
     tokio::time::sleep(Duration::from_secs(args.seconds)).await;
     let s = &session.stats;
-    let (decoded, audio_packets, audio_samples) = (
+    let (decoded, audio_packets, audio_samples, sent_video, sent_audio) = (
         s.video.decoded.load(Ordering::Relaxed),
         s.audio_packets.load(Ordering::Relaxed),
         s.audio_decoded.load(Ordering::Relaxed),
+        s.video_sent.load(Ordering::Relaxed),
+        s.audio_sent.load(Ordering::Relaxed),
     );
     println!(
         "call-check video={} sent_video={} sent_audio={} video_packets={} video_decoded={} \
          decode_errors={} audio_packets={} audio_samples={}",
         args.video,
-        s.video_sent.load(Ordering::Relaxed),
-        s.audio_sent.load(Ordering::Relaxed),
+        sent_video,
+        sent_audio,
         s.video.packets.load(Ordering::Relaxed),
         decoded,
         s.video.decode_errors.load(Ordering::Relaxed),
@@ -132,6 +140,9 @@ async fn run(args: Args, runtime: tokio::runtime::Handle) -> anyhow::Result<()> 
     app.shutdown().await;
     if audio_samples == 0 || (args.video && decoded == 0) {
         bail!("the contact's media did not arrive or did not decode");
+    }
+    if sent_audio == 0 || (args.video && sent_video == 0) {
+        bail!("our own media was not sent (the capture or encode path produced nothing)");
     }
     Ok(())
 }

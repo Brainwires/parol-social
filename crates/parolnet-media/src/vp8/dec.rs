@@ -1,5 +1,5 @@
 //! A minimal libvpx VP8 decoder binding (hand-written: six functions and two structs, so no
-//! bindgen and no MPL-licensed `-sys` crate). Moves to `parolnet-media` in M1.
+//! bindgen and no MPL-licensed `-sys` crate).
 //!
 //! The layouts below follow libvpx's public headers (`vpx_codec.h`, `vpx_decoder.h`,
 //! `vpx_image.h`), stable since ABI version 5 of `vpx_image_t` (libvpx 1.8 and later).
@@ -7,6 +7,7 @@
 use std::ffi::{CStr, c_char, c_int, c_long, c_uint, c_void};
 use std::ptr;
 
+use crate::MediaError;
 use crate::frame::I420Frame;
 
 /// `VPX_DECODER_ABI_VERSION` = 3 + `VPX_CODEC_ABI_VERSION` (4 + `VPX_IMAGE_ABI_VERSION` (5)).
@@ -95,7 +96,7 @@ pub struct Vp8Decoder {
 unsafe impl Send for Vp8Decoder {}
 
 impl Vp8Decoder {
-    pub fn new(threads: u32) -> anyhow::Result<Self> {
+    pub fn new(threads: u32) -> Result<Self, MediaError> {
         let mut ctx = Box::new(VpxCodecCtx {
             name: ptr::null(),
             iface: ptr::null(),
@@ -121,10 +122,10 @@ impl Vp8Decoder {
             )
         };
         if rc != 0 {
-            anyhow::bail!(
+            return Err(MediaError::Codec(format!(
                 "vpx_codec_dec_init failed ({rc}); libvpx {}",
                 libvpx_version()
-            );
+            )));
         }
         Ok(Self { ctx })
     }
@@ -138,7 +139,7 @@ impl Vp8Decoder {
 
     /// Decodes one VP8 frame (a whole RTP-reassembled sample) and returns the pictures it
     /// produced (zero or one for VP8).
-    pub fn decode(&mut self, data: &[u8]) -> anyhow::Result<Vec<I420Frame>> {
+    pub fn decode(&mut self, data: &[u8]) -> Result<Vec<I420Frame>, MediaError> {
         // SAFETY: data outlives the call. Deadline 1 is VPX_DL_REALTIME.
         let rc = unsafe {
             vpx_codec_decode(
@@ -150,7 +151,10 @@ impl Vp8Decoder {
             )
         };
         if rc != 0 {
-            anyhow::bail!("vpx_codec_decode: {}", self.last_error());
+            return Err(MediaError::Codec(format!(
+                "vpx_codec_decode: {}",
+                self.last_error()
+            )));
         }
         let mut frames = Vec::new();
         let mut iter: *const c_void = ptr::null();
@@ -163,7 +167,10 @@ impl Vp8Decoder {
             // SAFETY: libvpx returns a valid image until the next decode call.
             let img = unsafe { &*img };
             if img.fmt != VPX_IMG_FMT_I420 {
-                anyhow::bail!("unexpected libvpx image format {:#x}", img.fmt);
+                return Err(MediaError::Codec(format!(
+                    "unexpected libvpx image format {:#x}",
+                    img.fmt
+                )));
             }
             frames.push(copy_i420(img));
         }

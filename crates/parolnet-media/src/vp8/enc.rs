@@ -2,6 +2,7 @@
 
 use std::ffi::{CStr, c_char, c_int, c_uint, c_void};
 
+use crate::MediaError;
 use crate::frame::I420Frame;
 
 unsafe extern "C" {
@@ -46,14 +47,14 @@ unsafe impl Send for Vp8Encoder {}
 
 impl Vp8Encoder {
     /// `width` and `height` must be even.
-    pub fn new(width: u32, height: u32, fps: u32, kbps: u32) -> anyhow::Result<Self> {
+    pub fn new(width: u32, height: u32, fps: u32, kbps: u32) -> Result<Self, MediaError> {
         let mut err = [0 as c_char; 256];
         // SAFETY: plain values and a writable error buffer of the given size.
         let raw = unsafe { pn_vp8enc_new(width, height, fps, kbps, err.as_mut_ptr(), err.len()) };
         if raw.is_null() {
             // SAFETY: the shim NUL-terminates the buffer it wrote.
             let msg = unsafe { CStr::from_ptr(err.as_ptr()) }.to_string_lossy();
-            anyhow::bail!("VP8 encoder: {msg}");
+            return Err(MediaError::Codec(format!("VP8 encoder: {msg}")));
         }
         Ok(Self {
             raw,
@@ -69,15 +70,13 @@ impl Vp8Encoder {
         &mut self,
         frame: &I420Frame,
         force_keyframe: bool,
-    ) -> anyhow::Result<Option<EncodedFrame>> {
-        anyhow::ensure!(
-            frame.width == self.width && frame.height == self.height,
-            "frame is {}x{}, the encoder {}x{}",
-            frame.width,
-            frame.height,
-            self.width,
-            self.height
-        );
+    ) -> Result<Option<EncodedFrame>, MediaError> {
+        if frame.width != self.width || frame.height != self.height {
+            return Err(MediaError::Format(format!(
+                "frame is {}x{}, the encoder {}x{}",
+                frame.width, frame.height, self.width, self.height
+            )));
+        }
         let (mut len, mut key) = (0usize, 0 as c_int);
         // SAFETY: `frame.data()` holds a full I420 picture of the encoder's size; `out` is
         // writable for `out.len()` bytes; the context is ours.
@@ -94,7 +93,9 @@ impl Vp8Encoder {
             )
         };
         self.pts += 1;
-        anyhow::ensure!(rc == 0, "VP8 encode failed ({rc})");
+        if rc != 0 {
+            return Err(MediaError::Codec(format!("VP8 encode failed ({rc})")));
+        }
         Ok((len > 0).then(|| EncodedFrame {
             data: self.out[..len].to_vec(),
             keyframe: key != 0,
@@ -134,7 +135,7 @@ mod tests {
         out
     }
 
-    use crate::testpattern::TestPattern;
+    use crate::pattern::TestPattern;
     use crate::vp8::Vp8Decoder;
 
     #[test]
@@ -158,7 +159,7 @@ mod tests {
     }
 
     /// Writes the bot's test pattern (crates/parolnet-app/examples/testpattern.ivf):
-    /// `PAROLNET_WRITE_IVF=1 cargo test --features runtime-shaders write_bot_ivf -- --ignored`.
+    /// `cargo test -p parolnet-media --features vpx write_bot_ivf -- --ignored`.
     #[test]
     #[ignore]
     fn write_bot_ivf() {
