@@ -57,7 +57,10 @@
 //
 // Cases (the same in every browser; none is skipped anywhere)
 //   1. PWA presents its code, the desktop enters it (bot `pair`): bootstrap over the data
-//      channel, messages both ways.
+//      channel, messages both ways. Then the desktop is told its network changed (bot
+//      `network-changed`): the browser side does not take ICE restarts (PNP-011 section 8.2:
+//      it lists no `ice-restart`), so the desktop must send none and leave the connection
+//      alone; messages both ways again.
 //   2. The desktop presents its code, the PWA pastes it ("Paste Code" tab): the paste path
 //      pairs like a camera scan, messages both ways.
 //   3. Sender queue: with case 2's pair, the PWA's browser closes; the bot's message waits in
@@ -67,7 +70,10 @@
 //      see (as if a relay had swapped the desktop's), and the desktop must refuse the channel.
 //   5. The desktop video-calls the PWA (the browser's fake camera and microphone); the PWA
 //      accepts; the desktop sends its test pattern (VP8) and a tone (Opus): RTP flows both
-//      ways and the browser decodes the desktop's video and audio; the desktop hangs up.
+//      ways and the browser decodes the desktop's video and audio. The browser side does not
+//      renegotiate (it lists no `renegotiate`, PNP-011 section 7.5): the desktop's "camera
+//      off" must leave the call as it was set up, and a network change must send no
+//      `reoffer`; media goes on both ways. The desktop hangs up.
 //   6. The PWA video-calls the desktop; the same checks; the PWA hangs up. The browser is then
 //      the ICE controlling side (it offers). Chromium, holding media permission, gathers on
 //      every interface and may move its nomination to another pair a moment after connecting;
@@ -887,6 +893,16 @@ async function caseDesktopEntersPwaCode(ctx) {
   await bothVerified(bot, pwa, tag);
   log(`${tag}: paired, direct data channel, bindings verified`);
   await chatBothWays(bot, pwa, tag);
+  // The desktop's network "changes". With a peer that takes ICE restarts it would send a
+  // second rtc_offer; the browser side lists no such feature, would take that offer for a
+  // new connection, and must not get one: nothing happens to the path.
+  const mark = bot.events.length;
+  bot.send("network-changed");
+  await sleep(1500);
+  const moved = bot.events.slice(mark).filter((e) => e.event === "path" || e.event === "notice");
+  if (moved.length) throw new Error(`${tag}: the connection changed after a network change: ${JSON.stringify(moved)}`);
+  if (bot.stderr.some((l) => l.includes("restarting ICE"))) throw new Error(`${tag}: the desktop restarted ICE with a peer that does not take restarts`);
+  await chatBothWays(bot, pwa, `${tag}, after a network change`);
   await bot.quit();
   await closing(pwa, tag);
   await browser.close();
@@ -1008,6 +1024,20 @@ async function caseCalls(ctx) {
   const m6 = await botMedia(bot, out.call_id, 50, `${tag}: the desktop receives ${Browser}'s VP8 and Opus`);
   const s6 = await pwaDecodes(pwa, `${tag}: ${Browser} decodes the desktop's VP8 and Opus`);
   log(`${tag}: desktop got audio ${m6.audio_rx} / video ${m6.video_rx} packets; PWA decoded ${s6.videoFrames} frames, ${s6.audioSamples} audio samples`);
+  // The browser side does not renegotiate: the call is not renegotiable, "camera off" leaves
+  // the stream as it was set up, a network change sends no reoffer, and media goes on.
+  const active = bot.events.slice(mark).filter((e) => e.event === "call" && e.call_id === out.call_id && e.state === "Active").pop();
+  if (active.renegotiable !== false) throw new Error(`${tag}: the call with a browser must not be renegotiable: ${JSON.stringify(active)}`);
+  bot.send(`video off ${out.call_id}`);
+  const change = await bot.wait("the camera toggle's answer", (e) => e.event === "video-change" && e.call_id === out.call_id, 10_000, mark);
+  if (change.how !== "Unchanged") throw new Error(`${tag}: camera off renegotiated with a browser: ${JSON.stringify(change)}`);
+  bot.send("network-changed");
+  const more = await botMedia(bot, out.call_id, Math.max(m6.audio_rx, m6.video_rx) + 60, `${tag}: media goes on after camera off and a network change`);
+  if (bot.stderr.some((l) => l.includes("restarting the call's ICE"))) throw new Error(`${tag}: the desktop sent a reoffer to a peer that does not renegotiate`);
+  const estimate = bot.events.slice(mark).filter((e) => e.event === "bitrate" && e.call_id === out.call_id);
+  const quality = bot.events.slice(mark).filter((e) => e.event === "quality" && e.call_id === out.call_id).pop();
+  if (!estimate.length || !quality) throw new Error(`${tag}: no bitrate estimate or quality report from the call`);
+  log(`${tag}: not renegotiable; camera off left the stream; ${more.audio_rx} / ${more.video_rx} packets after a network change; estimate ${estimate[0].bps} -> ${estimate[estimate.length - 1].bps} bit/s; rtt ${quality.rtt_ms} ms, pair ${quality.local_candidate}/${quality.remote_candidate}`);
   bot.send(`hangup ${out.call_id}`);
   await bot.wait("ended", (e) => e.event === "call" && e.call_id === out.call_id && e.state === "Ended(HungUp)", 10_000, mark);
   await until(`${tag}: the PWA closes its call connection`, 15_000, async () => (await pwa.openCallPcs()) === 0);

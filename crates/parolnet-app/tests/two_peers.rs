@@ -1260,3 +1260,62 @@ async fn a_call_gains_and_loses_video_by_renegotiation() {
     bob.shutdown().await;
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Without a pinned address the clients gather on every interface the machine has (IPv4 and
+/// IPv6, whatever this machine's are) and watch them: pairing, chat, a restart and a call work
+/// the same, and each side's offer names more than loopback when the machine has a network.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn pairing_chat_and_a_call_on_every_interface() {
+    // macOS's local-network privacy drops datagrams between a process's own sockets on the
+    // machine's LAN and global addresses unless the process has that permission (a test run
+    // from an agent or over SSH has not); loopback always works. Nothing to test there.
+    let addresses = parolnet_rtc::net::local_addresses(&parolnet_rtc::SystemNetwork);
+    let delivers = |ip: std::net::IpAddr| {
+        let bind = |ip| std::net::UdpSocket::bind(std::net::SocketAddr::new(ip, 0));
+        let (Ok(a), Ok(b)) = (bind(ip), bind(ip)) else {
+            return false;
+        };
+        let _ = b.set_read_timeout(Some(Duration::from_millis(500)));
+        let mut buf = [0u8; 8];
+        b.local_addr()
+            .is_ok_and(|to| a.send_to(b"probe", to).is_ok() && b.recv_from(&mut buf).is_ok())
+    };
+    if !addresses.iter().any(|ip| delivers(*ip)) {
+        eprintln!("skipped: this machine does not deliver UDP between its own addresses");
+        return;
+    }
+    let relay = start_relay().await;
+    let dir = unique_dir("interfaces");
+    let all_interfaces = |name: &str| {
+        let mut cfg = config(&dir, &relay, name);
+        cfg.bind_ip = None;
+        cfg
+    };
+    let (alice, mut alice_rx) = start(all_interfaces("alice")).await;
+    let (bob, mut bob_rx) = start(all_interfaces("bob")).await;
+    registered(&mut alice_rx).await;
+    registered(&mut bob_rx).await;
+    let code = alice.create_pairing_code().await.unwrap();
+    bob.pair_with_code(&code).await.unwrap();
+    path(&mut alice_rx, "paired (alice)", 40, PathState::Direct).await;
+    path(&mut bob_rx, "paired (bob)", 40, PathState::Direct).await;
+    bob.send_text(alice.peer_id(), "over whichever pair won")
+        .await
+        .unwrap();
+    received(&mut alice_rx, bob.peer_id(), "over whichever pair won").await;
+
+    alice.network_changed();
+    ice_restarts(&alice, 1, "a restart on the real interfaces").await;
+    alice.send_text(bob.peer_id(), "after it").await.unwrap();
+    received(&mut bob_rx, alice.peer_id(), "after it").await;
+
+    let (call_id, alice_media, bob_media) =
+        active_call((&alice, &mut alice_rx), (&bob, &mut bob_rx), true).await;
+    alice_media.more("media (alice)", 25, 25).await;
+    bob_media.more("media (bob)", 25, 25).await;
+    alice.hangup(&call_id);
+    call_state(&mut bob_rx, "hang-up", |c| c.is_over()).await;
+    alice.shutdown().await;
+    bob.shutdown().await;
+    let _ = std::fs::remove_dir_all(&dir);
+}

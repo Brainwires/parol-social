@@ -217,3 +217,20 @@ pub fn host_addresses(sdp: &str) -> Vec<String> {
     out.dedup();
     out
 }
+
+/// Whether this machine delivers UDP between two of its own sockets on `ip`. Not a given:
+/// macOS's local-network privacy drops datagrams to the machine's own LAN and global
+/// addresses for a process without that permission (a test run from an agent or over SSH),
+/// while loopback always works. Tests on the real interfaces skip where it does not.
+pub fn delivers_to_itself(ip: std::net::IpAddr) -> bool {
+    let bind = |ip| std::net::UdpSocket::bind(std::net::SocketAddr::new(ip, 0));
+    let (Ok(a), Ok(b)) = (bind(ip), bind(ip)) else {
+        return false;
+    };
+    let Ok(to) = b.local_addr() else {
+        return false;
+    };
+    let _ = b.set_read_timeout(Some(Duration::from_millis(500)));
+    let mut buf = [0u8; 8];
+    a.send_to(b"probe", to).is_ok() && b.recv_from(&mut buf).is_ok_and(|(n, _)| n == 5)
+}
