@@ -2056,3 +2056,46 @@ fn test_envelope_padding_roundtrip() {
     assert_eq!(decoded.plaintext, original);
     assert_eq!(decoded.msg_type, 0x01);
 }
+
+// ── QR timestamp window (PNP-003-MUST-011) ──────────────────────
+
+fn qr_with_ts(ts: u64) -> Vec<u8> {
+    let payload = bootstrap::QrPayload {
+        v: 1,
+        ik: vec![0x11; 32],
+        seed: vec![0x22; 32],
+        rk: vec![0x33; 32],
+        relay: None,
+        ts,
+        net: 2,
+    };
+    let mut bytes = Vec::new();
+    ciborium::into_writer(&payload, &mut bytes).unwrap();
+    bytes
+}
+
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+}
+
+#[test]
+fn test_qr_without_a_timestamp_is_rejected() {
+    // ts = 0 is not "within 30 minutes" of anything current.
+    assert!(bootstrap::parse_qr_payload(&qr_with_ts(0)).is_err());
+    assert!(bootstrap::parse_qr_payload(&qr_with_ts(1)).is_err());
+}
+
+#[test]
+fn test_qr_from_the_future_is_rejected() {
+    let now = unix_now();
+    assert!(bootstrap::parse_qr_payload(&qr_with_ts(now + 2 * 3600)).is_err());
+    assert!(bootstrap::parse_qr_payload(&qr_with_ts(u64::MAX)).is_err());
+    // A presenter's clock a few minutes ahead is fine.
+    assert!(bootstrap::parse_qr_payload(&qr_with_ts(now + 600)).is_ok());
+    // And the past bound is unchanged.
+    assert!(bootstrap::parse_qr_payload(&qr_with_ts(now - 600)).is_ok());
+    assert!(bootstrap::parse_qr_payload(&qr_with_ts(now - 1900)).is_err());
+}

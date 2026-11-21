@@ -91,14 +91,32 @@ pub fn generate_qr_payload(
     Ok(generate_qr_payload_with_ratchet(identity_key, relay_hint)?.payload_bytes)
 }
 
-/// Maximum age of a QR code payload before it is rejected (30 minutes).
-const QR_MAX_AGE_SECS: u64 = 1800;
+/// How far a QR payload's `ts` may be from the scanner's time, either way
+/// (30 minutes, PNP-003-MUST-011).
+pub const QR_MAX_AGE_SECS: u64 = 1800;
+
+/// The bucket `ts` is coarsened to (PNP-003 §3.1).
+const QR_TS_BUCKET_SECS: u64 = 300;
 
 /// Parse a scanned QR code payload from CBOR bytes.
 ///
-/// Validates the timestamp: QR codes older than 30 minutes are rejected
-/// to prevent replay of intercepted codes.
+/// Validates the timestamp against this device's clock: see
+/// [`parse_qr_payload_at`].
 pub fn parse_qr_payload(data: &[u8]) -> Result<QrPayload, CoreError> {
+    parse_qr_payload_at(data, crate::now_epoch_secs())
+}
+
+/// Parse a scanned QR code payload from CBOR bytes, as of `now_secs`.
+///
+/// PNP-003-MUST-011: `ts` must be within 30 minutes of the current time.
+///
+/// - A code older than 30 minutes is rejected, measured from `ts` (which the
+///   presenter floored to 5 minutes) to `now_secs`. A payload without a
+///   timestamp (`ts = 0`) is as old as a code can be.
+/// - A code dated more than 30 minutes after the current coarsened time is
+///   rejected: a presenter's clock may run that far ahead, and no further, or
+///   `ts` would set no bound on how long a code can be scanned.
+pub fn parse_qr_payload_at(data: &[u8], now_secs: u64) -> Result<QrPayload, CoreError> {
     let payload: QrPayload = ciborium::from_reader(data)
         .map_err(|e| CoreError::BootstrapFailed(format!("CBOR decode: {e}")))?;
 
@@ -123,11 +141,19 @@ pub fn parse_qr_payload(data: &[u8]) -> Result<QrPayload, CoreError> {
     }
 
     // Reject QR codes older than 30 minutes
-    let now_secs = crate::now_epoch_secs();
-    if payload.ts > 0 && now_secs.saturating_sub(payload.ts) > QR_MAX_AGE_SECS {
+    if now_secs.saturating_sub(payload.ts) > QR_MAX_AGE_SECS {
         return Err(CoreError::BootstrapFailed(format!(
             "QR code expired: created {} seconds ago (max {})",
             now_secs.saturating_sub(payload.ts),
+            QR_MAX_AGE_SECS
+        )));
+    }
+    // ... and codes dated more than 30 minutes ahead of the current bucket
+    let now_bucket = now_secs - now_secs % QR_TS_BUCKET_SECS;
+    if payload.ts.saturating_sub(now_bucket) > QR_MAX_AGE_SECS {
+        return Err(CoreError::BootstrapFailed(format!(
+            "QR code timestamp is {} seconds ahead of this device's clock (max {})",
+            payload.ts.saturating_sub(now_bucket),
             QR_MAX_AGE_SECS
         )));
     }
