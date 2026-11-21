@@ -5,14 +5,7 @@
 //
 //   npx playwright test --project=flows-chromium      (needs the relay binary, see harness.ts)
 import type { Browser, BrowserContext, Page } from "@playwright/test";
-import {
-  expect,
-  expectClean,
-  type Problems,
-  type Server,
-  test,
-  watch,
-} from "./harness.ts";
+import { expect, expectClean, type Problems, type Server, test, watch } from "./harness.ts";
 
 const PHONE = { width: 390, height: 844 };
 const WIDE = { width: 1280, height: 900 };
@@ -99,9 +92,7 @@ async function recordPeerConnections(context: BrowserContext): Promise<void> {
           "icecandidate",
           (e) =>
             note(
-              `local candidate ${
-                e.candidate ? e.candidate.candidate || "(end)" : "(null)"
-              }`,
+              `local candidate ${e.candidate ? e.candidate.candidate || "(end)" : "(null)"}`,
             ),
         );
         pc.addEventListener("icecandidateerror", (e) => {
@@ -155,15 +146,9 @@ function connectionReport(page: Page): Promise<string> {
     for (const video of document.querySelectorAll("video")) {
       const tracks = (video.srcObject as MediaStream | null)?.getTracks().map((
         t,
-      ) =>
-        `${t.kind} ${t.readyState}${t.enabled ? "" : " disabled"}${
-          t.muted ? " muted" : ""
-        }`
-      );
+      ) => `${t.kind} ${t.readyState}${t.enabled ? "" : " disabled"}${t.muted ? " muted" : ""}`);
       out.push(
-        `video ${video.dataset.testid}: ${
-          video.paused ? "paused" : "playing"
-        }, ` +
+        `video ${video.dataset.testid}: ${video.paused ? "paused" : "playing"}, ` +
           `readyState ${video.readyState}, ${video.videoWidth}x${video.videoHeight}, ` +
           `tracks: ${tracks ? tracks.join("; ") || "none" : "no stream"}`,
       );
@@ -191,14 +176,10 @@ function connectionReport(page: Page): Promise<string> {
       try {
         const stats = await pc.getStats();
         const byId = new Map<string, Record<string, unknown>>();
-        stats.forEach((r: Record<string, unknown>) =>
-          byId.set(r.id as string, r)
-        );
+        stats.forEach((r: Record<string, unknown>) => byId.set(r.id as string, r));
         const where = (id: unknown) => {
           const c = byId.get(id as string);
-          return c
-            ? `${c.candidateType} ${c.protocol} ${c.address ?? c.ip}:${c.port}`
-            : "?";
+          return c ? `${c.candidateType} ${c.protocol} ${c.address ?? c.ip}:${c.port}` : "?";
         };
         stats.forEach((r: Record<string, unknown>) => {
           if (r.type === "candidate-pair") {
@@ -256,9 +237,7 @@ async function withConnectionReport(
         const connections = state === "the page answers"
           ? await Promise.race([
             connectionReport(page),
-            new Promise<string>((done) =>
-              setTimeout(() => done("no report in 10 s"), 10_000)
-            ),
+            new Promise<string>((done) => setTimeout(() => done("no report in 10 s"), 10_000)),
           ]).catch((e) => `no report: ${e}`)
           : "no report";
         const calls = (callLogs.get(page) ?? []).map((l) => `  ${l}`).join(
@@ -282,8 +261,7 @@ async function withConnectionReport(
       new Promise<void>((_done, fail) => {
         if (within !== undefined) {
           timer = setTimeout(
-            () =>
-              fail(new Error(`this step did not finish in ${within / 1000} s`)),
+            () => fail(new Error(`this step did not finish in ${within / 1000} s`)),
             within,
           );
         }
@@ -314,9 +292,7 @@ function shownCode(page: Page): Promise<string> {
     svg.setAttribute("height", "400");
     svg.querySelector("rect")!.setAttribute("fill", "#ffffff");
     svg.querySelector("path")!.setAttribute("fill", "#000000");
-    return `data:image/svg+xml;base64,${
-      btoa(new XMLSerializer().serializeToString(svg))
-    }`;
+    return `data:image/svg+xml;base64,${btoa(new XMLSerializer().serializeToString(svg))}`;
   });
 }
 
@@ -452,8 +428,7 @@ async function pairByPaste(
   await nameContact(presenter, names.scanner);
 }
 
-const lineOf = (page: Page) =>
-  page.getByTestId("conversation").getByTestId("line");
+const lineOf = (page: Page) => page.getByTestId("conversation").getByTestId("line");
 
 async function openLine(...pages: Page[]): Promise<void> {
   for (const page of pages) {
@@ -616,8 +591,7 @@ test("a code works only while its screen is open; someone who used it is asked f
   await expect(ana.page.getByTestId("name-prompt")).toHaveCount(0);
   // The confirmation stays clear of the composer.
   const toast = (await ana.page.getByTestId("toast").boundingBox())!;
-  const composer =
-    (await ana.page.getByTestId("composer-input").boundingBox())!;
+  const composer = (await ana.page.getByTestId("composer-input").boundingBox())!;
   expect(toast.y + toast.height).toBeLessThan(composer.y);
 
   await openLine(ana.page, ben.page);
@@ -899,9 +873,7 @@ test("a video call: ring, accept, controls, end; and a declined call", async ({ 
   const signaling = (page: Page, which: number[]) =>
     page.evaluate(
       (which) =>
-        which.map((i) =>
-          (window as unknown as { __pcs: Kept[] }).__pcs[i].pc.signalingState
-        ),
+        which.map((i) => (window as unknown as { __pcs: Kept[] }).__pcs[i].pc.signalingState),
       which,
     );
   await withConnectionReport({ ana: ana.page, ben: ben.page }, async () => {
