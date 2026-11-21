@@ -186,6 +186,14 @@ export interface MediaStreamLike {
 export interface RtpSender {
   readonly track: MediaTrack | null;
   replaceTrack(track: MediaTrack | null): Promise<void>;
+  /** The DTLS transport it sends on, once descriptions are set (where the browser has it). */
+  readonly transport?: DtlsTransport | null;
+}
+
+/** The part of `RTCDtlsTransport` the engine uses. */
+export interface DtlsTransport {
+  readonly state: string;
+  addEventListener(type: "statechange", listener: () => void): void;
 }
 
 /** The part of `RTCPeerConnection` the engine uses. */

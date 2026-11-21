@@ -5,14 +5,7 @@
 //
 //   npx playwright test --project=flows-chromium      (needs the relay binary, see harness.ts)
 import type { Browser, BrowserContext, Page } from "@playwright/test";
-import {
-  expect,
-  expectClean,
-  type Problems,
-  type Server,
-  test,
-  watch,
-} from "./harness.ts";
+import { expect, expectClean, type Problems, type Server, test, watch } from "./harness.ts";
 
 const PHONE = { width: 390, height: 844 };
 const WIDE = { width: 1280, height: 900 };
@@ -44,6 +37,156 @@ async function exposeHostAddresses(context: BrowserContext): Promise<void> {
   });
 }
 
+/**
+ * Keep every RTCPeerConnection a page makes, with a timed log of its ICE events, so a flow
+ * that fails to connect can say why (`connectionReport`). Diagnostics only: nothing in a
+ * flow reads it unless it failed.
+ */
+async function recordPeerConnections(context: BrowserContext): Promise<void> {
+  await context.addInitScript(() => {
+    type Kept = { pc: RTCPeerConnection; t0: number; log: string[] };
+    const kept: Kept[] = [];
+    (window as unknown as { __pcs: Kept[] }).__pcs = kept;
+    const Native = window.RTCPeerConnection;
+    if (!Native) return;
+    window.RTCPeerConnection = new Proxy(Native, {
+      construct(target, args, newTarget) {
+        const pc = Reflect.construct(
+          target,
+          args,
+          newTarget,
+        ) as RTCPeerConnection;
+        const entry: Kept = { pc, t0: performance.now(), log: [] };
+        const note = (what: string) =>
+          entry.log.push(
+            `+${Math.round(performance.now() - entry.t0)}ms ${what}`,
+          );
+        pc.addEventListener(
+          "icegatheringstatechange",
+          () => note(`gathering ${pc.iceGatheringState}`),
+        );
+        pc.addEventListener(
+          "iceconnectionstatechange",
+          () => note(`ice ${pc.iceConnectionState}`),
+        );
+        pc.addEventListener(
+          "connectionstatechange",
+          () => note(`connection ${pc.connectionState}`),
+        );
+        const watched = new Set<RTCDtlsTransport>();
+        pc.addEventListener("signalingstatechange", () => {
+          note(`signaling ${pc.signalingState}`);
+          for (const t of pc.getTransceivers()) {
+            const dtls = t.sender.transport;
+            if (!dtls || watched.has(dtls)) continue;
+            watched.add(dtls);
+            const n = watched.size;
+            note(`dtls transport ${n} (mid ${t.mid}) ${dtls.state}`);
+            dtls.addEventListener("statechange", () => note(`dtls transport ${n} ${dtls.state}`));
+          }
+        });
+        pc.addEventListener(
+          "icecandidate",
+          (e) =>
+            note(
+              `local candidate ${e.candidate ? e.candidate.candidate || "(end)" : "(null)"}`,
+            ),
+        );
+        pc.addEventListener("icecandidateerror", (e) => {
+          const err = e as RTCPeerConnectionIceErrorEvent;
+          note(`candidate error ${err.errorCode} ${err.errorText} ${err.url}`);
+        });
+        kept.push(entry);
+        return pc;
+      },
+    });
+  });
+}
+
+/** Every connection a page made: states, the timed ICE log, SDP candidates, candidate pairs. */
+function connectionReport(page: Page): Promise<string> {
+  return page.evaluate(async () => {
+    type Kept = { pc: RTCPeerConnection; t0: number; log: string[] };
+    const kept = (window as unknown as { __pcs?: Kept[] }).__pcs ?? [];
+    const out: string[] = [];
+    for (const [i, { pc, log }] of kept.entries()) {
+      const lines = (sdp: string | undefined) =>
+        // The description without its codec lists.
+        (sdp ?? "").split(/\r?\n/).filter((l) =>
+          l !== "" && !/^a=(rtpmap|fmtp|rtcp-fb|extmap|ssrc|msid)/.test(l)
+        );
+      out.push(
+        `connection ${i}: signaling ${pc.signalingState}, gathering ${pc.iceGatheringState}, ` +
+          `ice ${pc.iceConnectionState}, connection ${pc.connectionState}`,
+        ...log.map((l) => `  ${l}`),
+        "  local description:",
+        ...lines(pc.localDescription?.sdp).map((l) => `    ${l}`),
+        "  remote description:",
+        ...lines(pc.remoteDescription?.sdp).map((l) => `    ${l}`),
+        ...pc.getTransceivers().map((t) => {
+          const dtls = t.sender.transport;
+          return `  transceiver ${t.mid} ${t.currentDirection}: dtls ${dtls?.state}, ` +
+            `ice ${dtls?.iceTransport?.state}`;
+        }),
+      );
+      try {
+        const stats = await pc.getStats();
+        const byId = new Map<string, Record<string, unknown>>();
+        stats.forEach((r: Record<string, unknown>) => byId.set(r.id as string, r));
+        const where = (id: unknown) => {
+          const c = byId.get(id as string);
+          return c ? `${c.candidateType} ${c.protocol} ${c.address ?? c.ip}:${c.port}` : "?";
+        };
+        stats.forEach((r: Record<string, unknown>) => {
+          if (r.type === "candidate-pair") {
+            out.push(
+              `  pair ${r.state}${r.nominated ? " nominated" : ""}: ${
+                where(r.localCandidateId)
+              } -> ` +
+                `${
+                  where(r.remoteCandidateId)
+                } (requests ${r.requestsSent}, responses ${r.responsesReceived})`,
+            );
+          }
+        });
+      } catch (e) {
+        out.push(`  getStats failed: ${e}`);
+      }
+    }
+    return out.join("\n") || "no RTCPeerConnection was made";
+  });
+}
+
+/**
+ * Run `step`; if it throws, attach both pages' connection reports to the failure.
+ * `PAROLNET_CONNECTION_REPORT=1` prints them after a success too.
+ */
+async function withConnectionReport(
+  people: Record<string, Page>,
+  step: () => Promise<void>,
+): Promise<void> {
+  const report = async () => {
+    // Both at once: the test may be close to its own timeout.
+    const texts = await Promise.all(
+      Object.values(people).map((page) => connectionReport(page).catch((e) => `no report: ${e}`)),
+    );
+    for (const [i, name] of Object.keys(people).entries()) {
+      await test.info().attach(`connections-${name}.txt`, {
+        body: texts[i],
+        contentType: "text/plain",
+      });
+      console.log(`--- ${name}'s connections ---\n${texts[i]}`);
+    }
+  };
+  try {
+    await step();
+  } catch (error) {
+    await report();
+    throw error;
+  }
+  if (process.env.PAROLNET_CONNECTION_REPORT === "1") await report();
+}
+
 /** The QR code a page is showing, as a picture (a data URL) another page's camera can see. */
 function shownCode(page: Page): Promise<string> {
   return page.getByTestId("pairing-qr").evaluate((shown) => {
@@ -54,9 +197,7 @@ function shownCode(page: Page): Promise<string> {
     svg.setAttribute("height", "400");
     svg.querySelector("rect")!.setAttribute("fill", "#ffffff");
     svg.querySelector("path")!.setAttribute("fill", "#000000");
-    return `data:image/svg+xml;base64,${
-      btoa(new XMLSerializer().serializeToString(svg))
-    }`;
+    return `data:image/svg+xml;base64,${btoa(new XMLSerializer().serializeToString(svg))}`;
   });
 }
 
@@ -145,6 +286,7 @@ async function person(
   init?: (context: BrowserContext) => Promise<void>,
 ): Promise<Person> {
   const context = await browser.newContext({ viewport });
+  await recordPeerConnections(context);
   if (browser.browserType().name() === "webkit") {
     await exposeHostAddresses(context);
   }
@@ -190,8 +332,7 @@ async function pairByPaste(
   await nameContact(presenter, names.scanner);
 }
 
-const lineOf = (page: Page) =>
-  page.getByTestId("conversation").getByTestId("line");
+const lineOf = (page: Page) => page.getByTestId("conversation").getByTestId("line");
 
 async function openLine(...pages: Page[]): Promise<void> {
   for (const page of pages) {
@@ -354,8 +495,7 @@ test("a code works only while its screen is open; someone who used it is asked f
   await expect(ana.page.getByTestId("name-prompt")).toHaveCount(0);
   // The confirmation stays clear of the composer.
   const toast = (await ana.page.getByTestId("toast").boundingBox())!;
-  const composer =
-    (await ana.page.getByTestId("composer-input").boundingBox())!;
+  const composer = (await ana.page.getByTestId("composer-input").boundingBox())!;
   expect(toast.y + toast.height).toBeLessThan(composer.y);
 
   await openLine(ana.page, ben.page);
@@ -549,12 +689,16 @@ test("a video call: ring, accept, controls, end; and a declined call", async ({ 
   await expect(ana.page.getByTestId("call-accept")).toBeFocused();
   await ana.page.keyboard.press("Enter");
 
+  await withConnectionReport({ ana: ana.page, ben: ben.page }, async () => {
+    for (const page of [ana.page, ben.page]) {
+      await expect(page.getByTestId("call-screen")).toHaveAttribute(
+        "data-state",
+        "Active",
+        CONNECT,
+      );
+    }
+  });
   for (const page of [ana.page, ben.page]) {
-    await expect(page.getByTestId("call-screen")).toHaveAttribute(
-      "data-state",
-      "Active",
-      CONNECT,
-    );
     await expect(page.getByTestId("call-status")).toHaveText(
       "Direct, end-to-end encrypted",
     );
@@ -587,11 +731,13 @@ test("a video call: ring, accept, controls, end; and a declined call", async ({ 
   await ben.page.getByTestId("call-mute").click();
 
   // Ana ends it. Ben is told how it ended; both devices let the camera go.
-  await ana.page.getByTestId("call-hangup").click();
-  await expect(ana.page.getByTestId("call-status")).toHaveText("Call ended");
-  await expect(ben.page.getByTestId("call-status")).toHaveText(
-    "Ana ended the call",
-  );
+  await withConnectionReport({ ana: ana.page, ben: ben.page }, async () => {
+    await ana.page.getByTestId("call-hangup").click();
+    await expect(ana.page.getByTestId("call-status")).toHaveText("Call ended");
+    await expect(ben.page.getByTestId("call-status")).toHaveText(
+      "Ana ended the call",
+    );
+  });
   await ben.page.getByTestId("call-close").click();
   await expect(ben.page.getByTestId("call-screen")).toHaveCount(0);
   await ana.page.getByTestId("call-close").click();
