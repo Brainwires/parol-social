@@ -48,8 +48,8 @@ use tokio::sync::{mpsc, oneshot};
 
 pub use call::{CallEnd, CallInfo, CallMedia, CallState, FrameSink, MediaEvent};
 pub use parolnet_rtc::MediaKind;
-pub use store::KeyStorage;
 pub use reconnect::ReconnectConfig;
+pub use store::KeyStorage;
 
 /// Errors surfaced to the client.
 #[derive(Debug, thiserror::Error)]
