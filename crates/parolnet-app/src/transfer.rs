@@ -553,14 +553,17 @@ async fn send_attempt(
     ctl: &mut mpsc::UnboundedReceiver<WorkerCmd>,
     report: &Report,
 ) -> Outcome {
-    // The receiver speaks first.
-    let first = tokio::select! {
-        m = tokio::time::timeout(RESUME_TIMEOUT, ch.rx.recv()) => m,
-        cmd = ctl.recv() => return stop_or_shutdown(cmd),
-    };
-    let resume = match first {
-        Ok(Some(ChannelEvent::Message(m))) => m,
-        _ => return Outcome::Ended { progressed: false },
+    // The receiver speaks first. (A buffered-amount event of the new channel may come before.)
+    let resume = loop {
+        let first = tokio::select! {
+            m = tokio::time::timeout(RESUME_TIMEOUT, ch.rx.recv()) => m,
+            cmd = ctl.recv() => return stop_or_shutdown(cmd),
+        };
+        match first {
+            Ok(Some(ChannelEvent::Message(m))) => break m,
+            Ok(Some(ChannelEvent::BufferedLow)) => {}
+            Ok(None) | Err(_) => return Outcome::Ended { progressed: false },
+        }
     };
     let Ok(start) = sender.begin(&resume, parolnet_transfer::random_bytes()) else {
         return Outcome::Ended { progressed: false };
@@ -617,8 +620,12 @@ async fn send_attempt(
         };
         #[cfg(feature = "test-hooks")]
         test_hooks::maybe_corrupt(&mut record);
-        let Ok(buffered) = ch.data.send(ch.dc, record).await else {
-            return Outcome::Ended { progressed };
+        let buffered = match ch.data.send(ch.dc, record).await {
+            Ok(buffered) => buffered,
+            Err(err) => {
+                tracing::debug!(%err, "a record was not sent; the attempt is over");
+                return Outcome::Ended { progressed };
+            }
         };
         progressed = true;
         if last_report.elapsed() >= PROGRESS_EVERY {
