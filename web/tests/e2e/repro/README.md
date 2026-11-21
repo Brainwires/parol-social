@@ -61,9 +61,32 @@ page (`hold=1`) as the flows do:
 | `deferred`     | `pause()` + `srcObject = null`; a task later `track.stop()`; a task later `pc.close()` (what the app does now) | 0 of 30                 |
 | `camera-only`  | no connection at all: a camera playing in an element, `track.stop()` while it plays                            | 1 of 30 (5 rounds each) |
 
+`pause()` before `srcObject = null` is not what helps: `deferred` with `REPRO_PAUSE=0` (no
+`pause()`) also froze 0 of 30, and that is what the app does (below, why it does not pause).
+
 The app's order is `deferred`: `src/engine/calls.ts` publishes the end of the call first, the store
 detaches every element in the same turn (`src/platform/playback.ts`), and the engine stops the
 capture and closes the connection in later tasks.
+
+## A second freeze, which no order avoids
+
+`camera-off` ends no track at all: the camera is switched off (`enabled = false`), its element is
+detached, and the same stream is attached again 300 ms later. The page sometimes stops while the
+stream is attached again (once, in `srcObject = null`). The main thread is inside a state change of
+the element's pipeline, waiting on a condition inside WebKit, while a streaming thread of the
+capture (an `appsink` handing a sample to WebKit) is in an object's destruction, also waiting on a
+condition inside WebKit.
+
+| how the element is detached        | pages frozen, 5 rounds each | 30 rounds each |
+| ---------------------------------- | --------------------------- | -------------- |
+| `pause()`, then `srcObject = null` | 6 of 40                     | 16 of 20       |
+| `srcObject = null` alone           | 1 of 40                     | 16 of 20       |
+
+Pausing first makes it more likely, so the app does not pause. This is the shape of "turn camera
+off, turn it on again" in the app (the self view goes away and comes back), which the app does the
+way it did before the change above (`srcObject = null` when the self view goes away). In the call
+flow it shows up as a stall at that step, rarely. Nothing in the app avoids it yet; `camera-toggle`
+is the same loop with the element left attached.
 
 ## Running it
 
@@ -77,9 +100,10 @@ docker run --rm --ipc=host -v "$PWD":/work -w /work/tests/e2e \
 
 `run.mjs <order> <pages> <rounds per page> <pages at a time>` prints, for each frozen page, whether
 it still answers and its last lines, then a summary; it exits with 1 if any page froze. A busy
-machine freezes more often. `REPRO_ON_FREEZE` names a shell command to run when a page freezes (for
-example `gdb -p <pid> -batch -ex "thread apply all bt"` on the `WPEWebProcess` processes, in an
-image that has `gdb` and with `--cap-add SYS_PTRACE`).
+machine freezes more often. `REPRO_PAUSE=0` detaches without `pause()`. `REPRO_ON_FREEZE` names a
+shell command to run when a page freezes (for example
+`gdb -p <pid> -batch -ex "thread apply all bt"` on the `WPEWebProcess` processes, in an image that
+has `gdb` and with `--cap-add SYS_PTRACE`).
 
 ## What is not known
 

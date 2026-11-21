@@ -14,7 +14,10 @@ const server = createServer((_request, response) => {
   response.end(html);
 });
 await new Promise((done) => server.listen(0, "127.0.0.1", done));
-const url = `http://localhost:${server.address().port}/?order=${order}&rounds=${rounds}&hold=1`;
+// REPRO_PAUSE=0: detach with `srcObject = null` alone, without `pause()` first.
+const pause = process.env.REPRO_PAUSE === "0" ? "&pause=0" : "";
+const url =
+  `http://localhost:${server.address().port}/?order=${order}&rounds=${rounds}&hold=1${pause}`;
 
 const browser = await webkit.launch();
 let frozen = 0;
@@ -88,7 +91,7 @@ async function worker() {
 }
 await Promise.all(Array.from({ length: Number(parallel) }, worker));
 console.log(
-  `${order}: ${finished} of ${pages} pages finished all ${rounds} rounds, ${frozen} froze`,
+  `${order}${pause}: ${finished} of ${pages} pages finished all ${rounds} rounds, ${frozen} froze`,
 );
 await Promise.race([
   browser.close(),

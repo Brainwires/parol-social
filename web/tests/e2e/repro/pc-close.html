@@ -12,6 +12,9 @@
     ?order=stop-first     track.stop(), then pc.close(), then srcObject = null
     ?order=deferred       pause + srcObject = null; a task later track.stop(); a task later pc.close()
     ?order=camera-only    no connection: a camera playing in an element, track.stop() while it plays
+    ?order=camera-off     no connection: the camera is disabled and its element detached; no track ends
+    ?order=camera-toggle  as camera-off, but the element stays attached: only `enabled` changes
+    &pause=0              detach with srcObject = null alone, without pause() first
     &rounds=N             calls to make (default 1)
     &hold=1               also hold a second microphone capture for the whole page, as the flows do
 -->
@@ -24,6 +27,7 @@
 const q = new URLSearchParams(location.search);
 const order = q.get("order") || "close-first";
 const rounds = Number(q.get("rounds") || 1);
+const pauseFirst = q.get("pause") !== "0";
 const say = (text) => {
   console.log(`[repro] ${text}`);
   document.getElementById("out").textContent += text + "\n";
@@ -40,6 +44,41 @@ const playing = (video) =>
     const check = () => (video.videoWidth > 0 && !video.paused ? done() : setTimeout(check, 50));
     check();
   });
+
+// No connection, and no track ends: the camera is switched off (`enabled = false`) and its
+// element is detached, as when the self view goes away during a call.
+async function cameraOff(round, local) {
+  const self = document.getElementById("self-a");
+  self.srcObject = local;
+  self.play().catch(() => {});
+  await playing(self);
+  await new Promise((done) => setTimeout(done, 300));
+  say(`round ${round}: camera playing, switching it off and detaching (pause=${pauseFirst})`);
+  for (const track of local.getVideoTracks()) track.enabled = false;
+  await task();
+  if (pauseFirst) timed("self-a pause", () => self.pause());
+  timed("self-a srcObject = null", () => (self.srcObject = null));
+  for (const track of local.getVideoTracks()) track.enabled = true;
+  say(`round ${round}: done`);
+}
+
+// As `camera-off`, but the element keeps the stream: only `enabled` changes.
+async function cameraToggle(round, local) {
+  const self = document.getElementById("self-a");
+  if (self.srcObject !== local) {
+    self.srcObject = local;
+    self.play().catch(() => {});
+    await playing(self);
+  }
+  await new Promise((done) => setTimeout(done, 300));
+  say(`round ${round}: camera playing, switching it off and on, element attached`);
+  for (const track of local.getVideoTracks()) {
+    timed("enabled = false", () => (track.enabled = false));
+  }
+  await new Promise((done) => setTimeout(done, 100));
+  for (const track of local.getVideoTracks()) timed("enabled = true", () => (track.enabled = true));
+  say(`round ${round}: done`);
+}
 
 // No connection at all: a camera playing in an element, stopped while it plays.
 async function cameraOnly(round) {
@@ -90,7 +129,7 @@ async function call(round) {
 
   const detach = (s) => {
     for (const video of [s.remote, s.self]) {
-      timed(`${s.name} ${video.id} pause`, () => video.pause());
+      if (pauseFirst) timed(`${s.name} ${video.id} pause`, () => video.pause());
       timed(
         `${s.name} ${video.id} srcObject = null`,
         () => (video.srcObject = null),
@@ -136,8 +175,12 @@ async function call(round) {
         audio: true,
       });
     }
+    const camera = order === "camera-off" || order === "camera-toggle"
+      ? await navigator.mediaDevices.getUserMedia({ audio: true, video: true })
+      : null;
     for (let round = 1; round <= rounds; round++) {
-      await (order === "camera-only" ? cameraOnly(round) : call(round));
+      if (camera) await (order === "camera-off" ? cameraOff : cameraToggle)(round, camera);
+      else await (order === "camera-only" ? cameraOnly(round) : call(round));
     }
     say("ALL DONE");
   } catch (error) {

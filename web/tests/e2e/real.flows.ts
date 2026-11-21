@@ -137,6 +137,16 @@ function connectionReport(page: Page): Promise<string> {
     type Kept = { pc: RTCPeerConnection; t0: number; log: string[] };
     const kept = (window as unknown as { __pcs?: Kept[] }).__pcs ?? [];
     const out: string[] = [];
+    for (const video of document.querySelectorAll("video")) {
+      const tracks = (video.srcObject as MediaStream | null)?.getTracks().map((t) =>
+        `${t.kind} ${t.readyState}${t.enabled ? "" : " disabled"}${t.muted ? " muted" : ""}`
+      );
+      out.push(
+        `video ${video.dataset.testid}: ${video.paused ? "paused" : "playing"}, ` +
+          `readyState ${video.readyState}, ${video.videoWidth}x${video.videoHeight}, ` +
+          `tracks: ${tracks ? tracks.join("; ") || "none" : "no stream"}`,
+      );
+    }
     for (const [i, { pc, log }] of kept.entries()) {
       const lines = (sdp: string | undefined) =>
         // The description without its codec lists.
@@ -768,37 +778,44 @@ test("a video call: ring, accept, controls, end; and a declined call", async ({ 
       );
     }
   });
-  for (const page of [ana.page, ben.page]) {
-    await expect(page.getByTestId("call-status")).toHaveText(
-      "Direct, end-to-end encrypted",
-    );
-    await expect(page.getByTestId("call-timer")).toHaveText(/^\d+:\d\d$/);
-    // Their video is playing, and our own floats beside it.
-    await expect.poll(
-      () =>
-        page.getByTestId("call-remote").evaluate((video: HTMLVideoElement) =>
-          video.videoWidth > 0 && !video.paused
-        ),
-      CONNECT,
-    ).toBe(true);
-    await expect(page.getByTestId("call-self")).toBeVisible();
-  }
-  await expect(ben.page.getByTestId("call-timer")).not.toHaveText("0:00", {
-    timeout: 15_000,
-  });
+  // From here to the end of the call each step has a time limit of its own: a page whose
+  // main thread the browser's media stack has blocked answers nothing, and without the
+  // limit the test would end with no report of which page, or where.
+  await withConnectionReport({ ana: ana.page, ben: ben.page }, async () => {
+    for (const page of [ana.page, ben.page]) {
+      await expect(page.getByTestId("call-status")).toHaveText(
+        "Direct, end-to-end encrypted",
+      );
+      await expect(page.getByTestId("call-timer")).toHaveText(/^\d+:\d\d$/);
+      // Their video is playing, and our own floats beside it.
+      await expect.poll(
+        () =>
+          page.getByTestId("call-remote").evaluate((video: HTMLVideoElement) =>
+            video.videoWidth > 0 && !video.paused
+          ),
+        { timeout: 30_000 },
+      ).toBe(true);
+      await expect(page.getByTestId("call-self")).toBeVisible();
+    }
+    await expect(ben.page.getByTestId("call-timer")).not.toHaveText("0:00", {
+      timeout: 15_000,
+    });
+  }, 70_000);
 
   // Mute and camera: named for what they will do, and the track really stops flowing.
-  await ben.page.getByTestId("call-mute").click();
-  await expect(ben.page.getByTestId("call-mute")).toHaveAccessibleName(
-    "Unmute microphone",
-  );
-  await ben.page.getByTestId("call-camera").click();
-  await expect(ben.page.getByTestId("call-camera")).toHaveAccessibleName(
-    "Turn camera on",
-  );
-  await expect(ben.page.getByTestId("call-self")).toHaveCount(0);
-  await ben.page.getByTestId("call-camera").click();
-  await ben.page.getByTestId("call-mute").click();
+  await withConnectionReport({ ana: ana.page, ben: ben.page }, async () => {
+    await ben.page.getByTestId("call-mute").click();
+    await expect(ben.page.getByTestId("call-mute")).toHaveAccessibleName(
+      "Unmute microphone",
+    );
+    await ben.page.getByTestId("call-camera").click();
+    await expect(ben.page.getByTestId("call-camera")).toHaveAccessibleName(
+      "Turn camera on",
+    );
+    await expect(ben.page.getByTestId("call-self")).toHaveCount(0);
+    await ben.page.getByTestId("call-camera").click();
+    await ben.page.getByTestId("call-mute").click();
+  }, 30_000);
 
   // Ana ends it. Ben is told how it ended; both devices let the camera and the connection
   // go. The step has a time limit of its own, so that a page frozen in the browser's media
