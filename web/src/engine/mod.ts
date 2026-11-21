@@ -8,11 +8,33 @@ export * from "./types.ts";
 export type * from "./platform.ts";
 export { DEFAULT_RECONNECT, type ReconnectConfig } from "./reconnect.ts";
 export { DB_NAME, DB_VERSION, IdbStorage, MemoryStorage } from "./storage.ts";
+export { SealedStorage } from "./sealed-storage.ts";
+export {
+  KDF_DEFAULT,
+  type KdfParams,
+  MIN_PASSPHRASE,
+  Vault,
+  type VaultCrypto,
+  VaultError,
+  type VaultErrorCode,
+} from "./vault.ts";
+export {
+  BACKUP_EXTENSION,
+  type BackupContents,
+  BackupError,
+  type BackupErrorCode,
+  collectBackup,
+  decodeBackup,
+  encodeBackup,
+  restoredRows,
+} from "./backup.ts";
 export {
   attachLifecycle,
   browserMedia,
   browserPlatform,
   type BrowserPlatformOptions,
+  browserVaultCrypto,
+  openBrowserVault,
   requestPersistentStorage,
   sameOriginRelayUrl,
   wasmApi,

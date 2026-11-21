@@ -115,6 +115,46 @@ for (const theme of ["light", "dark"] as const) {
         await page.screenshot({ path: join(out, "settings-wipe.png") });
         await page.getByTestId("sheet-wipe-close").click();
 
+        // The passphrase lock, the backup and the restore.
+        await page.getByTestId("settings-lock").scrollIntoViewIfNeeded();
+        await page.screenshot({ path: join(out, "settings-protection.png") });
+        await page.getByTestId("lock-set").click();
+        await page.getByTestId("lock-new").fill("short");
+        await page.getByTestId("lock-submit").click();
+        await expect(page.getByTestId("lock-problem")).not.toBeEmpty();
+        await page.screenshot({ path: join(out, "lock-set.png") });
+        await page.getByTestId("sheet-lock-set-close").click();
+        await page.getByTestId("backup-open").click();
+        await page.screenshot({ path: join(out, "backup.png") });
+        await page.getByTestId("backup-new").fill("four random words here");
+        await page.getByTestId("backup-again").fill("four random words here");
+        await page.getByTestId("backup-make").click();
+        await expect(page.getByTestId("backup-save")).toBeVisible();
+        await page.screenshot({ path: join(out, "backup-ready.png") });
+        await page.getByTestId("sheet-backup-close").click();
+        await page.getByTestId("restore-open").click();
+        await page.screenshot({ path: join(out, "restore.png") });
+        await page.getByTestId("sheet-restore-close").click();
+
+        await go(page, "#/lab");
+        await page.getByTestId("lab-phase-locked").click();
+        await go(page, "#/");
+        await expect(page.getByTestId("locked")).toBeVisible();
+        await page.getByTestId("unlock-passphrase").fill("wrong");
+        await page.getByTestId("unlock-submit").click();
+        await expect(page.getByTestId("unlock-problem")).not.toBeEmpty();
+        await page.screenshot({ path: join(out, "locked.png") });
+        await page.getByTestId("unlock-forgot").click();
+        await page.screenshot({ path: join(out, "locked-forgot.png") });
+        await page.getByTestId("sheet-forget-close").click();
+        await go(page, "#/lab");
+        await page.getByTestId("lab-phase-first-run").click();
+        await go(page, "#/");
+        await expect(page.getByTestId("first-run")).toBeVisible();
+        await page.screenshot({ path: join(out, "first-run.png") });
+        await go(page, "#/lab");
+        await page.getByTestId("lab-phase-ready").click();
+
         await go(page, "#/lab");
         await page.getByTestId("lab-contact").selectOption("a1".repeat(32));
         await page.getByTestId("lab-call-incoming").click();

@@ -6,7 +6,7 @@ import { batch, signal } from "denext/signals";
 import type { Engine } from "../engine/engine.ts";
 import { type AppEvent, EngineError } from "../engine/types.ts";
 import type { CallInfo, ChatMessage, ContactView, PairingCode, RelayState } from "./model.ts";
-import type { AppStore, CallMediaStreams, Notice, Phase, TurnView } from "./store.ts";
+import type { AppStore, BackupFile, CallMediaStreams, Notice, Phase, TurnView } from "./store.ts";
 
 /** The part of the engine the store uses. `Engine` satisfies it. */
 export type EnginePort = Pick<
@@ -49,12 +49,48 @@ export class StartError extends Error {
   }
 }
 
-export interface Prepared {
+/**
+ * This device's protected storage, apart from the engine that runs on it. Rejections are
+ * `VaultError`s (the lock) and `BackupError`s (the file).
+ */
+export interface DeviceVault {
+  hasPassphrase(): boolean;
+  setPassphrase(next: string): Promise<void>;
+  changePassphrase(current: string, next: string): Promise<void>;
+  removePassphrase(current: string): Promise<void>;
+  backup(
+    passphrase: string,
+    options: { history: boolean; peerId: string },
+  ): Promise<BackupFile>;
+  /** Replace everything stored by the backup's contents. The page must reload afterwards. */
+  restore(file: Uint8Array, passphrase: string): Promise<void>;
+  lastBackupMs(): Promise<number | null>;
+}
+
+/** Storage that can be read: either it has no passphrase, or it was typed. */
+export interface Unlocked {
+  locked?: undefined;
   /** This device already has an identity (otherwise: the first-run screen). */
   hasIdentity: boolean;
   /** Start the engine; creates the identity when there is none. May reject with `Busy`. */
   start(): Promise<EnginePort>;
+  /** Absent only where the storage is not a protected one (tests). */
+  device?: DeviceVault;
 }
+
+/** Storage locked with a passphrase. */
+export interface Locked {
+  locked: {
+    /** When the next passphrase may be tried (0: now). */
+    retryAtMs(): Promise<number>;
+    /** Rejects with a `VaultError`: `WrongPassphrase` or `TooSoon`. */
+    unlock(passphrase: string): Promise<Unlocked>;
+    /** Delete the database, keys and all. */
+    destroy(): Promise<void>;
+  };
+}
+
+export type Prepared = Unlocked | Locked;
 
 /** What the store needs from the page. */
 export interface StoreEnv {
@@ -113,12 +149,31 @@ export function createEngineStore(env: StoreEnv): EngineStore {
   const turn = signal<TurnView | null>(null);
   const notice = signal<Notice | null>(null);
 
-  let prepared: Prepared | null = null;
+  const passphraseSet = signal(false);
+  const lastBackupMs = signal<number | null>(null);
+
+  let prepared: Unlocked | null = null;
+  let locked: Locked["locked"] | null = null;
+  let wantsTakeover = false;
   let engine: EnginePort | null = null;
   let unsubscribe: (() => void) | null = null;
   let endedTimer: unknown = null;
 
   const live = (): EnginePort => engine ?? notReady();
+  const device = (): DeviceVault => prepared?.device ?? notReady();
+
+  /** Storage can be read: first run, or start the engine. */
+  async function proceed(unlocked: Unlocked): Promise<void> {
+    prepared = unlocked;
+    locked = null;
+    passphraseSet.value = unlocked.device?.hasPassphrase() ?? false;
+    void unlocked.device?.lastBackupMs().then((ms) => (lastBackupMs.value = ms)).catch(() => {});
+    if (!unlocked.hasIdentity) {
+      phase.value = { kind: "first-run" };
+      return;
+    }
+    if (!(await launch()) && wantsTakeover) takeOver();
+  }
 
   function thread(peerId: string, change: (list: readonly ChatMessage[]) => ChatMessage[]): void {
     const next = new Map(messages.value);
@@ -317,9 +372,13 @@ export function createEngineStore(env: StoreEnv): EngineStore {
     turn,
     notice,
 
+    passphraseSet,
+    lastBackupMs,
+
     async start() {
+      let opened: Prepared;
       try {
-        prepared = await env.prepare();
+        opened = await env.prepare();
       } catch (error) {
         phase.value = {
           kind: "failed",
@@ -327,12 +386,77 @@ export function createEngineStore(env: StoreEnv): EngineStore {
         };
         return;
       }
-      const wantsTakeover = env.takeoverOnStart.take();
-      if (!prepared.hasIdentity) {
-        phase.value = { kind: "first-run" };
+      wantsTakeover = env.takeoverOnStart.take();
+      if (opened.locked) {
+        locked = opened.locked;
+        phase.value = { kind: "locked", retryAtMs: await locked.retryAtMs().catch(() => 0) };
         return;
       }
-      if (!(await launch()) && wantsTakeover) takeOver();
+      await proceed(opened);
+    },
+
+    async unlock(passphrase) {
+      const door = locked;
+      if (!door || phase.value.kind !== "locked") return;
+      let unlocked: Unlocked;
+      try {
+        unlocked = await door.unlock(passphrase);
+      } catch (error) {
+        if (error instanceof StartError) {
+          phase.value = { kind: "failed", reason: error.reason };
+          return;
+        }
+        // A wrong passphrase: the screen says so, and how long the next try has to wait.
+        phase.value = { kind: "locked", retryAtMs: await door.retryAtMs().catch(() => 0) };
+        throw error;
+      }
+      await proceed(unlocked);
+    },
+
+    async forget() {
+      const door = locked;
+      if (!door) return;
+      await door.destroy();
+      env.clearPreferences();
+      env.reload();
+    },
+
+    lock() {
+      // The keys exist only in this page: a reload ends at the passphrase.
+      if (!passphraseSet.value) return;
+      const running = engine;
+      if (running) detach();
+      void (running ? running.shutdown() : Promise.resolve()).finally(() => env.reload());
+    },
+
+    async setPassphrase(next) {
+      await device().setPassphrase(next);
+      passphraseSet.value = true;
+    },
+    async changePassphrase(current, next) {
+      await device().changePassphrase(current, next);
+    },
+    async removePassphrase(current) {
+      await device().removePassphrase(current);
+      passphraseSet.value = false;
+    },
+
+    async makeBackup(passphrase, options) {
+      const file = await device().backup(passphrase, {
+        history: options.history,
+        peerId: live().peerId,
+      });
+      lastBackupMs.value = file.madeMs;
+      return file;
+    },
+
+    async restore(file, passphrase) {
+      // Rejects before anything is written when the file or the passphrase is wrong.
+      await device().restore(file, passphrase);
+      // The database now holds the backup; an engine still running holds the old state and
+      // can no longer write. Start over from what was restored.
+      if (engine) detach();
+      env.reload();
     },
 
     async begin() {
@@ -389,7 +513,15 @@ export function createEngineStore(env: StoreEnv): EngineStore {
     },
     setCameraOff(off) {
       const current = call.value;
-      if (current) engine?.setCameraOff(current.callId, off);
+      if (!current || !engine) return;
+      // The self view lets its stream go before the camera track is switched off, never
+      // after: detaching a stream whose track was just disabled can freeze the page in
+      // WebKit on Linux (tests/e2e/repro, `camera-off` against `camera-off-detach-first`).
+      // Switching it back on allows the stream again; the screen attaches it once the
+      // engine has said the camera is on.
+      const media = callMedia.value;
+      env.keepPlaying?.(off ? [media.remote] : [media.local, media.remote]);
+      engine.setCameraOff(current.callId, off);
     },
     async replaceCamera(stream) {
       const current = call.value;

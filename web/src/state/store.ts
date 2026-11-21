@@ -19,6 +19,11 @@ import { shownName } from "./names.ts";
 export type Phase =
   /** Loading the encryption core and opening this device's storage. */
   | { kind: "loading" }
+  /**
+   * What is on this device is locked with a passphrase. `retryAtMs` is when the next try is
+   * allowed after too many wrong ones (0: now).
+   */
+  | { kind: "locked"; retryAtMs: number }
   /** Nothing on this device yet: the first-run screen. */
   | { kind: "first-run" }
   /** Another tab runs ParolNet (`moved`: this tab ran it until the other took over). */
@@ -55,6 +60,13 @@ export interface TurnInput {
   relayOnly: boolean;
 }
 
+/** A backup file, ready to be saved. */
+export interface BackupFile {
+  bytes: Uint8Array;
+  /** When it was made. */
+  madeMs: number;
+}
+
 export interface AppStore {
   readonly phase: ReadonlySignal<Phase>;
   /** The home relay connection. */
@@ -74,8 +86,33 @@ export interface AppStore {
   readonly turn: ReadonlySignal<TurnView | null>;
   readonly notice: ReadonlySignal<Notice | null>;
 
+  /** A passphrase locks what is on this device (asked for at every start). */
+  readonly passphraseSet: ReadonlySignal<boolean>;
+  /** When this device last made a backup; null: never (or not known yet). */
+  readonly lastBackupMs: ReadonlySignal<number | null>;
+
   /** First run: make this device's identity and start. */
   begin(): Promise<void>;
+  /**
+   * Locked: open with the passphrase. Rejects with a `VaultError` (`WrongPassphrase`,
+   * `TooSoon`); the `locked` phase then says when the next try is allowed.
+   */
+  unlock(passphrase: string): Promise<void>;
+  /** Locked, and the passphrase is forgotten: delete everything on this device. */
+  forget(): Promise<void>;
+  /** Close ParolNet until the passphrase is typed again. */
+  lock(): void;
+  /** Rejects with a `VaultError` (`Weak`; for a wrong current passphrase as `unlock` does). */
+  setPassphrase(next: string): Promise<void>;
+  changePassphrase(current: string, next: string): Promise<void>;
+  removePassphrase(current: string): Promise<void>;
+  /** A backup of this device under `passphrase`. Rejects with a `BackupError`. */
+  makeBackup(passphrase: string, options: { history: boolean }): Promise<BackupFile>;
+  /**
+   * Replace what is on this device by what a backup file holds, then start over from it.
+   * Rejects with a `BackupError`, and then nothing on this device has changed.
+   */
+  restore(file: Uint8Array, passphrase: string): Promise<void>;
   /** Another tab has ParolNet: run it in this one instead. */
   takeOver(): void;
 
@@ -122,6 +159,8 @@ export interface AppStore {
 
 /** What the state lab can flip on a fake store. The real store has no such controls. */
 export interface FakeControls {
+  /** Put the app in any phase (the locked screen, first run). */
+  setPhase(phase: Phase): void;
   setPath(peerId: string, path: PathState): void;
   setSelfOnline(online: boolean): void;
   /** Put a call on screen in any state (null: no call). */
