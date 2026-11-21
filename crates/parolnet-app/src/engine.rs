@@ -1552,7 +1552,12 @@ impl Engine {
             RtcEvent::IceConnectionState(_)
             | RtcEvent::Track { .. }
             | RtcEvent::Rtp { .. }
-            | RtcEvent::KeyframeRequested => {}
+            | RtcEvent::KeyframeRequested
+            | RtcEvent::RemoteMedia { .. }
+            | RtcEvent::LocalMedia { .. }
+            | RtcEvent::TargetBitrate { .. }
+            | RtcEvent::Quality(_)
+            | RtcEvent::RemoteOfferIgnored => {}
         }
     }
 
