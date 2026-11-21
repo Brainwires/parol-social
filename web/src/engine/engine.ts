@@ -2321,7 +2321,8 @@ export class Engine {
   /**
    * Send the video of `stream` instead of the camera the call started with (another
    * camera, chosen by the UI). No renegotiation. The engine takes the stream over: it stops
-   * the old video track now and this one when the call ends. Rejects with `UnknownCall`
+   * the old video track once `CallMedia` has announced the new one, and this one when the
+   * call ends. Rejects with `UnknownCall`
    * when the call is over or has no video (the stream is stopped then).
    */
   replaceCamera(callId: string, stream: MediaStreamLike): Promise<void> {

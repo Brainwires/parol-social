@@ -1,5 +1,5 @@
 // The registry of the elements that play a call (src/platform/playback.ts): everything is
-// detached in one turn, paused first, and a stream the call no longer has is not played.
+// detached in one turn, and a stream the call no longer has is not played.
 import { assertEquals } from "@std/assert";
 import { detach, keepOnly, play } from "../../src/platform/playback.ts";
 
@@ -26,7 +26,7 @@ function element(name: string, log: string[]) {
 
 const stream = (id: string) => ({ id }) as unknown as MediaStream;
 
-Deno.test("playback: when the call ends every element is paused and detached in that turn", () => {
+Deno.test("playback: when the call ends every element is detached in that turn", () => {
   const log: string[] = [];
   const [remote, self] = [element("remote", log), element("self", log)];
   const [theirs, ours] = [stream("theirs"), stream("ours")];
@@ -42,12 +42,7 @@ Deno.test("playback: when the call ends every element is paused and detached in 
 
   log.length = 0;
   keepOnly([]);
-  assertEquals(log, [
-    "remote.pause()",
-    "remote.srcObject = null",
-    "self.pause()",
-    "self.srcObject = null",
-  ]);
+  assertEquals(log, ["remote.srcObject = null", "self.srcObject = null"]);
 
   // Nothing is left to do when the screen lets go of them afterwards, or at the next call's end.
   log.length = 0;
@@ -68,7 +63,7 @@ Deno.test("playback: a stream the call no longer has is not played, and stops pl
   // The camera was switched: the old capture stops playing, their video goes on.
   log.length = 0;
   keepOnly([back, theirs]);
-  assertEquals(log, ["self.pause()", "self.srcObject = null"]);
+  assertEquals(log, ["self.srcObject = null"]);
   log.length = 0;
   play(self, back);
   assertEquals(log, ["self.srcObject = back", "self.play()"]);
@@ -88,10 +83,13 @@ Deno.test("playback: an element whose teardown throws does not keep the others p
   keepOnly([theirs]);
   play(broken, theirs);
   play(fine, theirs);
-  broken.pause = () => {
-    throw new Error("pause failed");
-  };
+  Object.defineProperty(broken, "srcObject", {
+    get: () => theirs,
+    set() {
+      throw new Error("detaching failed");
+    },
+  });
   log.length = 0;
   keepOnly([]);
-  assertEquals(log, ["fine.pause()", "fine.srcObject = null"]);
+  assertEquals(log, ["fine.srcObject = null"]);
 });

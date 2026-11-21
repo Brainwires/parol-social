@@ -30,14 +30,14 @@ export function play(
   void element.play().catch(() => {});
 }
 
-/** Stop playing in `element` and let go of its stream. */
+/** Let go of the stream `element` plays. */
 export function detach(element: HTMLMediaElement): void {
   playing.delete(element);
   try {
-    if (element.srcObject === null) return;
-    // Paused first: the element's pipeline is then idle when the stream is taken away.
-    element.pause();
-    element.srcObject = null;
+    // Not paused first: on the browser this is for, a paused pipeline made the freeze that
+    // comes with attaching the stream again more likely, and made this one no rarer
+    // (tests/e2e/repro).
+    if (element.srcObject !== null) element.srcObject = null;
   } catch {
     // An element the browser already tore down.
   }
