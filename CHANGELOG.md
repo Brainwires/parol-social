@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added — Desktop ↔ PWA interop in Firefox and WebKit (M1, third slice)
+- `apps/desktop/interop/pwa-interop.mjs` drives the PWA through Playwright instead of Puppeteer and takes `INTEROP_BROWSER=chromium|firefox|webkit`. The same seven cases (pairing both ways, chat, the sender queue across a browser restart, the refused tampered binding, video calls both ways, a PWA-offered data channel while holding media) pass in headless Chromium (mDNS and loopback candidates, as before), Firefox (mDNS and loopback candidates; fake streams) and Playwright's Linux WebKit (plain host candidates; mock capture devices), with no case skipped and no change to the PWA or the desktop core.
+- Firefox and WebKit reach nothing but 127.0.0.1 (a proxy that refuses every other host, service-worker requests included); every run now fails if a page learned a STUN or TURN server.
+- CI job `pwa-interop` installs Playwright's Chromium, Firefox and WebKit (cached) and runs the five configurations in sequence after one build; each runs even when an earlier one failed. `playwright` is a dev dependency; `puppeteer` stays for `tests/pwa-test.mjs`.
+
 ### Added — 1:1 voice and video calls (M1, second slice)
 - `parolnet-app`: calls on their own WebRTC connection, set up by `CALL_SIGNAL` envelopes (`offer` / `answer` / `ice` / `hangup` / `reject`, the PWA's JSON) on the verified data channel, so the call's DTLS fingerprints are end-to-end authenticated. `start_call` / `accept_call` / `reject_call` / `hangup` / `take_call_media`; `AppEvent::Call` with ringing, connecting, active and ended states (hung up, declined, busy, no answer after 60 s, failed). The client feeds encoded VP8 / Opus frames to a `FrameSink` and receives RTP as `MediaEvent`s.
 - `parolnet-rtc`: send tracks (`MediaConfig::send_vp8` / `send_opus`, `RtcHandle::send_frame`, a cloneable `FrameSender`): frames are packetized with the negotiated payload type and SSRC; `RtcEvent::KeyframeRequested` on a PLI / FIR; `request_keyframes`.
