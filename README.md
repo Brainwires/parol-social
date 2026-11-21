@@ -73,10 +73,11 @@ apps/desktop (GPUI)      web/ (TS + wasm)        later: iOS / Android shells (Un
 | `parolnet-relay-server` | Axum relay: signaling-only by default (register, SDP / ICE, presence, STUN URIs); opt-in relay profile with store-and-forward, federation, TURN credentials | exists |
 | `parolnet-rtc` | Async driver for the sans-I/O [`webrtc-rs-rtc`](https://github.com/Brainwires/webrtc-rs-rtc) engine (native): host + STUN candidates, data channels, RTP | M1 in progress |
 | `parolnet-store` | Encrypted native persistence: SQLite with SQLCipher (bundled), database key in the OS keychain (`keyring`) or an owner-only key file on machines without one; identity, contacts, sessions, messages, sender queue, settings; schema migrations, incremental transactional writes, import of the earlier plaintext data directory, wipe | M1 |
-| `parolnet-app` | Headless client core: identity, PWA-compatible pairing, signaling-only relay client, a direct data channel per contact bound to the E2EE session (DTLS fingerprints, PNP-001 §10.5.1), 1:1 encrypted chat, sender-side queue, 1:1 voice / video calls | M1 |
+| `parolnet-app` | Headless client core: identity, PWA-compatible pairing, signaling-only relay client, a direct data channel per contact bound to the E2EE session (DTLS fingerprints, PNP-001 §10.5.1), 1:1 encrypted chat, sender-side queue, 1:1 voice / video calls, file transfer that survives a lost connection and a restart (PNP-010) | M1 |
 | `apps/desktop` | GPUI desktop client: contacts, pairing, chat (UI v0), 1:1 calls with camera, echo cancellation and device menus; the M0 video spike behind `--spike` | M1 |
 | `parolnet-media` | Call media for native clients (no dependency on the rest of the workspace): frames, the capture traits and synthetic sources, resampling, Opus, echo cancellation / noise suppression / gain (AEC3, pure Rust), the audio duplex path; behind opt-in features, VP8 through libvpx, microphone and speakers (cpal), camera capture (nokhwa) | M1 |
-| `parolnet-call`, `-transfer`, `-simnet` | Calls, PNP-010 transfer, network simulator | M1 |
+| `parolnet-transfer` | File transfer (PNP-010) without I/O, for native and wasm: the offer and its answers, sealed 64 KiB records (ChaCha20-Poly1305, STREAM nonces, a key per attempt), resume at the record the receiver names, the final SHA-256 check, limits. `parolnet-app` streams files from and to disk with it; the web app drives it through `parolnet-wasm` | M1 |
+| `parolnet-call`, `-simnet` | Calls, network simulator | M1 |
 | `parolnet-mls`, `-sframe`, `-sfu` | MLS groups and devices, SFrame, the SFU | M2 |
 
 Media: Opus audio with echo cancellation (AEC3), VP8 video (VP9 / AV1 later), DTLS-SRTP end to end

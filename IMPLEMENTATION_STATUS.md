@@ -36,7 +36,8 @@ The root Cargo workspace has 15 members; the desktop app is a separate workspace
 | `parolnet-clause`, `parolnet-conformance` | Spec-clause attribute and the conformance suite |
 | `parolnet-rtc` | **New (M0, extended in M1).** Async driver for the sans-I/O `webrtc-rs-rtc` engine |
 | `parolnet-store` | **New (M1).** Encrypted native persistence: SQLite with SQLCipher, key in the OS keychain or a key file; identity, contacts, sessions, messages, queue, settings |
-| `parolnet-app` | **New (M1).** Headless client core: identity, pairing, signaling, direct data channels, 1:1 chat |
+| `parolnet-app` | **New (M1).** Headless client core: identity, pairing, signaling, direct data channels, 1:1 chat, calls, file transfer |
+| `parolnet-transfer` | **New (M1).** PNP-010 file transfer without I/O (native and wasm): control messages, the sealed record stream, sender and receiver, limits |
 | `parolnet-media` | **New (M1).** Call media for native clients: frames, capture traits and synthetic sources, resampler, Opus, AEC3 / noise suppression / gain (sonora, pure Rust), the audio duplex path; opt-in features for libvpx VP8, cpal, nokhwa |
 | `xtask` | Clause and test-vector tooling |
 | `apps/desktop` (own workspace) | **New (M0/M1).** GPUI client: contacts, pairing, chat (UI v0); the M0 video spike behind `--spike` |
@@ -71,6 +72,35 @@ for people who have the old PWA, translations).
   delete all data. No CSP violation, no console error, no request leaving the test server.
 - Not covered: real Safari (macOS / iOS), a phone's camera, STUN / TURN paths in a browser,
   notifications (the permission cannot be granted in these runs).
+
+## M1 (in progress): fourth slice, files (PNP-010)
+
+- **Spec**: `specs/PNP-010-file-transfer.md` (36 MUST, 7 SHOULD, 2 MAY; vectors from an
+  independent implementation in `specs/vectors/PNP-010`); it supersedes PNP-007 §7. Message type
+  0x15 `FILE_TRANSFER` (PNP-001 v0.15).
+- **`parolnet-transfer`** (new): the offer (id, name, size, MIME type, SHA-256, a fresh 256-bit
+  file key) and accept / decline / cancel / complete as CBOR; the record stream on the data
+  channel `pn-file/<id>`: 64 KiB messages, ChaCha20-Poly1305 with STREAM nonces under a key
+  derived for each attempt from both sides' fresh random contributions; sender and receiver
+  state machines without I/O; the rules both clients share.
+- **`parolnet-rtc`**: further data channels on a live connection (in-band), sends that report
+  the buffered amount, buffered-amount-low and close events.
+- **`parolnet-app`**: `offer_file` / `accept_transfer` / `decline_transfer` / `cancel_transfer`
+  / `transfers`, `AppEvent::Transfer` with progress. Transfer state (offer with key, phase, the
+  control message still owed, the receiver's durable record count) is in the encrypted store.
+  A worker task per transfer streams records from and to disk; a transfer resumes after a lost
+  connection and after a restart of either app. Measured on loopback, release build: 2 GiB
+  with one killed connection and a restart of each app, verified, in 48.7 s (42 MiB/s overall,
+  the reconnects included).
+- **Web** (`web/src/engine/transfers.ts`, `files.ts`): the same protocol through
+  `parolnet-wasm`; received files are written as segments to the origin private file system
+  where the browser lets a page write it, else kept as Blobs in memory. A received part in OPFS
+  survives a reload; a file being sent does not (the page holds no file handle afterwards), so
+  that transfer is cancelled.
+- **Not done**: group files (PNP-009 codes 0x0E to 0x10 are unchanged and unused); a receiver
+  in a browser cannot slow the sender down (the data-channel API has no receive-side
+  backpressure), so a sender much faster than the browser's storage grows the page's memory;
+  the old `parolnet-core` / `parolnet-wasm` file helpers of PNP-007 §7 are still in the tree.
 
 ## M1 (in progress): third slice, media
 
