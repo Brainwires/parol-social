@@ -8,10 +8,11 @@
 
 ## Changelog
 
-**v0.6 (2026-11-21) — Authenticated ratchet header (wire-incompatible)**
+**v0.6 (2026-11-21) — Authenticated ratchet header, bounded skipped message keys (wire-incompatible)**
 
 - §5.7 now defines the Double Ratchet header and requires all of it in the AEAD associated data: `ratchet_key (32) || previous_chain_length (u32 big-endian) || message_number (u32 big-endian)`, followed by the caller's associated data. Allocated **PNP-002-MUST-042**. Before, only `ratchet_key` was in the associated data, `message_number` was bound through the nonce alone and `previous_chain_length` was bound to nothing, so whoever relayed the first message of a new sending chain could rewrite it. PNP-001 v0.14 §3.3 (MUST-007) follows.
-- **Wire-incompatible** with v0.5 and earlier: a Double Ratchet message produced under one version does not authenticate under the other, in either direction. Key derivations, the nonce and the session state are unchanged. No version field is bumped and nothing is negotiated (PNP-001 v0.14 changelog): both ends must run v0.6. MUST count: 42.
+- **Wire-incompatible** with v0.5 and earlier: a Double Ratchet message produced under one version does not authenticate under the other, in either direction. Key derivations, the nonce and the session state are unchanged. No version field is bumped and nothing is negotiated (PNP-001 v0.14 changelog): both ends must run v0.6.
+- Added §5.8 "Skipped Message Keys": one message makes a receiver derive at most 1000 skipped keys (**PNP-002-MUST-043**), a session stores at most 2000 and deletes the oldest first when it is full (**PNP-002-MUST-044**), so stored keys can no longer make a session refuse out-of-order messages forever. MUST count: 44.
 
 **v0.5 (2026-11-21) — Atomic receive**
 
@@ -332,6 +333,17 @@ Processing a received Double Ratchet message is all-or-nothing. To find the mess
    The header travels in the clear and the receiver has to act on it before it can verify anything. `ratchet_key` and `message_number` select the message key, but `previous_chain_length` selects no key of the message that carries it: it only tells the receiver how many keys of the previous chain to keep for late messages. Outside the associated data, whoever relays the first message of a new chain could raise it, making the receiver derive and store keys for messages that were never sent, or lower it, making the receiver close the previous chain early so that its late messages can never be decrypted; the message would still authenticate. With the whole header authenticated, a message whose header was altered in transit fails verification and, by rule 1, changes nothing.
 
 Without rule 1 any party able to deliver one message to a session (a relay, a peer connected under another PeerId before the channel binding of PNP-001 §10.5.1 is verified, or a corrupted frame) could desynchronize it permanently. The same rule covers session creation: a session derived for a first message (PNP-001 §5.3.1) is kept only if that message authenticates, and does not replace an existing session otherwise.
+
+### 5.8 Skipped Message Keys
+
+When a message arrives ahead of the receiving chain, or closes the previous chain with messages still missing, the receiver derives the message keys of the messages it has not seen and stores them, each under its `(ratchet_key, message_number)`, so that those messages can be decrypted when they arrive. A stored key is deleted when its message authenticates under it (§5.7).
+
+1. A receiver MUST NOT derive more than `MAX_SKIP` = 1000 skipped message keys for one received message, counting the keys of the previous receiving chain (up to `previous_chain_length`) and of the new one (up to `message_number`) together. A message that would need more MUST be rejected, without any change to the session (§5.7). **PNP-002-MUST-043** This bounds the work a message can cost before it is authenticated. The number of keys already stored plays no part in this limit.
+2. A receiver MUST NOT keep more than `MAX_STORED_SKIPPED` = 2000 skipped message keys per session. When a new skipped key has to be stored and the session already holds that many, the receiver MUST delete the oldest stored key first (the one stored earliest, whatever chain it belongs to) and MUST NOT reject the message on account of the keys it holds. **PNP-002-MUST-044** A deleted skipped key, used or evicted, is securely erased like any other session key (§5.6), and the message it belonged to can no longer be decrypted.
+
+Rule 2 bounds the memory and the stored size of a session (2000 keys of 68 bytes) and keeps the bound from becoming a dead end: a store that refused new keys once full would make the session reject every later out-of-order message for good, since stored keys otherwise leave only when their messages arrive. Evicting the oldest key gives up the message that has been missing the longest instead. Eviction happens when the new state is committed, after the message that causes it has authenticated, so a forged message can evict nothing. The order of the stored keys is part of the session state and is preserved when a session is saved and restored.
+
+`MAX_STORED_SKIPPED` is twice `MAX_SKIP` so that the keys of a full gap closed on the previous chain and a full gap on the current one can be held together. Rule 1 has a consequence that no storage policy removes: if more than `MAX_SKIP` consecutive messages of one sending chain are lost, the receiver rejects every later message of that chain, and of the chain after it, whose `previous_chain_length` exceeds the receiver's position by more than `MAX_SKIP`. Such a session recovers only if enough of the lost messages are delivered after all, or through a new handshake.
 
 ## 6. Security Considerations
 

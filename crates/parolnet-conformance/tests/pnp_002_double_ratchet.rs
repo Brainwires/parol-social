@@ -1,10 +1,13 @@
-//! PNP-002 conformance — receiving Double Ratchet messages (§5.7).
+//! PNP-002 conformance — receiving Double Ratchet messages (§5.7) and skipped message
+//! keys (§5.8).
 //!
 //! PNP-002-MUST-041: a receiver changes no session state for a message that fails
 //! authentication. Session state is compared through the persistence export, which holds
 //! every field of a session.
 //!
 //! PNP-002-MUST-042: the complete ratchet header is in the AEAD associated data.
+//! PNP-002-MUST-043 / -044: one message skips at most 1000 keys; a session stores at most
+//! 2000 and deletes the oldest first.
 
 use parolnet_clause::clause;
 use parolnet_core::envelope::{
@@ -255,4 +258,106 @@ fn ratchet_header_altered_in_transit_fails_authentication() {
     assert_eq!(bob.decrypt(&h_skipped, &ct_skipped, AAD).unwrap(), b"a1");
     assert_eq!(bob.decrypt(&h_late, &ct_late, AAD).unwrap(), b"a2");
     converse(&mut alice, &mut bob);
+}
+
+// -- §5.8 — skipped message keys ----------------------------------------------
+
+/// `gap` messages from Alice that never arrive, then one that does: `gap` skipped keys.
+fn lose(
+    alice: &mut DoubleRatchetSession,
+    bob: &mut DoubleRatchetSession,
+    gap: usize,
+) -> Vec<(RatchetHeader, Vec<u8>)> {
+    let lost: Vec<_> = (0..gap)
+        .map(|_| alice.encrypt(b"lost", AAD).unwrap())
+        .collect();
+    let (h, ct) = alice.encrypt(b"arrives", AAD).unwrap();
+    assert_eq!(bob.decrypt(&h, &ct, AAD).unwrap(), b"arrives");
+    lost
+}
+
+#[clause("PNP-002-MUST-043")]
+#[test]
+fn one_message_skips_at_most_1000_keys() {
+    let (mut alice, mut bob) = session_pair();
+    converse(&mut alice, &mut bob);
+
+    // 1001 messages missing before it: refused, nothing stored.
+    let mut ahead: Vec<_> = (0..1002)
+        .map(|_| alice.encrypt(b"x", AAD).unwrap())
+        .collect();
+    let (h, ct) = ahead.pop().unwrap();
+    assert_refused_without_effect(&mut bob, &h, &ct, AAD, "1001 skipped keys");
+    // 1000 missing: accepted, and each of the 1000 can still arrive.
+    let (h, ct) = ahead.pop().unwrap();
+    assert_eq!(bob.decrypt(&h, &ct, AAD).unwrap(), b"x");
+    for (h, ct) in [&ahead[0], &ahead[999]] {
+        assert_eq!(bob.decrypt(h, ct, AAD).unwrap(), b"x");
+    }
+
+    // The limit counts both chains of a message that starts a new one: 600 missing on the
+    // previous chain and 401 on the new one is 1001.
+    let (mut alice, mut bob) = session_pair();
+    converse(&mut alice, &mut bob);
+    let (h, ct) = alice.encrypt(b"a0", AAD).unwrap();
+    bob.decrypt(&h, &ct, AAD).unwrap();
+    for _ in 0..600 {
+        alice.encrypt(b"lost", AAD).unwrap();
+    }
+    let (h, ct) = bob.encrypt(b"b", AAD).unwrap();
+    alice.decrypt(&h, &ct, AAD).unwrap();
+    let mut new_chain: Vec<_> = (0..402)
+        .map(|_| alice.encrypt(b"y", AAD).unwrap())
+        .collect();
+    let (h, ct) = new_chain.pop().unwrap();
+    assert_eq!((h.previous_chain_length, h.message_number), (601, 401));
+    assert_refused_without_effect(&mut bob, &h, &ct, AAD, "600 + 401 skipped keys");
+    let (h, ct) = new_chain.pop().unwrap();
+    assert_eq!(bob.decrypt(&h, &ct, AAD).unwrap(), b"y");
+}
+
+#[clause("PNP-002-MUST-044")]
+#[test]
+fn full_skipped_key_store_evicts_the_oldest_and_refuses_nothing() {
+    let (mut alice, mut bob) = session_pair();
+    converse(&mut alice, &mut bob);
+
+    // 2700 skipped keys in three gaps, the middle one on another chain: a store of 2000
+    // keeps the newest 2000 and the session accepts every one of the three messages.
+    let first = lose(&mut alice, &mut bob, 900);
+    let (h, ct) = bob.encrypt(b"b", AAD).unwrap();
+    alice.decrypt(&h, &ct, AAD).unwrap();
+    let second = lose(&mut alice, &mut bob, 900);
+    let third = lose(&mut alice, &mut bob, 900);
+
+    // The 700 oldest are gone, oldest first.
+    for (h, ct) in [&first[0], &first[350], &first[699]] {
+        assert_refused_without_effect(&mut bob, h, ct, AAD, "evicted skipped key");
+    }
+    for (h, ct) in [
+        &first[700],
+        &first[899],
+        &second[0],
+        &second[899],
+        &third[0],
+        &third[899],
+    ] {
+        assert_eq!(bob.decrypt(h, ct, AAD).unwrap(), b"lost");
+    }
+
+    // The order survives the persistence export: the restored session evicts the key the
+    // original would have evicted next.
+    let mut restored = DoubleRatchetSession::import_bytes(&bob.export_bytes()).unwrap();
+    assert!(restored.export_bytes() == bob.export_bytes());
+    let fourth = lose(&mut alice, &mut restored, 7);
+    assert_refused_without_effect(&mut restored, &first[701].0, &first[701].1, AAD, "evicted");
+    assert_eq!(
+        restored.decrypt(&first[702].0, &first[702].1, AAD).unwrap(),
+        b"lost"
+    );
+    assert_eq!(
+        restored.decrypt(&fourth[0].0, &fourth[0].1, AAD).unwrap(),
+        b"lost"
+    );
+    converse(&mut alice, &mut restored);
 }

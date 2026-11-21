@@ -9,12 +9,27 @@ use crate::aead::ChaCha20Poly1305Cipher;
 use crate::kdf::hkdf_sha256;
 use crate::{Aead, CryptoError, RatchetHeader, RatchetSession};
 use rand::rngs::OsRng;
-use std::collections::HashMap;
+use std::collections::VecDeque;
 use x25519_dalek::{PublicKey, StaticSecret};
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
-/// Maximum number of skipped message keys to store.
+/// Maximum number of skipped message keys one received message may make the receiver derive
+/// (PNP-002-MUST-043). It bounds the work a message costs before its AEAD tag is checked.
 const MAX_SKIP: u32 = 1000;
+
+/// Maximum number of skipped message keys a session stores (PNP-002-MUST-044). Storing one
+/// more deletes the oldest, so the stored keys never make the session refuse a message.
+const MAX_STORED_SKIPPED: usize = 2000;
+
+/// The key of a message that was skipped over, kept until that message arrives or the key is
+/// evicted.
+#[derive(Zeroize, ZeroizeOnDrop)]
+struct SkippedKey {
+    /// Ratchet public key of the chain the message belongs to.
+    ratchet_key: [u8; 32],
+    message_number: u32,
+    message_key: [u8; 32],
+}
 
 /// State for an active Double Ratchet session.
 #[derive(Zeroize)]
@@ -37,9 +52,10 @@ pub struct DoubleRatchetSession {
     recv_n: u32,
     /// Number of messages in previous sending chain.
     previous_send_n: u32,
-    /// Skipped message keys: (ratchet_pubkey, message_number) -> message_key
+    /// Skipped message keys in the order they were stored, oldest first. At most
+    /// `MAX_STORED_SKIPPED`; entries leave only through [`Self::erase_skipped`].
     #[zeroize(skip)]
-    skipped_keys: HashMap<([u8; 32], u32), [u8; 32]>,
+    skipped_keys: VecDeque<SkippedKey>,
 }
 
 impl DoubleRatchetSession {
@@ -79,7 +95,7 @@ impl DoubleRatchetSession {
             send_n: 0,
             recv_n: 0,
             previous_send_n: 0,
-            skipped_keys: HashMap::new(),
+            skipped_keys: VecDeque::new(),
         })
     }
 
@@ -99,7 +115,7 @@ impl DoubleRatchetSession {
             send_n: 0,
             recv_n: 0,
             previous_send_n: 0,
-            skipped_keys: HashMap::new(),
+            skipped_keys: VecDeque::new(),
         })
     }
 
@@ -117,6 +133,9 @@ impl DoubleRatchetSession {
     ///   || dh_remote_flag(1) [|| dh_remote(32)] || send_n(4) || recv_n(4)
     ///   || previous_send_n(4) || skipped_count(4)
     ///   || [ratchet_key(32) || msg_num(4) || msg_key(32)]...
+    ///
+    /// The skipped keys are written oldest first: their order is the eviction order
+    /// (PNP-002-MUST-044) and survives a round trip.
     pub fn export_bytes(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(200);
         out.push(0x01); // version
@@ -157,10 +176,10 @@ impl DoubleRatchetSession {
 
         let count = self.skipped_keys.len() as u32;
         out.extend_from_slice(&count.to_be_bytes());
-        for ((rk, n), mk) in &self.skipped_keys {
-            out.extend_from_slice(rk);
-            out.extend_from_slice(&n.to_be_bytes());
-            out.extend_from_slice(mk);
+        for key in &self.skipped_keys {
+            out.extend_from_slice(&key.ratchet_key);
+            out.extend_from_slice(&key.message_number.to_be_bytes());
+            out.extend_from_slice(&key.message_key);
         }
 
         out
@@ -238,16 +257,17 @@ impl DoubleRatchetSession {
         let previous_send_n = read_4(&mut pos)?;
 
         let skip_count = read_4(&mut pos)? as usize;
-        if skip_count > MAX_SKIP as usize {
+        if skip_count > MAX_STORED_SKIPPED {
             return Err(err());
         }
 
-        let mut skipped_keys = HashMap::with_capacity(skip_count);
+        let mut skipped_keys = VecDeque::with_capacity(skip_count);
         for _ in 0..skip_count {
-            let rk = read_32(&mut pos)?;
-            let n = read_4(&mut pos)?;
-            let mk = read_32(&mut pos)?;
-            skipped_keys.insert((rk, n), mk);
+            skipped_keys.push_back(SkippedKey {
+                ratchet_key: read_32(&mut pos)?,
+                message_number: read_4(&mut pos)?,
+                message_key: read_32(&mut pos)?,
+            });
         }
 
         Ok(Self {
@@ -288,6 +308,32 @@ impl DoubleRatchetSession {
         nonce[8..12].copy_from_slice(&message_number.to_be_bytes());
         nonce
     }
+
+    /// Delete the stored skipped key at `index` (0 is the oldest), keeping the order of the
+    /// others.
+    ///
+    /// The key is zeroized where it lies and then moved to the front with swaps before it is
+    /// popped, so no copy of it, or of a neighbour shifted over it, stays behind in the
+    /// buffer.
+    fn erase_skipped(&mut self, index: usize) {
+        let Some(key) = self.skipped_keys.get_mut(index) else {
+            return;
+        };
+        key.zeroize();
+        for i in (1..=index).rev() {
+            self.skipped_keys.swap(i, i - 1);
+        }
+        self.skipped_keys.pop_front();
+    }
+
+    /// Store a skipped key as the newest, evicting the oldest ones while the session is at
+    /// `MAX_STORED_SKIPPED` (PNP-002-MUST-044).
+    fn store_skipped(&mut self, key: SkippedKey) {
+        while self.skipped_keys.len() >= MAX_STORED_SKIPPED {
+            self.erase_skipped(0);
+        }
+        self.skipped_keys.push_back(key);
+    }
 }
 
 /// The state one received message may change, worked on apart from the session.
@@ -296,8 +342,9 @@ impl DoubleRatchetSession {
 /// copy and writes it back with [`ReceiveAttempt::commit`] only once the AEAD tag has
 /// verified (PNP-002-MUST-041). A message that does not authenticate drops the attempt, which
 /// zeroizes every key in it, and the session keeps the state it had. The session's stored
-/// skipped keys are never copied: the keys this message makes the receiver skip wait in
-/// `new_skipped`, and the session's own DH secret is only read.
+/// skipped keys are never copied, and none is evicted before the commit: the keys this
+/// message makes the receiver skip wait in `new_skipped`, and the session's own DH secret is
+/// only read.
 #[derive(Zeroize, ZeroizeOnDrop)]
 struct ReceiveAttempt {
     root_key: [u8; 32],
@@ -311,10 +358,8 @@ struct ReceiveAttempt {
     send_n: u32,
     recv_n: u32,
     previous_send_n: u32,
-    /// How many skipped keys the session already stores (for the `MAX_SKIP` limit).
-    stored_skipped: usize,
-    /// Skipped keys derived for this message: (ratchet_pubkey, message_number, message_key).
-    new_skipped: Vec<([u8; 32], u32, [u8; 32])>,
+    /// Skipped keys derived for this message, in derivation order. At most `MAX_SKIP`.
+    new_skipped: Vec<SkippedKey>,
 }
 
 impl ReceiveAttempt {
@@ -328,7 +373,6 @@ impl ReceiveAttempt {
             send_n: session.send_n,
             recv_n: session.recv_n,
             previous_send_n: session.previous_send_n,
-            stored_skipped: session.skipped_keys.len(),
             new_skipped: Vec::new(),
         }
     }
@@ -384,16 +428,23 @@ impl ReceiveAttempt {
     }
 
     /// Skip message keys for out-of-order delivery.
+    ///
+    /// One message may skip at most `MAX_SKIP` keys, the previous chain's and the new chain's
+    /// together (PNP-002-MUST-043). How many keys the session already stores plays no part.
     fn skip_message_keys(&mut self, remote_key: &[u8; 32], until: u32) -> Result<(), CryptoError> {
         if let Some(ref mut ck) = self.recv_chain_key {
             while self.recv_n < until {
-                if self.stored_skipped + self.new_skipped.len() >= MAX_SKIP as usize {
+                if self.new_skipped.len() >= MAX_SKIP as usize {
                     return Err(CryptoError::RatchetError {
                         reason: "too many skipped message keys".into(),
                     });
                 }
                 let mut mk = DoubleRatchetSession::chain_ratchet(ck)?;
-                self.new_skipped.push((*remote_key, self.recv_n, mk));
+                self.new_skipped.push(SkippedKey {
+                    ratchet_key: *remote_key,
+                    message_number: self.recv_n,
+                    message_key: mk,
+                });
                 mk.zeroize();
                 self.recv_n += 1;
             }
@@ -403,8 +454,9 @@ impl ReceiveAttempt {
 
     /// Write the attempt back to the session. Called only after the AEAD tag verified.
     ///
-    /// Dropping `self` afterwards zeroizes this copy; the session's previous ratchet secret
-    /// zeroizes itself when it is replaced.
+    /// Dropping `self` afterwards zeroizes this copy (the whole buffer the skipped keys were
+    /// moved out of included); the session's previous ratchet secret zeroizes itself when it
+    /// is replaced.
     fn commit(mut self, session: &mut DoubleRatchetSession) {
         session.root_key = self.root_key;
         session.send_chain_key = self.send_chain_key;
@@ -416,14 +468,14 @@ impl ReceiveAttempt {
         session.send_n = self.send_n;
         session.recv_n = self.recv_n;
         session.previous_send_n = self.previous_send_n;
-        for (ratchet_key, n, mk) in &self.new_skipped {
-            session.skipped_keys.insert((*ratchet_key, *n), *mk);
+        for key in self.new_skipped.drain(..) {
+            session.store_skipped(key);
         }
     }
 }
 
 /// Manual `Drop` to zeroize key material that `#[zeroize(skip)]` excludes:
-/// - `skipped_keys`: HashMap values contain message keys (secret material).
+/// - `skipped_keys`: the entries hold message keys (secret material).
 /// - `dh_remote`: `PublicKey` does not implement `Zeroize`; we manually wipe its bytes.
 /// - `dh_self`: `StaticSecret` implements `ZeroizeOnDrop` natively, so the skip is safe.
 impl Drop for DoubleRatchetSession {
@@ -431,9 +483,9 @@ impl Drop for DoubleRatchetSession {
         // Zeroize the derive-Zeroize fields (root_key, chain keys, etc.)
         self.zeroize();
 
-        // Zeroize all skipped message keys (HashMap is #[zeroize(skip)])
-        for value in self.skipped_keys.values_mut() {
-            value.zeroize();
+        // Zeroize all skipped message keys in place (the queue is #[zeroize(skip)])
+        for key in self.skipped_keys.iter_mut() {
+            key.zeroize();
         }
         self.skipped_keys.clear();
 
@@ -520,12 +572,13 @@ impl RatchetSession for DoubleRatchetSession {
         let aad = build_aad(header, extra_aad);
 
         // Check for skipped message key. It is consumed only by a message that authenticates.
-        let skipped_id = (header.ratchet_key, header.message_number);
-        if let Some(mk) = self.skipped_keys.get(&skipped_id) {
-            let plaintext = ChaCha20Poly1305Cipher::new(mk)?.decrypt(&nonce, ciphertext, &aad)?;
-            if let Some(mut used) = self.skipped_keys.remove(&skipped_id) {
-                used.zeroize();
-            }
+        // (The lookup compares public header values; at most `MAX_STORED_SKIPPED` entries.)
+        if let Some(index) = self.skipped_keys.iter().position(|k| {
+            k.ratchet_key == header.ratchet_key && k.message_number == header.message_number
+        }) {
+            let plaintext = ChaCha20Poly1305Cipher::new(&self.skipped_keys[index].message_key)?
+                .decrypt(&nonce, ciphertext, &aad)?;
+            self.erase_skipped(index);
             return Ok(plaintext);
         }
 
@@ -718,7 +771,7 @@ mod tests {
     //
     // A decrypt that fails leaves the session exactly as it was.
 
-    /// Every field of the session, skipped keys in a fixed order.
+    /// Every field of the session, skipped keys in their stored order.
     fn snapshot(s: &DoubleRatchetSession) -> Vec<u8> {
         let mut out = Vec::new();
         out.extend_from_slice(&s.root_key);
@@ -733,12 +786,10 @@ mod tests {
         for n in [s.send_n, s.recv_n, s.previous_send_n] {
             out.extend_from_slice(&n.to_be_bytes());
         }
-        let mut skipped: Vec<_> = s.skipped_keys.iter().collect();
-        skipped.sort();
-        for ((rk, n), mk) in skipped {
-            out.extend_from_slice(rk);
-            out.extend_from_slice(&n.to_be_bytes());
-            out.extend_from_slice(mk);
+        for key in &s.skipped_keys {
+            out.extend_from_slice(&key.ratchet_key);
+            out.extend_from_slice(&key.message_number.to_be_bytes());
+            out.extend_from_slice(&key.message_key);
         }
         out
     }
@@ -1179,5 +1230,201 @@ mod tests {
         assert_eq!(bob.decrypt(&h1, &ct1, b"aad").unwrap(), b"one");
         assert!(bob.skipped_keys.is_empty());
         assert_conversation_continues(&mut alice, &mut bob);
+    }
+
+    // ── Skipped message keys: bounded, oldest evicted (PNP-002-MUST-043, -044) ──
+
+    /// Alice sends `gap` messages that never arrive and one that does, so Bob stores `gap`
+    /// skipped keys. Returns the lost messages.
+    fn lose(
+        alice: &mut DoubleRatchetSession,
+        bob: &mut DoubleRatchetSession,
+        gap: u32,
+    ) -> Vec<(RatchetHeader, Vec<u8>)> {
+        let lost: Vec<_> = (0..gap)
+            .map(|_| alice.encrypt(b"lost", &[]).unwrap())
+            .collect();
+        let (h, ct) = alice.encrypt(b"arrives", &[]).unwrap();
+        assert_eq!(bob.decrypt(&h, &ct, &[]).unwrap(), b"arrives");
+        lost
+    }
+
+    #[test]
+    fn stored_skipped_keys_never_make_the_session_refuse_a_message() {
+        let (mut alice, mut bob) = established_pair();
+        let first = lose(&mut alice, &mut bob, MAX_SKIP);
+        assert_eq!(bob.skipped_keys.len(), MAX_SKIP as usize);
+
+        // A full MAX_SKIP gap again, with MAX_SKIP keys already stored.
+        let second = lose(&mut alice, &mut bob, MAX_SKIP);
+        assert_eq!(bob.skipped_keys.len(), MAX_STORED_SKIPPED);
+
+        // At the cap: every further skipped key evicts the oldest one.
+        let third = lose(&mut alice, &mut bob, 3);
+        assert_eq!(bob.skipped_keys.len(), MAX_STORED_SKIPPED);
+        for (h, ct) in &first[..3] {
+            assert_rejected_unchanged(&mut bob, h, ct, &[]);
+        }
+        let (h, ct) = &first[3];
+        assert_eq!(bob.decrypt(h, ct, &[]).unwrap(), b"lost");
+        for (h, ct) in [&first[999], &second[0], &second[999], &third[0], &third[2]] {
+            assert_eq!(bob.decrypt(h, ct, &[]).unwrap(), b"lost");
+        }
+        assert_eq!(bob.skipped_keys.len(), MAX_STORED_SKIPPED - 6);
+        assert_conversation_continues(&mut alice, &mut bob);
+    }
+
+    #[test]
+    fn eviction_takes_the_oldest_key_first_across_chains() {
+        let (mut alice, mut bob) = established_pair();
+        let old_chain = lose(&mut alice, &mut bob, 600);
+        // A round trip: Alice moves to a new sending chain.
+        let (h, ct) = bob.encrypt(b"b", &[]).unwrap();
+        alice.decrypt(&h, &ct, &[]).unwrap();
+        let mid_chain = lose(&mut alice, &mut bob, 900);
+        assert_ne!(mid_chain[0].0.ratchet_key, old_chain[0].0.ratchet_key);
+        let (h, ct) = bob.encrypt(b"b", &[]).unwrap();
+        alice.decrypt(&h, &ct, &[]).unwrap();
+        let new_chain = lose(&mut alice, &mut bob, 900);
+
+        // 2400 keys were skipped: the 400 oldest, all of the oldest chain, are gone.
+        assert_eq!(bob.skipped_keys.len(), MAX_STORED_SKIPPED);
+        let stored: Vec<_> = bob
+            .skipped_keys
+            .iter()
+            .map(|k| (k.ratchet_key, k.message_number))
+            .collect();
+        let expected: Vec<_> = old_chain[400..]
+            .iter()
+            .chain(&mid_chain)
+            .chain(&new_chain)
+            .map(|(h, _)| (h.ratchet_key, h.message_number))
+            .collect();
+        assert!(stored == expected, "stored keys are not oldest-first");
+
+        let (h, ct) = &old_chain[399];
+        assert_rejected_unchanged(&mut bob, h, ct, &[]);
+        for (h, ct) in [&old_chain[400], &mid_chain[0], &new_chain[899]] {
+            assert_eq!(bob.decrypt(h, ct, &[]).unwrap(), b"lost");
+        }
+        assert_conversation_continues(&mut alice, &mut bob);
+    }
+
+    #[test]
+    fn export_import_keeps_the_eviction_order() {
+        let (mut alice, mut bob) = established_pair();
+        let first = lose(&mut alice, &mut bob, MAX_SKIP);
+        let (h, ct) = bob.encrypt(b"b", &[]).unwrap();
+        alice.decrypt(&h, &ct, &[]).unwrap();
+        let second = lose(&mut alice, &mut bob, MAX_SKIP);
+        assert_eq!(bob.skipped_keys.len(), MAX_STORED_SKIPPED);
+
+        let exported = bob.export_bytes();
+        let mut restored = DoubleRatchetSession::import_bytes(&exported).unwrap();
+        assert!(snapshot(&restored) == snapshot(&bob));
+        assert_eq!(restored.export_bytes(), exported);
+
+        // The restored session evicts the same key the original would: the oldest.
+        let third = lose(&mut alice, &mut restored, 1);
+        assert_eq!(restored.skipped_keys.len(), MAX_STORED_SKIPPED);
+        let (h, ct) = &first[0];
+        assert_rejected_unchanged(&mut restored, h, ct, &[]);
+        for (h, ct) in [&first[1], &second[999], &third[0]] {
+            assert_eq!(restored.decrypt(h, ct, &[]).unwrap(), b"lost");
+        }
+        assert_conversation_continues(&mut alice, &mut restored);
+    }
+
+    #[test]
+    fn import_refuses_more_skipped_keys_than_the_cap() {
+        let (mut alice, mut bob) = established_pair();
+        lose(&mut alice, &mut bob, MAX_SKIP);
+        lose(&mut alice, &mut bob, MAX_SKIP);
+        let exported = bob.export_bytes();
+        const ENTRY: usize = 32 + 4 + 32;
+        let count_at = exported.len() - MAX_STORED_SKIPPED * ENTRY - 4;
+        assert_eq!(
+            exported[count_at..count_at + 4],
+            (MAX_STORED_SKIPPED as u32).to_be_bytes()
+        );
+
+        // One well-formed entry too many.
+        let mut over = exported.clone();
+        over.extend_from_slice(&[0x55; ENTRY]);
+        over[count_at..count_at + 4]
+            .copy_from_slice(&(MAX_STORED_SKIPPED as u32 + 1).to_be_bytes());
+        assert!(DoubleRatchetSession::import_bytes(&over).is_err());
+        assert!(DoubleRatchetSession::import_bytes(&exported).is_ok());
+    }
+
+    fn skipped(n: u32) -> SkippedKey {
+        SkippedKey {
+            ratchet_key: [n as u8; 32],
+            message_number: n,
+            message_key: [0xC0 | n as u8; 32],
+        }
+    }
+
+    fn stored_numbers(s: &DoubleRatchetSession) -> Vec<u32> {
+        s.skipped_keys.iter().map(|k| k.message_number).collect()
+    }
+
+    #[test]
+    fn erase_skipped_keeps_the_order_of_the_others() {
+        let (_, mut bob) = setup_session_pair();
+        for n in 1..=6 {
+            bob.store_skipped(skipped(n));
+        }
+        bob.erase_skipped(2);
+        assert_eq!(stored_numbers(&bob), [1, 2, 4, 5, 6]);
+        bob.erase_skipped(4);
+        assert_eq!(stored_numbers(&bob), [1, 2, 4, 5]);
+        bob.erase_skipped(0);
+        assert_eq!(stored_numbers(&bob), [2, 4, 5]);
+        bob.erase_skipped(3); // out of range: nothing to erase
+        assert_eq!(stored_numbers(&bob), [2, 4, 5]);
+        // The survivors still carry their own keys.
+        for key in &bob.skipped_keys {
+            let n = key.message_number;
+            assert_eq!(key.ratchet_key, [n as u8; 32]);
+            assert_eq!(key.message_key, [0xC0 | n as u8; 32]);
+        }
+    }
+
+    #[test]
+    fn store_skipped_evicts_the_oldest_at_the_cap() {
+        let (_, mut bob) = setup_session_pair();
+        for n in 0..MAX_STORED_SKIPPED as u32 + 5 {
+            bob.store_skipped(skipped(n));
+        }
+        assert_eq!(bob.skipped_keys.len(), MAX_STORED_SKIPPED);
+        assert_eq!(bob.skipped_keys.front().unwrap().message_number, 5);
+        assert_eq!(
+            bob.skipped_keys.back().unwrap().message_number,
+            MAX_STORED_SKIPPED as u32 + 4
+        );
+    }
+
+    #[test]
+    fn erased_skipped_key_is_zeroized_in_place() {
+        let mut key = skipped(9);
+        key.zeroize();
+        assert_eq!(key.ratchet_key, [0; 32]);
+        assert_eq!(key.message_number, 0);
+        assert_eq!(key.message_key, [0; 32]);
+
+        // The slot an evicted key occupied holds zeros afterwards, not the key.
+        const SIZE: usize = std::mem::size_of::<SkippedKey>();
+        let (_, mut bob) = setup_session_pair();
+        for n in 1..=4 {
+            bob.store_skipped(skipped(n));
+        }
+        let slot = bob.skipped_keys.front().unwrap() as *const SkippedKey as *const [u8; SIZE];
+        // SAFETY: the slot stays inside the queue's allocation (erasing never reallocates)
+        // and any byte pattern is a valid `[u8; SIZE]`.
+        assert_ne!(unsafe { std::ptr::read_volatile(slot) }, [0u8; SIZE]);
+        bob.erase_skipped(0);
+        assert_eq!(unsafe { std::ptr::read_volatile(slot) }, [0u8; SIZE]);
+        assert_eq!(stored_numbers(&bob), [2, 3, 4]);
     }
 }
