@@ -2,10 +2,13 @@
 //!
 //! - **video out** (`call-video` thread): the camera (or the test pattern when there is no
 //!   camera or synthetic media is selected) → I420 at the send size → libvpx VP8 → the call's
-//!   [`FrameSink`]; every other frame also goes to the self-view slot. With the camera off the
-//!   device is released and a black frame goes out once a second (what a browser sends for a
-//!   disabled track), so the contact sees black instead of a frozen picture and no
-//!   renegotiation is needed;
+//!   [`FrameSink`]; every other frame also goes to the self-view slot. The encoder's rate
+//!   follows the congestion controller's estimate ([`MediaEvent::TargetBitrate`]). With the
+//!   camera off the device is released; with a contact whose app renegotiates the stream is
+//!   stopped (the window asks the core, see [`CallSession::set_renegotiated`]), with any
+//!   other a black frame goes out once a second (what a browser sends for a disabled track),
+//!   so the contact sees black instead of a frozen picture. An audio call gains video with
+//!   [`CallSession::start_video`];
 //! - **audio** (`call-audio` thread): microphone → echo cancellation, noise suppression and
 //!   gain (AEC3) → Opus, and the contact's Opus → playout buffer → the processor's reverse
 //!   stream → speakers ([`parolnet_media::duplex`]);
@@ -17,7 +20,7 @@
 //! the system default once). Nothing here runs on the UI thread, and nothing panics on a
 //! device error.
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, Sender, TryRecvError};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -112,6 +115,12 @@ pub struct MediaStatus {
 struct Shared {
     muted: AtomicBool,
     camera_off: AtomicBool,
+    /// The call is renegotiated when the camera goes off or on: nothing is sent while it is
+    /// off (otherwise black is).
+    renegotiated: AtomicBool,
+    /// What the congestion controller allows for everything we send, in bits per second
+    /// (0: not known yet).
+    target_bps: AtomicU32,
     stop: AtomicBool,
     force_keyframe: AtomicBool,
     status: Mutex<MediaStatus>,
@@ -144,6 +153,9 @@ pub struct CallSession {
     video: bool,
     video_cmd: Option<Sender<VideoCmd>>,
     audio_cmd: Sender<AudioCmd>,
+    /// For a video sender started later (an audio call that gains video).
+    frames: FrameSink,
+    options: MediaOptions,
 }
 
 impl CallSession {
@@ -161,26 +173,16 @@ impl CallSession {
         let shared = Arc::new(Shared {
             muted: AtomicBool::new(false),
             camera_off: AtomicBool::new(false),
+            renegotiated: AtomicBool::new(false),
+            target_bps: AtomicU32::new(0),
             stop: AtomicBool::new(false),
             force_keyframe: AtomicBool::new(true),
             status: Mutex::default(),
         });
         let playout = PlayoutBuffer::new();
 
-        let video_cmd = video.then(|| {
-            let (tx, rx) = std::sync::mpsc::channel();
-            let worker = VideoSender {
-                frames: frames.clone(),
-                stats: stats.clone(),
-                shared: shared.clone(),
-                self_slot: self_slot.clone(),
-                synthetic: options.synthetic,
-                camera_id: options.camera.clone(),
-                cmds: rx,
-            };
-            spawn("call-video", move || worker.run());
-            tx
-        });
+        let video_cmd =
+            video.then(|| spawn_video_sender(&frames, &stats, &shared, &self_slot, &options));
         let (audio_cmd, audio_rx) = std::sync::mpsc::channel();
         {
             let worker = AudioWorker {
@@ -196,7 +198,7 @@ impl CallSession {
         }
         runtime.spawn(receive(
             events,
-            frames,
+            frames.clone(),
             slot.clone(),
             stats.clone(),
             playout,
@@ -215,7 +217,43 @@ impl CallSession {
             video,
             video_cmd,
             audio_cmd,
+            frames,
+            options,
         }
+    }
+
+    /// An audio call gains our video: start capturing and encoding (the core sends it once
+    /// the contact has accepted it). No-op when video already runs.
+    pub fn start_video(&mut self) {
+        if self.video_cmd.is_none() {
+            self.video_cmd = Some(spawn_video_sender(
+                &self.frames,
+                &self.stats,
+                &self.shared,
+                &self.self_slot,
+                &self.options,
+            ));
+        }
+        self.video = true;
+    }
+
+    /// The call has video in it now (the contact added theirs): the camera button and the
+    /// tiles apply even while we send none.
+    pub fn mark_video(&mut self) {
+        self.video = true;
+    }
+
+    /// Whether we capture and encode video (it may still be turned off).
+    pub fn sends_video(&self) -> bool {
+        self.video_cmd.is_some()
+    }
+
+    /// Whether turning the camera off stops the stream (the contact's app renegotiates)
+    /// instead of sending black.
+    pub fn set_renegotiated(&self, renegotiated: bool) {
+        self.shared
+            .renegotiated
+            .store(renegotiated, Ordering::Relaxed);
     }
 
     pub fn set_muted(&self, muted: bool) {
@@ -271,6 +309,36 @@ impl Drop for CallSession {
     }
 }
 
+fn spawn_video_sender(
+    frames: &FrameSink,
+    stats: &Arc<CallStats>,
+    shared: &Arc<Shared>,
+    self_slot: &FrameSlot,
+    options: &MediaOptions,
+) -> Sender<VideoCmd> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let worker = VideoSender {
+        frames: frames.clone(),
+        stats: stats.clone(),
+        shared: shared.clone(),
+        self_slot: self_slot.clone(),
+        synthetic: options.synthetic,
+        camera_id: options.camera.clone(),
+        cmds: rx,
+    };
+    spawn("call-video", move || worker.run());
+    tx
+}
+
+/// The encoder's rate in kbit/s for the congestion controller's estimate: the video share of
+/// it, never above what the picture size is encoded at on an open path.
+pub fn encoder_kbps(target_bps: u32, format_kbps: u32) -> u32 {
+    if target_bps == 0 {
+        return format_kbps;
+    }
+    (parolnet_app::video_bitrate_for(target_bps) / 1000).clamp(30, format_kbps.max(30))
+}
+
 /// A frame interval in the 90 kHz RTP clock, kept between 1 ms and 2 s.
 fn rtp_ticks(interval: Duration) -> u32 {
     (interval.as_micros() * 9 / 100).clamp(90, 180_000) as u32
@@ -314,6 +382,7 @@ impl VideoSender {
             }
         };
         let black = I420Frame::black(format.width, format.height);
+        let mut encoder_rate = kbps;
         let mut input = VideoInput::Closed;
         let mut last_black: Option<Instant> = None;
         let mut last_sent: Option<Instant> = None;
@@ -330,7 +399,26 @@ impl VideoSender {
                     Err(TryRecvError::Disconnected) => return,
                 }
             }
+            // Follow the congestion controller: the encoder never asks more of the path
+            // than it carries.
+            let wanted = encoder_kbps(self.shared.target_bps.load(Ordering::Relaxed), kbps);
+            if wanted != encoder_rate {
+                match encoder.set_bitrate(wanted) {
+                    Ok(()) => encoder_rate = wanted,
+                    Err(e) => tracing::debug!("{e}"),
+                }
+            }
             let off = self.shared.camera_off.load(Ordering::Relaxed);
+            if off && self.shared.renegotiated.load(Ordering::Relaxed) {
+                // The stream is stopped by renegotiation: release the device, send nothing.
+                if !matches!(input, VideoInput::Closed) {
+                    input = VideoInput::Closed;
+                    self.shared.set_status(|s| s.camera = "Camera off".into());
+                }
+                last_black = None;
+                std::thread::sleep(Duration::from_millis(50));
+                continue;
+            }
             if off && !matches!(input, VideoInput::Closed) {
                 // Release the device (its light goes out); turning the camera on reopens it.
                 input = VideoInput::Closed;
@@ -691,6 +779,21 @@ async fn receive(
                 Some(MediaEvent::KeyframeRequested) => {
                     shared.force_keyframe.store(true, Ordering::Relaxed);
                 }
+                Some(MediaEvent::TargetBitrate { bps }) => {
+                    shared.target_bps.store(bps, Ordering::Relaxed);
+                }
+                Some(MediaEvent::RemoteVideo { sending }) => {
+                    slot.set_status(if sending { "video" } else { "camera off" });
+                    if sending {
+                        let _ = frames.request_keyframe();
+                    }
+                }
+                Some(MediaEvent::LocalVideo { sending }) => {
+                    // Our stream starts (again): its first frame has to be a keyframe.
+                    if sending {
+                        shared.force_keyframe.store(true, Ordering::Relaxed);
+                    }
+                }
                 None => break,
             },
             Some(()) = want_rx.recv() => {
@@ -719,6 +822,19 @@ mod tests {
         // Bounded both ways.
         assert_eq!(rtp_ticks(Duration::ZERO), 90);
         assert_eq!(rtp_ticks(Duration::from_secs(60)), 180_000);
+    }
+
+    #[test]
+    fn the_encoder_follows_the_estimate_up_to_the_format_rate() {
+        // No estimate yet: the format's own rate.
+        assert_eq!(encoder_kbps(0, 900), 900);
+        // 300 kbit/s in total leave 198 for video.
+        assert_eq!(encoder_kbps(300_000, 900), 198);
+        // An open path does not push the encoder past what the picture size needs.
+        assert_eq!(encoder_kbps(2_500_000, 900), 900);
+        assert_eq!(encoder_kbps(2_500_000, 1800), 1800);
+        // The floor: a picture that is still one.
+        assert_eq!(encoder_kbps(100_000, 900), 30);
     }
 
     #[test]
