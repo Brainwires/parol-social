@@ -1,8 +1,9 @@
+use parolnet_relay_server::challenge::RegisterChallenge;
 use parolnet_relay_server::frames::{IncomingMessage, OutgoingMessage};
 use parolnet_relay_server::policy::{
     BinaryAdmission, Budget, FrameBudget, IpSlots, MAX_CIRCUITS_PER_CONN, MAX_REGISTER_ATTEMPTS,
-    MAX_TOKENS_PER_ISSUE, RelayPolicy, SignalReject, SignalingLimiter, SlotGuard,
-    TOKEN_ISSUE_PER_MINUTE_PER_IP, WatchRegistry,
+    MAX_TOKENS_PER_ISSUE, REGISTER_CHALLENGE_TTL_SECS, RelayPolicy, SignalReject, SignalingLimiter,
+    SlotGuard, TOKEN_ISSUE_PER_MINUTE_PER_IP, WatchRegistry,
 };
 use parolnet_relay_server::rate_limit::{
     ConnRateLimiter, LOOKUP_RATE_LIMIT, LOOKUP_RATE_WINDOW_SECS, LookupRateLimiter, MSG_RATE_LIMIT,
@@ -620,6 +621,14 @@ struct TokenIssueResponse {
 ///   3. Per-IP request limit and a per-request element cap.
 ///   4. Deserialize each `BlindedElement` (32-byte Ristretto255).
 ///   5. Call `TokenAuthority::issue` and return evaluated elements.
+///
+/// The nonce here is chosen by the client (PNP-001 §10.2 has no step in which
+/// the relay issues one), so the signature shows only that the request was
+/// made by someone who once held, or once saw a request of, some Ed25519 key:
+/// a captured request body can be replayed. Nothing is keyed on that identity
+/// (no per-identity budget is kept, PNP-001-MAY-005), so a replay obtains
+/// only what a freshly generated key obtains; volume is bounded per client
+/// address. Binding the signature to a relay-issued nonce needs a wire change.
 async fn handle_tokens_issue(
     authority: Arc<Mutex<TokenAuthority>>,
     issue_limiter: IssueLimiter,
@@ -2061,16 +2070,19 @@ fn presence_frame(peer_id: &str, online: bool) -> OutgoingMessage {
 }
 
 /// Verify a register challenge answer: PeerId = SHA-256(pubkey) and an
-/// Ed25519 signature over the nonce.
+/// Ed25519 signature over `nonce`.
+///
+/// `nonce` is the challenge this relay issued on this socket, as returned by
+/// [`RegisterChallenge::redeem`]; it is never the client's copy. A signature
+/// over a nonce the client chose proves nothing: it can be a replay.
 fn verify_register(
     peer_id: &str,
     pubkey_hex: &str,
     sig_hex: &str,
-    nonce_hex: &str,
+    nonce: &[u8; parolnet_relay_server::challenge::CHALLENGE_NONCE_LEN],
 ) -> Result<(), String> {
     let pubkey_bytes = hex::decode(pubkey_hex).map_err(|e| format!("invalid pubkey hex: {e}"))?;
     let sig_bytes = hex::decode(sig_hex).map_err(|e| format!("invalid signature hex: {e}"))?;
-    let nonce_bytes = hex::decode(nonce_hex).map_err(|e| format!("invalid nonce hex: {e}"))?;
 
     use sha2::{Digest, Sha256};
     let expected_pid = hex::encode(Sha256::digest(&pubkey_bytes));
@@ -2090,7 +2102,7 @@ fn verify_register(
 
     use ed25519_dalek::Verifier;
     verifying_key
-        .verify(&nonce_bytes, &signature)
+        .verify(nonce, &signature)
         .map_err(|_| "signature verification failed".to_string())
 }
 
@@ -2123,6 +2135,10 @@ async fn handle_socket(socket: WebSocket, ctx: WsCtx, client_ip: IpAddr, _conn_s
     // Released on drop when the socket ends, whatever the reason.
     let mut _peer_slot: Option<SlotGuard> = None;
     let mut register_attempts: u32 = 0;
+    // The one challenge this socket has outstanding. A credentialed
+    // `register` is accepted only against it, once.
+    let mut register_challenge =
+        RegisterChallenge::new(Duration::from_secs(REGISTER_CHALLENGE_TTL_SECS));
     let mut frame_budget = FrameBudget::new(policy.frames_per_minute);
 
     // Circuit routing state for onion relay cells (relay profile only).
@@ -2287,18 +2303,20 @@ async fn handle_socket(socket: WebSocket, ctx: WsCtx, client_ip: IpAddr, _conn_s
                     send_error(&tx, "already_registered", "socket already registered");
                     continue;
                 }
-                // Challenge-response: if peer provides pubkey + signature + nonce,
-                // verify identity. Otherwise issue a challenge nonce.
+                // Challenge-response: a plain `register` gets this socket's
+                // challenge nonce; a `register` with pubkey + signature +
+                // nonce must answer it.
                 let (Some(pubkey_hex), Some(sig_hex), Some(nonce_hex)) =
                     (&incoming.pubkey, &incoming.signature, &incoming.nonce)
                 else {
-                    let mut nonce = [0u8; 32];
-                    rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut nonce);
-                    let nonce_hex = hex::encode(nonce);
+                    // The same nonce again while one is outstanding, so a
+                    // client that asks twice before answering is not left
+                    // holding a superseded challenge.
+                    let nonce = register_challenge.issue(std::time::Instant::now());
                     let _ = tx.send(Message::Text(
                         serde_json::json!({
                             "type": "challenge",
-                            "nonce": nonce_hex,
+                            "nonce": hex::encode(nonce),
                             "peer_id": peer_id
                         })
                         .to_string()
@@ -2307,7 +2325,21 @@ async fn handle_socket(socket: WebSocket, ctx: WsCtx, client_ip: IpAddr, _conn_s
                     continue;
                 };
 
-                if let Err(err_msg) = verify_register(&peer_id, pubkey_hex, sig_hex, nonce_hex) {
+                // The nonce must be the one issued on this socket, alive and
+                // not yet answered; the signature is then checked over the
+                // relay's copy of it. Every credentialed `register` spends
+                // the challenge, pass or fail, and a refusal carries no new
+                // one: the client asks again with a plain `register`, which
+                // counts against MAX_REGISTER_ATTEMPTS like any other.
+                let redeemed = hex::decode(nonce_hex)
+                    .map_err(|e| format!("invalid nonce hex: {e}"))
+                    .and_then(|echoed| {
+                        register_challenge
+                            .redeem(&echoed, std::time::Instant::now())
+                            .map_err(|e| e.message().to_string())
+                    })
+                    .and_then(|nonce| verify_register(&peer_id, pubkey_hex, sig_hex, &nonce));
+                if let Err(err_msg) = redeemed {
                     send_error(
                         &tx,
                         "register_failed",
