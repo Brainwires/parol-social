@@ -117,6 +117,7 @@ const WASM_EXPORTS: readonly (keyof WasmApi)[] = [
   "process_scanned_qr",
   "safety_number",
   "version",
+  "argon2id",
 ];
 
 /**

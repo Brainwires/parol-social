@@ -98,6 +98,8 @@ const LATE_ICE_MAX = 4;
 export const GATHER_CAP_MS = 3_000;
 /** PNP-001-MUST-081. */
 export const BINDING_TIMEOUT_MS = 20_000;
+/** How long a verified connection to a restored contact must stay open to clear its mark. */
+export const RESTORED_PROVEN_MS = 10_000;
 /** `rate_limited`: pause offers 60 s × 2^hits (exponent capped at 4), at most 10 min. */
 export const RATE_LIMIT_BASE_MS = 60_000;
 export const RATE_LIMIT_MAX_MS = 600_000;
@@ -608,6 +610,11 @@ export class Engine {
       if (verified === "in-person" && row.verified !== "in-person") {
         row.verified = "in-person";
         row.verifiedMs = now;
+        changed = true;
+      }
+      // Added again: the session is new, whatever a backup brought.
+      if (identityKey !== null && row.restoredMs !== undefined) {
+        delete row.restoredMs;
         changed = true;
       }
       if (changed) this.contacts.set(peer, row);
@@ -1402,7 +1409,29 @@ export class Engine {
     await this.sendBinding(peer, conn);
     if (!this.live(peer, conn)) return;
     this.setPath(peer, "Direct");
+    this.connTimer(peer, conn, RESTORED_PROVEN_MS, () => this.restoredProven(peer));
     await this.flushQueue(peer);
+  }
+
+  /**
+   * A contact restored from a backup has a session that may be older than the one its
+   * device holds. Our check of their binding passing is half the proof: a stale session
+   * usually still reads what they send, while they cannot read what we send and close the
+   * connection at once. A verified connection that is still open a little later is the
+   * other half; the mark comes off then (and when the contact is added again).
+   */
+  private async restoredProven(peer: string): Promise<void> {
+    const existing = this.contacts.get(peer);
+    if (!existing || existing.restoredMs === undefined) return;
+    const row = { ...existing };
+    delete row.restoredMs;
+    try {
+      await this.save([{ op: "put", store: "contacts", value: row }]);
+    } catch {
+      return; // It stays marked; the next connection tries again.
+    }
+    this.contacts.set(peer, row);
+    this.emit({ kind: "ContactUpdated", contact: toContact(row) });
   }
 
   // ── Relay ────────────────────────────────────────────────────────
