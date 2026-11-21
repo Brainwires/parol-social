@@ -1,0 +1,90 @@
+@layer reset, tokens, base, components, screens;
+
+@layer screens {
+  .lab {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-5);
+    max-inline-size: 78rem;
+    margin-inline: auto;
+    padding: var(--space-4);
+  }
+  .lab__title {
+    font-size: var(--text-display);
+  }
+  .lab__note {
+    color: var(--ink-2);
+  }
+  .lab__controls {
+    display: flex;
+    flex-wrap: wrap;
+    gap: var(--space-3) var(--space-5);
+    padding: var(--space-4);
+    border-radius: var(--radius-panel);
+    border: var(--border-hairline) solid var(--fog);
+    background: var(--surface);
+  }
+  .lab__choice {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: var(--space-2);
+  }
+  .lab__choice-label {
+    inline-size: 100%;
+    color: var(--ink-2);
+    font-size: var(--text-caption);
+    font-weight: var(--weight-medium);
+  }
+  .lab__grid {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr);
+    gap: var(--space-5);
+  }
+  @media (min-width: 900px) {
+    .lab__grid {
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+    }
+  }
+  .lab__story {
+    min-inline-size: 0;
+  }
+  .lab__story-title {
+    margin-block-end: var(--space-2);
+    color: var(--ink-2);
+    font-size: var(--text-caption);
+    font-weight: var(--weight-medium);
+  }
+  .lab__story-body {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-3);
+    padding: var(--space-4);
+    border-radius: var(--radius-panel);
+    border: var(--border-hairline) solid var(--fog);
+  }
+  .lab__row {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: var(--space-2);
+  }
+  .lab__frame {
+    display: flex;
+    flex-direction: column;
+    block-size: 36rem;
+    border-radius: var(--radius-control);
+    border: var(--border-hairline) solid var(--fog);
+    overflow: hidden;
+  }
+  .lab__thread {
+    inline-size: 100%;
+  }
+  .lab__wasm {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-2);
+    font-size: var(--text-caption);
+    color: var(--ink-2);
+  }
+}
