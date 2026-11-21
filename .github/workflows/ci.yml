@@ -131,13 +131,20 @@ jobs:
         run: cargo xtask vectors --validate
 
   pwa-interop:
-    name: Desktop <-> PWA interop (headless Chromium)
-    # The headless desktop core (parolnet-app's bot) against the real PWA in Chromium through
-    # the relay binary in its signaling-only profile: pairing both ways, chat both ways, the
-    # sender queue. Twice: as Chromium ships (mDNS host candidates the desktop resolves) and
-    # with loopback candidates.
+    name: Desktop <-> PWA interop (Chromium, Firefox, WebKit)
+    # The headless desktop core (parolnet-app's bot) against the real PWA in headless Chromium,
+    # Firefox and WebKit (Playwright) through the relay binary in its signaling-only profile:
+    # pairing both ways, chat both ways, the sender queue, the channel binding, calls both ways.
+    # Chromium and Firefox twice each: as shipped (mDNS host candidates the desktop resolves) and
+    # with loopback candidates. WebKit once (Playwright's Linux build gathers plain host
+    # addresses). One job, browsers in sequence: the Rust build dominates and a browser run takes
+    # about a minute, so a matrix would rebuild (or ship ~100 MB of artifacts) three times for
+    # nothing. Every browser step runs even when an earlier one failed.
     runs-on: ubuntu-latest
     timeout-minutes: 45
+    env:
+      # The interop uses Playwright's browsers; puppeteer's Chrome is not needed here.
+      PUPPETEER_SKIP_DOWNLOAD: "1"
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
@@ -155,8 +162,15 @@ jobs:
       - uses: actions/setup-node@v6
         with:
           node-version: 22
-      - name: Chromium (puppeteer) and esbuild
+      - name: Playwright and esbuild
         run: npm ci
+      - uses: actions/cache@v6
+        with:
+          path: ~/.cache/ms-playwright
+          key: ${{ runner.os }}-playwright-${{ hashFiles('package-lock.json') }}
+      - name: Chromium, Firefox, WebKit (Playwright) and their system libraries
+        # With the cache restored only the system libraries are installed.
+        run: npx playwright install --with-deps chromium firefox webkit
       - name: Allow Chrome's sandbox
         # Ubuntu 24.04 restricts unprivileged user namespaces through AppArmor.
         run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
@@ -166,10 +180,23 @@ jobs:
         run: npm run build:wasm && npm run build
       - name: Build the relay and the desktop bot
         run: cargo build -p parolnet-relay-server --bin parolnet-relay -p parolnet-app --example bot
-      - name: Interop (mDNS host candidates)
-        run: INTEROP_ICE=mdns node apps/desktop/interop/pwa-interop.mjs
-      - name: Interop (loopback host candidates)
-        run: INTEROP_ICE=loopback node apps/desktop/interop/pwa-interop.mjs
+      - name: Chromium (mDNS host candidates)
+        id: first
+        run: INTEROP_BROWSER=chromium INTEROP_ICE=mdns node apps/desktop/interop/pwa-interop.mjs
+      # The remaining configurations run whatever the earlier ones did, unless the first was
+      # skipped (the build failed).
+      - name: Chromium (loopback host candidates)
+        if: ${{ !cancelled() && steps.first.conclusion != 'skipped' }}
+        run: INTEROP_BROWSER=chromium INTEROP_ICE=loopback node apps/desktop/interop/pwa-interop.mjs
+      - name: Firefox (mDNS host candidates)
+        if: ${{ !cancelled() && steps.first.conclusion != 'skipped' }}
+        run: INTEROP_BROWSER=firefox INTEROP_ICE=mdns node apps/desktop/interop/pwa-interop.mjs
+      - name: Firefox (loopback host candidates)
+        if: ${{ !cancelled() && steps.first.conclusion != 'skipped' }}
+        run: INTEROP_BROWSER=firefox INTEROP_ICE=loopback node apps/desktop/interop/pwa-interop.mjs
+      - name: WebKit (host candidates)
+        if: ${{ !cancelled() && steps.first.conclusion != 'skipped' }}
+        run: INTEROP_BROWSER=webkit INTEROP_ICE=host node apps/desktop/interop/pwa-interop.mjs
 
   msrv:
     name: MSRV (1.91.0)
