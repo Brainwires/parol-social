@@ -130,7 +130,28 @@ test("a new build is offered and applied on reload", async ({ page, server }) =>
     await expect(page.getByTestId("update-ready")).toHaveCount(0);
 
     server.setRoot(next);
-    await page.evaluate(() => navigator.serviceWorker.ready.then((r) => r.update()));
+    // Ask for the update and wait until the new build is installed, however long its install
+    // takes under load; only then is the notice checked, with the usual timeout. (Waiting on
+    // the notice alone tied the test to the install's speed.)
+    await page.evaluate(async () => {
+      const registration = await navigator.serviceWorker.ready;
+      const found = new Promise<ServiceWorker>((resolve, reject) =>
+        registration.addEventListener("updatefound", () => {
+          if (registration.installing) resolve(registration.installing);
+          else reject(new Error("updatefound without an installing worker"));
+        }, { once: true })
+      );
+      await registration.update();
+      const worker = await found;
+      await new Promise<void>((resolve, reject) => {
+        const settle = () => {
+          if (worker.state === "installed" || worker.state === "activated") resolve();
+          else if (worker.state === "redundant") reject(new Error("the new build did not install"));
+        };
+        worker.addEventListener("statechange", settle);
+        settle();
+      });
+    });
     await expect(page.getByTestId("update-ready")).toContainText("A new version is ready");
     // Until the person reloads, the old build keeps serving this tab.
     expect(await workerVersion(page)).toBe(version);
