@@ -17,10 +17,16 @@ const head = [
   `<script src="./theme-boot.js"></script>`,
 ].join("\n    ");
 
+// PAROLNET_BUILD=test (the `dev` and `build:test` tasks) bundles src/main.dev.tsx instead: the
+// same app plus the state lab (#/lab) and the `window.__parolnetTest` hooks. The production
+// export never contains either; scripts/postexport.ts fails the build if it does.
+// (An environment variable because `denext export --config <file>` is ignored in 4.21.)
+const testBuild = Deno.env.get("PAROLNET_BUILD") === "test";
+
 export default {
   mode: "spa",
   spa: {
-    entry: "./src/main.tsx",
+    entry: testBuild ? "./src/main.dev.tsx" : "./src/main.tsx",
     title: "ParolNet",
     lang: "en",
     assetsDir: "assets",

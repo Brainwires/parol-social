@@ -1,6 +1,6 @@
 // The state lab (#/lab): every component in every state, with controls to flip the fake
-// store. A development page: it ships with the app but nothing links to it, and its own
-// labels are not translated. The stories themselves render through the catalogue, so the
+// store. A development page: only development and test builds contain it (src/main.dev.tsx),
+// and its own labels are not translated. The stories themselves render through the catalogue, so the
 // locale and direction controls exercise them.
 import { type ReactNode, useEffect, useState } from "denext";
 import { Bubble, type BubbleKind } from "../components/Bubble.tsx";
@@ -10,16 +10,17 @@ import { Composer } from "../components/Composer.tsx";
 import { ConversationRow, SectionHeader } from "../components/ConversationRow.tsx";
 import { Line } from "../components/Line.tsx";
 import { Panel } from "../components/Panel.tsx";
+import { QrCode } from "../components/QrCode.tsx";
 import { Sheet } from "../components/Sheet.tsx";
 import { showToast } from "../components/Toast.tsx";
 import { direction, locale, LOCALES, setDirectionOverride, setLocale, t } from "../i18n/index.ts";
 import { setTheme, type ThemeChoice, themeChoice } from "../platform/theme.ts";
 import { loadWasm, wasmStatus } from "../platform/wasm.ts";
 import { hrefOf } from "../router.ts";
-import { useStore } from "../state/context.ts";
 import { FAKE_PEERS } from "../state/fake.ts";
-import type { LineState, PathState } from "../state/model.ts";
-import type { FakeControls } from "../state/store.ts";
+import type { CallEnd, CallInfo, ContactView, LineState, PathState } from "../state/model.ts";
+import { shownName } from "../state/names.ts";
+import type { AppStore, FakeControls } from "../state/store.ts";
 import { Conversation } from "./Conversation.tsx";
 
 const LINE_STATES: LineState[] = [
@@ -122,12 +123,50 @@ const SAMPLE_BUBBLES: Array<[BubbleKind, string]> = [
   ["dropped", "This one could not be kept."],
 ];
 
-export function Lab({ controls }: { controls: FakeControls }) {
-  const store = useStore();
+function sampleView(seed: string, name: string, path: PathState, queued: number, unread = 0) {
+  return {
+    contact: {
+      peerId: seed.repeat(32),
+      name,
+      identityKey: null,
+      addedMs: 0,
+      verified: "in-person",
+      verifiedMs: 0,
+    },
+    path,
+    queued,
+    unread,
+    lastActivityMs: 0,
+  } satisfies ContactView;
+}
+
+const CALL_ENDS: Array<[string, CallEnd, boolean]> = [
+  ["they ended", { kind: "RemoteHungUp" }, false],
+  ["they declined", { kind: "Rejected" }, false],
+  ["no answer", { kind: "NoAnswer" }, false],
+  ["missed", { kind: "NoAnswer" }, true],
+  ["failed", { kind: "Failed", reason: "the media connection did not come up" }, false],
+];
+
+export function Lab({ controls: store }: { controls: AppStore & FakeControls }) {
+  const controls = store;
   const [peer, setPeer] = useState<string>(FAKE_PEERS.tomasz);
   const [sheet, setSheet] = useState(false);
   const contacts = store.contacts.value;
-  const contact = contacts.find((c) => c.peerId === peer) ?? contacts[0];
+  const view = contacts.find((c) => c.contact.peerId === peer) ?? contacts[0];
+  const contact = view?.contact;
+  const call = (state: CallInfo["state"], incoming = false, video = true) => {
+    if (!contact) return;
+    controls.setCall({
+      callId: "c0".repeat(16),
+      peerId: contact.peerId,
+      video,
+      incoming,
+      state,
+      muted: false,
+      cameraOff: false,
+    });
+  };
   const selfOnline = store.selfOnline.value;
 
   return (
@@ -158,7 +197,7 @@ export function Lab({ controls }: { controls: FakeControls }) {
         <Choice
           label="Locale"
           values={LOCALES}
-          value={locale.value as (typeof LOCALES)[number]}
+          value={locale.value}
           onChoose={(code) => {
             setDirectionOverride(null);
             void setLocale(code);
@@ -175,7 +214,11 @@ export function Lab({ controls }: { controls: FakeControls }) {
                 data-testid="lab-contact"
                 onChange={(e) => setPeer(e.currentTarget.value)}
               >
-                {contacts.map((c) => <option key={c.peerId} value={c.peerId}>{c.name}</option>)}
+                {contacts.map((c) => (
+                  <option key={c.contact.peerId} value={c.contact.peerId}>
+                    {shownName(c.contact)}
+                  </option>
+                ))}
               </select>
             </label>
             <div className="lab__choice" role="group" aria-label="Presence">
@@ -193,7 +236,7 @@ export function Lab({ controls }: { controls: FakeControls }) {
             <Choice
               label="Path"
               values={PATH_STATES}
-              value={contact.path}
+              value={view.path}
               onChoose={(path) => controls.setPath(contact.peerId, path)}
               testId="lab-path"
             />
@@ -206,9 +249,50 @@ export function Lab({ controls }: { controls: FakeControls }) {
           onChoose={(v) => controls.setSelfOnline(v === "online")}
           testId="lab-self"
         />
+        <div className="lab__choice" role="group" aria-label="Call">
+          <span className="lab__choice-label">Call</span>
+          <Button testId="lab-call-incoming" onClick={() => call({ kind: "Incoming" }, true)}>
+            Incoming
+          </Button>
+          <Button testId="lab-call-outgoing" onClick={() => call({ kind: "Outgoing" })}>
+            Outgoing
+          </Button>
+          <Button testId="lab-call-active" onClick={() => call({ kind: "Active" })}>Active</Button>
+          <Button
+            testId="lab-call-voice"
+            onClick={() => call({ kind: "Active" }, false, false)}
+          >
+            Active, voice
+          </Button>
+          {CALL_ENDS.map(([label, end, incoming]) => (
+            <Button
+              key={label}
+              testId={`lab-call-ended-${label.replace(/\s+/g, "-")}`}
+              onClick={() => call({ kind: "Ended", end }, incoming)}
+            >
+              Ended: {label}
+            </Button>
+          ))}
+        </div>
+        <div className="lab__choice" role="group" aria-label="Screens">
+          <span className="lab__choice-label">Screens</span>
+          <a className="btn btn--quiet" href={hrefOf({ name: "add" })} data-testid="lab-to-add">
+            Add a contact
+          </a>
+          <a
+            className="btn btn--quiet"
+            href={hrefOf({ name: "settings" })}
+            data-testid="lab-to-settings"
+          >
+            Settings
+          </a>
+        </div>
         <div className="lab__choice">
           <Button testId="lab-reset" onClick={() => controls.reset()}>Reset fake data</Button>
           <Button testId="lab-clear" onClick={() => controls.clear()}>Remove all contacts</Button>
+          <Button testId="lab-someone-used-code" onClick={() => controls.someoneUsedCode()}>
+            Someone uses my code
+          </Button>
         </div>
       </section>
 
@@ -238,7 +322,7 @@ export function Lab({ controls }: { controls: FakeControls }) {
               >
                 <Bubble
                   kind={kind}
-                  body={{ kind: "text", text }}
+                  content={{ text }}
                   tail={kind === "received" ? "start" : "end"}
                   testId={`lab-bubble-${kind}`}
                 />
@@ -256,14 +340,17 @@ export function Lab({ controls }: { controls: FakeControls }) {
             <li className="thread__item thread__item--sent">
               <Bubble
                 kind="held"
-                body={{ kind: "file", name: "harbour.jpg", bytes: 2_411_724 }}
+                content={{
+                  text: "",
+                  attachment: { kind: "file", name: "harbour.jpg", bytes: 2_411_724 },
+                }}
                 testId="lab-bubble-file"
               />
             </li>
             <li className="thread__item thread__item--received">
               <Bubble
                 kind="received"
-                body={{ kind: "call", media: "video" }}
+                content={{ text: "", attachment: { kind: "call", media: "video" } }}
                 testId="lab-bubble-call"
               />
             </li>
@@ -343,41 +430,40 @@ export function Lab({ controls }: { controls: FakeControls }) {
         <Story title="Conversation rows" id="rows">
           <SectionHeader>{t("list.online")}</SectionHeader>
           <ConversationRow
-            contact={{ peerId: "a1".repeat(32), name: "Mira", kind: "person", path: "Direct" }}
+            view={sampleView("a1", "Mira", "Direct", 0, 2)}
             preview="Got it, thank you."
-            waiting={0}
             href="#/lab"
             current={false}
           />
           <ConversationRow
-            contact={{
-              peerId: "c3".repeat(32),
-              name: "Reading group",
-              kind: "group",
-              path: "Direct",
-            }}
+            view={sampleView("c3", "Reading group", "Direct", 0)}
             preview="Chapter six for Thursday."
-            waiting={0}
             href="#/lab"
             current
           />
           <SectionHeader>{t("list.away")}</SectionHeader>
           <ConversationRow
-            contact={{ peerId: "b2".repeat(32), name: NAME, kind: "person", path: "Offline" }}
+            view={sampleView("b2", NAME, "Offline", 3)}
             preview="Call me when you are back online, there is a lot to tell you about."
-            waiting={3}
             href="#/lab"
             current={false}
           />
         </Story>
 
         <Story title="Composer" id="composer">
-          <Composer name={NAME} away={false} onSend={() => {}} />
-          <Composer name={NAME} away onSend={() => {}} />
+          <Composer name={NAME} state="open" onSend={() => {}} />
+          <Composer name={NAME} state="away" onSend={() => {}} />
+          <Composer name={NAME} state="no-path" onSend={() => {}} />
         </Story>
 
         <Story title="Codes" id="codes">
           <CodeBlock code="7K4MQ2ZD9XTBH6RP" label={t("code.label")} testId="lab-code" />
+          <QrCode text="7k4mq2zd9xtbh6rp" label={t("add.qrLabel")} testId="lab-qr" />
+          <SafetyNumber
+            digits="385729104466271839500471626839157203948561027384951620777777"
+            label={t("safety.label")}
+            testId="lab-safety"
+          />
           <WasmProof />
         </Story>
 

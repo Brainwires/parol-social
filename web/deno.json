@@ -1,22 +1,32 @@
 {
   "tasks": {
-    "dev": "denext dev .",
+    "dev": "PAROLNET_BUILD=test denext dev .",
     "tokens": "denext deno run --allow-read=. --allow-write=src/design scripts/gen-tokens.ts",
     "build-wasm": "denext deno run -A scripts/build-wasm.ts",
     "build": "denext task tokens && denext export . && denext deno run --allow-read=. --allow-write=out scripts/postexport.ts",
+    "build:test": "denext task tokens && PAROLNET_BUILD=test denext export . && denext deno run --allow-read=. --allow-write=out,out-test scripts/postexport.ts --test",
     "export": "denext task build",
     "serve": "node tests/e2e/static-server.mjs",
-    "test": "denext test tests/unit",
-    "e2e": "cd tests/e2e && npm ci && npx playwright test",
+    "test": "denext test tests/unit && denext task test:engine",
+    "test:engine": "denext deno test --allow-read=.,../specs --allow-env=PAROLNET_WASM_PKG tests/engine",
+    "e2e": "cd tests/e2e && npm ci && npx playwright test --project=chromium --project=firefox --project=webkit",
+    "e2e:flows": "cd tests/e2e && npm ci && npx playwright test --project=flows-chromium --project=flows-firefox --project=flows-webkit",
+    "engine:e2e:build": "denext deno run --allow-read --allow-write --allow-run --allow-env tests/engine/e2e/build.ts",
+    "engine:e2e": "cd tests/engine/e2e && npm ci && node run.mjs",
     "lint": "denext lint",
     "fmt": "denext fmt",
     "fmt:check": "denext fmt --check",
-    "check": "denext check src scripts tests/unit denext.config.ts"
+    "check": "denext check src scripts tests/unit tests/engine/*.ts tests/engine/harness tests/engine/e2e/build.ts tests/engine/e2e/harness denext.config.ts"
   },
   "compilerOptions": {
     "jsx": "react-jsx",
     "jsxImportSource": "denext",
-    "lib": ["deno.window", "dom", "dom.iterable", "dom.asynciterable"]
+    "lib": [
+      "deno.window",
+      "dom",
+      "dom.iterable",
+      "dom.asynciterable"
+    ]
   },
   "imports": {
     "denext": "jsr:@denext/denext@^4.21.0",
@@ -29,22 +39,39 @@
   },
   "minimumDependencyAge": {
     "age": "P1D",
-    "exclude": ["jsr:@denext/denext"]
+    "exclude": [
+      "jsr:@denext/denext"
+    ]
   },
   "fmt": {
     "lineWidth": 100,
-    "exclude": ["public/wasm/", "public/fonts/", "src/design/tokens.css"]
+    "exclude": [
+      "public/wasm/",
+      "public/fonts/",
+      "public/vendor/",
+      "src/design/tokens.css",
+      "tests/engine/e2e/dist/"
+    ]
   },
   "lint": {
-    "exclude": ["public/wasm/", "tests/e2e/"]
+    "exclude": [
+      "public/wasm/",
+      "public/vendor/",
+      "tests/e2e/",
+      "tests/engine/e2e/dist/",
+      "tests/engine/e2e/node_modules/"
+    ]
   },
   "exclude": [
     "out/",
+    "out-test/",
     ".denext/",
     ".wasm-pkg/",
     "node_modules/",
     "tests/e2e/node_modules/",
     "tests/e2e/artifacts/",
-    "tests/e2e/test-results/"
+    "tests/e2e/test-results/",
+    "tests/engine/e2e/dist/",
+    "tests/engine/e2e/node_modules/"
   ]
 }

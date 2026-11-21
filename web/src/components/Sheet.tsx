@@ -12,12 +12,19 @@ export function Sheet({ title, onClose, children, testId }: {
 }) {
   const ref = useRef<HTMLDialogElement>(null);
   const titleId = useId();
+  // Closing the dialog on unmount fires its `close` event a moment later; by then another
+  // sheet may be open, and that event must not close it.
+  const gone = useRef(false);
 
   useEffect(() => {
     const dialog = ref.current;
+    gone.current = false;
     if (!dialog || dialog.open || typeof dialog.showModal !== "function") return;
     dialog.showModal();
-    return () => dialog.close();
+    return () => {
+      gone.current = true;
+      if (dialog.open) dialog.close();
+    };
   }, []);
 
   return (
@@ -26,7 +33,9 @@ export function Sheet({ title, onClose, children, testId }: {
       className="sheet"
       aria-labelledby={titleId}
       data-testid={testId}
-      onClose={onClose}
+      onClose={() => {
+        if (!gone.current) onClose();
+      }}
       onClick={(event: { target: EventTarget | null }) => {
         // A click on the backdrop lands on the dialog element itself.
         if (event.target === ref.current) onClose();

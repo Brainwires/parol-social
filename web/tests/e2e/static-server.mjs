@@ -2,9 +2,13 @@
 // Content-Security-Policy as an HTTP header, an index fallback and the cache headers of
 // web/nginx.example.conf. The browser tests start it in-process (and stop it, to go offline);
 // `node static-server.mjs [dir] [port]` serves web/out by hand.
+//
+// With `relayPort`, everything outside /pwa/ goes to a relay on 127.0.0.1 (`/ws` upgrades
+// included), as the production host does: the app then finds its relay at the same origin.
 import { createReadStream } from "node:fs";
 import { stat } from "node:fs/promises";
-import { createServer } from "node:http";
+import { createServer, request as httpRequest } from "node:http";
+import { connect as netConnect } from "node:net";
 import { extname, join, normalize, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -59,7 +63,7 @@ async function isFile(path) {
  * Starts the server. `root` can be swapped while it runs (`setRoot`) to stand in for a deploy.
  * Returns { origin, url, setRoot, close }.
  */
-export async function startServer({ root, port = 0 }) {
+export async function startServer({ root, port = 0, relayPort = null }) {
   let current = resolve(root);
   const server = createServer(async (request, response) => {
     const url = new URL(request.url ?? "/", "http://localhost");
@@ -68,7 +72,26 @@ export async function startServer({ root, port = 0 }) {
       return;
     }
     if (!url.pathname.startsWith(BASE_PATH)) {
-      response.writeHead(404, { "content-type": "text/plain" }).end("not found");
+      if (relayPort === null) {
+        response.writeHead(404, { "content-type": "text/plain" }).end("not found");
+        return;
+      }
+      // The relay's own endpoints (/turn-credentials, /health, ...).
+      const upstream = httpRequest(
+        {
+          host: "127.0.0.1",
+          port: relayPort,
+          method: request.method,
+          path: request.url,
+          headers: request.headers,
+        },
+        (up) => {
+          response.writeHead(up.statusCode ?? 502, up.headers);
+          up.pipe(response);
+        },
+      );
+      upstream.on("error", () => response.writeHead(502).end());
+      request.pipe(upstream);
       return;
     }
     let relative = normalize(decodeURIComponent(url.pathname.slice(BASE_PATH.length)));
@@ -98,6 +121,29 @@ export async function startServer({ root, port = 0 }) {
     if (request.method === "HEAD") response.end();
     else createReadStream(file).pipe(response);
   });
+  // WebSocket upgrades (/ws) go to the relay byte for byte.
+  const sockets = new Set();
+  server.on("upgrade", (request, socket, head) => {
+    if (relayPort === null) {
+      socket.destroy();
+      return;
+    }
+    const up = netConnect(relayPort, "127.0.0.1", () => {
+      let raw = `${request.method} ${request.url} HTTP/1.1\r\n`;
+      for (let i = 0; i < request.rawHeaders.length; i += 2) {
+        raw += `${request.rawHeaders[i]}: ${request.rawHeaders[i + 1]}\r\n`;
+      }
+      up.write(raw + "\r\n");
+      if (head?.length) up.write(head);
+      up.pipe(socket);
+      socket.pipe(up);
+    });
+    sockets.add(socket).add(up);
+    up.on("error", () => socket.destroy());
+    socket.on("error", () => up.destroy());
+    up.on("close", () => sockets.delete(up));
+    socket.on("close", () => sockets.delete(socket));
+  });
   await new Promise((done) => server.listen(port, "127.0.0.1", done));
   const origin = `http://127.0.0.1:${server.address().port}`;
   return {
@@ -107,6 +153,7 @@ export async function startServer({ root, port = 0 }) {
       current = resolve(next);
     },
     close() {
+      for (const socket of sockets) socket.destroy();
       server.closeAllConnections();
       return new Promise((done) => server.close(done));
     },
@@ -115,6 +162,10 @@ export async function startServer({ root, port = 0 }) {
 
 if (process.argv[1] === fileURLToPath(import.meta.url)) {
   const root = process.argv[2] ?? fileURLToPath(new URL("../../out", import.meta.url));
-  const server = await startServer({ root, port: Number(process.argv[3] ?? 8787) });
+  const server = await startServer({
+    root,
+    port: Number(process.argv[3] ?? 8787),
+    relayPort: process.env.RELAY_PORT ? Number(process.env.RELAY_PORT) : null,
+  });
   console.log(`serving ${root} at ${server.url}`);
 }

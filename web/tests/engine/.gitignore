@@ -1,0 +1,4 @@
+.pkg/
+e2e/dist/
+e2e/work/
+e2e/node_modules/

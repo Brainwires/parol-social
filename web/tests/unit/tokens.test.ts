@@ -39,7 +39,10 @@ const TEXT_PAIRS: Array<[string, string]> = [
   ["flare", "surface"],
   ["ink", "lamp-fill"], // amber panel
   ["ink", "flare-fill"], // red panel
-  ["ink", "open-fill"], // the call strip
+  ["ink", "open-fill"], // an open state's ground
+  ["on-video", "video-ground"], // the call screen's words
+  ["flare-on-video", "video-ground"], // "End call"
+  ["video-ground", "on-video"], // a call control that is switched on
 ];
 
 /** State colours drawn as lines and dots next to their words. WCAG 1.4.11: 3:1. */
@@ -68,17 +71,31 @@ for (const theme of ["light", "dark"] as const) {
   });
 }
 
-// lamp-line is the amber of waiting wires, dashed borders and the focus ring. In the dark
-// theme it clears 3:1 everywhere. In the light theme the decided value (#D9981E) does not:
-// about 2.3:1 on paper. Nothing depends on it alone (every use has words or a shape beside
-// it), but the focus ring does, so this is recorded here and raised in docs/ux/web-app.md
-// rather than hidden. If the token changes, this test says so.
-Deno.test("contrast: lamp-line, the known gap in the light theme", () => {
+// lamp-line is the amber of waiting wires and dashed borders. In the dark theme it clears 3:1
+// everywhere. In the light theme the decided value (#D9981E) does not (about 2.3:1 on paper),
+// which is fine where it is used: every dashed border has words or a shape beside it.
+Deno.test("contrast: lamp-line as a line", () => {
   for (const bg of ["paper", "surface", "lamp-fill"]) {
     assert(ratio("lamp-line", bg, "dark") >= 3, `lamp-line on ${bg} (dark)`);
   }
   const onPaper = ratio("lamp-line", "paper", "light");
   assert(onPaper > 2.2 && onPaper < 3, `lamp-line on paper (light) is ${onPaper.toFixed(2)}:1`);
+});
+
+// The focus ring depends on its colour alone, so it must clear 3:1 (WCAG 1.4.11) on every
+// ground a control sits on: `lamp` in the light theme, `lamp-line` in the dark one.
+Deno.test("contrast: the focus ring clears 3:1 on every ground, in both themes", () => {
+  assertEquals(tokens.focus.color, { light: "lamp", dark: "lamp-line" });
+  const grounds = ["paper", "surface", "fog", "lamp-fill", "flare-fill", "open-fill"];
+  for (const theme of ["light", "dark"] as const) {
+    for (const bg of grounds) {
+      const value = ratio(tokens.focus.color[theme], bg, theme);
+      assert(value >= 3, `focus ring on ${bg} (${theme}) is ${value.toFixed(2)}:1`);
+    }
+  }
+  // The call screen's ground is the same in both themes: the ring there is lamp-line.
+  assert(ratio("lamp-line", "video-ground", "light") >= 3);
+  assert(ratio("lamp-line", "video-ground", "dark") >= 3);
 });
 
 Deno.test("contrast: open is never text on open-fill (4.37:1 in light)", () => {
@@ -100,7 +117,11 @@ Deno.test("tokens: the decided values", () => {
     { light: "#F3F5F4", dark: "#0F181D", use: "Page ground" } as never,
   );
   assertEquals(tokens.radius, { control: 10, bubble: 14, "bubble-tail": 4, panel: 12, full: 9999 });
-  assertEquals(tokens.focus, { width: 3, offset: 2, color: "lamp-line" });
+  assertEquals(tokens.focus, {
+    width: 3,
+    offset: 2,
+    color: { light: "lamp", dark: "lamp-line" },
+  });
   assertEquals(tokens.target.min, 44);
   assertEquals(tokens.motion, { "fill-stagger": 350, "fill-duration": 450 });
 });

@@ -510,16 +510,25 @@
     }
   }
 
-  /* Toast: confirms something the person just did. */
+  /* Toast: confirms something the person just did. It sits at the top, just under the
+     tallest header (a conversation's, with its line, on a phone), so it never covers the
+     composer, the call controls or a sheet's actions, which are all at the bottom. */
   .toast-host {
     position: fixed;
     z-index: 10;
     inset-inline: 0;
-    inset-block-end: max(var(--space-5), env(safe-area-inset-bottom));
+    inset-block-start: calc(max(var(--space-2), env(safe-area-inset-top)) + 5.75rem);
     display: grid;
     justify-items: center;
-    padding-inline: var(--space-4);
+    padding-inline: max(var(--space-4), env(safe-area-inset-left), env(safe-area-inset-right));
     pointer-events: none;
+  }
+  /* Wide: under the one-row headers, centred over the screen beside the list. */
+  @media (min-width: 900px) {
+    .toast-host {
+      inset-inline-start: var(--layout-list-width);
+      inset-block-start: calc(max(var(--space-2), env(safe-area-inset-top)) + 4.75rem);
+    }
   }
   .toast {
     max-inline-size: 28rem;
@@ -547,5 +556,162 @@
   }
   .hint:empty {
     display: none;
+  }
+
+  /* Links in prose, and a button that reads as one. */
+  .link,
+  .link-btn {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    min-block-size: var(--target-min);
+    min-inline-size: var(--target-min);
+    color: var(--ink);
+    font-weight: var(--weight-medium);
+    text-decoration: underline;
+    text-underline-offset: 0.2em;
+    cursor: pointer;
+  }
+
+  /* Unread count: ink, because colour means state and this is not one. */
+  .badge {
+    display: inline-grid;
+    place-items: center;
+    flex: none;
+    min-inline-size: 1.5rem;
+    block-size: 1.5rem;
+    padding-inline: 0.4rem;
+    border-radius: var(--radius-full);
+    background: var(--ink);
+    color: var(--on-ink);
+    font-size: var(--text-caption);
+    font-weight: var(--weight-bold);
+    line-height: 1;
+  }
+  .row--unread .row__name {
+    font-weight: var(--weight-bold);
+  }
+  .row--unread .row__preview {
+    color: var(--ink);
+  }
+
+  /* QR code: dark on white in either theme, with its quiet zone. */
+  /* 17rem: a real pairing code (up to about 340 hex characters) is at most a version-15 code,
+     85 modules with its quiet zone, so a module is at least 3.2px; tests/unit/qr.test.ts
+     decodes that code at 3px a module. */
+  .qr {
+    inline-size: min(100%, 17rem);
+    block-size: auto;
+    aspect-ratio: 1;
+    border-radius: var(--radius-control);
+    border: var(--border-hairline) solid var(--fog);
+  }
+  .qr__ground {
+    fill: #ffffff;
+  }
+  .qr__modules {
+    fill: #000000;
+  }
+
+  .code--small {
+    gap: var(--space-1) var(--space-2);
+    padding: var(--space-3);
+    font-size: var(--text-caption);
+    font-weight: var(--weight-regular);
+  }
+
+  .field__input--area {
+    padding-block: var(--space-2);
+    line-height: var(--line-text);
+    resize: vertical;
+    overflow-wrap: anywhere;
+  }
+  select.field__input {
+    inline-size: 100%;
+  }
+  .btn:disabled {
+    opacity: 0.55;
+    cursor: default;
+  }
+
+  /* Switch: a button with two positions; the thumb's side says which, not colour alone. */
+  .switch {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-1);
+  }
+  .switch__control {
+    display: flex;
+    align-items: center;
+    gap: var(--space-3);
+    min-block-size: var(--target-min);
+    text-align: start;
+    cursor: pointer;
+  }
+  .switch__track {
+    display: inline-flex;
+    align-items: center;
+    flex: none;
+    inline-size: 3rem;
+    block-size: 1.75rem;
+    padding: 0.1875rem;
+    border-radius: var(--radius-full);
+    border: var(--border-state) solid var(--ink-2);
+    background: transparent;
+  }
+  .switch__thumb {
+    inline-size: 1.125rem;
+    block-size: 1.125rem;
+    border-radius: var(--radius-full);
+    background: var(--ink-2);
+  }
+  .switch__control[aria-checked="true"] .switch__track {
+    justify-content: flex-end;
+    border-color: var(--ink);
+    background: var(--ink);
+  }
+  .switch__control[aria-checked="true"] .switch__thumb {
+    background: var(--on-ink);
+  }
+  .switch__label {
+    font-weight: var(--weight-medium);
+  }
+
+  /* Segmented choice: one of a few, the chosen one filled. */
+  .segmented {
+    display: inline-flex;
+    flex-wrap: wrap;
+    gap: var(--space-2);
+  }
+  .segmented__option {
+    display: inline-flex;
+    align-items: center;
+    gap: var(--space-2);
+    min-block-size: var(--target-min);
+    padding-inline: var(--space-4);
+    border-radius: var(--radius-control);
+    border: var(--border-state) solid var(--ink-2);
+    color: var(--ink);
+    font-weight: var(--weight-medium);
+    cursor: pointer;
+  }
+  .segmented__option[aria-pressed="true"] {
+    background: var(--ink);
+    border-color: var(--ink);
+    color: var(--on-ink);
+  }
+
+  .sheet__section {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-start;
+    gap: var(--space-3);
+    padding-block-start: var(--space-4);
+    border-block-start: var(--border-hairline) solid var(--fog);
+  }
+  .sheet__actions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: var(--space-2);
   }
 }

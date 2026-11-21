@@ -10,18 +10,28 @@ const ready = signal(false);
 export const updateReady: ReadonlySignal<boolean> = ready;
 
 let registration: ServiceWorkerRegistration | null = null;
+/** The new build's worker, installed and waiting for the person to reload. */
+let waiting: ServiceWorker | null = null;
 let reloadOnTakeover = false;
 
 function watch(reg: ServiceWorkerRegistration): void {
-  const check = () => {
+  const offer = (worker: ServiceWorker | null) => {
     // A waiting worker next to a controller is an update; without a controller it is the
     // first install, which activates by itself.
-    ready.value = reg.waiting !== null && navigator.serviceWorker.controller !== null;
+    waiting = worker;
+    ready.value = worker !== null && navigator.serviceWorker.controller !== null;
   };
-  check();
+  offer(reg.waiting);
   reg.addEventListener("updatefound", () => {
     const installing = reg.installing;
-    installing?.addEventListener("statechange", check);
+    if (!installing) return;
+    // Judged by the worker's own state, not by `reg.waiting`: the browser reports the two
+    // separately and may deliver the state change first (seen in Chromium under load), and
+    // nothing would ask again afterwards.
+    installing.addEventListener("statechange", () => {
+      if (installing.state === "installed") offer(installing);
+      else if (installing.state === "redundant" && waiting === installing) offer(reg.waiting);
+    });
   });
 }
 
@@ -51,11 +61,11 @@ export async function registerServiceWorker(): Promise<void> {
 
 /** The person chose to reload: let the waiting worker take over, then reload onto it. */
 export function applyUpdate(): void {
-  const waiting = registration?.waiting;
-  if (!waiting) {
+  const next = waiting ?? registration?.waiting;
+  if (!next) {
     location.reload();
     return;
   }
   reloadOnTakeover = true;
-  waiting.postMessage({ type: "SKIP_WAITING" });
+  next.postMessage({ type: "SKIP_WAITING" });
 }

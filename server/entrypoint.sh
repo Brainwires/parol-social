@@ -1,10 +1,9 @@
 #!/bin/sh
-# Write build-info.js at startup so DEV_MODE env var takes effect without a rebuild.
+# Build metadata baked in at image build time. (The legacy PWA read it from a generated
+# build-info.js; the web app at /pwa/ reads no build metadata, so none is written.)
 # DEV_MODE env var wins over the baked-in PAROLNET_DEV_MODE build arg.
 _dev="${DEV_MODE:-${PAROLNET_DEV_MODE:-false}}"
-echo "window.BUILD_INFO={date:'v${PAROLNET_BUILD_VERSION} ${PAROLNET_BUILD_COMMIT} ${PAROLNET_BUILD_DATE}',dev:${_dev}};" \
-    > /usr/share/nginx/html/pwa/build-info.js
-echo "Build: v${PAROLNET_BUILD_VERSION} ${PAROLNET_BUILD_COMMIT} | dev=${_dev}"
+echo "Build: v${PAROLNET_BUILD_VERSION} ${PAROLNET_BUILD_COMMIT} ${PAROLNET_BUILD_DATE} | dev=${_dev}"
 
 # The image runs no TURN server. The relay defaults to the signaling-only
 # profile (SIGNALING_ONLY unset or 1): it serves STUN URIs from STUN_URIS and

@@ -3,8 +3,8 @@
 // failed security check); the composer is always there.
 import { useEffect, useId, useRef, useState } from "denext";
 import { Bubble, HeldBubble } from "../components/Bubble.tsx";
-import { Button, IconButton } from "../components/Button.tsx";
-import { Composer } from "../components/Composer.tsx";
+import { IconButton } from "../components/Button.tsx";
+import { Composer, type ComposerState } from "../components/Composer.tsx";
 import { Avatar } from "../components/ConversationRow.tsx";
 import { Icon } from "../components/Icon.tsx";
 import { Line } from "../components/Line.tsx";
@@ -12,10 +12,14 @@ import { Panel } from "../components/Panel.tsx";
 import { Sheet } from "../components/Sheet.tsx";
 import { showToast } from "../components/Toast.tsx";
 import { type MessageKey, t } from "../i18n/index.ts";
-import { hrefOf } from "../router.ts";
+import { hrefOf, navigate } from "../router.ts";
 import { useStore } from "../state/context.ts";
-import { type CallMedia, type Contact, type LineState, lineState } from "../state/model.ts";
-import { messagesOf } from "../state/store.ts";
+import { type ContactView, type LineState, lineState } from "../state/model.ts";
+import { asksForName, shownName } from "../state/names.ts";
+import { contactOf, messagesOf } from "../state/store.ts";
+import { ContactDetailsSheet, RemoveContactSheet, VerifySheet } from "./ContactSheets.tsx";
+import { errorText } from "./errors.ts";
+import { NamePrompt } from "./NamePrompt.tsx";
 import { type Caption, captionOf, threadItems, useFillSequence } from "./thread.ts";
 
 const CAPTION: Record<Caption, MessageKey> = {
@@ -40,10 +44,20 @@ function callBlocker(line: LineState): MessageKey | null {
   }
 }
 
-function Thread(
-  { contact, onEdit }: { contact: Contact; onEdit: (id: number, text: string) => void },
-) {
+/** What the composer's placeholder promises on this line. */
+function composerState(line: LineState): ComposerState {
+  if (line === "open") return "open";
+  // "{name} is away" is only true while we wait for them to come online.
+  return line === "waiting" ? "away" : "no-path";
+}
+
+function Thread({ view, onEdit, onProblem }: {
+  view: ContactView;
+  onEdit: (id: number, text: string) => void;
+  onProblem: (error: unknown) => void;
+}) {
   const store = useStore();
+  const { contact } = view;
   const messages = messagesOf(store, contact.peerId);
   const { stillOutlined, animated } = useFillSequence(messages);
   const items = threadItems(messages, stillOutlined);
@@ -59,7 +73,9 @@ function Thread(
   if (items.length === 0) {
     return (
       <div className="thread thread--empty" ref={scroller}>
-        <p className="thread__empty">{t("conversation.noMessages", { name: contact.name })}</p>
+        <p className="thread__empty">
+          {t("conversation.noMessages", { name: shownName(contact) })}
+        </p>
       </div>
     );
   }
@@ -80,27 +96,28 @@ function Thread(
               className={`thread__item thread__item--${sent ? "sent" : "received"}${
                 groupStart ? " thread__item--group-start" : ""
               }`}
+              data-testid="message-item"
+              data-direction={sent ? "sent" : "received"}
             >
               {actionable
                 ? (
                   <HeldBubble
-                    body={message.body}
+                    content={message}
                     tail={tail}
                     testId={testId}
                     onTakeBack={() => {
-                      store.takeBack(contact.peerId, message.id);
-                      showToast(t("toast.takenBack"));
+                      store.takeBack(message.id).then(
+                        () => showToast(t("toast.takenBack")),
+                        onProblem,
+                      );
                     }}
-                    onEdit={message.body.kind === "text"
-                      ? () =>
-                        onEdit(message.id, message.body.kind === "text" ? message.body.text : "")
-                      : undefined}
+                    onEdit={message.attachment ? undefined : () => onEdit(message.id, message.text)}
                   />
                 )
                 : (
                   <Bubble
                     kind={kind}
-                    body={message.body}
+                    content={message}
                     tail={tail}
                     fill={animated.has(message.id)}
                     testId={testId}
@@ -112,7 +129,7 @@ function Thread(
                   data-testid="thread-caption"
                   data-caption={caption.caption}
                 >
-                  {t(CAPTION[caption.caption], { name: contact.name })}
+                  {t(CAPTION[caption.caption], { name: shownName(contact) })}
                 </p>
               )}
             </li>
@@ -123,21 +140,38 @@ function Thread(
   );
 }
 
+type OpenSheet = "details" | "verify" | "remove" | "blocked" | null;
+
 export function Conversation({ peerId, showBack = true }: { peerId: string; showBack?: boolean }) {
   const store = useStore();
-  const contact = store.contacts.value.find((c) => c.peerId === peerId);
+  const view = contactOf(store, peerId);
   const [editing, setEditing] = useState<{ id: number; text: string } | null>(null);
-  const [sheet, setSheet] = useState<"relay" | "blocked" | null>(null);
+  const [sheet, setSheet] = useState<OpenSheet>(null);
   const [callHint, setCallHint] = useState(false);
+  const [problem, setProblem] = useState<string | null>(null);
   const hintId = useId();
   const heading = useRef<HTMLHeadingElement>(null);
+  const known = view !== undefined;
+  const unread = view?.unread ?? 0;
 
-  // Stack navigation: arriving on a conversation moves focus to its name.
+  // Stack navigation: arriving on a conversation moves focus to its name, and asks for the
+  // direct path now.
   useEffect(() => {
     heading.current?.focus();
-  }, [peerId]);
+    if (known) store.connect(peerId);
+  }, [peerId, known]);
 
-  if (!contact) {
+  // What is on screen has been read, as long as the person can see it.
+  useEffect(() => {
+    const read = () => {
+      if (unread > 0 && document.visibilityState === "visible") store.markRead(peerId);
+    };
+    read();
+    document.addEventListener("visibilitychange", read);
+    return () => document.removeEventListener("visibilitychange", read);
+  }, [peerId, unread]);
+
+  if (!view) {
     return (
       <div className="conversation conversation--placeholder" data-testid="conversation-missing">
         <p>{t("conversation.missing")}</p>
@@ -148,23 +182,28 @@ export function Conversation({ peerId, showBack = true }: { peerId: string; show
     );
   }
 
-  const name = contact.name;
-  const line = lineState(contact.path, store.selfOnline.value);
+  const { contact } = view;
+  const name = shownName(contact);
+  const line = lineState(view.path, store.selfOnline.value);
   const blocker = callBlocker(line);
-  const call = store.call.value?.peerId === peerId ? store.call.value : null;
+  const fail = (error: unknown) => setProblem(errorText(error, { name }));
 
-  const callButton = (media: CallMedia) => (
+  const callButton = (video: boolean) => (
     <IconButton
-      icon={media === "video" ? "video" : "phone"}
-      label={t(media === "video" ? "call.video" : "call.voice", { name })}
-      testId={`call-${media}`}
+      icon={video ? "video" : "phone"}
+      label={t(video ? "call.video" : "call.voice", { name })}
+      testId={video ? "call-video" : "call-voice"}
       unavailable={blocker !== null}
       describedBy={blocker && callHint ? hintId : undefined}
       onFocus={() => setCallHint(blocker !== null)}
       onBlur={() => setCallHint(false)}
       onClick={() => {
-        if (blocker) setCallHint(true);
-        else store.startCall(peerId, media);
+        if (blocker) {
+          setCallHint(true);
+          return;
+        }
+        setProblem(null);
+        store.startCall(peerId, video).catch(fail);
       }}
     />
   );
@@ -182,7 +221,15 @@ export function Conversation({ peerId, showBack = true }: { peerId: string; show
             <Icon name="back" />
           </a>
         )}
-        <Avatar contact={contact} />
+        <button
+          type="button"
+          className="conversation__avatar"
+          aria-label={t("conversation.details", { name })}
+          data-testid="conversation-details"
+          onClick={() => setSheet("details")}
+        >
+          <Avatar name={name} />
+        </button>
         <h1
           className="conversation__name"
           tabIndex={-1}
@@ -192,23 +239,35 @@ export function Conversation({ peerId, showBack = true }: { peerId: string; show
           <bdi>{name}</bdi>
         </h1>
         <Line state={line} name={name} />
-        {callButton("voice")}
-        {callButton("video")}
+        {callButton(false)}
+        {callButton(true)}
       </header>
       {/* Floats under the call buttons, so showing the reason moves nothing. */}
       <p className="hint conversation__hint" id={hintId} role="status" data-testid="call-hint">
         {blocker && callHint ? t(blocker, { name }) : ""}
       </p>
-      {call && (
-        <div className="conversation__call" data-testid="call-strip">
-          <span>{t("call.outgoing", { name })}</span>
-          <Button variant="danger" testId="call-end" onClick={() => store.endCall()}>
-            {t("call.end")}
-          </Button>
+      {asksForName(contact) && <NamePrompt key={peerId} peerId={peerId} />}
+      {contact.verified === "no" && (
+        <div className="conversation__verify" data-testid="verify-prompt">
+          <span>{t("verify.prompt")}</span>
+          <button
+            type="button"
+            className="link-btn"
+            data-testid="verify-open"
+            onClick={() =>
+              setSheet("verify")}
+          >
+            {t("verify.open")}
+          </button>
         </div>
       )}
 
-      <Thread key={peerId} contact={contact} onEdit={(id, text) => setEditing({ id, text })} />
+      <Thread
+        key={peerId}
+        view={view}
+        onEdit={(id, text) => setEditing({ id, text })}
+        onProblem={fail}
+      />
 
       {line === "no-path" && (
         <div className="conversation__panel">
@@ -221,12 +280,12 @@ export function Conversation({ peerId, showBack = true }: { peerId: string; show
                 label: t("action.tryAgain"),
                 testId: "panel-try-again",
                 primary: true,
-                onClick: () => store.retryPath(peerId),
+                onClick: () => store.connect(peerId),
               },
               {
                 label: t("action.useOwnRelay"),
                 testId: "panel-own-relay",
-                onClick: () => setSheet("relay"),
+                onClick: () => navigate({ name: "settings" }),
               },
             ]}
           >
@@ -245,7 +304,7 @@ export function Conversation({ peerId, showBack = true }: { peerId: string; show
                 label: t("action.tryAgain"),
                 testId: "panel-try-again",
                 primary: true,
-                onClick: () => store.retryPath(peerId),
+                onClick: () => store.connect(peerId),
               },
               {
                 label: t("action.whatThisMeans"),
@@ -259,27 +318,58 @@ export function Conversation({ peerId, showBack = true }: { peerId: string; show
         </div>
       )}
 
+      <p className="conversation__problem" role="alert" data-testid="conversation-problem">
+        {problem ?? ""}
+      </p>
       <Composer
         name={name}
-        away={line !== "open"}
+        state={composerState(line)}
         editingText={editing?.text ?? null}
-        onSend={(text) => store.send(peerId, text)}
-        onSaveEdit={(text) => {
-          if (editing) store.edit(peerId, editing.id, text);
+        onSend={async (text) => {
+          try {
+            await store.send(peerId, text);
+            setProblem(null);
+          } catch (error) {
+            fail(error);
+            throw error;
+          }
+        }}
+        onSaveEdit={async (text) => {
+          if (!editing) return;
+          try {
+            await store.edit(editing.id, text);
+            setProblem(null);
+            showToast(t("toast.edited"));
+          } catch (error) {
+            // It left this device while it was being edited: nothing to edit any more.
+            fail(error);
+          }
           setEditing(null);
-          showToast(t("toast.edited"));
         }}
         onCancelEdit={() => setEditing(null)}
       />
 
-      {sheet === "relay" && (
-        <Sheet
-          title={t("sheet.relay.title")}
-          testId="sheet-relay"
+      {sheet === "details" && (
+        <ContactDetailsSheet
+          view={view}
           onClose={() => setSheet(null)}
-        >
-          <p>{t("sheet.relay.body")}</p>
-        </Sheet>
+          onVerify={() => setSheet("verify")}
+          onRemove={() => setSheet("remove")}
+        />
+      )}
+      {sheet === "verify" && (
+        <VerifySheet
+          view={view}
+          onClose={() => setSheet(null)}
+          onRemoved={() => navigate({ name: "add" })}
+        />
+      )}
+      {sheet === "remove" && (
+        <RemoveContactSheet
+          view={view}
+          onClose={() => setSheet(null)}
+          onRemoved={() => navigate({ name: "list" })}
+        />
       )}
       {sheet === "blocked" && (
         <Sheet

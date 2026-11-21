@@ -2,6 +2,20 @@
 //
 //   node apps/desktop/interop/pwa-interop.mjs
 //   INTEROP_BROWSER=firefox node apps/desktop/interop/pwa-interop.mjs
+//   INTEROP_APP=web node apps/desktop/interop/pwa-interop.mjs
+//
+// The browser side (INTEROP_APP)
+//   pwa  (default) the PWA in pwa/, as below.
+//   web  the Denext web app in web/ that replaces it: its test build (web/out-test, from
+//        `denext task build-wasm && denext task build:test` in web/), served under /pwa/ with
+//        the production Content-Security-Policy by web/tests/e2e/static-server.mjs, the relay
+//        behind it at the same origin. The cases and what they assert are the same; only how
+//        the browser side is driven differs (see `class Web`): actions go through the
+//        interface (first run, the add-a-contact screen, the composer, the call buttons), and
+//        state is read from the app's database and its `window.__parolnetTest` hooks, which
+//        only the test build has. Where a case read old-PWA internals the web target has an
+//        equivalent, listed at `class Web`. In this file "the PWA" means the browser side
+//        under test, whichever it is.
 //
 // Peers
 //   - "desktop": the headless `parolnet-app` bot (examples/bot.rs), the same core the GPUI app
@@ -85,6 +99,12 @@ import { fileURLToPath } from "node:url";
 const here = dirname(fileURLToPath(import.meta.url));
 const root = resolve(here, "../../..");
 const pwaDir = join(root, "pwa");
+const webOutDir = join(root, "web", "out-test");
+const target = process.env.INTEROP_APP || "pwa";
+if (target !== "pwa" && target !== "web") {
+  console.error(`INTEROP_APP must be pwa or web (got ${target})`);
+  process.exit(2);
+}
 const exe = process.platform === "win32" ? ".exe" : "";
 const targetDir = process.env.CARGO_TARGET_DIR || join(root, "target");
 const relayBin = process.env.PAROLNET_RELAY_BIN || join(targetDir, "debug", `parolnet-relay${exe}`);
@@ -206,6 +226,21 @@ const MIME = {
   ".webmanifest": "application/manifest+json",
 };
 
+/// The web app's test build, hosted the way production hosts it: under /pwa/, behind the CSP
+/// header, with the relay at the same origin (web/tests/e2e/static-server.mjs).
+async function startWebServer(relayPort) {
+  for (const f of ["index.html", "sw.js", "wasm/manifest.json"]) {
+    if (!existsSync(join(webOutDir, f))) {
+      throw new Error(`web/out-test/${f} is missing: in web/, run denext task build-wasm && denext task build:test first`);
+    }
+  }
+  const { startServer } = await import("../../../web/tests/e2e/static-server.mjs");
+  const server = await startServer({ root: webOutDir, relayPort });
+  cleanups.push(() => server.close());
+  log(`web app on ${server.url}`);
+  return { port: Number(new URL(server.origin).port), path: "/pwa/" };
+}
+
 async function startPwaServer(relayPort) {
   for (const f of ["app.js", "sw.js", "pkg/parolnet_wasm_bg.wasm"]) {
     if (!existsSync(join(pwaDir, f))) {
@@ -256,7 +291,7 @@ async function startPwaServer(relayPort) {
   await new Promise((r) => server.listen(port, "127.0.0.1", r));
   cleanups.push(() => server.close());
   log(`PWA on http://127.0.0.1:${port}/`);
-  return port;
+  return { port, path: "/index.html" };
 }
 
 // ── Desktop bot ──────────────────────────────────────────────
@@ -402,8 +437,11 @@ async function launchBrowser(profileDir, { media = false } = {}) {
   });
 }
 
-class Pwa {
-  static async open(context, port, name, { tamperBinding = false } = {}) {
+/// What both browser sides share: the page, its console, and what is read from the browser
+/// itself (the connections it made, their statistics).
+class Client {
+  /// Open the app in `context`'s first page and wait until it is registered with the relay.
+  static async open(context, site, name, { tamperBinding = false } = {}) {
     const page = context.pages()[0] ?? (await context.newPage());
     if (tamperBinding) {
       // Once connected, the local description the PWA binds names a fingerprint that is not
@@ -421,7 +459,7 @@ class Pwa {
         });
       });
     }
-    const p = new Pwa(page, name);
+    const p = new this(page, name);
     // Keep every RTCPeerConnection the PWA makes, for call stats.
     await page.addInitScript(() => {
       const Orig = window.RTCPeerConnection;
@@ -465,18 +503,12 @@ class Pwa {
     page.on("pageerror", (e) => {
       p.console.push(`PAGE ERROR ${e.message}`);
       p.consoleAt.push(new Date().toISOString().slice(11, 23));
+      p.pageErrors.push(e.message);
       // WebKit reports the refused fallback fetch (see deadProxy) as a page error.
       if (verbose || !e.message.includes("/turn-credentials due to access control checks")) log(`[pwa ${name}] PAGE ERROR`, e.message);
     });
-    await page.goto(`http://127.0.0.1:${port}/index.html`, { waitUntil: "domcontentloaded" });
-    p.peerId = await until(`pwa ${name}: identity`, 30_000, () =>
-      page.evaluate(() => (typeof window._peerId === "string" && window._peerId.length === 64 ? window._peerId : null)),
-    );
-    await until(`pwa ${name}: registered with the relay`, 30_000, () =>
-      // Not "SW registered: ...": the relay's own registration, or the desktop's first offer
-      // can find the PWA offline (`peer_offline`).
-      p.console.some((t) => t.startsWith("Registered with relay")),
-    );
+    await page.goto(`http://127.0.0.1:${site.port}${site.path}`, { waitUntil: "domcontentloaded" });
+    await p.start();
     log(`pwa ${name} is ${p.peerId.slice(0, 8)}`);
     return p;
   }
@@ -486,6 +518,7 @@ class Pwa {
     this.name = name;
     this.console = [];
     this.consoleAt = [];
+    this.pageErrors = [];
     openPwas.add(this);
   }
 
@@ -511,6 +544,50 @@ class Pwa {
         return out;
       })
       .catch((e) => `diag failed: ${e.message}`);
+  }
+
+  /// What the PWA's call connection receives: decoded video frames and audio.
+  async callStats() {
+    return this.page.evaluate(async () => {
+      const out = { videoFrames: 0, videoPackets: 0, audioPackets: 0, audioSamples: 0, connected: false };
+      for (const pc of window.__pcs || []) {
+        if (pc.connectionState === "closed") continue;
+        if (!pc.getReceivers().some((r) => r.track && r.track.kind === "video" || r.track && r.track.kind === "audio")) continue;
+        if (pc.connectionState === "connected") out.connected = true;
+        (await pc.getStats()).forEach((s) => {
+          if (s.type !== "inbound-rtp") return;
+          if (s.kind === "video") {
+            out.videoFrames = Math.max(out.videoFrames, s.framesDecoded || 0);
+            out.videoPackets = Math.max(out.videoPackets, s.packetsReceived || 0);
+          } else if (s.kind === "audio") {
+            out.audioPackets = Math.max(out.audioPackets, s.packetsReceived || 0);
+            out.audioSamples = Math.max(out.audioSamples, s.totalSamplesReceived || 0);
+          }
+        });
+      }
+      return out;
+    });
+  }
+
+  async openCallPcs() {
+    return this.page.evaluate(
+      () => (window.__pcs || []).filter((pc) => pc.connectionState !== "closed" && pc.getTransceivers().length > 0).length,
+    );
+  }
+}
+
+/// The PWA in pwa/: driven through its window functions, read from its IndexedDB and console.
+class Pwa extends Client {
+  /// The identity is loaded and the relay has registered it.
+  async start() {
+    this.peerId = await until(`pwa ${this.name}: identity`, 30_000, () =>
+      this.page.evaluate(() => (typeof window._peerId === "string" && window._peerId.length === 64 ? window._peerId : null)),
+    );
+    await until(`pwa ${this.name}: registered with the relay`, 30_000, () =>
+      // Not "SW registered: ...": the relay's own registration, or the desktop's first offer
+      // can find the PWA offline (`peer_offline`).
+      this.console.some((t) => t.startsWith("Registered with relay")),
+    );
   }
 
   async showCode() {
@@ -570,38 +647,204 @@ class Pwa {
     );
   }
 
-  /// What the PWA's call connection receives: decoded video frames and audio.
-  async callStats() {
-    return this.page.evaluate(async () => {
-      const out = { videoFrames: 0, videoPackets: 0, audioPackets: 0, audioSamples: 0, connected: false };
-      for (const pc of window.__pcs || []) {
-        if (pc.connectionState === "closed") continue;
-        if (!pc.getReceivers().some((r) => r.track && r.track.kind === "video" || r.track && r.track.kind === "audio")) continue;
-        if (pc.connectionState === "connected") out.connected = true;
-        (await pc.getStats()).forEach((s) => {
-          if (s.type !== "inbound-rtp") return;
-          if (s.kind === "video") {
-            out.videoFrames = Math.max(out.videoFrames, s.framesDecoded || 0);
-            out.videoPackets = Math.max(out.videoPackets, s.packetsReceived || 0);
-          } else if (s.kind === "audio") {
-            out.audioPackets = Math.max(out.audioPackets, s.packetsReceived || 0);
-            out.audioSamples = Math.max(out.audioSamples, s.totalSamplesReceived || 0);
-          }
-        });
-      }
-      return out;
-    });
-  }
-
-  async openCallPcs() {
-    return this.page.evaluate(
-      () => (window.__pcs || []).filter((pc) => pc.connectionState !== "closed" && pc.getTransceivers().length > 0).length,
-    );
-  }
-
   async verified(peerId) {
     return this.console.some((t) => t.includes("direct channel verified with") && t.includes(peerId.slice(0, 8)));
   }
+
+  /// The incoming-call notification is showing.
+  async ringing() {
+    return this.page.evaluate(() => !document.getElementById("incoming-call-notification")?.classList.contains("hidden"));
+  }
+
+  async acceptCall() {
+    await this.page.evaluate(() => window.acceptIncomingCall());
+  }
+
+  async startVideoCall(peer) {
+    await this.page.evaluate((peer) => {
+      window.openChat(peer);
+      return window.initiateCall(peer, true);
+    }, peer);
+  }
+
+  async hangupCall() {
+    await this.page.evaluate(() => window.hangupCall());
+  }
+
+  /// The console line the PWA prints when it learned STUN / TURN servers, if it did.
+  async learnedIceServers() {
+    return this.console.find((t) => t.includes("[WebRTC] ICE servers from")) ?? null;
+  }
+}
+
+/// The web app in web/ (its test build). Actions go through the interface, as a person's
+/// would; state is read from the app's own database and from `window.__parolnetTest`
+/// (docs/web-port/interop.md §11.4), which exposes nothing the interface does not show.
+///
+/// Where the cases read old-PWA internals, this is what the web target checks instead:
+///   - `window._peerId`                     -> `__parolnetTest.ready()`;
+///   - console "Registered with relay"      -> `__parolnetTest.relayRegistered()` (and the
+///                                             same console line, which the engine prints);
+///   - IndexedDB `parolnet` / `contacts`    -> IndexedDB `parolnet-web` / `contacts` (the
+///                                             contact is stored, not merely shown);
+///   - IndexedDB `parolnet` / `messages`    -> IndexedDB `parolnet-web` / `messages`, a row
+///     (`direction: "received"`, `content`)    with `direction: "Received"` and `text`, and the
+///                                             same text in the history the interface shows;
+///   - console "direct channel verified"    -> the same console line, and
+///                                             `__parolnetTest.pathState(peer) === "direct"`,
+///                                             which is only true once the binding verified;
+///   - `#incoming-call-notification`        -> the ringing dialog (`data-testid="incoming-call"`)
+///                                             is visible;
+///   - console "[WebRTC] ICE servers from"  -> `__parolnetTest.iceServers()` is empty.
+/// It also fails on any uncaught page error and on any Content-Security-Policy violation.
+class Web extends Client {
+  hook(method, ...args) {
+    return this.page.evaluate(([m, a]) => window.__parolnetTest[m](...a), [method, args]);
+  }
+
+  async goTo(hash) {
+    await this.page.evaluate((h) => {
+      if (location.hash !== h) location.hash = h;
+    }, hash);
+  }
+
+  async start() {
+    await this.page.addInitScript(() => {
+      window.__csp = [];
+      document.addEventListener("securitypolicyviolation", (e) => window.__csp.push(`${e.violatedDirective} blocked ${e.blockedURI}`));
+    });
+    // A new browser profile shows the first-run screen: Start makes the identity. A profile
+    // that already has one (case 3's relaunch) goes straight to the app.
+    const first = await until(`web ${this.name}: the app or its first-run screen`, 30_000, () =>
+      this.page.evaluate(() => {
+        if (document.querySelector('[data-testid="first-run-start"]')) return "first-run";
+        return window.__parolnetTest ? "running" : null;
+      }),
+    );
+    if (first === "first-run") await this.page.click('[data-testid="first-run-start"]');
+    await until(`web ${this.name}: the test hooks (is this the test build?)`, 30_000, () =>
+      this.page.evaluate(() => window.__parolnetTest?.version === 1),
+    );
+    this.peerId = (await this.hook("ready")).peerId;
+    await until(`web ${this.name}: registered with the relay`, 30_000, async () =>
+      (await this.hook("relayRegistered")) && this.console.some((t) => t.startsWith("Registered with relay")),
+    );
+  }
+
+  /// The add-a-contact screen shows this device's code.
+  async showCode() {
+    await this.goTo("#/add");
+    return until(`web ${this.name}: its code on the add screen`, 15_000, async () => {
+      const code = (await this.page.textContent('[data-testid="pairing-code"]').catch(() => null))?.trim();
+      return code && code.length > 0 ? code : null;
+    });
+  }
+
+  /// "Paste theirs" on the add-a-contact screen.
+  async pasteCode(code) {
+    await this.goTo("#/add");
+    await this.page.click('[data-testid="pairing-paste-open"]');
+    await this.page.fill('[data-testid="pairing-code-input"]', code);
+    await this.page.click('[data-testid="pairing-code-submit"]');
+  }
+
+  async idbAll(store) {
+    return this.page.evaluate(
+      (store) =>
+        new Promise((res, rej) => {
+          const open = indexedDB.open("parolnet-web");
+          open.onerror = () => rej(open.error);
+          open.onsuccess = () => {
+            const db = open.result;
+            if (!db.objectStoreNames.contains(store)) {
+              db.close();
+              return res([]);
+            }
+            const req = db.transaction(store, "readonly").objectStore(store).getAll();
+            req.onsuccess = () => {
+              db.close();
+              res(req.result);
+            };
+            req.onerror = () => rej(req.error);
+          };
+        }),
+      store,
+    );
+  }
+
+  async hasContact(peerId) {
+    return (await this.idbAll("contacts")).some((c) => c.peerId === peerId);
+  }
+
+  async waitReceived(from, text, ms = 30_000) {
+    await until(`web ${this.name}: message ${JSON.stringify(text)}`, ms, async () =>
+      (await this.idbAll("messages")).some((m) => m.peerId === from && m.direction === "Received" && m.text === text) &&
+      (await this.hook("messages", from)).some((m) => m.direction === "received" && m.text === text),
+    );
+  }
+
+  /// The conversation's composer: type, press Send.
+  async sendText(to, text) {
+    await this.goTo(`#/c/${to}`);
+    await this.page.fill('[data-testid="composer-input"]', text);
+    await this.page.click('[data-testid="composer-send"]');
+  }
+
+  async verified(peerId) {
+    return (
+      this.console.some((t) => t.includes("direct channel verified with") && t.includes(peerId.slice(0, 8))) &&
+      (await this.hook("pathState", peerId)) === "direct"
+    );
+  }
+
+  async ringing() {
+    return this.page.isVisible('[data-testid="incoming-call"]');
+  }
+
+  async acceptCall() {
+    await this.page.click('[data-testid="call-accept"]');
+  }
+
+  /// The video-call button in the conversation's header (enabled only on an open line).
+  async startVideoCall(peer) {
+    // The screen that says how the last call ended is still up for a few seconds: close it.
+    const close = this.page.locator('[data-testid="call-close"]');
+    if (await close.isVisible()) await close.click();
+    await this.goTo(`#/c/${peer}`);
+    await this.page.click('[data-testid="call-video"]:not([aria-disabled="true"])');
+  }
+
+  async hangupCall() {
+    await this.page.click('[data-testid="call-hangup"]');
+  }
+
+  async learnedIceServers() {
+    const servers = await this.hook("iceServers").catch(() => []);
+    if (servers.length > 0) return JSON.stringify(servers);
+    return this.console.find((t) => t.includes("[WebRTC] ICE servers from")) ?? null;
+  }
+
+  /// Page errors and CSP violations so far (the web app must have neither).
+  async problems() {
+    const csp = await this.page.evaluate(() => window.__csp ?? []).catch(() => []);
+    return [...this.pageErrors.map((e) => `page error: ${e}`), ...csp.map((v) => `CSP: ${v}`)];
+  }
+}
+
+/// The browser side under test.
+const App = target === "web" ? Web : Pwa;
+
+/// What each page had learned of ICE servers when its browser closed (checked at the end).
+const learned = [];
+
+/// Before a case closes a browser: note what the page learned of ICE servers, and, for the
+/// web app, fail on any page error or Content-Security-Policy violation. (The PWA target
+/// keeps its original checks only.)
+async function closing(pwa, tag) {
+  learned.push([pwa, await pwa.learnedIceServers()]);
+  if (!(pwa instanceof Web)) return;
+  const problems = await pwa.problems();
+  if (problems.length) throw new Error(`${tag}: the web app reported ${problems.join("; ")}`);
 }
 
 async function bothVerified(bot, pwa, tag) {
@@ -633,7 +876,7 @@ async function caseDesktopEntersPwaCode(ctx) {
   const ready = await bot.wait("ready", (e) => e.event === "ready");
   bot.peerId = ready.peer_id;
   await bot.wait("registered", (e) => e.event === "relay" && e.state.includes("Registered"));
-  const pwa = await Pwa.open(browser, ctx.pwaPort, "one");
+  const pwa = await App.open(browser, ctx.site, "one");
 
   const code = await pwa.showCode();
   if (!/^[0-9a-f]{100,}$/i.test(code)) throw new Error(`${tag}: unexpected PWA code ${code.slice(0, 40)}`);
@@ -645,6 +888,7 @@ async function caseDesktopEntersPwaCode(ctx) {
   log(`${tag}: paired, direct data channel, bindings verified`);
   await chatBothWays(bot, pwa, tag);
   await bot.quit();
+  await closing(pwa, tag);
   await browser.close();
   return bot;
 }
@@ -658,7 +902,7 @@ async function casePwaPastesDesktopCode(ctx) {
   const ready = await bot.wait("ready", (e) => e.event === "ready");
   bot.peerId = ready.peer_id;
   await bot.wait("registered", (e) => e.event === "relay" && e.state.includes("Registered"));
-  let pwa = await Pwa.open(browser, ctx.pwaPort, "two");
+  let pwa = await App.open(browser, ctx.site, "two");
 
   const mark = bot.events.length;
   bot.send("code");
@@ -673,6 +917,7 @@ async function casePwaPastesDesktopCode(ctx) {
 
   // Case 3: the PWA goes away; the bot's message waits in its sender queue.
   const tag3 = "case 3 (sender queue)";
+  await closing(pwa, tag);
   await browser.close();
   await bot.wait("PWA offline", (e) => e.event === "path" && e.peer_id === pwa.peerId && e.state === "Offline", 45_000, mark);
   const queuedMark = bot.events.length;
@@ -682,10 +927,11 @@ async function casePwaPastesDesktopCode(ctx) {
   if (sent.state !== "Queued") throw new Error(`${tag3}: expected the message to queue, got ${sent.state}`);
   browser = await launchBrowser(profile);
   cleanups.push(() => browser.close().catch(() => {}));
-  pwa = await Pwa.open(browser, ctx.pwaPort, "two-again");
+  pwa = await App.open(browser, ctx.site, "two-again");
   await pwa.waitReceived(bot.peerId, waiting, 60_000);
   log(`${tag3}: queued message delivered after the PWA came back`);
   await bot.quit();
+  await closing(pwa, tag3);
   await browser.close();
   return bot;
 }
@@ -699,7 +945,7 @@ async function caseTamperedBindingIsRefused(ctx) {
   const ready = await bot.wait("ready", (e) => e.event === "ready");
   bot.peerId = ready.peer_id;
   await bot.wait("registered", (e) => e.event === "relay" && e.state.includes("Registered"));
-  const pwa = await Pwa.open(browser, ctx.pwaPort, "four", { tamperBinding: true });
+  const pwa = await App.open(browser, ctx.site, "four", { tamperBinding: true });
 
   const code = await pwa.showCode();
   bot.send(`pair ${code}`);
@@ -720,6 +966,7 @@ async function caseTamperedBindingIsRefused(ctx) {
   if (sent.state !== "Queued") throw new Error(`${tag}: expected the message to queue, got ${sent.state}`);
   log(`${tag}: refused (${notice.text.slice(0, 60)}...)`);
   await bot.quit();
+  await closing(pwa, tag);
   await browser.close();
   return bot;
 }
@@ -744,7 +991,7 @@ async function caseCalls(ctx) {
   const ready = await bot.wait("ready", (e) => e.event === "ready");
   bot.peerId = ready.peer_id;
   await bot.wait("registered", (e) => e.event === "relay" && e.state.includes("Registered"));
-  const pwa = await Pwa.open(browser, ctx.pwaPort, "calls");
+  const pwa = await App.open(browser, ctx.site, "calls");
   const code = await pwa.showCode();
   bot.send(`pair ${code}`);
   await bot.wait("direct path", (e) => e.event === "path" && e.peer_id === pwa.peerId && e.state === "Direct", 45_000);
@@ -755,10 +1002,8 @@ async function caseCalls(ctx) {
   const mark = bot.events.length;
   bot.send(`call ${pwa.peerId} video`);
   const out = await bot.wait("outgoing", (e) => e.event === "call" && e.state === "Outgoing", 10_000, mark);
-  await until(`${tag}: the PWA rings`, 20_000, () =>
-    pwa.page.evaluate(() => !document.getElementById("incoming-call-notification")?.classList.contains("hidden")),
-  );
-  await pwa.page.evaluate(() => window.acceptIncomingCall());
+  await until(`${tag}: the PWA rings`, 20_000, () => pwa.ringing());
+  await pwa.acceptCall();
   await bot.wait("active", (e) => e.event === "call" && e.call_id === out.call_id && e.state === "Active", 30_000, mark);
   const m6 = await botMedia(bot, out.call_id, 50, `${tag}: the desktop receives ${Browser}'s VP8 and Opus`);
   const s6 = await pwaDecodes(pwa, `${tag}: ${Browser} decodes the desktop's VP8 and Opus`);
@@ -770,10 +1015,7 @@ async function caseCalls(ctx) {
   if (process.env.INTEROP_PWA_CALLS !== "0") {
     // Case 6: the PWA calls (see the header).
     tag = "case 6 (PWA video-calls the desktop)";
-    await pwa.page.evaluate((peer) => {
-      window.openChat(peer);
-      return window.initiateCall(peer, true);
-    }, bot.peerId);
+    await pwa.startVideoCall(bot.peerId);
     const ring = await bot.wait("incoming call", (e) => e.event === "call" && e.state === "Incoming" && e.peer_id === pwa.peerId, 30_000);
     if (!ring.video) throw new Error(`${tag}: the PWA's offer should carry video`);
     bot.send(`accept ${ring.call_id}`);
@@ -782,13 +1024,14 @@ async function caseCalls(ctx) {
     const s5 = await pwaDecodes(pwa, `${tag}: ${Browser} decodes the desktop's VP8 and Opus`);
     log(`${tag}: desktop got audio ${m5.audio_rx} / video ${m5.video_rx} packets; PWA decoded ${s5.videoFrames} frames, ${s5.audioSamples} audio samples`);
     log(`${tag}: selected-pair changes on the PWA's connections: ${JSON.stringify(await pairChanges(pwa))}`);
-    await pwa.page.evaluate(() => window.hangupCall());
+    await pwa.hangupCall();
     await bot.wait("remote hang-up", (e) => e.event === "call" && e.call_id === ring.call_id && e.state === "Ended(RemoteHungUp)", 15_000);
     log(`${tag}: hung up by the PWA`);
   } else {
     log("case 6 (PWA video-calls the desktop): skipped (INTEROP_PWA_CALLS=0)");
   }
   await bot.quit();
+  await closing(pwa, "calls");
   await browser.close();
   return bot;
 }
@@ -807,7 +1050,7 @@ async function casePwaOffersWithMedia(ctx) {
   const ready = await bot.wait("ready", (e) => e.event === "ready");
   bot.peerId = ready.peer_id;
   await bot.wait("registered", (e) => e.event === "relay" && e.state.includes("Registered"));
-  const pwa = await Pwa.open(browser, ctx.pwaPort, "seven");
+  const pwa = await App.open(browser, ctx.site, "seven");
   // Hold the camera and microphone for the whole case, as a page in a call does.
   const tracks = await pwa.page.evaluate(async () => {
     window.__held = await navigator.mediaDevices.getUserMedia({ audio: true, video: true });
@@ -836,6 +1079,7 @@ async function casePwaOffersWithMedia(ctx) {
   }
   log(`${tag}: selected-pair changes on the PWA's connections: ${JSON.stringify(await pairChanges(pwa))}`);
   await bot.quit();
+  await closing(pwa, tag);
   await browser.close();
   return bot;
 }
@@ -845,10 +1089,10 @@ async function casePwaOffersWithMedia(ctx) {
 async function main() {
   if (!existsSync(botBin)) throw new Error(`bot binary not found: ${botBin} (cargo build -p parolnet-app --example bot)`);
   const bindIp = mode === "loopback" ? "127.0.0.1" : lanIPv4();
-  log(`${Browser}, ICE mode ${mode}, desktop host candidate ${bindIp}`);
+  log(`${Browser}, ${target === "web" ? "the web app (web/)" : "the PWA (pwa/)"}, ICE mode ${mode}, desktop host candidate ${bindIp}`);
   const relayPort = await startRelay();
-  const pwaPort = await startPwaServer(relayPort);
-  const ctx = { relayPort, pwaPort, bindIp };
+  const site = target === "web" ? await startWebServer(relayPort) : await startPwaServer(relayPort);
+  const ctx = { relayPort, site, bindIp };
 
   const bots = [];
   bots.push(await caseDesktopEntersPwaCode(ctx));
@@ -859,8 +1103,7 @@ async function main() {
 
   // Host candidates only: no page may have learned a STUN / TURN server (that would mean a
   // request left the machine).
-  for (const p of openPwas) {
-    const line = p.console.find((t) => t.includes("[WebRTC] ICE servers from"));
+  for (const [p, line] of learned) {
     if (line) throw new Error(`pwa ${p.name} learned ICE servers, so a request left the machine: ${line}`);
   }
   if (refusedHosts.size) log(`requests refused by the proxy: ${[...refusedHosts].map(([h, n]) => `${h} x${n}`).join(", ")}`);
@@ -870,7 +1113,7 @@ async function main() {
     log(`mDNS: the desktop resolved ${Browser}'s .local candidates`);
   }
   const cases = 5 + (process.env.INTEROP_CALLS === "0" ? 0 : process.env.INTEROP_PWA_CALLS === "0" ? 1 : 2);
-  log(`PASS: desktop <-> PWA interop, ${Browser}, ${mode} candidates (${cases} cases)`);
+  log(`PASS: desktop <-> ${target === "web" ? "web app" : "PWA"} interop, ${Browser}, ${mode} candidates (${cases} cases)`);
 }
 
 let status = 0;

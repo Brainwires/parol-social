@@ -41,6 +41,37 @@ The root Cargo workspace has 15 members; the desktop app is a separate workspace
 | `xtask` | Clause and test-vector tooling |
 | `apps/desktop` (own workspace) | **New (M0/M1).** GPUI client: contacts, pairing, chat (UI v0); the M0 video spike behind `--spike` |
 
+## Web app (`web/`): the client that replaces the PWA
+
+Not deployed yet; `pwa/` is still the live client. [docs/web-port/app.md](docs/web-port/app.md)
+lists what is owed before the switch (encryption at rest and a backup, migration or a notice
+for people who have the old PWA, translations).
+
+- **Engine** (`web/src/engine`, [docs/web-port/engine.md](docs/web-port/engine.md)): identity,
+  relay client, PNP-003 pairing, one bound data channel per contact, 1:1 text with a sender-side
+  queue (edit and take-back of what still waits), verification state, removal of a contact, the
+  user's own TURN server, 1:1 calls, IndexedDB storage (plaintext at rest), one tab at a time.
+- **App**: first run, add a contact (QR code made and scanned on the device, or a pasted code),
+  conversations on real state, safety numbers, calls, settings, "open in another tab" with
+  take-over; nine locales, English complete.
+- **Desktop ↔ web app** (`INTEROP_APP=web node apps/desktop/interop/pwa-interop.mjs`, steps of
+  the CI job `pwa-interop`; the same seven cases as the PWA matrix below, the web app driven
+  through its interface):
+
+  | | Chromium | Firefox | WebKit (Playwright, Linux) |
+  |---|---|---|---|
+  | Pairing both ways, chat, sender queue, refused tampered binding (cases 1-4) | pass | pass | pass |
+  | Video calls both ways, VP8 + Opus decoded on both sides (cases 5-6) | pass | pass | pass |
+  | Web-offered data channel while holding media (case 7) | pass | pass | pass |
+  | Host candidates covered | mDNS names, loopback | mDNS names, loopback | plain address only |
+
+- **Web ↔ web** (`web/tests/e2e/real.flows.ts`, the production export behind the production
+  CSP with a real relay at the same origin, in the same three browsers): first run, pairing by
+  paste and by camera, chat, the queue, unread counts, a video call, a second tab, settings,
+  delete all data. No CSP violation, no console error, no request leaving the test server.
+- Not covered: real Safari (macOS / iOS), a phone's camera, STUN / TURN paths in a browser,
+  notifications (the permission cannot be granted in these runs).
+
 ## M1 (in progress): third slice, media
 
 - **`parolnet-media`** (new, root workspace; default features pure Rust, so the workspace's CI

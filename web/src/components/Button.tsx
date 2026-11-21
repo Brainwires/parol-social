@@ -10,20 +10,35 @@ interface ButtonProps {
   onClick?: () => void;
   type?: "button" | "submit";
   block?: boolean;
+  /** Really unavailable (a form that is being sent): not focusable until it is back. */
+  disabled?: boolean;
+  /** Leading icon. */
+  icon?: IconName;
   children: ReactNode;
 }
 
 /** Primary is ink, quiet is an ink outline, danger is a flare outline. Colour is never brand. */
 export function Button(
-  { variant = "quiet", testId, onClick, type = "button", block = false, children }: ButtonProps,
+  {
+    variant = "quiet",
+    testId,
+    onClick,
+    type = "button",
+    block = false,
+    disabled = false,
+    icon,
+    children,
+  }: ButtonProps,
 ) {
   return (
     <button
       type={type}
       className={`btn btn--${variant}${block ? " btn--block" : ""}`}
       data-testid={testId}
+      disabled={disabled}
       onClick={onClick}
     >
+      {icon && <Icon name={icon} />}
       {children}
     </button>
   );
@@ -37,6 +52,10 @@ interface IconButtonProps {
   onClick?: () => void;
   type?: "button" | "submit";
   filled?: boolean;
+  /** A toggle that is on (`aria-pressed`). Omit for a plain button. */
+  pressed?: boolean;
+  /** Extra class names (the call controls style theirs). */
+  className?: string;
   /**
    * Unavailable, but still focusable so it can say why: the click and focus handlers keep
    * running and the caller shows the reason (`describedBy` points at it).
@@ -51,8 +70,11 @@ export function IconButton(props: IconButtonProps) {
   return (
     <button
       type={props.type ?? "button"}
-      className={props.filled ? "icon-btn icon-btn--filled" : "icon-btn"}
+      className={`icon-btn${props.filled ? " icon-btn--filled" : ""}${
+        props.className ? ` ${props.className}` : ""
+      }`}
       aria-label={props.label}
+      aria-pressed={props.pressed === undefined ? undefined : props.pressed ? "true" : "false"}
       aria-disabled={props.unavailable ? "true" : undefined}
       aria-describedby={props.describedBy}
       data-testid={props.testId}

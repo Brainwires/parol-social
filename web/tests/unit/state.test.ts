@@ -1,9 +1,17 @@
-import { assertEquals } from "@std/assert";
-import { parseRoute } from "../../src/router.ts";
+import { assertEquals, assertRejects } from "@std/assert";
+import { EngineError } from "../../src/engine/types.ts";
+import { hrefOf, isLabHash, parseRoute } from "../../src/router.ts";
 import { captionOf, threadItems } from "../../src/screens/thread.ts";
 import { createFakeStore, FAKE_PEERS } from "../../src/state/fake.ts";
-import { isOnline, lineState, type PathState } from "../../src/state/model.ts";
-import { messagesOf, waitingCount } from "../../src/state/store.ts";
+import {
+  callEndWords,
+  type ContactView,
+  isOnline,
+  lineState,
+  type PathState,
+  sortContacts,
+} from "../../src/state/model.ts";
+import { contactOf, messagesOf } from "../../src/state/store.ts";
 
 Deno.test("lineState: one variant per path state; being offline ourselves wins", () => {
   const expected: Record<PathState, string> = {
@@ -28,56 +36,102 @@ Deno.test("isOnline: who is listed under Online now", () => {
   );
 });
 
-Deno.test("fake store: a message on an open line is delivered, otherwise it waits", () => {
+Deno.test("sortContacts: online first, then by last activity, newest first", () => {
+  const view = (name: string, path: PathState, lastActivityMs: number): ContactView => ({
+    contact: {
+      peerId: name,
+      name,
+      identityKey: null,
+      addedMs: 0,
+      verified: "no",
+      verifiedMs: null,
+    },
+    path,
+    queued: 0,
+    unread: 0,
+    lastActivityMs,
+  });
+  const sorted = sortContacts([
+    view("away-old", "Offline", 10),
+    view("online-old", "Direct", 20),
+    view("away-new", "Unknown", 90),
+    view("online-new", "NoDirectPath", 80),
+    view("b-tie", "Offline", 5),
+    view("a-tie", "Offline", 5),
+  ]);
+  assertEquals(sorted.map((v) => v.contact.name), [
+    "online-new",
+    "online-old",
+    "away-new",
+    "away-old",
+    "a-tie",
+    "b-tie",
+  ]);
+});
+
+Deno.test("callEndWords: one wording per way a call ends", () => {
+  assertEquals(callEndWords({ kind: "HungUp" }, false), "youEnded");
+  assertEquals(callEndWords({ kind: "RemoteHungUp" }, true), "theyEnded");
+  // The engine's names: we declined is `Declined`, they declined is `Rejected`.
+  assertEquals(callEndWords({ kind: "Declined" }, true), "youDeclined");
+  assertEquals(callEndWords({ kind: "Rejected" }, false), "theyDeclined");
+  assertEquals(callEndWords({ kind: "NoAnswer" }, false), "noAnswer");
+  assertEquals(callEndWords({ kind: "NoAnswer" }, true), "missed");
+  assertEquals(callEndWords({ kind: "Failed", reason: "x" }, false), "failed");
+});
+
+const queued = (store: ReturnType<typeof createFakeStore>, peer: string) =>
+  contactOf(store, peer)?.queued;
+
+Deno.test("fake store: a message on an open line is delivered, otherwise it waits", async () => {
   const store = createFakeStore();
-  store.send(FAKE_PEERS.mira, "hello");
+  await store.send(FAKE_PEERS.mira, "hello");
   assertEquals(messagesOf(store, FAKE_PEERS.mira).at(-1)?.state, "Sent");
-  store.send(FAKE_PEERS.tomasz, "hello");
+  await store.send(FAKE_PEERS.tomasz, "hello");
   assertEquals(messagesOf(store, FAKE_PEERS.tomasz).at(-1)?.state, "Queued");
-  assertEquals(waitingCount(messagesOf(store, FAKE_PEERS.tomasz)), 4);
+  assertEquals(queued(store, FAKE_PEERS.tomasz), 4);
 });
 
 Deno.test("fake store: when the line opens, what waited is delivered", () => {
   const store = createFakeStore();
   store.setPath(FAKE_PEERS.tomasz, "Direct");
-  assertEquals(waitingCount(messagesOf(store, FAKE_PEERS.tomasz)), 0);
+  assertEquals(queued(store, FAKE_PEERS.tomasz), 0);
   // Other contacts are untouched.
-  assertEquals(waitingCount(messagesOf(store, FAKE_PEERS.kofi)), 2);
+  assertEquals(queued(store, FAKE_PEERS.kofi), 2);
 });
 
-Deno.test("fake store: offline ourselves, even a direct contact's message waits", () => {
+Deno.test("fake store: offline ourselves, even a direct contact's message waits", async () => {
   const store = createFakeStore();
   store.setSelfOnline(false);
   assertEquals(store.relay.value.kind, "Disconnected");
-  store.send(FAKE_PEERS.mira, "later");
+  await store.send(FAKE_PEERS.mira, "later");
   assertEquals(messagesOf(store, FAKE_PEERS.mira).at(-1)?.state, "Queued");
   store.setSelfOnline(true);
-  assertEquals(waitingCount(messagesOf(store, FAKE_PEERS.mira)), 0);
+  assertEquals(queued(store, FAKE_PEERS.mira), 0);
 });
 
-Deno.test("fake store: take back and edit only touch messages still on this device", () => {
+Deno.test("fake store: take back and edit only touch messages still on this device", async () => {
   const store = createFakeStore();
   const [delivered, held] = messagesOf(store, FAKE_PEERS.tomasz).filter((m) =>
     m.direction === "Sent"
   );
-  store.takeBack(FAKE_PEERS.tomasz, delivered.id);
-  store.edit(FAKE_PEERS.tomasz, delivered.id, "changed");
+  // As the engine: a message that has left the device rejects with `NotQueued`.
+  const gone = await assertRejects(() => store.takeBack(delivered.id), EngineError);
+  assertEquals(gone.code, "NotQueued");
+  await assertRejects(() => store.edit(delivered.id, "changed"), EngineError);
   assertEquals(messagesOf(store, FAKE_PEERS.tomasz).find((m) => m.id === delivered.id), delivered);
 
-  store.edit(FAKE_PEERS.tomasz, held.id, "changed");
-  assertEquals(messagesOf(store, FAKE_PEERS.tomasz).find((m) => m.id === held.id)?.body, {
-    kind: "text",
-    text: "changed",
-  });
-  store.takeBack(FAKE_PEERS.tomasz, held.id);
+  await store.edit(held.id, "changed");
+  assertEquals(messagesOf(store, FAKE_PEERS.tomasz).find((m) => m.id === held.id)?.text, "changed");
+  await store.takeBack(held.id);
   assertEquals(messagesOf(store, FAKE_PEERS.tomasz).some((m) => m.id === held.id), false);
 });
 
-Deno.test("fake store: calls only start on an open line", () => {
+Deno.test("fake store: calls only start on an open line", async () => {
   const store = createFakeStore();
-  store.startCall(FAKE_PEERS.tomasz, "voice");
+  await store.startCall(FAKE_PEERS.tomasz, false);
   assertEquals(store.call.value, null);
-  store.startCall(FAKE_PEERS.mira, "video");
+  await store.startCall(FAKE_PEERS.mira, true);
   assertEquals(store.call.value?.state.kind, "Outgoing");
   store.setPath(FAKE_PEERS.mira, "Offline");
   assertEquals(store.call.value, null);
@@ -85,11 +139,26 @@ Deno.test("fake store: calls only start on an open line", () => {
 
 Deno.test("fake store: retry shows the attempt, then the same reason", async () => {
   const store = createFakeStore({ retryDelayMs: 5 });
-  const path = () => store.contacts.value.find((c) => c.peerId === FAKE_PEERS.kofi)?.path;
-  store.retryPath(FAKE_PEERS.kofi);
+  const path = () => contactOf(store, FAKE_PEERS.kofi)?.path;
+  store.connect(FAKE_PEERS.kofi);
   assertEquals(path(), "Connecting");
   await new Promise((done) => setTimeout(done, 30));
   assertEquals(path(), "NoDirectPath");
+});
+
+Deno.test("fake store: a scanned code is verified in person, a pasted one is not", async () => {
+  const store = createFakeStore({ empty: true });
+  const scanned = await store.pair("ab".repeat(40), "scan");
+  assertEquals(scanned.verified, "in-person");
+  const pasted = await store.pair("cd".repeat(40), "paste");
+  assertEquals(pasted.verified, "no");
+  await store.setCompared(pasted.peerId, true);
+  assertEquals(contactOf(store, pasted.peerId)?.contact.verified, "compared");
+  // Comparing numbers never undoes having met.
+  await store.setCompared(scanned.peerId, false);
+  assertEquals(contactOf(store, scanned.peerId)?.contact.verified, "in-person");
+  const bad = await assertRejects(() => store.pair("zz", "paste"), EngineError);
+  assertEquals(bad.code, "InvalidCode");
 });
 
 Deno.test("thread: bubble kinds, groups and the single caption", () => {
@@ -118,7 +187,21 @@ Deno.test("thread: a delivered message stays outlined until its turn in the fill
 Deno.test("router: hash routes", () => {
   assertEquals(parseRoute(""), { name: "list" });
   assertEquals(parseRoute("#/"), { name: "list" });
-  assertEquals(parseRoute("#/lab"), { name: "lab" });
+  assertEquals(parseRoute("#/add"), { name: "add" });
+  assertEquals(parseRoute("#/settings"), { name: "settings" });
   assertEquals(parseRoute("#/c/A1b2"), { name: "conversation", peerId: "a1b2" });
   assertEquals(parseRoute("#/c/not-hex"), { name: "list" });
+  assertEquals(hrefOf({ name: "conversation", peerId: "a1b2" }), "#/c/a1b2");
+  assertEquals(hrefOf({ name: "add" }), "#/add");
+});
+
+Deno.test("router: everything under #/lab is the lab's own world", () => {
+  assertEquals(parseRoute("#/lab"), { name: "lab" });
+  assertEquals(parseRoute("#/lab/"), { name: "list" });
+  assertEquals(parseRoute("#/lab/c/a1b2"), { name: "conversation", peerId: "a1b2" });
+  assertEquals(parseRoute("#/lab/settings"), { name: "settings" });
+  assertEquals(isLabHash("#/lab"), true);
+  assertEquals(isLabHash("#/lab/add"), true);
+  assertEquals(isLabHash("#/"), false);
+  assertEquals(isLabHash("#/labyrinth"), false);
 });

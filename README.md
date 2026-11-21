@@ -52,7 +52,7 @@ relying on it.
 ## Architecture
 
 ```
-apps/desktop (GPUI)      pwa/ (JS + wasm)        later: iOS / Android shells (UniFFI)
+apps/desktop (GPUI)      web/ (TS + wasm)        later: iOS / Android shells (UniFFI)
         \                    |                         /
          parolnet-app   (headless app core: accounts, conversations, calls as observable state)
             |        |          |            |            |
@@ -103,7 +103,7 @@ The specs in [`specs/`](specs/) are the source of truth for wire formats and beh
 ```bash
 cargo check --workspace                 # the library, relay and CLI crates
 cargo test --workspace
-wasm-pack build crates/parolnet-wasm    # the PWA's wasm
+wasm-pack build crates/parolnet-wasm    # the wasm core (web/ builds it with `denext task build-wasm`)
 cargo deny check licenses sources bans  # the licence gate (no GPL / AGPL)
 ```
 
@@ -115,31 +115,47 @@ brew install libvpx                     # macOS; apt install libvpx-dev (+ X11/W
 cd apps/desktop && cargo run --release  # see apps/desktop/README.md
 ```
 
-### Relay server and PWA
+### Relay server and web app (deployment)
+
+The relay image builds everything from source: the relay binary, the wasm core and the web
+app's static export (`web/out`), which nginx serves at `/pwa/` with its Content-Security-Policy
+and cache rules, the relay behind it at the same origin. Nothing has to be built on the host
+first. To deploy or update:
 
 ```bash
-npm run build:all        # the wasm and the PWA bundle
-npm run docker:rebuild   # + the relay image, then restarts the container
+git pull && docker compose up -d --build
 ```
 
-For PWA work without rebuilding the image, a `docker-compose.override.yml` (gitignored) that
-bind-mounts `./pwa` into the running container lets you edit and reload; `npm run build:wasm`
-rebuilds only the wasm. See [GETTING-STARTED.md](GETTING-STARTED.md) and
-[STARTUP-GUIDE.md](STARTUP-GUIDE.md).
+Build arguments: `AUTHORITY_PUBKEYS` (comma-separated hex Ed25519 keys) and
+`AUTHORITY_THRESHOLD` are baked into the wasm core (the dev placeholder keys when empty);
+`BUILD_COMMIT`, `BUILD_VERSION`, `BUILD_DATE` are printed by the container at startup. The
+first build takes a while (Rust twice: the relay and the wasm core); later builds reuse the
+Rust and Denext layers when only the app changes. `scripts/image-smoke.sh http://127.0.0.1:1411`
+checks a running container (CI's `image` job runs it). See [server/README.md](server/README.md).
+
+`pwa/` is the legacy vanilla-JS client. It is no longer built into or served by the image and
+stays in the repository for now (the desktop interop suite still has a `pwa` target); `npm run
+build:all` builds it for that suite.
 
 ### Web app rewrite (`web/`)
 
-The PWA is being rewritten as a [Denext](https://denext.dev) app with a new design
-([docs/ux/web-app.md](docs/ux/web-app.md)). Phase 1 is in `web/`: the platform (static export
-under `/pwa/`, strict CSP, wasm, service worker, offline) and the design system and
-conversation screens on fake state. `pwa/` stays the deployed client until the protocol
-services are ported. See [web/README.md](web/README.md).
+The PWA is rewritten as a [Denext](https://denext.dev) app with a new design
+([docs/ux/web-app.md](docs/ux/web-app.md)). `web/` is the whole client now: a UI-free engine
+(identity, relay, pairing, the bound data channel, chat with its queue, verification, 1:1 calls,
+IndexedDB storage; [docs/web-port/engine.md](docs/web-port/engine.md)) and the screens on it
+(first run, adding a contact by QR code or pasted code, conversations, safety numbers, calls,
+settings; [docs/web-port/app.md](docs/web-port/app.md)), exported as static files that run under
+`/pwa/` behind a strict CSP. It passes the seven desktop ↔ browser interop cases in Chromium,
+Firefox and WebKit. It is the client the relay image serves at `/pwa/`, in place of the legacy
+`pwa/` (what [app.md](docs/web-port/app.md#owed-before-this-replaces-the-old-pwa) lists as owed
+still applies). See [web/README.md](web/README.md).
 
 ```bash
 cd web
 denext task build-wasm   # crates/parolnet-wasm -> web/public/wasm
-denext task build        # static site in web/out
-denext task test         # unit tests; `denext task e2e` runs the three browsers
+denext task build:test   # the test build (state lab, test hooks) in web/out-test
+denext task build        # the production export in web/out
+denext task test         # unit tests; `denext task e2e` and `e2e:flows` run the three browsers
 ```
 
 ## Roadmap

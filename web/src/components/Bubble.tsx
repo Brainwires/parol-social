@@ -2,7 +2,7 @@
 // filled once it is on theirs. Text, files and call invitations share the form.
 import { useEffect, useId, useRef, useState } from "denext";
 import { locale, t } from "../i18n/index.ts";
-import type { MessageBody } from "../state/model.ts";
+import type { Attachment } from "../state/model.ts";
 import { Icon } from "./Icon.tsx";
 
 export type BubbleKind = "received" | "delivered" | "held" | "dropped";
@@ -24,17 +24,24 @@ export function formatBytes(bytes: number, localeCode: string): string {
   }).format(value);
 }
 
-function Body({ body }: { body: MessageBody }) {
+/** What a bubble shows: text, or (in the state lab) a file or a call invitation. */
+export interface BubbleContent {
+  text: string;
+  attachment?: Attachment;
+}
+
+function Body({ content }: { content: BubbleContent }) {
+  const { text, attachment } = content;
   // The text is the writer's: its direction follows its own script, not the interface's.
-  if (body.kind === "text") return <span className="bubble__text" dir="auto">{body.text}</span>;
-  if (body.kind === "file") {
+  if (!attachment) return <span className="bubble__text" dir="auto">{text}</span>;
+  if (attachment.kind === "file") {
     return (
       <span className="bubble__attachment">
         <Icon name="file" />
         <span>
-          <bdi>{body.name}</bdi>
+          <bdi>{attachment.name}</bdi>
           <span className="bubble__meta">
-            {t("message.fileSize", { size: formatBytes(body.bytes, locale.value) })}
+            {t("message.fileSize", { size: formatBytes(attachment.bytes, locale.value) })}
           </span>
         </span>
       </span>
@@ -42,8 +49,10 @@ function Body({ body }: { body: MessageBody }) {
   }
   return (
     <span className="bubble__attachment">
-      <Icon name={body.media === "video" ? "video" : "phone"} />
-      <span>{t(body.media === "video" ? "message.videoInvite" : "message.voiceInvite")}</span>
+      <Icon name={attachment.media === "video" ? "video" : "phone"} />
+      <span>
+        {t(attachment.media === "video" ? "message.videoInvite" : "message.voiceInvite")}
+      </span>
     </span>
   );
 }
@@ -52,9 +61,9 @@ function className(kind: BubbleKind, tail: "start" | "end" | null): string {
   return `bubble bubble--${kind}${tail ? ` bubble--tail-${tail}` : ""}`;
 }
 
-export function Bubble({ kind, body, tail = null, fill = false, testId }: {
+export function Bubble({ kind, content, tail = null, fill = false, testId }: {
   kind: BubbleKind;
-  body: MessageBody;
+  content: BubbleContent;
   /** The corner that points at the sender, on the last bubble of a group. */
   tail?: "start" | "end" | null;
   /** This bubble takes part in the fill animation (it was waiting when the line opened). */
@@ -68,7 +77,7 @@ export function Bubble({ kind, body, tail = null, fill = false, testId }: {
       data-testid={testId}
       data-kind={kind}
     >
-      <Body body={body} />
+      <Body content={content} />
     </div>
   );
 }
@@ -77,8 +86,8 @@ export function Bubble({ kind, body, tail = null, fill = false, testId }: {
  * A waiting message is a button: it opens a menu with "Take back" and "Edit" (edit only for
  * text). Arrow keys move in the menu, Escape closes it and returns to the bubble.
  */
-export function HeldBubble({ body, tail = null, onTakeBack, onEdit, testId }: {
-  body: MessageBody;
+export function HeldBubble({ content, tail = null, onTakeBack, onEdit, testId }: {
+  content: BubbleContent;
   tail?: "start" | "end" | null;
   onTakeBack: () => void;
   onEdit?: () => void;
@@ -138,7 +147,7 @@ export function HeldBubble({ body, tail = null, onTakeBack, onEdit, testId }: {
         data-kind="held"
         onClick={() => setOpen(!open)}
       >
-        <Body body={body} />
+        <Body content={content} />
       </button>
       <span className="visually-hidden" id={hintId}>{t("message.heldHint")}</span>
       {open && (

@@ -1,0 +1,165 @@
+/* The landing pages (index.html, install.html). Colours and type are the web app's
+   (web/src/design/tokens.json, docs/ux/web-app.md): ink on cool paper, colour only for state
+   (so none here), sentence case. The fonts are the app's own files under /pwa/fonts/; their
+   names carry the font version, so these URLs only change with a font upgrade. */
+
+@font-face {
+  font-family: "Atkinson Hyperlegible Next";
+  font-style: normal;
+  font-weight: 200 800;
+  font-display: swap;
+  src: url("/pwa/fonts/atkinson-hyperlegible-next-latin-5.3.0.woff2") format("woff2");
+  unicode-range:
+    U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC, U+0304, U+0308,
+    U+0329, U+2000-206F, U+20AC, U+2122, U+2191, U+2193, U+2212, U+2215, U+FEFF, U+FFFD;
+}
+@font-face {
+  font-family: "Atkinson Hyperlegible Next";
+  font-style: normal;
+  font-weight: 200 800;
+  font-display: swap;
+  src: url("/pwa/fonts/atkinson-hyperlegible-next-latin-ext-5.3.0.woff2") format("woff2");
+  unicode-range:
+    U+0100-02BA, U+02BD-02C5, U+02C7-02CC, U+02CE-02D7, U+02DD-02FF, U+1D00-1DBF, U+1E00-1E9F,
+    U+1EF2-1EFF, U+2020, U+20A0-20AB, U+20AD-20C0, U+2113, U+2C60-2C7F, U+A720-A7FF;
+}
+
+:root {
+  color-scheme: light dark;
+  --paper: #F3F5F4;
+  --surface: #FFFFFF;
+  --fog: #E1E6E4;
+  --ink: #15232D;
+  --ink-2: #51606A;
+  --on-ink: #F3F5F4;
+  --focus: #8A5A00; /* lamp */
+  --font-text: "Atkinson Hyperlegible Next", system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  --measure: 680px;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --paper: #0F181D;
+    --surface: #172229;
+    --fog: #26343C;
+    --ink: #E8EEEC;
+    --ink-2: #9DACB3;
+    --on-ink: #0F181D;
+    --focus: #D9981E; /* lamp-line */
+  }
+}
+
+*, *::before, *::after { box-sizing: border-box; }
+
+html {
+  background: var(--paper);
+  color: var(--ink);
+  font-family: var(--font-text);
+  font-size: 100%;
+  line-height: 1.45;
+  -webkit-text-size-adjust: 100%;
+}
+body {
+  margin: 0;
+  background: var(--paper);
+  font-size: 1.0625rem; /* 17px */
+  overflow-wrap: break-word;
+}
+
+h1, h2, h3, p, ol, ul { margin: 0; }
+h1, h2, h3 { line-height: 1.2; font-weight: 700; }
+h1 { font-size: 1.8125rem; } /* 29px */
+h2 { font-size: 1.5rem; }    /* 24px */
+h3 { font-size: 1.0625rem; } /* 17px */
+
+a { color: var(--ink); text-underline-offset: 0.15em; }
+a:hover { text-decoration-thickness: 2px; }
+
+:focus-visible {
+  outline: 3px solid var(--focus);
+  outline-offset: 2px;
+  border-radius: 4px;
+}
+
+.skip {
+  position: absolute;
+  left: 16px;
+  top: -100px;
+  padding: 8px 12px;
+  background: var(--surface);
+  border-radius: 10px;
+}
+.skip:focus { top: 16px; }
+
+.page {
+  max-width: var(--measure);
+  margin: 0 auto;
+  padding: 0 16px;
+}
+
+.intro { padding-top: 48px; padding-bottom: 32px; }
+.intro .lead { font-size: 1.25rem; margin-top: 12px; } /* 20px */
+.intro .support { color: var(--ink-2); margin-top: 8px; }
+.intro .action { margin-top: 24px; }
+
+.button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 48px;
+  padding: 12px 24px;
+  border-radius: 10px;
+  background: var(--ink);
+  color: var(--on-ink);
+  font-weight: 700;
+  text-decoration: none;
+}
+.button:hover { text-decoration: underline; text-decoration-thickness: 2px; }
+@media (max-width: 480px) {
+  .intro .button { display: flex; width: 100%; }
+}
+
+main section { padding: 32px 0 0; }
+main section > p { margin-top: 8px; color: var(--ink-2); }
+
+.platforms { margin-top: 16px; display: grid; gap: 8px; }
+.platform {
+  background: var(--surface);
+  border: 1px solid var(--fog);
+  border-radius: 12px;
+}
+.platform summary {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  min-height: 48px;
+  padding: 12px 16px;
+  cursor: pointer;
+  list-style: none;
+  border-radius: 12px;
+}
+.platform summary::-webkit-details-marker { display: none; }
+.platform summary::before {
+  content: "";
+  flex: none;
+  width: 8px;
+  height: 8px;
+  border-right: 2px solid var(--ink-2);
+  border-bottom: 2px solid var(--ink-2);
+  transform: rotate(-45deg);
+}
+.platform[open] summary::before { transform: rotate(45deg); }
+.platform ol { padding: 0 16px 16px 56px; }
+.platform > p { padding: 0 16px 16px 36px; }
+.platform li + li { margin-top: 8px; }
+.platform li::marker { color: var(--ink-2); }
+
+.facts { margin-top: 16px; padding: 0; list-style: none; }
+.facts li {
+  padding: 12px 0;
+  border-top: 1px solid var(--fog);
+}
+.facts li:last-child { border-bottom: 1px solid var(--fog); }
+
+footer.page { padding-top: 48px; padding-bottom: 48px; color: var(--ink-2); font-size: 0.875rem; } /* 14px */
+footer.page a { color: var(--ink-2); }
+footer.page a:hover { color: var(--ink); }

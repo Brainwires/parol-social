@@ -1,0 +1,220 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>RTCPeerConnection.close() with media playing</title>
+<!--
+  No app code. Two peer connections in this page call each other with a camera and a
+  microphone; each one's remote stream plays in a <video>. Then each is torn down in the
+  order the query string names, and the page reports how long every step took. A step
+  that never returns freezes the page: the last line logged names it.
+
+    ?order=close-first    pc.close(), then track.stop(), then srcObject = null
+    ?order=detach-first   pause + srcObject = null, then pc.close(), then track.stop()
+    ?order=stop-first     track.stop(), then pc.close(), then srcObject = null
+    ?order=deferred       pause + srcObject = null; a task later track.stop(); a task later pc.close()
+    ?order=camera-only    no connection: a camera playing in an element, track.stop() while it plays
+    ?order=camera-off     no connection: the camera is disabled and its element detached; no track ends
+    ?order=camera-end     camera off and on with the element attached (&hide=1: hidden meanwhile),
+                          then the element is detached &after= ms later
+    ?order=camera-toggle  as camera-off, but the element stays attached: only `enabled` changes
+    &pause=0              detach with srcObject = null alone, without pause() first
+    &rounds=N             calls to make (default 1)
+    &hold=1               also hold a second microphone capture for the whole page, as the flows do
+-->
+<video id="remote-a" autoplay playsinline></video>
+<video id="remote-b" autoplay playsinline></video>
+<video id="self-a" autoplay playsinline muted></video>
+<video id="self-b" autoplay playsinline muted></video>
+<pre id="out"></pre>
+<script>
+const q = new URLSearchParams(location.search);
+const order = q.get("order") || "close-first";
+const rounds = Number(q.get("rounds") || 1);
+const pauseFirst = q.get("pause") !== "0";
+const say = (text) => {
+  console.log(`[repro] ${text}`);
+  document.getElementById("out").textContent += text + "\n";
+};
+const task = () => new Promise((done) => setTimeout(done, 0));
+const timed = (name, fn) => {
+  say(`${name} >`);
+  const t0 = performance.now();
+  fn();
+  say(`${name} < ${Math.round(performance.now() - t0)}ms`);
+};
+const playing = (video) =>
+  new Promise((done) => {
+    const check = () => (video.videoWidth > 0 && !video.paused ? done() : setTimeout(check, 50));
+    check();
+  });
+
+// No connection, and no track ends: the camera is switched off (`enabled = false`) and its
+// element is detached, as when the self view goes away during a call.
+async function cameraOff(round, local) {
+  const self = document.getElementById("self-a");
+  self.srcObject = local;
+  self.play().catch(() => {});
+  await playing(self);
+  await new Promise((done) => setTimeout(done, 300));
+  say(`round ${round}: camera playing, switching it off and detaching (pause=${pauseFirst})`);
+  for (const track of local.getVideoTracks()) track.enabled = false;
+  await task();
+  if (pauseFirst) timed("self-a pause", () => self.pause());
+  timed("self-a srcObject = null", () => (self.srcObject = null));
+  for (const track of local.getVideoTracks()) track.enabled = true;
+  say(`round ${round}: done`);
+}
+
+// The camera is switched off and on with the element attached all the while (`&hide=1`:
+// and hidden meanwhile), and the element is detached `&after=` ms later (default 200).
+async function cameraEnd(round, local) {
+  const self = document.getElementById("self-a");
+  const hide = q.get("hide") === "1";
+  const after = Number(q.get("after") || 200);
+  self.srcObject = local;
+  self.play().catch(() => {});
+  await playing(self);
+  await new Promise((done) => setTimeout(done, 300));
+  say(`round ${round}: camera playing; off and on (hide=${hide}), detach after ${after} ms`);
+  if (hide) self.hidden = true;
+  for (const track of local.getVideoTracks()) {
+    timed("enabled = false", () => (track.enabled = false));
+  }
+  await new Promise((done) => setTimeout(done, 200));
+  for (const track of local.getVideoTracks()) timed("enabled = true", () => (track.enabled = true));
+  if (hide) self.hidden = false;
+  await new Promise((done) => setTimeout(done, after));
+  timed("self-a srcObject = null", () => (self.srcObject = null));
+  say(`round ${round}: done`);
+}
+
+// As `camera-off`, but the element keeps the stream: only `enabled` changes.
+async function cameraToggle(round, local) {
+  const self = document.getElementById("self-a");
+  if (self.srcObject !== local) {
+    self.srcObject = local;
+    self.play().catch(() => {});
+    await playing(self);
+  }
+  await new Promise((done) => setTimeout(done, 300));
+  say(`round ${round}: camera playing, switching it off and on, element attached`);
+  for (const track of local.getVideoTracks()) {
+    timed("enabled = false", () => (track.enabled = false));
+  }
+  await new Promise((done) => setTimeout(done, 100));
+  for (const track of local.getVideoTracks()) timed("enabled = true", () => (track.enabled = true));
+  say(`round ${round}: done`);
+}
+
+// No connection at all: a camera playing in an element, stopped while it plays.
+async function cameraOnly(round) {
+  const local = await navigator.mediaDevices.getUserMedia({ audio: true, video: true });
+  const self = document.getElementById("self-a");
+  self.srcObject = local;
+  self.play().catch(() => {});
+  await playing(self);
+  await new Promise((done) => setTimeout(done, 500));
+  say(`round ${round}: camera playing, stopping it (${order})`);
+  for (const track of local.getTracks()) timed(`${track.kind} track.stop()`, () => track.stop());
+  await task();
+  timed("self-a srcObject = null", () => (self.srcObject = null));
+  say(`round ${round}: done`);
+}
+
+async function call(round) {
+  const sides = [];
+  for (const name of ["a", "b"]) {
+    const local = await navigator.mediaDevices.getUserMedia({
+      audio: true,
+      video: true,
+    });
+    const pc = new RTCPeerConnection();
+    for (const track of local.getTracks()) pc.addTrack(track, local);
+    const remote = document.getElementById(`remote-${name}`);
+    const self = document.getElementById(`self-${name}`);
+    pc.ontrack = (ev) => {
+      if (remote.srcObject !== ev.streams[0]) {
+        remote.srcObject = ev.streams[0];
+        remote.play().catch(() => {});
+      }
+    };
+    self.srcObject = local;
+    self.play().catch(() => {});
+    sides.push({ name, pc, local, remote, self });
+  }
+  const [a, b] = sides;
+  a.pc.onicecandidate = (ev) => ev.candidate && b.pc.addIceCandidate(ev.candidate).catch(() => {});
+  b.pc.onicecandidate = (ev) => ev.candidate && a.pc.addIceCandidate(ev.candidate).catch(() => {});
+  await a.pc.setLocalDescription(await a.pc.createOffer());
+  await b.pc.setRemoteDescription(a.pc.localDescription);
+  await b.pc.setLocalDescription(await b.pc.createAnswer());
+  await a.pc.setRemoteDescription(b.pc.localDescription);
+  await Promise.all([playing(a.remote), playing(b.remote)]);
+  await new Promise((done) => setTimeout(done, 500));
+  say(`round ${round}: media playing both ways, tearing down (${order})`);
+
+  const detach = (s) => {
+    for (const video of [s.remote, s.self]) {
+      if (pauseFirst) timed(`${s.name} ${video.id} pause`, () => video.pause());
+      timed(
+        `${s.name} ${video.id} srcObject = null`,
+        () => (video.srcObject = null),
+      );
+    }
+  };
+  const stop = (s) => {
+    for (const track of s.local.getTracks()) {
+      timed(`${s.name} ${track.kind} track.stop()`, () => track.stop());
+    }
+  };
+  const close = (s) => timed(`${s.name} pc.close()`, () => s.pc.close());
+  for (const s of sides) {
+    if (order === "close-first") {
+      close(s);
+      stop(s);
+      await task();
+      detach(s);
+    } else if (order === "detach-first") {
+      detach(s);
+      close(s);
+      stop(s);
+    } else if (order === "stop-first") {
+      stop(s);
+      close(s);
+      await task();
+      detach(s);
+    } else {
+      detach(s);
+      await task();
+      stop(s);
+      await task();
+      close(s);
+    }
+  }
+  say(`round ${round}: done`);
+}
+
+(async () => {
+  try {
+    if (q.get("hold") === "1") {
+      window.__held = await navigator.mediaDevices.getUserMedia({
+        audio: true,
+      });
+    }
+    const cameraRounds = {
+      "camera-off": cameraOff,
+      "camera-toggle": cameraToggle,
+      "camera-end": cameraEnd,
+    }[order];
+    const camera = cameraRounds
+      ? await navigator.mediaDevices.getUserMedia({ audio: true, video: true })
+      : null;
+    for (let round = 1; round <= rounds; round++) {
+      if (camera) await cameraRounds(round, camera);
+      else await (order === "camera-only" ? cameraOnly(round) : call(round));
+    }
+    say("ALL DONE");
+  } catch (error) {
+    say(`FAILED ${error}`);
+  }
+})();
+</script>

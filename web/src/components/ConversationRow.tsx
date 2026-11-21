@@ -1,5 +1,6 @@
 import { t } from "../i18n/index.ts";
-import type { Contact } from "../state/model.ts";
+import type { ContactView } from "../state/model.ts";
+import { shownName } from "../state/names.ts";
 
 /** The first letter of a name, for an avatar. */
 export function initial(name: string): string {
@@ -7,13 +8,10 @@ export function initial(name: string): string {
   return first ? first.toLocaleUpperCase() : "?";
 }
 
-export function Avatar({ contact, dot = false }: { contact: Contact; dot?: boolean }) {
+export function Avatar({ name, dot = false }: { name: string; dot?: boolean }) {
   return (
-    <span
-      className={contact.kind === "group" ? "avatar avatar--group" : "avatar"}
-      aria-hidden="true"
-    >
-      {initial(contact.name)}
+    <span className="avatar" aria-hidden="true">
+      {initial(name)}
       {dot && <span className="avatar__dot" />}
     </span>
   );
@@ -24,35 +22,46 @@ export function WaitingChip({ count }: { count: number }) {
   return <span className="chip" data-testid="waiting-chip">{t("list.waiting", { n: count })}</span>;
 }
 
+/** How many messages arrived and have not been read: ink, like everything that is not state. */
+export function UnreadBadge({ count }: { count: number }) {
+  return (
+    <span className="badge" data-testid="unread-badge">
+      <span aria-hidden="true">{count > 99 ? "99+" : count}</span>
+      <span className="visually-hidden">{t("list.unread", { n: count })}</span>
+    </span>
+  );
+}
+
 export function SectionHeader({ children }: { children: string }) {
   return <h2 className="section-header">{children}</h2>;
 }
 
-export function ConversationRow({ contact, preview, waiting, href, current }: {
-  contact: Contact;
+export function ConversationRow({ view, preview, href, current }: {
+  view: ContactView;
   /** The last message, already in words. */
   preview: string;
-  waiting: number;
   href: string;
   current: boolean;
 }) {
+  const { contact } = view;
   return (
     <a
-      className="row"
+      className={view.unread > 0 ? "row row--unread" : "row"}
       href={href}
       aria-current={current ? "page" : undefined}
       data-testid={`row-${contact.peerId.slice(0, 8)}`}
     >
-      <Avatar contact={contact} dot={contact.path === "Direct"} />
+      <Avatar name={shownName(contact)} dot={view.path === "Direct"} />
       <span className="row__text">
         <span className="row__name">
-          <bdi>{contact.name}</bdi>
+          <bdi>{shownName(contact)}</bdi>
         </span>
         <span className="row__preview">
           <bdi>{preview}</bdi>
         </span>
       </span>
-      {waiting > 0 && <WaitingChip count={waiting} />}
+      {view.queued > 0 && <WaitingChip count={view.queued} />}
+      {view.unread > 0 && <UnreadBadge count={view.unread} />}
     </a>
   );
 }

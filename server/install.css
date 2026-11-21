@@ -1,0 +1,17 @@
+/* install.html: the old direct-install link, kept alive. It uses index.css for the palette,
+   type and button; this adds its layout. */
+
+.moved { padding-top: 48px; padding-bottom: 48px; }
+.moved > p { margin-top: 12px; }
+.moved .links {
+  margin-top: 24px;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 12px 24px;
+}
+.moved .links a:not(.button) {
+  display: inline-flex;
+  align-items: center;
+  min-height: 48px;
+}
