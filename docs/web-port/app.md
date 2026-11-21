@@ -43,7 +43,7 @@ the first phase's fake store called differently is gone:
 | `ChatMessage.body` (text, file or call) | `ChatMessage.text`. The lab's made-up files and call invitations are an optional `attachment` only the fake store sets |
 | `takeBack(peerId, id)`, `edit(peerId, id, text)`, synchronous | `takeBack(id)`, `edit(id, text)`: asynchronous, rejecting with `NotQueued` once the message has left |
 | `addContact(name, code)` | `pair(code, via)`, then `rename`. The other side arrives through `ContactAdded` |
-| a fixed code | `PairingCode { code, expiresAtMs }`; none after a reload, so the screen asks for a new one |
+| a fixed code | `PairingCode { code, expiresAtMs }`; the same code after a reload within its lifetime (the engine stores its pending half), otherwise the screen asks for a new one |
 
 **What the engine gained for the app** (see engine.md): `removeContact`, `replaceCamera`,
 coded `Notice` events, `ContactRemoved`, and a call-failure reason for a refused microphone or
@@ -135,6 +135,6 @@ A missing key falls back to English, key by key.
 - **Groups, files, identity rotation**: not in the engine yet.
 - **History.** No trimming and no deletion of single messages; threads are loaded whole at
   start.
-- **The wasm core.** Removing a contact reloads the identity in wasm memory because the core
-  has no `remove_session`; a shown code does not survive a reload because the pending
-  bootstrap cannot be exported (engine.md, "wasm API gaps").
+- **The wasm core.** `bootstrap_decrypt` and per-session export / import are in the core but
+  not used by the engine yet (engine.md, "wasm API gaps" #3 and #6). The stored pending
+  bootstrap, like the identity, is plain in IndexedDB until encryption at rest exists.

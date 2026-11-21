@@ -56,6 +56,18 @@ export interface DeviceOptions {
   config?: Partial<EngineConfig>;
   /** Give the device a microphone and camera. */
   media?: boolean;
+  /** Exports this device's core lacks: the engine runs as on an older parolnet-wasm. */
+  without?: readonly (keyof WasmApi)[];
+}
+
+/** `wasm` without some of its exports (they read as missing, as on an older core). */
+function withoutExports(wasm: WasmApi, names: readonly (keyof WasmApi)[] = []): WasmApi {
+  if (names.length === 0) return wasm;
+  const copy: Record<string, unknown> = {};
+  for (const [name, value] of Object.entries(wasm)) {
+    if (!names.includes(name as keyof WasmApi)) copy[name] = value;
+  }
+  return copy as unknown as WasmApi;
 }
 
 export class Device {
@@ -127,7 +139,7 @@ export class World {
   }
 
   async device(name: string, options: DeviceOptions = {}): Promise<Device> {
-    const wasm = await newWasm();
+    const wasm = withoutExports(await newWasm(), options.without);
     const storage = options.storage ?? new MemoryStorage();
     const logs: string[] = [];
     const log: Logger = {

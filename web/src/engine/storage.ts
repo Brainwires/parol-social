@@ -14,6 +14,19 @@ export interface IdentityRow {
   secretHex: string;
 }
 
+/**
+ * store `identity`, key `"pairing"`: the pairing code on screen, so it survives a reload within
+ * its lifetime. `pendingHex` is the wasm `export_pending_bootstrap()` blob: secret key material,
+ * kept like the identity secret and deleted once the code is used, expires or is cancelled.
+ */
+export interface PendingPairingRow {
+  id: "pairing";
+  code: string;
+  expiresAtMs: number;
+  /** Never logged. */
+  pendingHex: string;
+}
+
 /** store `sessions`, key `"blob"`: the wasm `export_sessions()` JSON, one row. */
 export interface SessionsRow {
   id: "blob";

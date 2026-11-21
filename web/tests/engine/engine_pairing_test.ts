@@ -217,12 +217,76 @@ Deno.test(
 );
 
 Deno.test(
-  "pairing: a reload invalidates a shown code (the pending half lives in wasm memory)",
+  "pairing: a shown code survives a reload within its lifetime, and works once",
   withWorld(async (w) => {
     const a = await w.device("a");
     const b = await w.device("b");
-    const { code } = await a.engine.createPairingCode();
+    const { code, expiresAtMs } = await a.engine.createPairingCode();
+    const stored = await a.storage.get<{ code: string; pendingHex: string }>(
+      "identity",
+      "pairing",
+    );
+    assertEquals(stored?.code, code);
+    assert(/^01[0-9a-f]{128}$/.test(stored!.pendingHex));
+
     const again = await w.restart(a);
+    assertEquals(again.engine.snapshot().pairing, { code, expiresAtMs });
+    assert(again.engine.snapshot().pairingOpen);
+    await b.engine.pairWithCode(code, { via: "paste" });
+    await w.settle();
+    assertEquals(again.path(b), "Direct");
+    assertEquals(b.path(again), "Direct");
+    assertEquals(again.engine.snapshot().contacts.map((v) => v.contact.peerId), [b.id]);
+    // Used up: gone from the snapshot, from wasm memory and from storage.
+    assertEquals(again.engine.snapshot().pairing, null);
+    assertEquals(again.wasm.export_pending_bootstrap?.(), undefined);
+    assertEquals(await again.storage.get("identity", "pairing"), undefined);
+  }),
+);
+
+Deno.test(
+  "pairing: a code that expired while the app was closed is not shown again",
+  withWorld(async (w) => {
+    const a = await w.device("a");
+    const { expiresAtMs } = await a.engine.createPairingCode();
+    await a.engine.shutdown();
+    await w.advance(expiresAtMs - w.clock.now() + 1);
+    const again = await w.restart(a);
+    assertEquals(again.engine.snapshot().pairing, null);
+    assertEquals(again.wasm.export_pending_bootstrap?.(), undefined);
+    assertEquals(await again.storage.get("identity", "pairing"), undefined);
+  }),
+);
+
+Deno.test(
+  "pairing: cancelling or expiring clears the pending half from wasm memory and storage",
+  withWorld(async (w) => {
+    const a = await w.device("a");
+    await a.engine.createPairingCode();
+    assert(typeof a.wasm.export_pending_bootstrap?.() === "string");
+    await a.engine.cancelPairing();
+    await w.settle();
+    assertEquals(a.wasm.export_pending_bootstrap?.(), undefined);
+    assertEquals(await a.storage.get("identity", "pairing"), undefined);
+
+    const { expiresAtMs } = await a.engine.createPairingCode();
+    assert(await a.storage.get("identity", "pairing"));
+    await w.advance(expiresAtMs - w.clock.now() + 1);
+    assertEquals(a.engine.snapshot().pairing, null);
+    assertEquals(a.wasm.export_pending_bootstrap?.(), undefined);
+    assertEquals(await a.storage.get("identity", "pairing"), undefined);
+  }),
+);
+
+Deno.test(
+  "pairing: on a core that cannot export the pending half, a reload invalidates a shown code",
+  withWorld(async (w) => {
+    const older = { without: ["export_pending_bootstrap", "import_pending_bootstrap"] as const };
+    const a = await w.device("a", older);
+    const b = await w.device("b");
+    const { code } = await a.engine.createPairingCode();
+    assertEquals(await a.storage.get("identity", "pairing"), undefined);
+    const again = await w.restart(a, older);
     assertEquals(again.engine.snapshot().pairing, null);
     assert(!again.engine.snapshot().pairingOpen);
     await b.engine.pairWithCode(code, { via: "paste" });
@@ -328,67 +392,73 @@ Deno.test(
   }),
 );
 
-Deno.test(
-  "contacts: removing one deletes its history, queue and session, and leaves the others",
-  withWorld(async (w) => {
-    const a = await w.device("a");
-    const b = await w.device("b");
-    const c = await w.device("c");
-    await w.pair(a, b);
-    await w.pair(a, c);
-    await a.engine.sendText(b.id, "to b");
-    await b.engine.sendText(a.id, "from b");
-    await a.engine.sendText(c.id, "to c");
-    await w.settle();
-    // Something still waiting for b.
-    w.relay.socketOf(b.id)?.drop();
-    for (const pc of b.pcs) pc.close();
-    await w.settle();
-    assertEquals((await a.engine.sendText(b.id, "waits")).state, "Queued");
-    // A code on screen while the contact is removed.
-    await a.engine.createPairingCode();
+for (const core of ["with remove_session", "without remove_session"] as const) {
+  Deno.test(
+    `contacts: removing one deletes its history, queue and session, and leaves the others (${core})`,
+    withWorld(async (w) => {
+      const older = core === "without remove_session";
+      const a = await w.device("a", older ? { without: ["remove_session"] } : {});
+      assertEquals(typeof a.wasm.remove_session, older ? "undefined" : "function");
+      const b = await w.device("b");
+      const c = await w.device("c");
+      await w.pair(a, b);
+      await w.pair(a, c);
+      await a.engine.sendText(b.id, "to b");
+      await b.engine.sendText(a.id, "from b");
+      await a.engine.sendText(c.id, "to c");
+      await w.settle();
+      // Something still waiting for b.
+      w.relay.socketOf(b.id)?.drop();
+      for (const pc of b.pcs) pc.close();
+      await w.settle();
+      assertEquals((await a.engine.sendText(b.id, "waits")).state, "Queued");
+      // A code on screen while the contact is removed.
+      const shown = await a.engine.createPairingCode();
 
-    await a.engine.removeContact(b.id);
-    await w.settle();
+      await a.engine.removeContact(b.id);
+      await w.settle();
 
-    assertEquals(a.eventsOf("ContactRemoved"), [{ kind: "ContactRemoved", peerId: b.id }]);
-    assertEquals(a.engine.snapshot().contacts.map((v) => v.contact.peerId), [c.id]);
-    assertEquals(await a.engine.messages(b.id), []);
-    assertEquals(a.wasm.has_session(b.id), false);
-    assertEquals(a.wasm.has_session(c.id), true);
-    assertEquals(a.wasm.get_peer_id(), a.id, "the identity is the same");
-    assertEquals(await a.storage.get("contacts", b.id), undefined);
-    assertEquals(await a.storage.get("contactState", b.id), undefined);
-    assertEquals(await a.storage.getAllByPeer("messages", b.id), []);
-    assertEquals(await a.storage.getAllByPeer("outbox", b.id), []);
-    const saved = await a.storage.get<{ json: string }>("sessions", "blob");
-    assertEquals(Object.keys(JSON.parse(saved!.json)), [c.id]);
-    // Without `remove_session` in the core the identity was reloaded: the shown code is gone.
-    assertEquals(a.engine.snapshot().pairing, null);
+      assertEquals(a.eventsOf("ContactRemoved"), [{ kind: "ContactRemoved", peerId: b.id }]);
+      assertEquals(a.engine.snapshot().contacts.map((v) => v.contact.peerId), [c.id]);
+      assertEquals(await a.engine.messages(b.id), []);
+      assertEquals(a.wasm.has_session(b.id), false);
+      assertEquals(a.wasm.has_session(c.id), true);
+      assertEquals(a.wasm.get_peer_id(), a.id, "the identity is the same");
+      assertEquals(await a.storage.get("contacts", b.id), undefined);
+      assertEquals(await a.storage.get("contactState", b.id), undefined);
+      assertEquals(await a.storage.getAllByPeer("messages", b.id), []);
+      assertEquals(await a.storage.getAllByPeer("outbox", b.id), []);
+      const saved = await a.storage.get<{ json: string }>("sessions", "blob");
+      assertEquals(Object.keys(JSON.parse(saved!.json)), [c.id]);
+      // With `remove_session` only that session goes and the shown code stays. Without it the
+      // identity was reloaded, which drops the pending bootstrap: the code is closed.
+      if (older) assertEquals(a.engine.snapshot().pairing, null);
+      else assertEquals(a.engine.snapshot().pairing?.code, shown.code);
 
-    // The other contact still works, both ways.
-    await a.engine.sendText(c.id, "still here");
-    await c.engine.sendText(a.id, "so am I");
-    await w.settle();
-    assertEquals((await a.engine.messages(c.id)).map((m) => m.text), [
-      "to c",
-      "still here",
-      "so am I",
-    ]);
-    assertEquals((await c.engine.messages(a.id)).at(-2)?.text, "still here");
+      // The other contact still works, both ways.
+      await a.engine.sendText(c.id, "still here");
+      await c.engine.sendText(a.id, "so am I");
+      await w.settle();
+      assertEquals((await a.engine.messages(c.id)).map((m) => m.text), [
+        "to c",
+        "still here",
+        "so am I",
+      ]);
+      assertEquals((await c.engine.messages(a.id)).at(-2)?.text, "still here");
 
-    // The removed contact is a stranger again: nothing it sends is accepted.
-    const err = await assertRejects(() => a.engine.sendText(b.id, "x"), EngineError);
-    assertEquals(err.code, "UnknownContact");
-    const again = await assertRejects(() => a.engine.removeContact(b.id), EngineError);
-    assertEquals(again.code, "UnknownContact");
+      // The removed contact is a stranger again: nothing it sends is accepted.
+      const err = await assertRejects(() => a.engine.sendText(b.id, "x"), EngineError);
+      assertEquals(err.code, "UnknownContact");
+      const again = await assertRejects(() => a.engine.removeContact(b.id), EngineError);
+      assertEquals(again.code, "UnknownContact");
 
-    // And survives a restart.
-    const a2 = await w.restart(a);
-    assertEquals(a2.engine.snapshot().contacts.map((v) => v.contact.peerId), [c.id]);
-    assertEquals(a2.wasm.has_session(b.id), false);
-  }),
-);
+      // And survives a restart.
+      const a2 = await w.restart(a);
+      assertEquals(a2.engine.snapshot().contacts.map((v) => v.contact.peerId), [c.id]);
+      assertEquals(a2.wasm.has_session(b.id), false);
+    }),
+  );
+}
 
 Deno.test(
   "contacts: a removed contact can be added again with a new code",

@@ -76,8 +76,14 @@ export interface WasmApi {
   version(): string;
   /** Clears the identity, sessions and pending bootstrap from wasm memory. */
   panic_wipe?(): void;
-  /** Not in the core yet (engine.md, "wasm API gaps"): drops one peer's session. */
+  /** Drops one peer's session (its keys are zeroized). Feature-detected: older cores lack it. */
   remove_session?(peerIdHex: string): void;
+  /** The pending bootstrap as a hex blob (secret), or undefined when there is none. */
+  export_pending_bootstrap?(): string | undefined;
+  /** Restores a pending bootstrap exported by `export_pending_bootstrap`. Throws on a bad blob. */
+  import_pending_bootstrap?(blobHex: string): void;
+  /** Forgets the pending bootstrap: the code shown for it stops working. */
+  clear_pending_bootstrap?(): void;
 }
 
 // ── storage ──────────────────────────────────────────────────────
