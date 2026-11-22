@@ -21,7 +21,7 @@ use gpui_component::input::{Input, InputEvent, InputState};
 use parolnet_app::KeyStorage;
 use parolnet_app::{
     AppConfig, AppEvent, AppHandle, CallEnd, CallInfo, CallMedia, CallState, ChatMessage, Contact,
-    DeliveryState, Direction, PathState, RelayState,
+    DeliveryState, Direction, PathState, RelayState, pairing_code_text,
 };
 
 use crate::call::{CallSession, DeviceLists, MediaOptions};
@@ -223,10 +223,9 @@ pub struct QrRows {
 }
 
 pub fn qr_rows(data: &str) -> Option<QrRows> {
-    let code =
-        qrcode::QrCode::with_error_correction_level(data.as_bytes(), qrcode::EcLevel::L).ok()?;
-    let w = code.width();
-    let colors = code.to_colors();
+    // Error correction level M (PNP-003-MUST-008), from the core.
+    let code = parolnet_app::qr::pairing_qr(data)?;
+    let w = code.width;
     const QUIET: usize = 4;
     let full = w + 2 * QUIET;
     let mut rows = Vec::with_capacity(full);
@@ -236,7 +235,7 @@ pub fn qr_rows(data: &str) -> Option<QrRows> {
     for y in 0..w {
         let mut runs: Vec<(bool, usize)> = vec![(false, QUIET)];
         for x in 0..w {
-            let dark = colors[y * w + x] == qrcode::Color::Dark;
+            let dark = code.is_dark(y, x);
             match runs.last_mut() {
                 Some((d, n)) if *d == dark => *n += 1,
                 _ => runs.push((dark, 1)),
@@ -287,6 +286,18 @@ struct ContactRow {
     path: PathState,
 }
 
+/// How long a pairing code is shown (the core's default pairing window).
+const PAIRING_CODE_MINUTES: u64 = 10;
+
+/// The Short Authentication String of a pairing, for the user to compare (PNP-003 §5.5).
+struct SasPrompt {
+    peer_id: String,
+    digits: String,
+    emoji: String,
+    /// The user confirmed; the contact's confirmation is awaited.
+    confirmed: bool,
+}
+
 pub struct ChatView {
     app: AppHandle,
     relay: RelayState,
@@ -296,6 +307,10 @@ pub struct ChatView {
     pane: Pane,
     pairing_code: Option<String>,
     qr: Option<QrRows>,
+    /// When the code on display expires (PNP-003-SHOULD-001).
+    pairing_expires: Option<std::time::Instant>,
+    /// A pairing waiting for the user to compare its Short Authentication String.
+    sas: Option<SasPrompt>,
     notice: Option<String>,
     code_input: Entity<InputState>,
     composer: Entity<InputState>,
@@ -401,6 +416,8 @@ impl ChatView {
             pane: Pane::Welcome,
             pairing_code: None,
             qr: None,
+            pairing_expires: None,
+            sas: None,
             notice: None,
             show_safety: false,
             runtime,
@@ -475,6 +492,45 @@ impl ChatView {
                 }
             }
             AppEvent::Notice(n) => self.notice = Some(n),
+            // PNP-003-MUST-009 / -MUST-048: the code and its QR code leave the display as
+            // soon as a contact used it, it expired or it was cancelled.
+            AppEvent::PairingCodeClosed => self.clear_pairing_code(),
+            AppEvent::ContactRemoved { peer_id } => {
+                self.contacts.retain(|r| r.contact.peer_id != peer_id);
+                if self.selected.as_deref() == Some(peer_id.as_str()) {
+                    self.selected = None;
+                    self.pane = Pane::Welcome;
+                }
+            }
+            // PNP-003-MUST-026: show the SAS.
+            AppEvent::SasVerification {
+                peer_id,
+                digits,
+                emoji,
+            } => {
+                self.sas = Some(SasPrompt {
+                    peer_id,
+                    digits,
+                    emoji,
+                    confirmed: false,
+                })
+            }
+            AppEvent::PairingComplete {
+                peer_id,
+                sas_verified,
+            } => {
+                if self.sas.as_ref().is_some_and(|s| s.peer_id == peer_id) {
+                    self.sas = None;
+                }
+                if sas_verified {
+                    self.notice = Some("Verification code confirmed on both devices.".into());
+                }
+            }
+            AppEvent::PairingFailed { peer_id, .. } => {
+                if self.sas.as_ref().is_some_and(|s| s.peer_id == peer_id) {
+                    self.sas = None;
+                }
+            }
         }
         cx.notify();
     }
@@ -984,6 +1040,12 @@ impl ChatView {
         .detach();
     }
 
+    fn clear_pairing_code(&mut self) {
+        self.pairing_code = None;
+        self.qr = None;
+        self.pairing_expires = None;
+    }
+
     fn generate_code(&mut self, cx: &mut Context<Self>) {
         let app = self.app.clone();
         cx.spawn(async move |this, cx| {
@@ -993,6 +1055,10 @@ impl ChatView {
                     Ok(code) => {
                         view.qr = qr_rows(&code);
                         view.pairing_code = Some(code);
+                        view.pairing_expires = Some(
+                            std::time::Instant::now()
+                                + std::time::Duration::from_secs(60 * PAIRING_CODE_MINUTES),
+                        );
                     }
                     Err(e) => view.notice = Some(format!("Could not make a code: {e}")),
                 }
@@ -1023,6 +1089,71 @@ impl ChatView {
             });
         })
         .detach();
+    }
+
+    /// The verification step of a pairing (PNP-003 §5.5): the SAS as digits and as emoji,
+    /// what to do with it, and the two answers.
+    fn render_sas(&self, sas: &SasPrompt, cx: &mut Context<Self>) -> impl IntoElement {
+        let mut panel = div()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .p_3()
+            .border_1()
+            .border_color(rgb(0xd29922))
+            .rounded_md()
+            .child(heading("Verify your contact"))
+            .child(
+                div()
+                    .text_2xl()
+                    .font_weight(FontWeight::BOLD)
+                    .child(sas_spaced(&sas.digits)),
+            )
+            .child(div().text_2xl().child(sas.emoji.clone()))
+            .child(muted(SAS_INSTRUCTIONS));
+        if sas.confirmed {
+            panel = panel.child(muted(
+                "Waiting for your contact to confirm on their device.",
+            ));
+        } else {
+            let (confirm_peer, reject_peer) = (sas.peer_id.clone(), sas.peer_id.clone());
+            panel = panel
+                .child(
+                    Button::new("sas-confirm")
+                        .label("The codes match")
+                        .primary()
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.confirm_sas(confirm_peer.clone(), cx)
+                        })),
+                )
+                .child(
+                    Button::new("sas-reject")
+                        .label("They do not match")
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.app.reject_sas(&reject_peer);
+                            this.sas = None;
+                            cx.notify();
+                        })),
+                );
+        }
+        panel
+    }
+
+    fn confirm_sas(&mut self, peer: String, cx: &mut Context<Self>) {
+        if let Some(sas) = self.sas.as_mut() {
+            sas.confirmed = true;
+        }
+        let app = self.app.clone();
+        cx.spawn(async move |this, cx| {
+            if let Err(e) = app.confirm_sas(&peer).await {
+                let _ = this.update(cx, |view, cx| {
+                    view.notice = Some(format!("Could not confirm: {e}"));
+                    cx.notify();
+                });
+            }
+        })
+        .detach();
+        cx.notify();
     }
 
     fn rename(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
@@ -1154,7 +1285,8 @@ impl ChatView {
             .child(heading("Show my code"))
             .child(muted(
                 "Your contact scans this QR code (or pastes the text) in their ParolNet app. \
-                 It is valid for 30 minutes.",
+                 It is shown for 10 minutes and works for one contact. After pairing, both \
+                 devices show a verification code to compare.",
             ))
             .child(
                 Button::new("make-code")
@@ -1168,7 +1300,18 @@ impl ChatView {
         if let Some(qr) = &self.qr {
             show = show.child(render_qr(qr));
         }
-        if let Some(code) = self.pairing_code.clone() {
+        // PNP-003-SHOULD-001: the expiry indicator.
+        if let Some(expires) = self.pairing_expires {
+            let left = expires.saturating_duration_since(std::time::Instant::now());
+            show = show.child(
+                div()
+                    .text_sm()
+                    .text_color(rgb(0xd29922))
+                    .child(expiry_label(left)),
+            );
+        }
+        // As text, the code is shown in its form for copying (no blanks to lose).
+        if let Some(code) = self.pairing_code.as_deref().map(pairing_code_text) {
             show = show
                 .child(
                     div()
@@ -1198,21 +1341,19 @@ impl ChatView {
                     .primary()
                     .on_click(cx.listener(|this, _, window, cx| this.pair(window, cx))),
             );
-        div()
+        let page = div()
             .id("pair")
             .size_full()
             .overflow_y_scroll()
             .p_4()
             .flex()
             .flex_col()
-            .gap_6()
-            .child(show)
-            .child(enter)
-            .child(muted(
-                "Connections go directly between your devices. A contact you connect to can see \
+            .gap_6();
+        page.child(show).child(enter).child(muted(
+            "Connections go directly between your devices. A contact you connect to can see \
                  your IP address; strangers never can. To hide it, add your own TURN server in \
                  Settings.",
-            ))
+        ))
     }
 
     fn render_chat(&self, peer: &str, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1382,6 +1523,35 @@ impl ChatView {
     }
 }
 
+/// What the user is asked to do with the verification code (PNP-003-SHOULD-002).
+pub const SAS_INSTRUCTIONS: &str = "Compare this code with the one on your contact's device, \
+     by voice or in person, not by message. If the codes differ, someone may be \
+     intercepting the pairing: choose \"They do not match\".";
+
+/// The 6-digit code in two groups of three.
+pub fn sas_spaced(digits: &str) -> String {
+    match digits.len() {
+        6 => format!("{} {}", &digits[..3], &digits[3..]),
+        _ => digits.to_owned(),
+    }
+}
+
+/// The text of the expiry indicator under a pairing code.
+pub fn expiry_label(left: std::time::Duration) -> String {
+    let secs = left.as_secs();
+    if secs == 0 {
+        "This code has expired. Make a new one.".to_owned()
+    } else if secs < 60 {
+        "Expires in less than a minute".to_owned()
+    } else {
+        let minutes = secs.div_ceil(60);
+        format!(
+            "Expires in {minutes} minute{}",
+            if minutes == 1 { "" } else { "s" }
+        )
+    }
+}
+
 fn heading(text: &'static str) -> impl IntoElement {
     div()
         .text_lg()
@@ -1434,6 +1604,14 @@ impl Render for ChatView {
                 .child("Pick a contact, or add one.")
                 .into_any_element(),
         };
+        // PNP-003-MUST-042: while a pairing waits for it, the verification step is on top
+        // of whatever pane is open.
+        let sas = self.sas.as_ref().map(|sas| {
+            div()
+                .p_3()
+                .child(self.render_sas(sas, cx))
+                .into_any_element()
+        });
         let call = self.render_call(cx);
         let mut right = div()
             .flex_1()
@@ -1441,6 +1619,7 @@ impl Render for ChatView {
             .flex()
             .flex_col()
             .children(call)
+            .children(sas)
             .child(div().flex_1().min_h_0().child(main));
         if let Some(n) = &self.notice {
             right = right.child(
@@ -1471,6 +1650,10 @@ pub fn main(raw: &[String]) -> anyhow::Result<()> {
         .build()?;
     let mut config = AppConfig::new(opts.data_dir.clone(), opts.relay_url.clone());
     config.key_storage = opts.key_storage.clone();
+    // PNP-003-SHOULD-006: every pairing made here asks for the verification code (the
+    // core's default, stated here because the interface below depends on it).
+    config.request_sas = true;
+    config.pairing_window = std::time::Duration::from_secs(60 * PAIRING_CODE_MINUTES);
     let (app, events) = runtime
         .block_on(parolnet_app::start(config))
         .with_context(|| {
@@ -1621,6 +1804,41 @@ mod tests {
             }),
             "Relay: online (signaling-only)"
         );
+    }
+
+    // PNP-003-MUST-008: error correction level M or higher. 114 alphanumeric characters
+    // fill version 4 at level L (33 modules); at level M version 4 holds 90, so the code
+    // shown must be version 5 (37 modules).
+    #[test]
+    fn qr_code_uses_error_correction_level_m() {
+        let text = "A".repeat(114);
+        let shown = qr_rows(&text).unwrap();
+        assert_eq!(shown.width - 8, 37, "not error correction level M");
+    }
+
+    #[test]
+    fn expiry_indicator_counts_down() {
+        use std::time::Duration;
+        assert_eq!(
+            expiry_label(Duration::from_secs(600)),
+            "Expires in 10 minutes"
+        );
+        assert_eq!(
+            expiry_label(Duration::from_secs(61)),
+            "Expires in 2 minutes"
+        );
+        assert_eq!(expiry_label(Duration::from_secs(60)), "Expires in 1 minute");
+        assert_eq!(
+            expiry_label(Duration::from_secs(5)),
+            "Expires in less than a minute"
+        );
+        assert!(expiry_label(Duration::ZERO).contains("expired"));
+    }
+
+    #[test]
+    fn sas_prompt_text() {
+        assert_eq!(sas_spaced("448362"), "448 362");
+        assert!(SAS_INSTRUCTIONS.contains("by voice or in person"));
     }
 
     #[test]
