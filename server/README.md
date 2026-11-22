@@ -26,6 +26,8 @@ docker compose up -d
 docker compose down
 ```
 
+The compose file is the parol.social deployment: it sets `RELAY_PUBLIC_NAMES=parol.social`, the name clients dial the relay under. A client signs its registration for the name it dialed and the relay refuses any other (PNP-001 §10.7), so to use the app on a local run of the compose file start it with `RELAY_PUBLIC_NAMES=localhost:1411 docker compose up -d`. On your own host set it to your host name. (`docker run` below sets no name, and a relay without one accepts loopback clients, so `http://localhost:1411` works there as it is.)
+
 ### Using Docker directly
 
 ```bash

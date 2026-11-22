@@ -41,7 +41,10 @@ relying on it.
   connect to sees your IP address unless you relay through your own TURN server (Settings; the
   relay never offers one and the apps have none built in); messages to an offline
   contact wait on your device. Operators who want store-and-forward, tokens, TURN credentials or
-  federation run the relay profile (`SIGNALING_ONLY=0`).
+  federation run the relay profile (`SIGNALING_ONLY=0`). A registration is signed for the relay
+  it is made at (its `host:port`, which an operator sets in `RELAY_PUBLIC_NAMES`), so one relay
+  cannot register you at another, and a signaling-only relay answers no HTTP request about who
+  is online ([PNP-001 §10.7](specs/PNP-001-wire-protocol.md)).
 - **Metadata, honestly stated.** Your home relay learns your `PeerId`, your IP address, when you are
   online and the `PeerId`s you exchange signaling with (and, on a relay-profile relay, envelopes). A media server (M2) learns who is in a room
   and packet sizes and timing. The default mode does **not** hide that you use ParolNet, resist
