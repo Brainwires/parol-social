@@ -13,7 +13,8 @@ use std::time::Duration;
 
 use futures_util::{SinkExt as _, StreamExt as _};
 use parolnet_app::{
-    AppConfig, AppEvent, AppHandle, DeliveryState, Direction, PathState, RelayState, TurnSettings,
+    AppConfig, AppEvent, AppHandle, DeliveryState, Direction, PairingMark, PathState, RelayState,
+    TurnSettings,
 };
 use parolnet_rtc::test_turn::TestTurnServer;
 use tokio::sync::mpsc::UnboundedReceiver;
@@ -310,6 +311,86 @@ async fn offers_from_strangers_are_ignored() {
 
     alice.shutdown().await;
     eve.shutdown().await;
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A pairing lives in memory only. If the app is closed in the middle of one (here: while
+/// the verification code waits for an answer), the next start removes the contact the
+/// pairing had added and its bootstrap session; the other side's pairing ends with the
+/// connection (PNP-003 §4), and its contact goes too.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_restart_in_the_middle_of_a_pairing_leaves_no_contact() {
+    let relay = start_relay().await;
+    let dir = unique_dir("pairing-restart");
+    // Alice asks for the verification code, so both show it and neither goes on without it.
+    let alice_cfg = || {
+        let mut cfg = config(&dir, &relay, "alice");
+        cfg.request_sas = true;
+        cfg
+    };
+    let (alice, mut alice_rx) = start(alice_cfg()).await;
+    let (bob, mut bob_rx) = start(config(&dir, &relay, "bob")).await;
+    registered(&mut alice_rx).await;
+    registered(&mut bob_rx).await;
+
+    let code = alice.create_pairing_code().await.unwrap();
+    let contact = bob.pair_with_code(&code).await.unwrap();
+    assert_eq!(contact.pairing, Some(PairingMark::New));
+    assert!(!contact.sas_verified);
+    let is_sas = |e: &AppEvent| matches!(e, AppEvent::SasVerification { .. });
+    wait_for(&mut bob_rx, "bob's verification code", 60, is_sas).await;
+    wait_for(&mut alice_rx, "alice's verification code", 60, is_sas).await;
+    let marks = |snap: parolnet_app::Snapshot| -> Vec<Option<PairingMark>> {
+        snap.contacts.iter().map(|c| c.contact.pairing).collect()
+    };
+    assert_eq!(
+        marks(bob.snapshot().await.unwrap()),
+        [Some(PairingMark::New)]
+    );
+    assert_eq!(
+        marks(alice.snapshot().await.unwrap()),
+        [Some(PairingMark::New)]
+    );
+
+    // Bob's app is closed and started again: nothing of the pairing is left.
+    bob.shutdown().await;
+    drop(bob_rx);
+    let (bob2, mut bob2_rx) = start(config(&dir, &relay, "bob")).await;
+    registered(&mut bob2_rx).await;
+    assert!(bob2.snapshot().await.unwrap().contacts.is_empty());
+    // Nor the bootstrap session that had been stored for it.
+    assert!(matches!(
+        bob2.send_text(alice.peer_id(), "to nobody").await,
+        Err(parolnet_app::AppError::NoSession(_))
+    ));
+
+    // Alice's pairing ended with the connection it was on.
+    wait_for(&mut alice_rx, "alice's pairing to fail", 90, |e| {
+        matches!(e, AppEvent::PairingFailed { .. })
+    })
+    .await;
+    assert!(alice.snapshot().await.unwrap().contacts.is_empty());
+
+    // The other way round: a new pairing, and this time the presenter is restarted.
+    let code = alice.create_pairing_code().await.unwrap();
+    bob2.pair_with_code(&code).await.unwrap();
+    wait_for(&mut alice_rx, "alice's verification code", 60, is_sas).await;
+    alice.shutdown().await;
+    drop(alice_rx);
+    let (alice2, mut alice2_rx) = start(alice_cfg()).await;
+    registered(&mut alice2_rx).await;
+    let snap = alice2.snapshot().await.unwrap();
+    assert!(snap.contacts.is_empty());
+    // The code that was used did not come back either.
+    assert!(snap.pairing_code.is_none());
+    wait_for(&mut bob2_rx, "bob's pairing to fail", 90, |e| {
+        matches!(e, AppEvent::PairingFailed { .. })
+    })
+    .await;
+    assert!(bob2.snapshot().await.unwrap().contacts.is_empty());
+
+    alice2.shutdown().await;
+    bob2.shutdown().await;
     let _ = std::fs::remove_dir_all(&dir);
 }
 
