@@ -121,8 +121,8 @@ have seen mDNS answers (`:867-871`).
 
 > **Status.** Implemented: `web/src/engine/test-hooks.ts`, installed only by the test build of
 > the web app (`denext task build:test`; the production export fails its build if the bundle
-> names the hooks). The driver takes `INTEROP_APP=web` to run the same seven cases against the
-> web app; `class Web` in `apps/desktop/interop/pwa-interop.mjs` lists, case by case, what it
+> names the hooks). The driver runs the same seven cases (and files) against the
+> web app, its only target since the old PWA was removed; `class Web` in `apps/desktop/interop/pwa-interop.mjs` lists, case by case, what it
 > checks in place of each old-PWA internal. It acts through the interface (first run, the
 > add-a-contact screen, the composer, the call buttons) and reads the app's database
 > (`parolnet-web`) and the hooks; the `data-testid`s below that the app uses are

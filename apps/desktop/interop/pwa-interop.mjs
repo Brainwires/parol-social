@@ -1,34 +1,24 @@
-// Desktop <-> PWA interop test: pairing, chat, the sender queue, the channel binding, calls.
+// Desktop <-> web app interop test: pairing, chat, the sender queue, the channel binding,
+// calls, files.
 //
 //   node apps/desktop/interop/pwa-interop.mjs
 //   INTEROP_BROWSER=firefox node apps/desktop/interop/pwa-interop.mjs
-//   INTEROP_APP=web node apps/desktop/interop/pwa-interop.mjs
 //
-// The browser side (INTEROP_APP)
-//   pwa  (default) the PWA in pwa/, as below. It speaks the pairing that came before the
-//        PNP-003 BootstrapHandshake and can no longer pair with the desktop: CI runs the web
-//        target only.
-//   web  the Denext web app in web/ that replaces it: its test build (web/out-test, from
-//        `denext task build-wasm && denext task build:test` in web/), served under /pwa/ with
-//        the production Content-Security-Policy by web/tests/e2e/static-server.mjs, the relay
-//        behind it at the same origin. The cases and what they assert are the same; only how
-//        the browser side is driven differs (see `class Web`): actions go through the
-//        interface (first run, the add-a-contact screen, the composer, the call buttons), and
-//        state is read from its `window.__parolnetTest` hooks, which
-//        only the test build has. Where a case read old-PWA internals the web target has an
-//        equivalent, listed at `class Web`. In this file "the PWA" means the browser side
-//        under test, whichever it is.
+// The browser side is the Denext web app in web/: its test build (web/out-test, from
+// `denext task build-wasm && denext task build:test` in web/), served under /pwa/ with the
+// production Content-Security-Policy by web/tests/e2e/static-server.mjs, the relay behind it at
+// the same origin. It is driven through its interface (first run, the add-a-contact screen, the
+// composer, the call buttons), and its state is read from its `window.__parolnetTest` hooks,
+// which only the test build has (see `class Web`). In this file "the PWA" means that browser
+// side (the web app is the PWA served under /pwa/).
 //
 // Peers
 //   - "desktop": the headless `parolnet-app` bot (examples/bot.rs), the same core the GPUI app
 //     runs, speaking JSON lines on stdout / commands on stdin.
-//   - "pwa": the real PWA (pwa/, built with `npm run build:wasm && npm run build`) in a headless
-//     browser through Playwright (`npx playwright install chromium firefox webkit`), a fresh
-//     profile per case. INTEROP_BROWSER: chromium (default), firefox, webkit.
+//   - "pwa": the web app in a headless browser through Playwright (`npx playwright install
+//     chromium firefox webkit`), a fresh profile per case. INTEROP_BROWSER: chromium
+//     (default), firefox, webkit.
 //   - one local relay: the `parolnet-relay` binary in its default signaling-only profile.
-//
-// A small HTTP server serves pwa/ and proxies the relay's endpoints (`/ws` upgrade included),
-// so the PWA finds its relay at `location.host + '/ws'` with no settings.
 //
 // Browsers
 //   chromium  The full browser in its headless mode (Playwright's `chromium` channel), with
@@ -63,7 +53,7 @@
 //      `network-changed`): the browser side does not take ICE restarts (PNP-011 section 8.2:
 //      it lists no `ice-restart`), so the desktop must send none and leave the connection
 //      alone; messages both ways again.
-//   2. The desktop presents its code, the PWA pastes it ("Paste Code" tab): the paste path
+//   2. The desktop presents its code, the PWA pastes it ("Paste theirs"): the paste path
 //      pairs like a camera scan, messages both ways.
 //   3. Sender queue: with case 2's pair, the PWA's browser closes; the bot's message waits in
 //      its queue and is delivered when the PWA comes back (same browser profile).
@@ -93,11 +83,11 @@
 //      getUserMedia stream): the same renomination as case 6 on a chat connection. The PWA
 //      pastes the desktop's code and must be the offerer; bindings verified, messages both
 //      ways, and again after the connection has settled.
-//   8. (web app only) Files, PNP-010: the desktop offers a file, the web app accepts it in the
-//      conversation and stores it; the web app then offers one (picked in the composer) and
-//      the desktop accepts it. Each is INTEROP_FILE_MIB MiB (default 8; the M1 bar is 100) and
-//      is compared by SHA-256 on the receiving side. The old PWA has no PNP-010: its target
-//      skips the case. INTEROP_FILES=0 skips it; INTEROP_ONLY=files runs it alone.
+//   8. Files, PNP-010: the desktop offers a file, the web app accepts it in the conversation
+//      and stores it; the web app then offers one (picked in the composer) and the desktop
+//      accepts it. Each is INTEROP_FILE_MIB MiB (default 8; the M1 bar is 100) and is compared
+//      by SHA-256 on the receiving side. INTEROP_FILES=0 skips it; INTEROP_ONLY=files runs it
+//      alone.
 //
 // Every PWA connection records its selected ICE candidate pair changes (`window.__pcs[i]
 // .__pairChanges`); a failure report prints them with the page console and the bot's stderr.
@@ -109,24 +99,18 @@
 
 import { chromium, firefox, webkit } from "playwright";
 import { spawn } from "node:child_process";
-import { createServer, request as httpRequest } from "node:http";
+import { createServer } from "node:http";
 import { connect as netConnect, createServer as netCreateServer } from "node:net";
 import { createHash, randomFillSync } from "node:crypto";
-import { closeSync, createReadStream, existsSync, mkdtempSync, openSync, rmSync, statSync, writeSync } from "node:fs";
+import { closeSync, existsSync, mkdtempSync, openSync, rmSync, statSync, writeSync } from "node:fs";
 import { networkInterfaces, tmpdir } from "node:os";
-import { dirname, extname, join, normalize, resolve, sep } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { createInterface } from "node:readline";
 import { fileURLToPath } from "node:url";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const root = resolve(here, "../../..");
-const pwaDir = join(root, "pwa");
 const webOutDir = join(root, "web", "out-test");
-const target = process.env.INTEROP_APP || "pwa";
-if (target !== "pwa" && target !== "web") {
-  console.error(`INTEROP_APP must be pwa or web (got ${target})`);
-  process.exit(2);
-}
 const exe = process.platform === "win32" ? ".exe" : "";
 const targetDir = process.env.CARGO_TARGET_DIR || join(root, "target");
 const relayBin = process.env.PAROLNET_RELAY_BIN || join(targetDir, "debug", `parolnet-relay${exe}`);
@@ -233,20 +217,7 @@ async function startRelay() {
   return port;
 }
 
-// ── PWA server (static files + relay proxy) ──────────────────
-
-const MIME = {
-  ".html": "text/html; charset=utf-8",
-  ".js": "text/javascript; charset=utf-8",
-  ".mjs": "text/javascript; charset=utf-8",
-  ".css": "text/css; charset=utf-8",
-  ".json": "application/json",
-  ".wasm": "application/wasm",
-  ".png": "image/png",
-  ".svg": "image/svg+xml",
-  ".ico": "image/x-icon",
-  ".webmanifest": "application/manifest+json",
-};
+// ── Web app server (static files + relay proxy) ──────────────
 
 /// The web app's test build, hosted the way production hosts it: under /pwa/, behind the CSP
 /// header, with the relay at the same origin (web/tests/e2e/static-server.mjs).
@@ -261,59 +232,6 @@ async function startWebServer(relayPort) {
   cleanups.push(() => server.close());
   log(`web app on ${server.url}`);
   return { port: Number(new URL(server.origin).port), path: "/pwa/" };
-}
-
-async function startPwaServer(relayPort) {
-  for (const f of ["app.js", "sw.js", "pkg/parolnet_wasm_bg.wasm"]) {
-    if (!existsSync(join(pwaDir, f))) {
-      throw new Error(`pwa/${f} is missing: run npm run build:wasm && npm run build first`);
-    }
-  }
-  const server = createServer((req, res) => {
-    const url = new URL(req.url, "http://x");
-    let rel = decodeURIComponent(url.pathname);
-    if (rel.endsWith("/")) rel += "index.html";
-    const file = normalize(join(pwaDir, rel));
-    if (file.startsWith(pwaDir + sep) && existsSync(file) && statSync(file).isFile()) {
-      res.writeHead(200, {
-        "content-type": MIME[extname(file)] ?? "application/octet-stream",
-        "cache-control": "no-store",
-      });
-      createReadStream(file).pipe(res);
-      return;
-    }
-    // Everything else is the relay's (/turn-credentials, /health, ...).
-    const upstream = httpRequest(
-      { host: "127.0.0.1", port: relayPort, method: req.method, path: req.url, headers: req.headers },
-      (up) => {
-        res.writeHead(up.statusCode ?? 502, up.headers);
-        up.pipe(res);
-      },
-    );
-    upstream.on("error", () => {
-      res.writeHead(502);
-      res.end();
-    });
-    req.pipe(upstream);
-  });
-  // WebSocket upgrades (/ws) go to the relay byte for byte.
-  server.on("upgrade", (req, socket, head) => {
-    const up = netConnect(relayPort, "127.0.0.1", () => {
-      let raw = `${req.method} ${req.url} HTTP/1.1\r\n`;
-      for (let i = 0; i < req.rawHeaders.length; i += 2) raw += `${req.rawHeaders[i]}: ${req.rawHeaders[i + 1]}\r\n`;
-      up.write(raw + "\r\n");
-      if (head?.length) up.write(head);
-      up.pipe(socket);
-      socket.pipe(up);
-    });
-    up.on("error", () => socket.destroy());
-    socket.on("error", () => up.destroy());
-  });
-  const port = await freePort();
-  await new Promise((r) => server.listen(port, "127.0.0.1", r));
-  cleanups.push(() => server.close());
-  log(`PWA on http://127.0.0.1:${port}/`);
-  return { port, path: "/index.html" };
 }
 
 // ── Desktop bot ──────────────────────────────────────────────
@@ -598,126 +516,19 @@ class Client {
   }
 }
 
-/// The PWA in pwa/: driven through its window functions, read from its IndexedDB and console.
-class Pwa extends Client {
-  /// The identity is loaded and the relay has registered it.
-  async start() {
-    this.peerId = await until(`pwa ${this.name}: identity`, 30_000, () =>
-      this.page.evaluate(() => (typeof window._peerId === "string" && window._peerId.length === 64 ? window._peerId : null)),
-    );
-    await until(`pwa ${this.name}: registered with the relay`, 30_000, () =>
-      // Not "SW registered: ...": the relay's own registration, or the desktop's first offer
-      // can find the PWA offline (`peer_offline`).
-      this.console.some((t) => t.startsWith("Registered with relay")),
-    );
-  }
-
-  async showCode() {
-    return this.page.evaluate(() => {
-      window.showView("add-contact");
-      window.showAddTab("qr-show");
-      return document.getElementById("qr-share-code").textContent.trim();
-    });
-  }
-
-  async pasteCode(code) {
-    await this.page.evaluate((c) => {
-      window.showView("add-contact");
-      window.showAddTab("passphrase");
-      document.querySelector("#add-tab-passphrase input").value = c;
-      window.connectViaPassphrase();
-    }, code);
-  }
-
-  async idbAll(store) {
-    return this.page.evaluate(
-      (store) =>
-        new Promise((res, rej) => {
-          const open = indexedDB.open("parolnet");
-          open.onerror = () => rej(open.error);
-          open.onsuccess = () => {
-            const db = open.result;
-            if (!db.objectStoreNames.contains(store)) return res([]);
-            const req = db.transaction(store, "readonly").objectStore(store).getAll();
-            req.onsuccess = () => res(req.result);
-            req.onerror = () => rej(req.error);
-          };
-        }),
-      store,
-    );
-  }
-
-  async hasContact(peerId) {
-    return (await this.idbAll("contacts")).some((c) => c.peerId === peerId);
-  }
-
-  async waitReceived(from, text, ms = 30_000) {
-    await until(`pwa ${this.name}: message ${JSON.stringify(text)}`, ms, async () =>
-      (await this.idbAll("messages")).some((m) => m.peerId === from && m.direction === "received" && m.content === text),
-    );
-  }
-
-  async sendText(to, text) {
-    await this.page.evaluate(
-      async ({ to, text }) => {
-        window.openChat(to);
-        await new Promise((r) => setTimeout(r, 100));
-        document.getElementById("message-input").value = text;
-        await window.sendMessage();
-      },
-      { to, text },
-    );
-  }
-
-  async verified(peerId) {
-    return this.console.some((t) => t.includes("direct channel verified with") && t.includes(peerId.slice(0, 8)));
-  }
-
-  /// The incoming-call notification is showing.
-  async ringing() {
-    return this.page.evaluate(() => !document.getElementById("incoming-call-notification")?.classList.contains("hidden"));
-  }
-
-  async acceptCall() {
-    await this.page.evaluate(() => window.acceptIncomingCall());
-  }
-
-  async startVideoCall(peer) {
-    await this.page.evaluate((peer) => {
-      window.openChat(peer);
-      return window.initiateCall(peer, true);
-    }, peer);
-  }
-
-  async hangupCall() {
-    await this.page.evaluate(() => window.hangupCall());
-  }
-
-  /// The console line the PWA prints when it learned STUN / TURN servers, if it did.
-  async learnedIceServers() {
-    return this.console.find((t) => t.includes("[WebRTC] ICE servers from")) ?? null;
-  }
-}
-
 /// The web app in web/ (its test build). Actions go through the interface, as a person's
 /// would; state is read from `window.__parolnetTest`
-/// (docs/web-port/interop.md §11.4), which exposes nothing the interface does not show.
-///
-/// Where the cases read old-PWA internals, this is what the web target checks instead:
-///   - `window._peerId`                     -> `__parolnetTest.ready()`;
-///   - console "Registered with relay"      -> `__parolnetTest.relayRegistered()` (and the
-///                                             same console line, which the engine prints);
-///   - IndexedDB `parolnet` / `contacts`    -> IndexedDB `parolnet-web` / `contacts` (the
-///                                             contact is stored, not merely shown);
-///   - IndexedDB `parolnet` / `messages`    -> IndexedDB `parolnet-web` / `messages`, a row
-///     (`direction: "received"`, `content`)    with `direction: "Received"` and `text`, and the
-///                                             same text in the history the interface shows;
-///   - console "direct channel verified"    -> the same console line, and
-///                                             `__parolnetTest.pathState(peer) === "direct"`,
-///                                             which is only true once the binding verified;
-///   - `#incoming-call-notification`        -> the ringing dialog (`data-testid="incoming-call"`)
-///                                             is visible;
-///   - console "[WebRTC] ICE servers from"  -> `__parolnetTest.iceServers()` is empty.
+/// (docs/web-port/interop.md §11.4), which exposes nothing the interface does not show:
+///   - the identity: `__parolnetTest.ready()`;
+///   - registered with the relay: `__parolnetTest.relayRegistered()` and the console line
+///     "Registered with relay", which the engine prints;
+///   - contacts and messages: `__parolnetTest.contacts()` / `messages(peer)` (the database is
+///     sealed at rest);
+///   - the direct channel: the console line "direct channel verified", and
+///     `__parolnetTest.pathState(peer) === "direct"`, which is only true once the binding
+///     verified;
+///   - ringing: the dialog `data-testid="incoming-call"` is visible;
+///   - no ICE servers learned: `__parolnetTest.iceServers()` is empty.
 /// It also fails on any uncaught page error and on any Content-Security-Policy violation.
 class Web extends Client {
   hook(method, ...args) {
@@ -861,17 +672,15 @@ class Web extends Client {
 }
 
 /// The browser side under test.
-const App = target === "web" ? Web : Pwa;
+const App = Web;
 
 /// What each page had learned of ICE servers when its browser closed (checked at the end).
 const learned = [];
 
-/// Before a case closes a browser: note what the page learned of ICE servers, and, for the
-/// web app, fail on any page error or Content-Security-Policy violation. (The PWA target
-/// keeps its original checks only.)
+/// Before a case closes a browser: note what the page learned of ICE servers, and fail on any
+/// page error or Content-Security-Policy violation.
 async function closing(pwa, tag) {
   learned.push([pwa, await pwa.learnedIceServers()]);
-  if (!(pwa instanceof Web)) return;
   const problems = await pwa.problems();
   if (problems.length) throw new Error(`${tag}: the web app reported ${problems.join("; ")}`);
 }
@@ -879,10 +688,9 @@ async function closing(pwa, tag) {
 /// PNP-003 §5.5. The web app asks for the verification code in every pairing, so both ends
 /// show it (the bot asks for none and shows it because its contact does). The test stands in
 /// for the two people: the two codes must be the same, then each side says so, and the
-/// desktop reports the pairing as complete with the code confirmed. The old PWA knows no such
-/// step. `from`: where in the bot's event log this pairing began.
+/// desktop reports the pairing as complete with the code confirmed. `from`: where in the bot's
+/// event log this pairing began.
 async function compareSas(bot, pwa, tag, from = 0) {
-  if (!(pwa instanceof Web)) return;
   const shown = await bot.wait("the verification code", (e) => e.event === "sas" && e.peer_id === pwa.peerId, 45_000, from);
   const digits = await pwa.sasDigits();
   if (!/^\d{6}$/.test(shown.digits) || digits !== shown.digits) {
@@ -897,8 +705,8 @@ async function compareSas(bot, pwa, tag, from = 0) {
 }
 
 /// What a pairing code looks like as text: the web app's and the desktop's are base45
-/// (PNP-003) with an underscore for every blank; the old PWA's was hex.
-const CODE_AS_TEXT = target === "web" ? /^[0-9A-Z_$%*+\-./:]{100,}$/ : /^[0-9a-f]{100,}$/i;
+/// (PNP-003) with an underscore for every blank.
+const CODE_AS_TEXT = /^[0-9A-Z_$%*+\-./:]{100,}$/;
 
 async function bothVerified(bot, pwa, tag) {
   await until(`${tag}: the PWA verifies the desktop's channel binding`, 20_000, () => pwa.verified(bot.peerId));
@@ -1036,9 +844,7 @@ async function caseTamperedBindingIsRefused(ctx) {
   bot.send(`send ${pwa.peerId} must not be delivered on a refused channel`);
   const answer = await bot.wait("the send to be refused", (e) => e.event === "sent" || e.event === "error", 10_000, mark);
   if (answer.event !== "error") throw new Error(`${tag}: expected the send to be refused, got ${JSON.stringify(answer)}`);
-  if (pwa instanceof Web) {
-    await until(`${tag}: the web app keeps no contact either`, 30_000, async () => !(await pwa.hasContact(bot.peerId)));
-  }
+  await until(`${tag}: the web app keeps no contact either`, 30_000, async () => !(await pwa.hasContact(bot.peerId)));
   log(`${tag}: refused (${notice.text.slice(0, 60)}...)`);
   await bot.quit();
   await closing(pwa, tag);
@@ -1277,14 +1083,13 @@ async function caseFiles(ctx) {
 async function main() {
   if (!existsSync(botBin)) throw new Error(`bot binary not found: ${botBin} (cargo build -p parolnet-app --example bot)`);
   const bindIp = mode === "loopback" ? "127.0.0.1" : lanIPv4();
-  log(`${Browser}, ${target === "web" ? "the web app (web/)" : "the PWA (pwa/)"}, ICE mode ${mode}, desktop host candidate ${bindIp}`);
+  log(`${Browser}, the web app (web/), ICE mode ${mode}, desktop host candidate ${bindIp}`);
   const relayPort = await startRelay();
-  const site = target === "web" ? await startWebServer(relayPort) : await startPwaServer(relayPort);
+  const site = await startWebServer(relayPort);
   const ctx = { relayPort, site, bindIp };
 
   const bots = [];
   const filesOnly = process.env.INTEROP_ONLY === "files";
-  if (filesOnly && target !== "web") throw new Error("INTEROP_ONLY=files needs INTEROP_APP=web");
   if (!filesOnly) {
     bots.push(await caseDesktopEntersPwaCode(ctx));
     bots.push(await casePwaPastesDesktopCode(ctx));
@@ -1292,7 +1097,7 @@ async function main() {
     if (process.env.INTEROP_CALLS !== "0") bots.push(await caseCalls(ctx));
     bots.push(await casePwaOffersWithMedia(ctx));
   }
-  if (target === "web" && process.env.INTEROP_FILES !== "0") bots.push(await caseFiles(ctx));
+  if (process.env.INTEROP_FILES !== "0") bots.push(await caseFiles(ctx));
 
   // Host candidates only: no page may have learned a STUN / TURN server (that would mean a
   // request left the machine).
@@ -1308,8 +1113,8 @@ async function main() {
   const cases = filesOnly
     ? 1
     : 5 + (process.env.INTEROP_CALLS === "0" ? 0 : process.env.INTEROP_PWA_CALLS === "0" ? 1 : 2) +
-      (target === "web" && process.env.INTEROP_FILES !== "0" ? 1 : 0);
-  log(`PASS: desktop <-> ${target === "web" ? "web app" : "PWA"} interop, ${Browser}, ${mode} candidates (${cases} cases)`);
+      (process.env.INTEROP_FILES !== "0" ? 1 : 0);
+  log(`PASS: desktop <-> web app interop, ${Browser}, ${mode} candidates (${cases} cases)`);
 }
 
 let status = 0;

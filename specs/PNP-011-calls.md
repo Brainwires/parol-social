@@ -23,7 +23,7 @@ A ParolNet call is a WebRTC session between two paired peers. Its media (Opus au
 
 A call uses a WebRTC connection of its own, next to the data connection that carries its signals. The two have separate ICE sessions, certificates and lifetimes: a call ends without touching the data connection, and the data connection can be rebuilt during a call.
 
-This specification describes calls as implemented by `parolnet-app` and `parolnet-rtc` (native clients), `web/src/engine/calls.ts` (web app) and `pwa/src/call.js` (PWA). Sections 4 to 6 are common to all of them. Sections 7 to 10 are implemented by the native clients; the web app and the PWA do not list the features that enable them and interoperate through sections 4 to 6 alone.
+This specification describes calls as implemented by `parolnet-app` and `parolnet-rtc` (native clients), and `web/src/engine/calls.ts` (web app). Sections 4 to 6 are common to both. Sections 7 to 10 are implemented by the native clients; the web app does not list the features that enable them and interoperates through sections 4 to 6 alone.
 
 The key words "MUST", "MUST NOT", "SHOULD", "SHOULD NOT" and "MAY" in this document are to be interpreted as described in RFC 2119.
 
@@ -62,7 +62,7 @@ The caller chooses the `callId` of a new call: 16 bytes from a cryptographically
 
 `sdp` is a string holding the description. `withVideo` is a boolean saying whether the call was started as a video call; an absent `withVideo` means false. An `offer` or `answer` without a string `sdp` MUST be ignored. **PNP-011-MUST-003**
 
-A receiver MUST ignore a signal whose `action` it does not know, and MUST ignore members it does not know in a signal it does. **PNP-011-MUST-004** This is what lets signals and members be added: the PWA and the web app ignore `reoffer`, `reanswer` and `features`.
+A receiver MUST ignore a signal whose `action` it does not know, and MUST ignore members it does not know in a signal it does. **PNP-011-MUST-004** This is what lets signals and members be added: the web app ignores `reoffer`, `reanswer` and `features`.
 
 ### 3.3 Features
 
@@ -74,7 +74,7 @@ A receiver MUST ignore a signal whose `action` it does not know, and MUST ignore
 
 A receiver MUST treat a `features` member that is not an array as an empty list, MUST skip entries that are not strings, and MUST keep names it does not know out of its decisions without failing the signal. **PNP-011-MUST-005**
 
-An implementation that accepts `reoffer` MUST list `renegotiate` in every `offer` and `answer` it sends. An implementation that does not MUST NOT list it; with nothing to list it omits `features`, and its signals are then exactly those of the PWA. **PNP-011-MUST-006**
+An implementation that accepts `reoffer` MUST list `renegotiate` in every `offer` and `answer` it sends. An implementation that does not MUST NOT list it; with nothing to list it omits `features`, and its signals are then exactly the base signals of sections 4 to 6. **PNP-011-MUST-006**
 
 A `reoffer` or `reanswer` without a string `sdp` MUST be ignored. **PNP-011-MUST-007**
 
@@ -201,7 +201,7 @@ A call whose peer does not list `renegotiate` cannot be restarted; it continues 
 
 The descriptions of a data connection cross the signaling relay (`rtc_offer`, `rtc_answer`, PNP-001 section 10.5), and so do those of its ICE restart. Whether a peer applies a second `rtc_offer` to the connection it has, instead of replacing the connection, is announced on the data channel: the `identity` frame each side sends when the channel opens has a `features` array of strings, in which `ice-restart` says so.
 
-A peer that applies ICE restarts to its data connection MUST list `ice-restart` in its `identity` frame; a peer MUST NOT send an ICE restart offer for a data connection whose other side did not list it, or when it did not list it itself. **PNP-011-MUST-030** A peer that does not list it (the PWA, the web app) treats every `rtc_offer` as an offer for a new connection, as before.
+A peer that applies ICE restarts to its data connection MUST list `ice-restart` in its `identity` frame; a peer MUST NOT send an ICE restart offer for a data connection whose other side did not list it, or when it did not list it itself. **PNP-011-MUST-030** A peer that does not list it (the web app) treats every `rtc_offer` as an offer for a new connection, as before.
 
 An `rtc_offer` from a peer to which the receiver holds a connection MUST be applied to that connection only if the connection is verified and the offer carries exactly the DTLS fingerprints that the connection's CHANNEL_BINDING covers; any other `rtc_offer` is an offer for a new connection. Likewise the `rtc_answer` to a restart MUST carry those fingerprints, and a peer that receives another answer MUST give the connection up and build a new one. **PNP-011-MUST-031**
 

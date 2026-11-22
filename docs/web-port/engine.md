@@ -424,7 +424,7 @@ The unit tests run each engine over its own wasm instance, so the crypto, the pa
 the channel binding in them are real. `e2e/run.mjs` documents its scenarios and environment
 variables; it fails if any request leaves `127.0.0.1`. CI runs the unit tests (job `web`); the
 scenarios of `e2e/run.mjs` are covered there through the app instead: `web/tests/e2e/real.flows.ts`
-(web ↔ web) and `apps/desktop/interop/pwa-interop.mjs` with `INTEROP_APP=web` (web ↔ desktop),
+(web ↔ web) and `apps/desktop/interop/pwa-interop.mjs` (web ↔ desktop),
 both in job `pwa-interop`.
 
 ## File transfer (PNP-010)

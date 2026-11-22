@@ -1,6 +1,6 @@
 #!/bin/sh
-# Build metadata baked in at image build time. (The legacy PWA read it from a generated
-# build-info.js; the web app at /pwa/ reads no build metadata, so none is written.)
+# Build metadata baked in at image build time. (The web app at /pwa/ reads no build metadata,
+# so none is written.)
 # DEV_MODE env var wins over the baked-in PAROLNET_DEV_MODE build arg.
 _dev="${DEV_MODE:-${PAROLNET_DEV_MODE:-false}}"
 echo "Build: v${PAROLNET_BUILD_VERSION} ${PAROLNET_BUILD_COMMIT} ${PAROLNET_BUILD_DATE} | dev=${_dev}"

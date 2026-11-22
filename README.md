@@ -138,10 +138,6 @@ first build takes a while (Rust twice: the relay and the wasm core); later build
 Rust and Denext layers when only the app changes. `scripts/image-smoke.sh http://127.0.0.1:1411`
 checks a running container (CI's `image` job runs it). See [server/README.md](server/README.md).
 
-`pwa/` is the legacy vanilla-JS client. It is no longer built into or served by the image and
-stays in the repository for now (the desktop interop suite still has a `pwa` target); `npm run
-build:all` builds it for that suite.
-
 ### Web app rewrite (`web/`)
 
 The PWA is rewritten as a [Denext](https://denext.dev) app with a new design
@@ -155,9 +151,9 @@ with a passphrase ([docs/web-port/at-rest.md](docs/web-port/at-rest.md), which a
 that does not protect against); a device can be backed up to one encrypted file and restored
 from it ([docs/web-port/backup.md](docs/web-port/backup.md)). Nine languages, eight of them
 machine-translated and awaiting review. It passes the seven desktop ↔ browser interop cases in Chromium,
-Firefox and WebKit. It is the client the relay image serves at `/pwa/`, in place of the legacy
-`pwa/` (what [app.md](docs/web-port/app.md#owed-before-this-replaces-the-old-pwa) lists as owed
-still applies). See [web/README.md](web/README.md).
+Firefox and WebKit. It is the client the relay image serves at `/pwa/`; the legacy vanilla-JS client it replaced
+has been removed from the repository (what [app.md](docs/web-port/app.md#still-owed) lists as
+owed still applies). See [web/README.md](web/README.md).
 
 ```bash
 cd web

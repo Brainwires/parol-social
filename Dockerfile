@@ -72,8 +72,8 @@ RUN cd web && denext deno install --frozen
 
 # The wasm core. Its inputs are the Rust workspace and the build script, not the app's sources.
 # AUTHORITY_PUBKEYS (comma-separated 64-char hex Ed25519 keys) and AUTHORITY_THRESHOLD reach
-# crates/parolnet-wasm/build.rs through the environment, as with pwa/build.sh; empty keys mean
-# the dev placeholder keys.
+# crates/parolnet-wasm/build.rs through the environment; empty keys mean the dev placeholder
+# keys.
 COPY Cargo.toml Cargo.lock ./
 COPY .cargo .cargo
 COPY crates crates

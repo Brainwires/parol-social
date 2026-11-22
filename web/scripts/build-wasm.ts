@@ -11,8 +11,7 @@
 // which is why nothing here goes through the bundler's module graph.
 //
 // Run: `denext task build-wasm` (needs cargo, the wasm32-unknown-unknown target and wasm-pack).
-// AUTHORITY_PUBKEYS / AUTHORITY_THRESHOLD are passed through to the crate's build script, as
-// pwa/build.sh does.
+// AUTHORITY_PUBKEYS / AUTHORITY_THRESHOLD are passed through to the crate's build script.
 import { encodeHex } from "@std/encoding/hex";
 import { emptyDir } from "@std/fs/empty-dir";
 import { fromFileUrl, join } from "@std/path";

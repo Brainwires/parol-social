@@ -20,6 +20,3 @@ web/tests/e2e/artifacts/
 web/tests/e2e/test-results/
 web/tests/e2e/playwright-report/
 web/tests/engine/e2e/dist/
-# The legacy PWA's build outputs (pwa/ itself is not copied into the image).
-pwa/pkg/
-pwa/build-info.js

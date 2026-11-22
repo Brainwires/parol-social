@@ -1,8 +1,8 @@
 # ParolNet web app
 
 The web client, rewritten as a [Denext](https://denext.dev) app (`mode: "spa"`, TypeScript and TSX)
-with the design in [`docs/ux/web-app.md`](../docs/ux/web-app.md). It replaces the vanilla-JS PWA in
-`pwa/` once the protocol services are ported.
+with the design in [`docs/ux/web-app.md`](../docs/ux/web-app.md). It replaced the vanilla-JS PWA
+that was in `pwa/` (since removed from the repository).
 
 **What it is today:** the whole client. The screens of the design run on the engine in `src/engine/`
 (identity, relay, pairing, the bound data channel, chat with its queue, verification, 1:1 calls,
@@ -11,8 +11,8 @@ contact by QR code or pasted code, conversations, comparing safety numbers, call
 keeps on the device is encrypted at rest and can be locked with a passphrase
 ([`docs/web-port/at-rest.md`](../docs/web-port/at-rest.md)); a device can be backed up to one
 encrypted file and restored from it ([`docs/web-port/backup.md`](../docs/web-port/backup.md)). How
-the two are joined, the test layers, the languages and what is still owed before it replaces `pwa/`
-in production: [`docs/web-port/app.md`](../docs/web-port/app.md).
+the two are joined, the test layers, the languages and what is still owed:
+[`docs/web-port/app.md`](../docs/web-port/app.md).
 
 ## Commands
 
@@ -115,7 +115,7 @@ and `wasm-pack`. Run from `web/`.
     playing `<video>`, and the order of teardown that avoids it (`repro/README.md`). Not part of any
     test run.
 - The seven desktop ↔ browser interop cases run against this app with
-  `INTEROP_APP=web node apps/desktop/interop/pwa-interop.mjs` (from the repository root, after
+  `node apps/desktop/interop/pwa-interop.mjs` (from the repository root, after
   `denext task build:test`).
 
 ## Hosting
