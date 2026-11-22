@@ -122,25 +122,27 @@ fn test_shaper_large_burst_doubles_rate() {
         mode: BandwidthMode::Normal,
     };
 
-    // Large burst (>32): first 32 at double rate
+    // Large burst (>32): the rate doubles, for at most five seconds (PNP-006-MAY-001).
     let messages: Vec<Vec<u8>> = (0..50).map(|i| vec![i]).collect();
     let shaped = shaper.shape(messages);
     assert_eq!(shaped.len(), 50);
 
-    // First 32 should have halved base interval (250ms + jitter)
-    for (delay, _) in &shaped[..32] {
+    let doubled: Vec<Duration> = shaped
+        .iter()
+        .map(|(d, _)| *d)
+        .take_while(|d| *d < Duration::from_millis(500))
+        .collect();
+    assert!(!doubled.is_empty(), "the burst never doubled the rate");
+    for delay in &doubled {
         assert!(
-            *delay >= Duration::from_millis(250),
-            "burst delay {delay:?} too low"
-        );
-        assert!(
-            *delay <= Duration::from_millis(350),
-            "burst delay {delay:?} too high"
+            *delay >= Duration::from_millis(250) && *delay <= Duration::from_millis(350),
+            "burst delay {delay:?} out of range"
         );
     }
+    assert!(doubled.iter().sum::<Duration>() <= Duration::from_secs(5));
 
-    // Remaining should have normal interval
-    for (delay, _) in &shaped[32..] {
+    // After it, the base rate for the rest of the queue.
+    for (delay, _) in &shaped[doubled.len()..] {
         assert!(*delay >= Duration::from_millis(500));
     }
 }
