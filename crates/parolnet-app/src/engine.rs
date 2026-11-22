@@ -382,9 +382,9 @@ pub(crate) async fn start(
     let mut secret = identity.secret_bytes();
     let signing_key = ed25519_dalek::SigningKey::from_bytes(&secret);
     secret.zeroize();
-    let signer: Signer = Arc::new(move |nonce: &[u8]| {
+    let signer: Signer = Arc::new(move |message: &[u8]| {
         use ed25519_dalek::Signer as _;
-        signing_key.sign(nonce).to_bytes()
+        signing_key.sign(message).to_bytes()
     });
 
     let client = ParolNet::from_identity(ParolNetConfig::default(), identity);

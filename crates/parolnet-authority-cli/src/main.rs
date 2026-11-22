@@ -6,7 +6,10 @@
 
 use clap::{Parser, Subcommand};
 use ed25519_dalek::{Signer, SigningKey, VerifyingKey};
-use parolnet_relay::authority::{AuthorityEndorsement, SignedDirectory};
+use parolnet_relay::authority::{
+    AuthorityEndorsement, MAX_ENDORSED_DESCRIPTOR_AGE_SECS, SignedDirectory,
+};
+use parolnet_relay::directory::RelayDescriptor;
 use sha2::{Digest, Sha256};
 use std::path::PathBuf;
 use zeroize::Zeroize;
@@ -30,17 +33,25 @@ enum Commands {
         #[arg(long, default_value = ".")]
         output_dir: PathBuf,
     },
-    /// Create an authority endorsement for a relay
+    /// Create an authority endorsement for one relay descriptor.
+    ///
+    /// The endorsement signs the whole descriptor (PNP-008-MUST-002), so it
+    /// is valid for that descriptor only and for as long as the descriptor
+    /// is (seven days from its timestamp). A relay that publishes a new
+    /// descriptor needs a new endorsement.
     EndorseRelay {
-        /// Hex-encoded PeerId of the relay to endorse (64 hex chars)
+        /// Path to the CBOR-encoded descriptor to endorse: one
+        /// `RelayDescriptor`, or a list of them (the body of a relay's
+        /// `GET /directory`) together with --relay-peer-id
         #[arg(long)]
-        relay_peer_id: String,
+        descriptor: PathBuf,
+        /// Hex-encoded PeerId the descriptor must have (64 hex chars).
+        /// Required when --descriptor holds a list
+        #[arg(long)]
+        relay_peer_id: Option<String>,
         /// Path to authority private key file
         #[arg(long)]
         authority_key: PathBuf,
-        /// Number of days until endorsement expires
-        #[arg(long, default_value = "365")]
-        expires_days: u64,
         /// Output file for CBOR-encoded endorsement (default: stdout hex)
         #[arg(long)]
         output: Option<PathBuf>,
@@ -63,11 +74,17 @@ enum Commands {
         #[arg(long)]
         pubkeys: String,
     },
-    /// Verify and display details of an endorsement
+    /// Verify an endorsement against the descriptor it was made for
     VerifyEndorsement {
         /// Path to CBOR file or hex-encoded endorsement
         #[arg(long)]
         endorsement: String,
+        /// Path to the CBOR-encoded descriptor (as for endorse-relay)
+        #[arg(long)]
+        descriptor: PathBuf,
+        /// Hex-encoded PeerId the descriptor must have
+        #[arg(long)]
+        relay_peer_id: Option<String>,
     },
 }
 
@@ -77,14 +94,14 @@ fn main() {
     let result = match cli.command {
         Commands::InitNetwork { count, output_dir } => cmd_init_network(count, &output_dir),
         Commands::EndorseRelay {
+            descriptor,
             relay_peer_id,
             authority_key,
-            expires_days,
             output,
         } => cmd_endorse_relay(
-            &relay_peer_id,
+            &descriptor,
+            relay_peer_id.as_deref(),
             &authority_key,
-            expires_days,
             output.as_deref(),
         ),
         Commands::SignDirectory {
@@ -93,7 +110,11 @@ fn main() {
             output,
         } => cmd_sign_directory(&directory, &authority_key, output.as_deref()),
         Commands::NetworkInfo { pubkeys } => cmd_network_info(&pubkeys),
-        Commands::VerifyEndorsement { endorsement } => cmd_verify_endorsement(&endorsement),
+        Commands::VerifyEndorsement {
+            endorsement,
+            descriptor,
+            relay_peer_id,
+        } => cmd_verify_endorsement(&endorsement, &descriptor, relay_peer_id.as_deref()),
     };
 
     if let Err(e) = result {
@@ -193,45 +214,66 @@ fn cmd_init_network(count: usize, output_dir: &std::path::Path) -> Result<(), St
     Ok(())
 }
 
+/// Read the descriptor to endorse: one CBOR `RelayDescriptor`, or the one
+/// with `relay_peer_id_hex` out of a CBOR list of them. It has to be the
+/// relay's own statement and no older than seven days (PNP-008-MUST-027):
+/// an endorsement of anything else would never be accepted.
+fn read_descriptor(
+    path: &std::path::Path,
+    relay_peer_id_hex: Option<&str>,
+) -> Result<RelayDescriptor, String> {
+    let bytes = std::fs::read(path)
+        .map_err(|e| format!("failed to read descriptor file {}: {e}", path.display()))?;
+    let wanted = match relay_peer_id_hex {
+        None => None,
+        Some(h) => {
+            let id: [u8; 32] = hex::decode(h)
+                .map_err(|e| format!("invalid relay-peer-id hex: {e}"))?
+                .try_into()
+                .map_err(|_| "relay-peer-id must be 32 bytes (64 hex chars)".to_string())?;
+            Some(parolnet_protocol::address::PeerId(id))
+        }
+    };
+    let descriptor = if let Ok(one) = ciborium::from_reader::<RelayDescriptor, _>(&bytes[..]) {
+        one
+    } else {
+        let list: Vec<RelayDescriptor> = ciborium::from_reader(&bytes[..])
+            .map_err(|e| format!("not a CBOR RelayDescriptor or a list of them: {e}"))?;
+        let wanted = wanted.ok_or("the file holds a list of descriptors: pass --relay-peer-id")?;
+        list.into_iter()
+            .find(|d| d.peer_id == wanted)
+            .ok_or("no descriptor with that relay-peer-id in the file")?
+    };
+    if let Some(wanted) = wanted
+        && descriptor.peer_id != wanted
+    {
+        return Err("the descriptor is not for that relay-peer-id".into());
+    }
+    if !descriptor.verify_self_signature() {
+        return Err(
+            "the descriptor is not signed by the key its PeerId is the hash of; not endorsing"
+                .into(),
+        );
+    }
+    if now_secs().saturating_sub(descriptor.timestamp) >= MAX_ENDORSED_DESCRIPTOR_AGE_SECS {
+        return Err("the descriptor is older than seven days; ask the relay for a new one".into());
+    }
+    Ok(descriptor)
+}
+
 fn cmd_endorse_relay(
-    relay_peer_id_hex: &str,
+    descriptor_path: &std::path::Path,
+    relay_peer_id_hex: Option<&str>,
     authority_key_path: &std::path::Path,
-    expires_days: u64,
     output: Option<&std::path::Path>,
 ) -> Result<(), String> {
-    // Parse relay peer ID
-    let peer_id_bytes =
-        hex::decode(relay_peer_id_hex).map_err(|e| format!("invalid relay-peer-id hex: {e}"))?;
-    if peer_id_bytes.len() != 32 {
-        return Err(format!(
-            "relay-peer-id must be 32 bytes (64 hex chars), got {} bytes",
-            peer_id_bytes.len()
-        ));
-    }
-    let mut peer_id_arr = [0u8; 32];
-    peer_id_arr.copy_from_slice(&peer_id_bytes);
-    let relay_peer_id = parolnet_protocol::address::PeerId(peer_id_arr);
+    let descriptor = read_descriptor(descriptor_path, relay_peer_id_hex)?;
 
     // Read authority key
     let signing_key = read_signing_key(authority_key_path)?;
-    let authority_pubkey = signing_key.verifying_key().to_bytes();
 
-    // Build endorsement
-    let endorsed_at = now_secs();
-    let expires_at = endorsed_at + (expires_days * 86400);
-
-    let mut endorsement = AuthorityEndorsement {
-        authority_pubkey,
-        relay_peer_id,
-        endorsed_at,
-        expires_at,
-        signature: [0u8; 64],
-    };
-
-    // Sign: exactly matching what verify() expects
-    let signable = endorsement.signable_bytes();
-    let sig = signing_key.sign(&signable);
-    endorsement.signature = sig.to_bytes();
+    // Sign the descriptor: exactly what verify() checks (PNP-008-MUST-002).
+    let endorsement = AuthorityEndorsement::sign(&descriptor, &signing_key);
 
     // signing_key is dropped and zeroized here (ed25519-dalek SigningKey implements Drop with zeroize)
 
@@ -253,15 +295,28 @@ fn cmd_endorse_relay(
 
     // Also print hex to stderr for easy copy-paste
     eprintln!("Endorsement (hex): {}", hex::encode(&cbor_buf));
-    eprintln!("Authority pubkey:  {}", hex::encode(authority_pubkey));
-    eprintln!("Relay PeerId:      {relay_peer_id_hex}");
-    eprintln!("Endorsed at:       {endorsed_at} (unix)");
     eprintln!(
-        "Expires at:        {expires_at} (unix, {} days)",
-        expires_days
+        "Authority pubkey:  {}",
+        hex::encode(endorsement.authority_pubkey)
     );
+    print_descriptor(&descriptor);
 
     Ok(())
+}
+
+/// What was endorsed, for the operator to read back before publishing it.
+fn print_descriptor(descriptor: &RelayDescriptor) {
+    eprintln!("Relay PeerId:      {}", hex::encode(descriptor.peer_id.0));
+    eprintln!(
+        "Relay key:         {}",
+        hex::encode(descriptor.identity_key)
+    );
+    eprintln!("Relay address:     {}", descriptor.addr);
+    eprintln!("Descriptor time:   {} (unix)", descriptor.timestamp);
+    eprintln!(
+        "Valid until:       {} (unix; the descriptor's seven days)",
+        descriptor.timestamp + MAX_ENDORSED_DESCRIPTOR_AGE_SECS
+    );
 }
 
 fn cmd_sign_directory(
@@ -354,7 +409,11 @@ fn cmd_network_info(pubkeys_str: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn cmd_verify_endorsement(endorsement_input: &str) -> Result<(), String> {
+fn cmd_verify_endorsement(
+    endorsement_input: &str,
+    descriptor_path: &std::path::Path,
+    relay_peer_id_hex: Option<&str>,
+) -> Result<(), String> {
     // Try as file path first, then as hex string
     let cbor_bytes = if std::path::Path::new(endorsement_input).exists() {
         std::fs::read(endorsement_input)
@@ -366,31 +425,18 @@ fn cmd_verify_endorsement(endorsement_input: &str) -> Result<(), String> {
 
     let endorsement: AuthorityEndorsement = ciborium::from_reader(&cbor_bytes[..])
         .map_err(|e| format!("failed to parse endorsement CBOR: {e}"))?;
+    let descriptor = read_descriptor(descriptor_path, relay_peer_id_hex)?;
 
     println!(
         "Authority pubkey: {}",
         hex::encode(endorsement.authority_pubkey)
     );
-    println!(
-        "Relay PeerId:     {}",
-        hex::encode(endorsement.relay_peer_id.0)
-    );
-    println!("Endorsed at:      {} (unix)", endorsement.endorsed_at);
-    println!("Expires at:       {} (unix)", endorsement.expires_at);
+    print_descriptor(&descriptor);
 
-    let now = now_secs();
-    if endorsement.is_expired(now) {
-        println!("Status:           EXPIRED");
-    } else {
-        let remaining_secs = endorsement.expires_at.saturating_sub(now);
-        let remaining_days = remaining_secs / 86400;
-        println!("Status:           ACTIVE ({remaining_days} days remaining)");
-    }
-
-    // Verify signature
-    match endorsement.verify() {
-        Ok(true) => println!("Signature:        VALID"),
-        Ok(false) => println!("Signature:        INVALID"),
+    // Verify the signature over this descriptor
+    match endorsement.verify(&descriptor) {
+        Ok(true) => println!("Signature:        VALID for this descriptor"),
+        Ok(false) => println!("Signature:        INVALID for this descriptor"),
         Err(e) => println!("Signature:        ERROR ({e})"),
     }
 

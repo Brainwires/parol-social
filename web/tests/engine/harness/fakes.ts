@@ -14,6 +14,7 @@ import type {
   SessionDescription,
   Socket,
 } from "../../../src/engine/platform.ts";
+import { relayEndpoint } from "../../../src/engine/wire.ts";
 
 /** One turn of the event loop (lets promise chains and crypto.subtle settle). */
 export function tick(): Promise<void> {
@@ -209,9 +210,12 @@ export class FakeRelay {
           s.deliver({ type: "challenge", nonce: s.nonce });
           return;
         }
+        // The answer names the relay the socket was opened to (PNP-001 §10.7); the
+        // signature itself is checked against the real relay in the interop runs.
+        const { host, port } = relayEndpoint(s.url);
         if (
           f.nonce !== s.nonce || typeof f.pubkey !== "string" ||
-          f.peer_id !== s.peerId
+          f.peer_id !== s.peerId || f.relay !== `${host}:${port}`
         ) {
           s.deliver({ type: "error", code: "bad_signature", message: "" });
           return;

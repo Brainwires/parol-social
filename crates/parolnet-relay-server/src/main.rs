@@ -1,9 +1,13 @@
-use parolnet_relay_server::challenge::RegisterChallenge;
+use parolnet_relay_server::challenge::{
+    RegisterAnswer, RegisterChallenge, RelayNames, verify_register,
+};
 use parolnet_relay_server::frames::{IncomingMessage, OutgoingMessage};
+use parolnet_relay_server::peers_auth::{FederationPeers, PeersAuthError, authenticate, may_ask};
 use parolnet_relay_server::policy::{
     BinaryAdmission, Budget, FrameBudget, IpSlots, MAX_CIRCUITS_PER_CONN, MAX_REGISTER_ATTEMPTS,
-    MAX_TOKENS_PER_ISSUE, REGISTER_CHALLENGE_TTL_SECS, RelayPolicy, SignalReject, SignalingLimiter,
-    SlotGuard, TOKEN_ISSUE_PER_MINUTE_PER_IP, WatchRegistry,
+    MAX_TOKENS_PER_ISSUE, PEERS_LOOKUP_PATH, PEERS_PRESENCE_PATH, REGISTER_CHALLENGE_TTL_SECS,
+    RelayPolicy, SignalReject, SignalingLimiter, SlotGuard, TOKEN_ISSUE_PER_MINUTE_PER_IP,
+    WatchRegistry,
 };
 use parolnet_relay_server::rate_limit::{
     ConnRateLimiter, LOOKUP_RATE_LIMIT, LOOKUP_RATE_WINDOW_SECS, LookupRateLimiter, MSG_RATE_LIMIT,
@@ -27,6 +31,7 @@ use axum::{
 use futures_util::{SinkExt, StreamExt};
 use parolnet_mesh::peer_manager::PeerManager;
 use parolnet_protocol::address::PeerId;
+use parolnet_protocol::relay_auth::{PeersAuthorization, PeersRequest, RelayName};
 use parolnet_relay::authority::EndorsedDescriptor;
 use parolnet_relay::bridge::{
     COVER_CONTENT_TYPE, COVER_PAGE_HTML, DisclosureLimiter, DisclosureScope,
@@ -352,19 +357,89 @@ async fn handle_directory_push(
 //
 // `LookupRateLimiter` and its constants live in `rate_limit` now; they
 // implement PNP-008-MUST-066 (10 req/s per client) via the shared limiter.
+//
+// Both endpoints say who is online, so neither is answered to an anonymous
+// caller (PNP-008 §10.8). A signaling-only relay does not register them at
+// all; a relay-profile relay requires the request signature checked by
+// `peers_auth::authenticate`.
+
+/// What the `/peers/*` handlers need to tell who is asking.
+#[derive(Clone)]
+struct PeersAccess {
+    names: Arc<RelayNames>,
+    federation_peers: Arc<FederationPeers>,
+    peers: PeerMap,
+}
+
+impl PeersAccess {
+    /// The Ed25519 key that signed this request for this relay. Nothing
+    /// about any peer is read before this passes.
+    fn authenticate(
+        &self,
+        headers: &axum::http::HeaderMap,
+        request: PeersRequest,
+    ) -> Result<[u8; 32], PeersAuthError> {
+        let authorization = headers
+            .get(axum::http::header::AUTHORIZATION)
+            .and_then(|v| v.to_str().ok());
+        authenticate(authorization, request, &self.names, unix_now())
+    }
+
+    /// Whether `key` is the identity of a peer registered here right now.
+    async fn is_registered_peer(&self, key: &[u8; 32]) -> bool {
+        let peer_id = hex::encode(PeerId::from_public_key(key).0);
+        self.peers.lock().await.contains_key(&peer_id)
+    }
+}
+
+/// The 401 a `/peers/*` request without valid credentials gets. It depends
+/// on the credentials alone, never on the peer asked about.
+fn peers_auth_refusal(e: PeersAuthError) -> axum::response::Response {
+    let reason = match e {
+        PeersAuthError::Missing => "authentication required",
+        PeersAuthError::Malformed => "malformed authorization",
+        PeersAuthError::WrongRelay => "signed for another relay name",
+        PeersAuthError::Stale => "stale or future timestamp",
+        PeersAuthError::BadSignature => "signature verification failed",
+    };
+    (
+        StatusCode::UNAUTHORIZED,
+        [(
+            axum::http::header::WWW_AUTHENTICATE,
+            parolnet_protocol::relay_auth::PEERS_AUTH_SCHEME,
+        )],
+        reason,
+    )
+        .into_response()
+}
 
 /// GET /peers/presence — return the locally-connected peers of this relay,
-/// CBOR-encoded as `Vec<PresenceEntry>`. Rate-limited per client IP.
+/// CBOR-encoded as `Vec<PresenceEntry>`. Relay profile only, and only to a
+/// federation peer listed in `FEDERATION_PEER_KEYS`. Rate-limited per client
+/// IP.
 ///
 /// Clauses: PNP-008-MUST-063 (endpoint shape), PNP-008-MUST-064 (signatures),
-/// PNP-008-MUST-066 (rate limit).
+/// PNP-008-MUST-066 (rate limit), PNP-008-MUST-099 / MUST-102 (who may ask).
 async fn handle_peers_presence(
     presence: Arc<Mutex<PresenceAuthority>>,
+    access: PeersAccess,
     rl: LookupRateLimiter,
     client_ip: IpAddr,
+    headers: axum::http::HeaderMap,
 ) -> axum::response::Response {
     if rl.is_limited(&client_ip) {
         return (StatusCode::TOO_MANY_REQUESTS, "rate limited").into_response();
+    }
+    let key = match access.authenticate(&headers, PeersRequest::Presence) {
+        Ok(key) => key,
+        Err(e) => return peers_auth_refusal(e),
+    };
+    if !may_ask(
+        PeersRequest::Presence,
+        access.federation_peers.contains(&key),
+        false,
+    ) {
+        return (StatusCode::FORBIDDEN, "not a federation peer of this relay").into_response();
     }
     let rows: Vec<PresenceEntry> = presence.lock().await.local_presence();
     let mut cbor_buf = Vec::new();
@@ -381,16 +456,22 @@ async fn handle_peers_presence(
 }
 
 /// GET /peers/lookup?id=<peer_id_hex> — resolve the home relay of `peer_id`.
+/// Relay profile only, and only to a peer registered on this relay at that
+/// moment or to a federation peer.
 ///
 /// Returns 200 + CBOR `LookupResult` on hit; 404 on miss; 400 on malformed id;
-/// 429 on rate limit.
+/// 401 / 403 when the caller may not ask; 429 on rate limit. The refusals are
+/// decided before the presence map is read, so they are the same whether or
+/// not the peer is online.
 ///
 /// Clauses: PNP-008-MUST-065 (local-first, federation-second), PNP-008-MUST-066
-/// (rate limit).
+/// (rate limit), PNP-008-MUST-099 / MUST-102 (who may ask).
 async fn handle_peers_lookup(
     presence: Arc<Mutex<PresenceAuthority>>,
+    access: PeersAccess,
     rl: LookupRateLimiter,
     client_ip: IpAddr,
+    headers: axum::http::HeaderMap,
     Query(params): Query<HashMap<String, String>>,
 ) -> axum::response::Response {
     if rl.is_limited(&client_ip) {
@@ -402,6 +483,18 @@ async fn handle_peers_lookup(
     let Some(peer_id) = parse_peer_id(id_hex) else {
         return (StatusCode::BAD_REQUEST, "invalid id").into_response();
     };
+    let key = match access.authenticate(&headers, PeersRequest::Lookup(peer_id)) {
+        Ok(key) => key,
+        Err(e) => return peers_auth_refusal(e),
+    };
+    let request = PeersRequest::Lookup(peer_id);
+    if !may_ask(
+        request,
+        access.federation_peers.contains(&key),
+        access.is_registered_peer(&key).await,
+    ) {
+        return (StatusCode::FORBIDDEN, "not registered on this relay").into_response();
+    }
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
@@ -427,11 +520,16 @@ async fn handle_peers_lookup(
 /// peer relay's Ed25519 pubkey via the authority-verified directory, verify
 /// each `PresenceEntry` signature, and merge into the local federation cache.
 /// Expired entries are evicted on every tick (PNP-008-MUST-070).
+///
+/// Each request is signed with this relay's identity key for the relay it is
+/// sent to (PNP-008 §10.8); the peer answers only if its operator listed that
+/// key in `FEDERATION_PEER_KEYS`.
 async fn federation_presence_fetch(
     presence: Arc<Mutex<PresenceAuthority>>,
     directory: Arc<Mutex<RelayDirectory>>,
     peer_relay_urls: Arc<Mutex<Vec<String>>>,
     poll_interval_secs: u64,
+    signing_key: ed25519_dalek::SigningKey,
 ) {
     let client = match reqwest::Client::builder()
         .timeout(Duration::from_secs(10))
@@ -498,7 +596,27 @@ async fn federation_presence_fetch(
                 continue;
             };
 
-            match client.get(&presence_url).send().await {
+            // The relay name the request is signed for: the one this relay
+            // dials. A URL without a usable name cannot be asked.
+            let Ok(peer_name) = RelayName::from_url(url) else {
+                tracing::debug!(url = %presence_url, "presence fetch skipped: URL has no relay name");
+                continue;
+            };
+            let authorization = PeersAuthorization::sign(
+                PeersRequest::Presence,
+                signing_key.verifying_key().to_bytes(),
+                unix_now(),
+                peer_name,
+                |m| ed25519_dalek::Signer::sign(&signing_key, m).to_bytes(),
+            )
+            .to_header();
+
+            match client
+                .get(&presence_url)
+                .header(reqwest::header::AUTHORIZATION, authorization)
+                .send()
+                .await
+            {
                 Ok(resp) if resp.status().is_success() => match resp.bytes().await {
                     Ok(body) => {
                         let entries: Vec<PresenceEntry> = match ciborium::from_reader(body.as_ref())
@@ -1122,30 +1240,17 @@ async fn handle_peers(
     Ok(Json(peer_ids))
 }
 
-/// GET /bootstrap?exclude=<peer_id> — returns up to 20 known peer IDs,
-/// excluding the optionally specified peer. Used by clients for peer discovery
-/// to establish direct WebRTC connections.
+/// GET /bootstrap — always an empty list.
 ///
-/// A signaling-only relay returns an empty list and ignores `exclude`: it
-/// hands no stranger a list of online PeerIds, and no PeerId rides in a URL
-/// (clients learn contacts' presence from `watch` instead).
-async fn handle_bootstrap(
-    Query(params): Query<HashMap<String, String>>,
-    peers: PeerMap,
-    signaling_only: bool,
-) -> Json<Vec<String>> {
-    if signaling_only {
-        return Json(Vec::new());
-    }
-    let peer_list = peers.lock().await;
-    let exclude = params.get("exclude").cloned().unwrap_or_default();
-    let known: Vec<String> = peer_list
-        .keys()
-        .filter(|p| **p != exclude)
-        .take(20)
-        .cloned()
-        .collect();
-    Json(known)
+/// It used to hand any caller up to 20 PeerIds online on a relay-profile
+/// relay: an anonymous enumeration of who is connected, the same disclosure
+/// `/peers/presence` made (PNP-008-MUST-099). Clients find their contacts
+/// through `watch` / `presence` on their registered socket in both profiles,
+/// so the list is gone and the endpoint stays only so that older clients get
+/// a well-formed answer. The `exclude` parameter is ignored: no PeerId needs
+/// to ride in a URL (PNP-001-SHOULD-017).
+async fn handle_bootstrap() -> Json<Vec<String>> {
+    Json(Vec::new())
 }
 
 /// Build the VOPRF token authority (relay profile only). Loads and persists
@@ -1243,6 +1348,51 @@ async fn main() {
         );
     } else {
         info!("Relay profile: relay (SIGNALING_ONLY=0)");
+    }
+
+    // The names clients dial this relay under. A register answer is accepted
+    // only when it was signed for one of them (PNP-001 §10.7), so a public
+    // relay without RELAY_PUBLIC_NAMES registers nobody but local clients.
+    let relay_names = match RelayNames::from_config(
+        std::env::var("RELAY_PUBLIC_NAMES").ok().as_deref(),
+    ) {
+        Ok(names) => Arc::new(names),
+        Err((entry, e)) => {
+            eprintln!(
+                "RELAY_PUBLIC_NAMES: {entry:?} is not a relay name ({e}); expected host or host:port, comma-separated"
+            );
+            std::process::exit(2);
+        }
+    };
+    if relay_names.configured().is_empty() {
+        tracing::warn!(
+            "RELAY_PUBLIC_NAMES is not set: only clients that dialed this relay by a loopback address (localhost, 127.0.0.1, [::1]) can register. Set it to the host[:port] clients connect to, e.g. RELAY_PUBLIC_NAMES=relay.example.org"
+        );
+    } else {
+        let names: Vec<&str> = relay_names
+            .configured()
+            .iter()
+            .map(|n| n.as_str())
+            .collect();
+        info!("Relay public names: {}", names.join(", "));
+    }
+    // Federation peers that may read this relay's presence (relay profile).
+    let federation_peers = match FederationPeers::from_config(
+        std::env::var("FEDERATION_PEER_KEYS").ok().as_deref(),
+    ) {
+        Ok(peers) => Arc::new(peers),
+        Err(entry) => {
+            eprintln!(
+                "FEDERATION_PEER_KEYS: {entry:?} is not an Ed25519 public key (64 hex characters)"
+            );
+            std::process::exit(2);
+        }
+    };
+    if !policy.signaling_only {
+        info!(
+            "Federation peers allowed to read presence: {}",
+            federation_peers.len()
+        );
     }
 
     // Bridge mode configuration
@@ -1428,6 +1578,9 @@ async fn main() {
         pa
     }));
 
+    // Signs this relay's presence requests to its federation peers.
+    let federation_signing_key = relay_signing_key.clone();
+
     // Gossip supernode: relay profile only.
     let peer_manager: Option<Arc<PeerManager>> = if policy.signaling_only {
         None
@@ -1488,7 +1641,13 @@ async fn main() {
             .await
             .config()
             .federation_poll_interval_secs;
-        tokio::spawn(federation_presence_fetch(pa, dir, urls, poll));
+        tokio::spawn(federation_presence_fetch(
+            pa,
+            dir,
+            urls,
+            poll,
+            federation_signing_key,
+        ));
     }
 
     // Rate limiter for presence + lookup endpoints (10 req/s per IP,
@@ -1532,6 +1691,8 @@ async fn main() {
         signal_limiter: signal_limiter.clone(),
         peer_slots: peer_slots.clone(),
         watches: watches.clone(),
+        relay_names: relay_names.clone(),
+        relay_pubkey: pubkey_bytes,
     };
 
     #[allow(unused_mut)]
@@ -1584,17 +1745,7 @@ async fn main() {
                 }
             }),
         )
-        .route(
-            "/bootstrap",
-            get({
-                let peers = peers.clone();
-                let signaling_only = policy.signaling_only;
-                move |query: Query<HashMap<String, String>>| {
-                    let peers = peers.clone();
-                    async move { handle_bootstrap(query, peers, signaling_only).await }
-                }
-            }),
-        )
+        .route("/bootstrap", get(handle_bootstrap))
         .route(
             "/directory",
             get({
@@ -1604,42 +1755,64 @@ async fn main() {
                     async move { handle_directory(directory).await }
                 }
             }),
-        )
-        .route(
-            "/peers/presence",
-            get({
-                let pa = presence_authority.clone();
-                let rl = lookup_rate_limiter.clone();
-                let tp = trusted_proxies.clone();
-                move |headers: axum::http::HeaderMap,
-                      connect_info: axum::extract::ConnectInfo<std::net::SocketAddr>| {
-                    let pa = pa.clone();
-                    let rl = rl.clone();
-                    let client_ip = get_client_ip(connect_info.0.ip(), &headers, &tp);
-                    async move { handle_peers_presence(pa, rl, client_ip).await }
-                }
-            }),
-        )
-        .route(
-            "/peers/lookup",
-            get({
-                let pa = presence_authority.clone();
-                let rl = lookup_rate_limiter.clone();
-                let tp = trusted_proxies.clone();
-                move |headers: axum::http::HeaderMap,
-                      connect_info: axum::extract::ConnectInfo<std::net::SocketAddr>,
-                      query: Query<HashMap<String, String>>| {
-                    let pa = pa.clone();
-                    let rl = rl.clone();
-                    let client_ip = get_client_ip(connect_info.0.ip(), &headers, &tp);
-                    async move { handle_peers_lookup(pa, rl, client_ip, query).await }
-                }
-            }),
         );
 
-    // Relay-profile endpoints. A signaling-only relay does not register
-    // them at all (404): no federation link, telemetry, endorsement,
-    // directory push or token minting.
+    // Presence and lookup say who is online. A signaling-only relay does not
+    // register them (404): there, that is learned only over a registered
+    // socket (`presence` between mutual watchers, `peer_offline` in answer to
+    // an offer). A relay-profile relay answers signed requests only
+    // (PNP-008 §10.8).
+    if policy.serves_endpoint(PEERS_PRESENCE_PATH) && policy.serves_endpoint(PEERS_LOOKUP_PATH) {
+        let peers_access = PeersAccess {
+            names: relay_names.clone(),
+            federation_peers: federation_peers.clone(),
+            peers: peers.clone(),
+        };
+        app = app
+            .route(
+                PEERS_PRESENCE_PATH,
+                get({
+                    let pa = presence_authority.clone();
+                    let access = peers_access.clone();
+                    let rl = lookup_rate_limiter.clone();
+                    let tp = trusted_proxies.clone();
+                    move |headers: axum::http::HeaderMap,
+                          connect_info: axum::extract::ConnectInfo<std::net::SocketAddr>| {
+                        let pa = pa.clone();
+                        let access = access.clone();
+                        let rl = rl.clone();
+                        let client_ip = get_client_ip(connect_info.0.ip(), &headers, &tp);
+                        async move {
+                            handle_peers_presence(pa, access, rl, client_ip, headers).await
+                        }
+                    }
+                }),
+            )
+            .route(
+                PEERS_LOOKUP_PATH,
+                get({
+                    let pa = presence_authority.clone();
+                    let access = peers_access.clone();
+                    let rl = lookup_rate_limiter.clone();
+                    let tp = trusted_proxies.clone();
+                    move |headers: axum::http::HeaderMap,
+                          connect_info: axum::extract::ConnectInfo<std::net::SocketAddr>,
+                          query: Query<HashMap<String, String>>| {
+                        let pa = pa.clone();
+                        let access = access.clone();
+                        let rl = rl.clone();
+                        let client_ip = get_client_ip(connect_info.0.ip(), &headers, &tp);
+                        async move {
+                            handle_peers_lookup(pa, access, rl, client_ip, headers, query).await
+                        }
+                    }
+                }),
+            );
+    }
+
+    // The other relay-profile endpoints. A signaling-only relay does not
+    // register them at all (404): no federation link, telemetry,
+    // endorsement, directory push or token minting.
     if let Some(ref ta) = token_authority {
         app = app
             .route(
@@ -2078,6 +2251,10 @@ struct WsCtx {
     /// Registered PeerIds per client IP.
     peer_slots: IpSlots,
     watches: Arc<Mutex<WatchRegistry>>,
+    /// Names a register answer may be signed for (PNP-001 §10.7).
+    relay_names: Arc<RelayNames>,
+    /// This relay's Ed25519 identity key, for clients that pin it.
+    relay_pubkey: [u8; 32],
 }
 
 fn send_json(tx: &mpsc::UnboundedSender<Message>, msg: &OutgoingMessage) {
@@ -2095,43 +2272,6 @@ fn presence_frame(peer_id: &str, online: bool) -> OutgoingMessage {
         online: Some(online),
         ..Default::default()
     }
-}
-
-/// Verify a register challenge answer: PeerId = SHA-256(pubkey) and an
-/// Ed25519 signature over `nonce`.
-///
-/// `nonce` is the challenge this relay issued on this socket, as returned by
-/// [`RegisterChallenge::redeem`]; it is never the client's copy. A signature
-/// over a nonce the client chose proves nothing: it can be a replay.
-fn verify_register(
-    peer_id: &str,
-    pubkey_hex: &str,
-    sig_hex: &str,
-    nonce: &[u8; parolnet_relay_server::challenge::CHALLENGE_NONCE_LEN],
-) -> Result<(), String> {
-    let pubkey_bytes = hex::decode(pubkey_hex).map_err(|e| format!("invalid pubkey hex: {e}"))?;
-    let sig_bytes = hex::decode(sig_hex).map_err(|e| format!("invalid signature hex: {e}"))?;
-
-    use sha2::{Digest, Sha256};
-    let expected_pid = hex::encode(Sha256::digest(&pubkey_bytes));
-    if expected_pid != peer_id {
-        return Err("peer_id does not match pubkey".into());
-    }
-
-    let vk_bytes: [u8; 32] = pubkey_bytes
-        .try_into()
-        .map_err(|_| "pubkey must be 32 bytes".to_string())?;
-    let verifying_key = ed25519_dalek::VerifyingKey::from_bytes(&vk_bytes)
-        .map_err(|e| format!("invalid Ed25519 key: {e}"))?;
-    let sig_arr: [u8; 64] = sig_bytes
-        .try_into()
-        .map_err(|_| "signature must be 64 bytes".to_string())?;
-    let signature = ed25519_dalek::Signature::from_bytes(&sig_arr);
-
-    use ed25519_dalek::Verifier;
-    verifying_key
-        .verify(nonce, &signature)
-        .map_err(|_| "signature verification failed".to_string())
 }
 
 fn unix_now() -> u64 {
@@ -2154,6 +2294,8 @@ async fn handle_socket(socket: WebSocket, ctx: WsCtx, client_ip: IpAddr, _conn_s
         signal_limiter,
         peer_slots,
         watches,
+        relay_names,
+        relay_pubkey,
     } = ctx;
 
     let (mut sender, mut receiver) = socket.split();
@@ -2358,7 +2500,10 @@ async fn handle_socket(socket: WebSocket, ctx: WsCtx, client_ip: IpAddr, _conn_s
 
                 // The nonce must be the one issued on this socket, alive and
                 // not yet answered; the signature is then checked over the
-                // relay's copy of it. Every credentialed `register` spends
+                // register message built from the relay's copy of it and a
+                // name this relay serves, so an answer the client made for
+                // another relay does not register it here (PNP-001 §10.7).
+                // Every credentialed `register` spends
                 // the challenge, pass or fail, and a refusal carries no new
                 // one: the client asks again with a plain `register`, which
                 // counts against MAX_REGISTER_ATTEMPTS like any other.
@@ -2369,7 +2514,21 @@ async fn handle_socket(socket: WebSocket, ctx: WsCtx, client_ip: IpAddr, _conn_s
                             .redeem(&echoed, std::time::Instant::now())
                             .map_err(|e| e.message().to_string())
                     })
-                    .and_then(|nonce| verify_register(&peer_id, pubkey_hex, sig_hex, &nonce));
+                    .and_then(|nonce| {
+                        verify_register(
+                            RegisterAnswer {
+                                peer_id: &peer_id,
+                                pubkey_hex,
+                                signature_hex: sig_hex,
+                                relay: incoming.relay.as_deref(),
+                                relay_key_hex: incoming.relay_key.as_deref(),
+                            },
+                            &nonce,
+                            &relay_names,
+                            &relay_pubkey,
+                        )
+                        .map_err(|e| e.message())
+                    });
                 if let Err(err_msg) = redeemed {
                     send_error(
                         &tx,
@@ -2417,9 +2576,10 @@ async fn handle_socket(socket: WebSocket, ctx: WsCtx, client_ip: IpAddr, _conn_s
 
                 info!("Peer registered ({} online)", online);
 
-                // Publish presence (PNP-008-MUST-063): this
-                // peer is now authoritatively connected here,
-                // so `/peers/presence` must advertise it.
+                // Record presence (PNP-008-MUST-063): this peer is now
+                // authoritatively connected here. A relay-profile relay
+                // serves it to its federation peers; a signaling-only
+                // relay serves it to nobody.
                 if let Some(mesh_pid) = parse_peer_id(&peer_id) {
                     presence_authority
                         .lock()

@@ -66,6 +66,14 @@ timing, never media. **Must not** read content, impersonate a participant, add i
 room, or fork a group's history unnoticed. **Can** deny service, drop or delay traffic, and log
 metadata. *Detail: M2 (SFU trust boundary, commit sequencing, PNP-012 / PNP-013).*
 
+A relay **must not** be able to register a client's `PeerId` at another relay: the answer to a
+relay's register challenge is signed for the `host:port` the client dialed and a relay accepts
+only its own names (PNP-001 §10.7). A party with no socket on a relay **must not** learn from it
+who is online: a signaling-only relay answers no HTTP request about presence, and a relay-profile
+relay answers only signed requests from its federation peers and its own registered peers
+(PNP-008 §10.8). A party that registers an identity of its own on a relay can still learn whether
+a `PeerId` it knows is online there; registration is free.
+
 ### 3.3 Malicious group member
 A legitimate member who misbehaves. Can read what the group can read while a member, and share it.
 **Must not** forge other members' messages or media, keep reading after removal (at the next

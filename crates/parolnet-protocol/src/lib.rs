@@ -16,6 +16,7 @@
 pub mod address;
 pub mod channel_binding;
 pub mod codec;
+pub mod det_cbor;
 pub mod envelope;
 pub mod ephemeral;
 pub mod error;
@@ -28,6 +29,7 @@ pub mod identity_rotation;
 pub mod media;
 pub mod message;
 pub mod padding;
+pub mod relay_auth;
 
 pub use address::{BridgeAddress, PeerId};
 pub use error::ProtocolError;

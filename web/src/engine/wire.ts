@@ -50,6 +50,8 @@ export type ClientFrame =
     pubkey?: string;
     signature?: string;
     nonce?: string;
+    /** The canonical name of the relay this client dialed (PNP-001 §10.7); signed. */
+    relay?: string;
   }
   | { type: "watch"; peer_ids: string[] }
   | { type: SignalKind; to: string; payload: string }
@@ -66,6 +68,28 @@ export type ServerFrame =
 
 function str(v: unknown): string | null {
   return typeof v === "string" ? v : null;
+}
+
+/**
+ * The host and port a relay URL points at, as the browser's URL parser reads it: the same
+ * parser the WebSocket constructor uses, so this is the endpoint the socket goes to. A URL
+ * that names no port has its scheme's default (443 for `wss:`, 80 for `ws:`). Throws for
+ * anything that is not a plain `ws:` / `wss:` URL (user information included): the answer
+ * to a relay's challenge is signed for this endpoint (PNP-001 §10.7), so there must be no
+ * doubt about which one it is.
+ */
+export function relayEndpoint(url: string): { host: string; port: number } {
+  const u = new URL(url);
+  let port: number;
+  if (u.protocol === "wss:") port = 443;
+  else if (u.protocol === "ws:") port = 80;
+  else throw new Error("not a ws: or wss: URL");
+  if (u.username !== "" || u.password !== "") {
+    throw new Error("a relay URL carries no user information");
+  }
+  if (u.hostname === "") throw new Error("a relay URL names a host");
+  if (u.port !== "") port = Number(u.port);
+  return { host: u.hostname, port };
 }
 
 /** Parse a relay text frame. `null` for malformed JSON or a frame missing a required field. */

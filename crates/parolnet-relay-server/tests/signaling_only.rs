@@ -4,6 +4,14 @@
 //! with an isolated key directory, talks to it over real WebSockets and HTTP,
 //! and kills it on drop. The default profile is signaling-only; tests that
 //! need the relay profile pass `SIGNALING_ONLY=0`.
+//!
+//! No `RELAY_PUBLIC_NAMES` is set unless a test sets it, so a relay here
+//! serves loopback names: clients sign their register answer for
+//! `127.0.0.1:<port>`, the name they dialed (PNP-001 §10.7).
+
+use parolnet_protocol::relay_auth::{
+    PeersAuthorization, PeersRequest, RelayName, register_signable,
+};
 
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{Value, json};
@@ -70,7 +78,8 @@ impl Relay {
             .stdout(Stdio::null())
             .stderr(Stdio::null());
         for (k, v) in envs {
-            cmd.env(k, v);
+            // `{port}` stands for the port this relay listens on.
+            cmd.env(k, v.replace("{port}", &port.to_string()));
         }
         let child = cmd.spawn().expect("spawn relay binary");
         let relay = Relay { child, port, dir };
@@ -85,6 +94,11 @@ impl Relay {
 
     fn http(&self, path: &str) -> String {
         format!("http://127.0.0.1:{}{}", self.port, path)
+    }
+
+    /// The canonical name clients here dial this relay under.
+    fn name(&self) -> String {
+        format!("127.0.0.1:{}", self.port)
     }
 
     async fn ws(&self) -> Ws {
@@ -157,22 +171,10 @@ async fn closed_within(ws: &mut Ws, timeout_ms: u64) -> bool {
 /// Run the challenge-response registration; returns the `registered` frame
 /// or the error frame.
 async fn register(ws: &mut Ws, id: &Identity) -> Value {
-    use ed25519_dalek::Signer;
     send(ws, json!({"type": "register", "peer_id": id.peer_id})).await;
     let ch = recv_type(ws, "challenge", 3000).await.expect("challenge");
-    let nonce = hex::decode(ch["nonce"].as_str().unwrap()).unwrap();
-    let sig = id.key.sign(&nonce);
-    send(
-        ws,
-        json!({
-            "type": "register",
-            "peer_id": id.peer_id,
-            "pubkey": hex::encode(id.key.verifying_key().to_bytes()),
-            "signature": hex::encode(sig.to_bytes()),
-            "nonce": hex::encode(&nonce),
-        }),
-    )
-    .await;
+    let answer = signed_register(id, ch["nonce"].as_str().unwrap(), &dialed(ws));
+    send(ws, answer).await;
     loop {
         let v = recv(ws, 3000).await.expect("register reply");
         if v["type"] == "registered" || v["type"] == "error" {
@@ -406,16 +408,29 @@ async fn reconnect_overlap_keeps_the_newer_socket_routable() {
     assert_eq!(got["payload"], "still here");
 }
 
-/// A `register` answer: the credentials a client sends for `nonce_hex`.
-fn signed_register(id: &Identity, nonce_hex: &str) -> Value {
+/// The canonical name of the relay a socket was opened to: what its client
+/// dialed.
+fn dialed(ws: &Ws) -> String {
+    match ws.get_ref() {
+        MaybeTlsStream::Plain(tcp) => tcp.peer_addr().unwrap().to_string(),
+        _ => panic!("a plain TCP socket"),
+    }
+}
+
+/// A `register` answer: the credentials a client that dialed `relay_name`
+/// sends for `nonce_hex` (PNP-001 §10.7).
+fn signed_register(id: &Identity, nonce_hex: &str, relay_name: &str) -> Value {
     use ed25519_dalek::Signer;
-    let sig = id.key.sign(&hex::decode(nonce_hex).unwrap());
+    let nonce: [u8; 32] = hex::decode(nonce_hex).unwrap().try_into().unwrap();
+    let relay = RelayName::parse(relay_name).unwrap();
+    let sig = id.key.sign(&register_signable(&nonce, &relay, None));
     json!({
         "type": "register",
         "peer_id": id.peer_id,
         "pubkey": hex::encode(id.key.verifying_key().to_bytes()),
         "signature": hex::encode(sig.to_bytes()),
         "nonce": nonce_hex,
+        "relay": relay_name,
     })
 }
 
@@ -444,7 +459,7 @@ async fn a_captured_register_answer_cannot_be_replayed() {
     // or anyone on the path) holds a (pubkey, signature, nonce) triple.
     let mut c1 = relay.ws().await;
     let nonce = challenge_nonce(&mut c1, &p.peer_id).await;
-    let captured = signed_register(&p, &nonce);
+    let captured = signed_register(&p, &nonce, &relay.name());
     send(&mut c1, captured.clone()).await;
     assert_eq!(register_reply(&mut c1).await["type"], "registered");
 
@@ -504,11 +519,11 @@ async fn a_challenge_is_answered_once_and_only_with_its_own_nonce() {
     let id = Identity::new();
     let mut ws = relay.ws().await;
     let nonce = challenge_nonce(&mut ws, &id.peer_id).await;
-    let mut bad = signed_register(&id, &nonce);
+    let mut bad = signed_register(&id, &nonce, &relay.name());
     bad["signature"] = json!(hex::encode([0u8; 64]));
     send(&mut ws, bad.clone()).await;
     assert_eq!(register_reply(&mut ws).await["code"], "register_failed");
-    send(&mut ws, signed_register(&id, &nonce)).await;
+    send(&mut ws, signed_register(&id, &nonce, &relay.name())).await;
     let r = register_reply(&mut ws).await;
     assert_eq!(r["code"], "register_failed", "{r}");
     let again = challenge_nonce(&mut ws, &id.peer_id).await;
@@ -518,20 +533,24 @@ async fn a_challenge_is_answered_once_and_only_with_its_own_nonce() {
     let id = Identity::new();
     let mut ws = relay.ws().await;
     let nonce = challenge_nonce(&mut ws, &id.peer_id).await;
-    let mut bad = signed_register(&id, &nonce);
+    let mut bad = signed_register(&id, &nonce, &relay.name());
     bad["signature"] = json!(hex::encode([0u8; 64]));
     send(&mut ws, bad).await;
     assert_eq!(register_reply(&mut ws).await["code"], "register_failed");
     let again = challenge_nonce(&mut ws, &id.peer_id).await;
     assert_ne!(again, nonce);
-    send(&mut ws, signed_register(&id, &again)).await;
+    send(&mut ws, signed_register(&id, &again, &relay.name())).await;
     assert_eq!(register_reply(&mut ws).await["type"], "registered");
 
     // A nonce the client made up, validly signed, is refused.
     let id = Identity::new();
     let mut ws = relay.ws().await;
     let _ = challenge_nonce(&mut ws, &id.peer_id).await;
-    send(&mut ws, signed_register(&id, &hex::encode([0x5a; 32]))).await;
+    send(
+        &mut ws,
+        signed_register(&id, &hex::encode([0x5a; 32]), &relay.name()),
+    )
+    .await;
     let r = register_reply(&mut ws).await;
     assert_eq!(r["code"], "register_failed", "{r}");
 }
@@ -547,8 +566,8 @@ async fn two_plain_registers_before_the_answer_still_register() {
     let n1 = challenge_nonce(&mut ws, &id.peer_id).await;
     let n2 = challenge_nonce(&mut ws, &id.peer_id).await;
     assert_eq!(n1, n2);
-    send(&mut ws, signed_register(&id, &n1)).await;
-    send(&mut ws, signed_register(&id, &n2)).await;
+    send(&mut ws, signed_register(&id, &n1, &relay.name())).await;
+    send(&mut ws, signed_register(&id, &n2, &relay.name())).await;
     assert_eq!(register_reply(&mut ws).await["type"], "registered");
     // No error follows for the second answer.
     assert!(recv_type(&mut ws, "error", 300).await.is_none());
@@ -711,4 +730,389 @@ async fn relay_profile_frame_cap() {
     let big = "x".repeat(129 * 1024);
     send(&mut a, json!({"type": "gossip", "payload": big})).await;
     assert!(closed_within(&mut a, 3000).await, "128 KiB frame cap");
+}
+
+// ---- PNP-001 §10.7: a register answer is valid at one relay only ----------
+
+/// The attack: the victim connects to relay E. E opens its own socket to
+/// relay R as the victim, takes R's nonce, hands it to the victim as its own
+/// challenge and presents the victim's answer at R. The victim signed for E.
+#[tokio::test]
+async fn an_answer_signed_for_another_relay_does_not_register_here() {
+    // R knows its own name; E is any other relay.
+    let r = Relay::start(&[("RELAY_PUBLIC_NAMES", "127.0.0.1:{port}")]).await;
+    let e = Relay::start(&[]).await;
+    let victim = Identity::new();
+
+    // E's socket to R, claiming the victim's PeerId.
+    let mut at_r = r.ws().await;
+    let nonce_of_r = challenge_nonce(&mut at_r, &victim.peer_id).await;
+
+    // The victim answers what it takes for E's challenge: R's nonce, signed
+    // for the relay it dialed.
+    let answer_for_e = signed_register(&victim, &nonce_of_r, &e.name());
+
+    // Presented at R as it was made.
+    send(&mut at_r, answer_for_e.clone()).await;
+    let reply = register_reply(&mut at_r).await;
+    assert_eq!(reply["type"], "error", "{reply}");
+    assert_eq!(reply["code"], "register_failed", "{reply}");
+
+    // Presented at R with the unsigned `relay` field rewritten to R's name.
+    let mut at_r = r.ws().await;
+    let nonce_of_r = challenge_nonce(&mut at_r, &victim.peer_id).await;
+    let mut rewritten = signed_register(&victim, &nonce_of_r, &e.name());
+    rewritten["relay"] = json!(r.name());
+    send(&mut at_r, rewritten).await;
+    let reply = register_reply(&mut at_r).await;
+    assert_eq!(reply["code"], "register_failed", "{reply}");
+
+    // E is not registered as the victim at R: signaling for the victim does
+    // not reach E's socket, and that socket may not signal.
+    let (mut other, _) = registered_peer(&r).await;
+    send(
+        &mut other,
+        json!({"type": "rtc_offer", "to": victim.peer_id, "payload": "for the victim"}),
+    )
+    .await;
+    let err = recv_type(&mut other, "error", 3000).await.unwrap();
+    assert_eq!(err["code"], "peer_offline", "{err}");
+    assert!(recv_type(&mut at_r, "rtc_offer", 300).await.is_none());
+
+    // The victim itself, dialing R, registers.
+    let mut own = r.ws().await;
+    assert_eq!(register(&mut own, &victim).await["type"], "registered");
+}
+
+#[tokio::test]
+async fn a_signature_over_the_bare_nonce_or_without_a_relay_name_is_refused() {
+    use ed25519_dalek::Signer;
+    let relay = Relay::start(&[]).await;
+    let id = Identity::new();
+
+    // What clients sent before PNP-001 v0.17: the nonce itself, signed.
+    let mut ws = relay.ws().await;
+    let nonce = challenge_nonce(&mut ws, &id.peer_id).await;
+    let bare = id.key.sign(&hex::decode(&nonce).unwrap());
+    let mut old_style = signed_register(&id, &nonce, &relay.name());
+    old_style["signature"] = json!(hex::encode(bare.to_bytes()));
+    old_style.as_object_mut().unwrap().remove("relay");
+    send(&mut ws, old_style).await;
+    let r = register_reply(&mut ws).await;
+    assert_eq!(r["code"], "register_failed", "{r}");
+
+    // The bare-nonce signature with a relay name beside it.
+    let mut ws = relay.ws().await;
+    let nonce = challenge_nonce(&mut ws, &id.peer_id).await;
+    let bare = id.key.sign(&hex::decode(&nonce).unwrap());
+    let mut named = signed_register(&id, &nonce, &relay.name());
+    named["signature"] = json!(hex::encode(bare.to_bytes()));
+    send(&mut ws, named).await;
+    let r = register_reply(&mut ws).await;
+    assert_eq!(r["code"], "register_failed", "{r}");
+
+    // A name that is not canonical, though it means this relay.
+    let mut ws = relay.ws().await;
+    let nonce = challenge_nonce(&mut ws, &id.peer_id).await;
+    let mut spelled = signed_register(&id, &nonce, &relay.name());
+    spelled["relay"] = json!(format!("ws://{}/ws", relay.name()));
+    send(&mut ws, spelled).await;
+    let r = register_reply(&mut ws).await;
+    assert_eq!(r["code"], "register_failed", "{r}");
+}
+
+#[tokio::test]
+async fn a_relay_serves_only_its_configured_names() {
+    // Configured: exactly these names, and no longer the loopback default.
+    let relay = Relay::start(&[("RELAY_PUBLIC_NAMES", "Relay-R.Example, alt.example:8443")]).await;
+    for (name, accepted) in [
+        ("relay-r.example:443", true),
+        ("alt.example:8443", true),
+        ("relay-r.example:8443", false),
+        ("alt.example:443", false),
+        ("other.example:443", false),
+    ] {
+        let id = Identity::new();
+        let mut ws = relay.ws().await;
+        let nonce = challenge_nonce(&mut ws, &id.peer_id).await;
+        send(&mut ws, signed_register(&id, &nonce, name)).await;
+        let r = register_reply(&mut ws).await;
+        assert_eq!(r["type"] == "registered", accepted, "{name}: {r}");
+    }
+    // The address the test dialed is not one of them.
+    let id = Identity::new();
+    let mut ws = relay.ws().await;
+    let r = register(&mut ws, &id).await;
+    assert_eq!(r["code"], "register_failed", "{r}");
+
+    // Unconfigured: loopback names only.
+    let relay = Relay::start(&[]).await;
+    for (name, accepted) in [
+        (relay.name(), true),
+        ("localhost:1411".to_owned(), true),
+        ("[::1]:9000".to_owned(), true),
+        ("relay-r.example:443".to_owned(), false),
+    ] {
+        let id = Identity::new();
+        let mut ws = relay.ws().await;
+        let nonce = challenge_nonce(&mut ws, &id.peer_id).await;
+        send(&mut ws, signed_register(&id, &nonce, &name)).await;
+        let r = register_reply(&mut ws).await;
+        assert_eq!(r["type"] == "registered", accepted, "{name}: {r}");
+    }
+}
+
+#[tokio::test]
+async fn a_pinned_relay_key_has_to_be_the_relays_own() {
+    use ed25519_dalek::Signer;
+    // The relay's identity key, fixed for the test.
+    let relay_key = ed25519_dalek::SigningKey::from_bytes(&[0x33; 32]);
+    let relay_pub = relay_key.verifying_key().to_bytes();
+    let relay = Relay::start(&[("RELAY_SECRET_KEY", &hex::encode([0x33u8; 32]))]).await;
+    let name = RelayName::parse(&relay.name()).unwrap();
+    let answer = |id: &Identity, nonce_hex: &str, pinned: &[u8; 32]| {
+        let nonce: [u8; 32] = hex::decode(nonce_hex).unwrap().try_into().unwrap();
+        let sig = id.key.sign(&register_signable(&nonce, &name, Some(pinned)));
+        json!({
+            "type": "register",
+            "peer_id": id.peer_id,
+            "pubkey": hex::encode(id.key.verifying_key().to_bytes()),
+            "signature": hex::encode(sig.to_bytes()),
+            "nonce": nonce_hex,
+            "relay": relay.name(),
+            "relay_key": hex::encode(pinned),
+        })
+    };
+
+    let id = Identity::new();
+    let mut ws = relay.ws().await;
+    let nonce = challenge_nonce(&mut ws, &id.peer_id).await;
+    send(&mut ws, answer(&id, &nonce, &relay_pub)).await;
+    assert_eq!(register_reply(&mut ws).await["type"], "registered");
+
+    // A client that pinned another relay's key is talking to the wrong relay.
+    let id = Identity::new();
+    let mut ws = relay.ws().await;
+    let nonce = challenge_nonce(&mut ws, &id.peer_id).await;
+    send(&mut ws, answer(&id, &nonce, &[0x44; 32])).await;
+    let r = register_reply(&mut ws).await;
+    assert_eq!(r["code"], "register_failed", "{r}");
+    // ... and swapping the unsigned field for the right key does not help.
+    let nonce = challenge_nonce(&mut ws, &id.peer_id).await;
+    let mut swapped = answer(&id, &nonce, &[0x44; 32]);
+    swapped["relay_key"] = json!(hex::encode(relay_pub));
+    send(&mut ws, swapped).await;
+    let r = register_reply(&mut ws).await;
+    assert_eq!(r["code"], "register_failed", "{r}");
+}
+
+// ---- who may ask who is online (PNP-001-MUST-071, PNP-008 §10.8) ----------
+
+/// An `Authorization` header for a `/peers/*` request, signed by `key` for
+/// the relay named `relay_name` at `timestamp`.
+fn peers_authorization(
+    key: &ed25519_dalek::SigningKey,
+    request: PeersRequest,
+    relay_name: &str,
+    timestamp: u64,
+) -> String {
+    use ed25519_dalek::Signer;
+    PeersAuthorization::sign(
+        request,
+        key.verifying_key().to_bytes(),
+        timestamp,
+        RelayName::parse(relay_name).unwrap(),
+        |m| key.sign(m).to_bytes(),
+    )
+    .to_header()
+}
+
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+}
+
+fn peer_id_of(id: &Identity) -> parolnet_protocol::address::PeerId {
+    parolnet_protocol::address::PeerId(hex::decode(&id.peer_id).unwrap().try_into().unwrap())
+}
+
+async fn get_peers(relay: &Relay, path: &str, authorization: Option<&str>) -> (u16, Vec<u8>) {
+    // The relay allows one address 10 presence / lookup requests a second
+    // (PNP-008-MUST-066); stay below it.
+    tokio::time::sleep(Duration::from_millis(125)).await;
+    let mut req = http_client().get(relay.http(path));
+    if let Some(a) = authorization {
+        req = req.header("Authorization", a);
+    }
+    let resp = req.send().await.unwrap();
+    let status = resp.status().as_u16();
+    (status, resp.bytes().await.unwrap().to_vec())
+}
+
+#[tokio::test]
+async fn a_signaling_only_relay_tells_no_http_caller_who_is_online() {
+    let relay = Relay::start(&[]).await;
+    let (_a, ida) = registered_peer(&relay).await;
+    let offline = Identity::new();
+
+    // Anonymous: the answer is 404 for an online peer and for one that is
+    // not, with the same (empty) body.
+    let (online_status, online_body) =
+        get_peers(&relay, &format!("/peers/lookup?id={}", ida.peer_id), None).await;
+    let (offline_status, offline_body) = get_peers(
+        &relay,
+        &format!("/peers/lookup?id={}", offline.peer_id),
+        None,
+    )
+    .await;
+    assert_eq!(online_status, 404);
+    assert_eq!(
+        (online_status, &online_body),
+        (offline_status, &offline_body)
+    );
+    assert_eq!(get_peers(&relay, "/peers/presence", None).await.0, 404);
+
+    // Signed by a registered peer, for this relay, now: still not served.
+    let now = unix_now();
+    let lookup = PeersRequest::Lookup(peer_id_of(&ida));
+    let auth = peers_authorization(&ida.key, lookup, &relay.name(), now);
+    let path = format!("/peers/lookup?id={}", ida.peer_id);
+    assert_eq!(get_peers(&relay, &path, Some(&auth)).await.0, 404);
+    let auth = peers_authorization(&ida.key, PeersRequest::Presence, &relay.name(), now);
+    assert_eq!(
+        get_peers(&relay, "/peers/presence", Some(&auth)).await.0,
+        404
+    );
+
+    // The other HTTP surfaces name no peer either.
+    let (status, body) = get_peers(&relay, "/bootstrap", None).await;
+    assert_eq!((status, body.as_slice()), (200, b"[]".as_slice()));
+    assert_eq!(get_peers(&relay, "/peers", None).await.0, 404);
+
+    // Over the registered socket the peer still learns what it needs: an
+    // offer to an offline peer is answered `peer_offline`.
+    let (mut b, _) = registered_peer(&relay).await;
+    send(
+        &mut b,
+        json!({"type": "rtc_offer", "to": offline.peer_id, "payload": "x"}),
+    )
+    .await;
+    let e = recv_type(&mut b, "error", 3000).await.unwrap();
+    assert_eq!(e["code"], "peer_offline");
+}
+
+#[tokio::test]
+async fn a_relay_profile_relay_answers_presence_and_lookup_only_to_signed_requests() {
+    let federation_key = ed25519_dalek::SigningKey::from_bytes(&[0x55; 32]);
+    let federation_pub = hex::encode(federation_key.verifying_key().to_bytes());
+    let relay = Relay::start(&[
+        ("SIGNALING_ONLY", "0"),
+        ("RELAY_PUBLIC_NAMES", "127.0.0.1:{port}"),
+        ("FEDERATION_PEER_KEYS", &federation_pub),
+    ])
+    .await;
+    let (_a, ida) = registered_peer(&relay).await;
+    let (_b, idb) = registered_peer(&relay).await;
+    let stranger = Identity::new();
+    let offline = Identity::new();
+    let now = unix_now();
+    let name = relay.name();
+    let lookup_path = |id: &Identity| format!("/peers/lookup?id={}", id.peer_id);
+    let lookup_of = |id: &Identity| PeersRequest::Lookup(peer_id_of(id));
+
+    // No credentials: refused the same way whether or not the peer is online.
+    let online = get_peers(&relay, &lookup_path(&idb), None).await;
+    let absent = get_peers(&relay, &lookup_path(&offline), None).await;
+    assert_eq!(online.0, 401);
+    assert_eq!(online, absent);
+    assert_eq!(get_peers(&relay, "/peers/presence", None).await.0, 401);
+
+    // A registered peer may look a peer up ...
+    let auth = peers_authorization(&ida.key, lookup_of(&idb), &name, now);
+    let (status, body) = get_peers(&relay, &lookup_path(&idb), Some(&auth)).await;
+    assert_eq!(status, 200);
+    assert!(!body.is_empty());
+    let auth = peers_authorization(&ida.key, lookup_of(&offline), &name, now);
+    assert_eq!(
+        get_peers(&relay, &lookup_path(&offline), Some(&auth))
+            .await
+            .0,
+        404
+    );
+    // ... but not list everyone.
+    let auth = peers_authorization(&ida.key, PeersRequest::Presence, &name, now);
+    assert_eq!(
+        get_peers(&relay, "/peers/presence", Some(&auth)).await.0,
+        403
+    );
+
+    // A key that is not registered here: a valid signature, and no answer,
+    // the same for an online and an offline target.
+    let auth = peers_authorization(&stranger.key, lookup_of(&idb), &name, now);
+    let online = get_peers(&relay, &lookup_path(&idb), Some(&auth)).await;
+    let auth = peers_authorization(&stranger.key, lookup_of(&offline), &name, now);
+    let absent = get_peers(&relay, &lookup_path(&offline), Some(&auth)).await;
+    assert_eq!(online.0, 403);
+    assert_eq!(online, absent);
+
+    // A registered peer's credentials do not stretch: another target, an old
+    // timestamp, another relay's name.
+    let for_b = peers_authorization(&ida.key, lookup_of(&idb), &name, now);
+    assert_eq!(
+        get_peers(&relay, &lookup_path(&offline), Some(&for_b))
+            .await
+            .0,
+        401
+    );
+    let stale = peers_authorization(&ida.key, lookup_of(&idb), &name, now - 3600);
+    assert_eq!(
+        get_peers(&relay, &lookup_path(&idb), Some(&stale)).await.0,
+        401
+    );
+    let elsewhere = peers_authorization(&ida.key, lookup_of(&idb), "relay-e.example:443", now);
+    assert_eq!(
+        get_peers(&relay, &lookup_path(&idb), Some(&elsewhere))
+            .await
+            .0,
+        401
+    );
+    assert_eq!(
+        get_peers(&relay, &lookup_path(&idb), Some("Bearer token"))
+            .await
+            .0,
+        401
+    );
+
+    // No other HTTP endpoint lists who is connected, in this profile either.
+    let (status, body) = get_peers(&relay, "/bootstrap?exclude=x", None).await;
+    assert_eq!((status, body.as_slice()), (200, b"[]".as_slice()));
+    assert_eq!(get_peers(&relay, "/peers", None).await.0, 404);
+
+    // The configured federation peer reads presence and may look up.
+    let auth = peers_authorization(&federation_key, PeersRequest::Presence, &name, now);
+    let (status, body) = get_peers(&relay, "/peers/presence", Some(&auth)).await;
+    assert_eq!(status, 200);
+    #[derive(serde::Deserialize)]
+    struct Entry {
+        peer_id: parolnet_protocol::address::PeerId,
+    }
+    let entries: Vec<Entry> = ciborium::from_reader(body.as_slice()).unwrap();
+    let listed: Vec<String> = entries.iter().map(|e| hex::encode(e.peer_id.0)).collect();
+    assert!(listed.contains(&ida.peer_id) && listed.contains(&idb.peer_id));
+    let auth = peers_authorization(&federation_key, lookup_of(&idb), &name, now);
+    assert_eq!(
+        get_peers(&relay, &lookup_path(&idb), Some(&auth)).await.0,
+        200
+    );
+
+    // A peer that has left is no longer allowed to ask.
+    drop(_a);
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    let auth = peers_authorization(&ida.key, lookup_of(&idb), &name, unix_now());
+    assert_eq!(
+        get_peers(&relay, &lookup_path(&idb), Some(&auth)).await.0,
+        403
+    );
 }
