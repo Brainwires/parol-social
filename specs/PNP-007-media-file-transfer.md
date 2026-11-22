@@ -28,6 +28,12 @@
 
 ---
 
+## Superseded Sections
+
+Sections 4 (Call Signaling Protocol), 5 (Audio Framing) and 6 (Video Framing), and what section 8 says about calls, are **superseded by PNP-011 (1:1 Calls)**. Calls as implemented do not carry media in relay cells with application-level SRTP keys: a call is a WebRTC connection between the two peers, keyed by DTLS-SRTP, whose session descriptions travel inside the end-to-end session. The clauses of the superseded sections stay registered (clause identifiers are never reused, `SPEC-INDEX.md`) and describe the earlier design; new implementations follow PNP-011.
+
+---
+
 ## Implementation Note
 
 This specification describes the media/file-transfer design target. Current code has core/WASM helpers for calls and file transfer, but the PWA UI does not yet send media or file traffic through production 3-hop onion circuits with MediaCall traffic shaping.
@@ -82,6 +88,8 @@ MEDIA_DATA cells use the same 512-byte fixed cell format as DATA cells (PNP-004 
 Relay nodes MUST forward MEDIA_DATA cells with the same processing as DATA cells (PNP-004 §5.5). **PNP-007-MUST-003** The cell type does NOT alter relay behavior except that relay-to-relay padding timers MUST NOT delay MEDIA_DATA cells. **PNP-007-MUST-004**
 
 ## 4. Call Signaling Protocol
+
+> **Superseded by PNP-011** for 1:1 calls (see "Superseded Sections" above). Kept for reference.
 
 ### 4.1 Call Identifiers
 
@@ -197,6 +205,8 @@ The callee follows a parallel state machine:
 
 ## 5. Audio Framing
 
+> **Superseded by PNP-011** for 1:1 calls (see "Superseded Sections" above). Kept for reference.
+
 ### 5.1 RTP Packetization
 
 Audio frames MUST be packetized per RFC 3550. **PNP-007-MUST-009** Each RTP packet carries exactly one codec frame. **PNP-007-MUST-010** The RTP header fields MUST be populated as follows:
@@ -253,6 +263,8 @@ Codec selection is negotiated via SDP in the Offer/Answer exchange (§4.2). The 
 4. This ensures a constant traffic rate regardless of mute state, preventing an observer from inferring call activity by monitoring traffic volume.
 
 ## 6. Video Framing
+
+> **Superseded by PNP-011** for 1:1 calls (see "Superseded Sections" above). Kept for reference.
 
 ### 6.1 RTP Packetization
 

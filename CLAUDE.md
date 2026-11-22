@@ -77,6 +77,9 @@ parolnet-wasm (depends on crypto + protocol + transfer, WASM target only)
 parolnet-transfer (PNP-010 file transfer, sans-I/O; no workspace deps, WASM-compatible: no tokio)
 
 parolnet-rtc (native only; drives the sans-I/O `rtc` engine; no workspace deps)
+  |
+  +---> parolnet-simnet (test-only; an in-memory network that runs parolnet-rtc in virtual
+          time, and the M1 call checks; + parolnet-media default features; `vpx` opt-in)
 parolnet-store (native only; encrypted persistence: SQLite + SQLCipher, key in the OS keychain; no workspace deps)
   |
   v
@@ -100,4 +103,4 @@ systems, a vendored OpenSSL libcrypto elsewhere). Security invariant 6 covers th
 
 ## Protocol Specifications
 
-The `specs/` directory contains formal RFC-style specifications (PNP-001 through PNP-010; PNP-010 is file transfer and supersedes PNP-007 §7; PNP-011 calls comes in M1 and supersedes the rest of PNP-007). These define the wire formats, state machines, and behavioral rules. Code implementations must match the specs. If the spec needs to change, update the spec document first, then update the code.
+The `specs/` directory contains formal RFC-style specifications (PNP-001 through PNP-011; PNP-010 is file transfer and supersedes PNP-007 §7; PNP-011 is 1:1 calls and supersedes PNP-007's call and media sections). These define the wire formats, state machines, and behavioral rules. Code implementations must match the specs. If the spec needs to change, update the spec document first, then update the code.

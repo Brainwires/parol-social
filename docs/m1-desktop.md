@@ -255,6 +255,97 @@ connection and the file flows on it as 64 KiB sealed records.
   and the genuine one arrives on a new channel; persistent corruption cancels).
 - **Bot**: `sendfile <peer> <path>`, `acceptfile`, `declinefile`, `cancelfile`, `--downloads`,
   `--accept-files`; a `transfer` line per state change, with the received file's SHA-256.
+## Connections that follow the network (PNP-011 sections 5.5 and 8)
+
+- **Candidates.** A connection binds one UDP socket per usable local address, IPv4 and IPv6,
+  and announces each as a host candidate (`parolnet_rtc::net::select_addresses`): no loopback
+  or link-local address unless the machine has nothing else; per interface and /64 one IPv6
+  address, the temporary one the system itself uses and never the hardware-derived one beside
+  it; the default route's addresses first, IPv6 before IPv4, at most six. Every socket asks
+  the STUN servers of its own family; the user's TURN allocation lives on the first socket
+  whose family the server has. `AppConfig::bind_ip` (the bot's `--bind`, the tests) pins one
+  address as before. Remote mDNS names are resolved as before.
+- **Noticing a change.** The core polls the interface list every 2 s and counts a new address
+  set once two polls agree (`parolnet_rtc::NetworkMonitor`). Polling, not the systems' push
+  notifications: the route socket (macOS, BSD), netlink (Linux) and `NotifyIpInterfaceChange`
+  (Windows) are three implementations to keep correct, the one crate that wraps two of them
+  (`if-addrs`, MIT OR BSD-3-Clause, used here for the interface list) has none for Apple
+  systems, and listing the interfaces is one system call. So a change is acted on 2 to 4 s
+  after it happened. `AppHandle::network_changed()` does the same on request.
+- **ICE restart before teardown.** On a change (and when a connection reports that it lost its
+  path) the relay client is asked at once whether its socket lives, and ICE is restarted in
+  place: on the data connection through a second `rtc_offer` / `rtc_answer`, on a call through
+  `reoffer` / `reanswer` inside the session. The driver binds the addresses the machine has
+  now, gathers again and offers new credentials; DTLS, SRTP and SCTP continue, on the old pair
+  until the restart selects a new one. The receiver applies a restart offer to the connection
+  it has only when the connection is verified and the offer carries the DTLS fingerprints its
+  channel binding covers; anything else is a new connection, as before. Crossing restarts are
+  settled by the designated initiator (data) and the caller (call).
+- **Fallback.** A restart that is not answered and connected within 15 s ends as before
+  restarts existed: the data connection is rebuilt (with backoff), a call ends when its ICE
+  fails. A restart offer made while the relay is away is sent when the relay is back.
+- **Only between peers that say so.** The data channel's identity frame lists `ice-restart`,
+  a call's `offer` / `answer` lists `renegotiate`. The web app and the PWA list neither (and
+  ignore both): with them nothing is restarted or renegotiated and everything works as it did
+  (`two_peers.rs`, with one side started with `AppConfig::renegotiation = false`; the browser
+  interop). The web engine's `networkChanged()` reconnects its relay socket and no more; for
+  it to restart ICE it has to list the feature and implement sections 7 and 8 of PNP-011.
+- **The path state stays honest.** A connection without a working pair shows "connecting"
+  from the moment ICE says so, and "direct" again when a pair is selected; a restart on a
+  path that still works changes nothing on screen.
+- **Not covered.** A relay-only connection whose TURN allocation was on the address that
+  went away is not restarted (the allocation cannot be moved): it is rebuilt. TURN over TCP /
+  TLS is still M4.
+
+## Renegotiation, adaptation, quality (PNP-011 sections 7, 9 and 10)
+
+- **Camera off and on, audio to video.** `AppHandle::set_call_video`: with a contact whose
+  app renegotiates, an audio call gains a video section (the contact's side receives until it
+  turns its own camera on the same way), and a camera that is turned off stops its stream.
+  With any other contact a video call keeps its stream and black is sent, as before, and an
+  audio call cannot gain video. The desktop's Camera button does this; an audio call shows it
+  when the contact's app can add video. A `reoffer` not answered in 10 s is taken back.
+- **Bitrate.** A call connection runs the engine's TWCC-driven congestion control (trendline
+  filter, AIMD; 300 kbit/s to start, 100 kbit/s to 2.5 Mbit/s). Its estimate reaches the call
+  session as `MediaEvent::TargetBitrate`; libvpx's rate is set to nine tenths of what the
+  estimate leaves after 80 kbit/s of audio (`parolnet_app::video_bitrate_for`), never above
+  the picture size's own rate. Video is repaired over RTX. Received audio is de-jittered in
+  the driver (`parolnet_rtc::jitter`): in order, at the sender's pace, held as long as packets
+  have recently been late (5 ms on a steady path, up to 400 ms).
+- **Quality.** `AppEvent::CallQuality` once a second (RTT, loss each way, bitrates, the
+  estimate, the selected pair's candidate types). The call panel shows one line, such as
+  "Weak connection: packets are being lost, low bandwidth (relayed)", while loss exceeds 5%,
+  the round trip 400 ms, or the estimate is under 200 kbit/s; nothing otherwise.
+
+## The simulated network (`parolnet-simnet`)
+
+A test-only crate: an in-memory internet whose hosts' uplinks lose, delay, jitter, reorder and
+cap what they send, from a seeded generator, with deliveries ordered by time and sequence. A
+host is a `parolnet_rtc::Network`, and the driver takes every instant from tokio's clock, so
+the same driver that runs on UDP sockets runs there on a paused runtime in virtual time:
+thirty seconds of call take about five seconds of CPU in a debug build and do not depend on
+the machine's load. What the engine randomizes (ICE credentials, certificates, SSRCs) still
+differs between runs, so a run is reproducible in its shape, not byte for byte. NAT is not
+modelled.
+
+`crates/parolnet-simnet/tests/m1.rs` puts two drivers in a call with `parolnet-media`'s
+synthetic sources (the tone through Opus into the desktop's playout buffer, popped on the
+clock as a sound card would; a rate-following video source through the engine's VP8
+packetizer, or with `--features vpx` the test pattern through libvpx and back) and checks:
+
+| Check | What is asserted |
+| --- | --- |
+| Call setup | connected in under 1 s over a 10 ms link with 50 ms signaling; first frame within 0.5 s; 30 frames a second; audio is the tone |
+| Renegotiation (2% loss) | an audio call gains video in under 2 s, the other side adds its own, one side turns its off: the other is told and receives none; audio unaffected |
+| ICE restart | one machine's address is replaced; the monitor reports it within 4 s; the restart connects on the new address within 2 s of being asked; video is back within 2 s; the connection never fails. The same move without a restart ends the call. A restart whose offer never arrives leaves the old path in use |
+| Estimate | open link: never down, 1 Mbit/s after about 16 s, the maximum after 28 s. 300 kbit/s cap: the median between 150 and 330 kbit/s, never over 450; under 6% of the datagrams dropped. A cap that appears is followed in under 4 s, one that goes is climbed out of |
+| 2% loss, 300 kbit/s cap, 100 ms jitter (three seeds each) | **video does not freeze**: never more than 2 s without a usable frame, at least 500 usable frames in 30 s, the video bitrate within the estimate's share. **Audio stays intelligible**: at least 92% of the played 20 ms windows are the tone that was sent at its level (most of their power at 440 Hz, level within 6 dB), no dropout over 0.4 s |
+
+Measured (seed 1, debug build): 2% loss: 899 of 901 frames usable, longest gap 0.23 s, audio
+98.4%; 300 kbit/s cap: 1196 of 1200 frames, gap 0.77 s, audio 95.6%, the estimate between
+about 115 and 395 kbit/s; 100 ms jitter: 894 of 900 frames, gap 0.13 s, audio 100%, the estimate
+at its floor (a delay-based estimator reads random jitter with reordering as congestion, so
+video runs at its minimum there: adapted, not frozen).
 
 ## Known gaps
 
@@ -270,24 +361,31 @@ connection and the file flows on it as 64 KiB sealed records.
   browser run goes through STUN or TURN (host candidates only).
 - Camera, microphone and speaker paths are unverified on real devices (the checklist above);
   the call panel's new controls are unverified on screen.
-- Adding or removing a track mid-call (an audio call that becomes a video call): camera off /
-  on keeps the video track and sends black. The engine at `v0.22.0+brainwires.5` has
-  `RTCRtpTransceiver::set_direction` with negotiation-needed and re-binds a sender after a
-  renegotiation; what is missing is on our side: `parolnet-rtc` exposes no renegotiation, the
-  call signals carry one offer and one answer, and the PWA does not renegotiate either.
+- Renegotiation and ICE restart exist between native clients only: the web app and the PWA
+  do not list the features, so with them a camera that is off sends black, an audio call
+  stays audio, and a network change is survived only by rebuilding. The desktop's Camera
+  button in an audio call, the upgrade's tiles and the weak-connection line are unverified on
+  screen (built without opening a window; their helpers are unit-tested).
+- Engine findings (reported to the fork; ParolNet carries no patch): with transport-wide
+  sequence numbers a NACK retransmission without RTX is refused by SRTP's index-reuse check
+  and still counted as sent, so the peer's feedback reports it lost (worked around by
+  negotiating RTX); the engine's other congestion controller and its pacer were tried and set
+  aside (its delay detector rarely fired on a capped link, and the pacer queued audio behind
+  video). Under 100 ms of random jitter the estimate sits at its floor.
+- The pacer is not used: a keyframe leaves as a burst. The audio's share of the estimate is
+  a constant (80 kbit/s), not measured.
 - The playout buffer is a fixed prebuffer, not an adaptive jitter buffer (no time stretching,
   no packet-loss concealment beyond Opus's own); Opus in-band FEC and DTX are not switched on.
-  Call stats in the UI.
+  In front of it the driver now de-jitters and reorders received audio (above).
 - A device chosen in the call panel is not remembered across restarts (the settings screen).
 - No macOS app bundle yet: the usage strings are embedded in the executable.
 - TURN: the user's own TURN server over UDP works (below). TURN over TCP and TLS on 443 (for
-  networks that block UDP) is M4; `turn:...?transport=tcp` and `turns:` are refused by name. No
-  ICE restart, so a connection made before the TURN settings changed is rebuilt, not migrated; a
-  contact in a call keeps its connections until the next reconnect. The engine's TURN client
+  networks that block UDP) is M4; `turn:...?transport=tcp` and `turns:` are refused by name. A
+  connection made before the TURN settings changed is still rebuilt, not migrated (a restart
+  keeps its allocation); a contact in a call keeps its connections until the next reconnect. The engine's TURN client
   keeps its own copy of the password in memory without wiping it. Every re-probe of an offline
   contact gathers candidates first (non-trickle), so with a TURN server set it allocates and
   releases on that server once per probe.
-- IPv6 host candidates and several sockets; ICE restart on network change (E9).
 - Storage (`parolnet-store`, see "Storage" below): no settings UI for "Delete all data on this
   device" (`parolnet_app::delete_all_data` exists) or for a store whose key is gone from the
   keychain (the start error says so); no key rotation; the keychain path has run on no real
@@ -300,5 +398,6 @@ connection and the file flows on it as 64 KiB sealed records.
 ## Next slice
 
 1. The manual media checklist on the three OSes; device choices in the settings screen; an
-   adaptive jitter buffer and Opus FEC / DTX; audio-to-video upgrade by renegotiation.
+   adaptive jitter buffer and Opus FEC / DTX; renegotiation and ICE restart in the web
+   engine (PNP-011 sections 7 and 8).
 2. Settings: "Delete all data on this device" over `parolnet-store`.

@@ -7,7 +7,7 @@
 //! - X3DH key agreement for decentralized session establishment
 //! - Double Ratchet for forward-secret message encryption
 //! - Identity key management (Ed25519 + X25519)
-//! - Key derivation (HKDF-SHA-256)
+//! - Key derivation (HKDF-SHA-256), and Argon2id for keys from a passphrase
 //! - Deniable authentication primitives
 //! - Secure memory wiping utilities
 //!

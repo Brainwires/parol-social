@@ -54,6 +54,8 @@ export interface Contact {
   readonly addedMs: number;
   readonly verified: Verification;
   readonly verifiedMs: number | null;
+  /** Web-only: restored from a backup, and no connection has passed its check since. */
+  readonly restoredMs?: number;
 }
 
 export interface ChatMessage {

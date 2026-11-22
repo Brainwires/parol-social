@@ -45,6 +45,13 @@ fn derive_tag(discovery_key: &[u8; 32], epoch_hour: u64) -> [u8; 8] {
     tag
 }
 
+/// Compare a received tag with a derived one in constant time: the tag is a
+/// truncated MAC under the discovery key.
+fn tag_matches(received: &[u8], expected: &[u8; 8]) -> bool {
+    use subtle::ConstantTimeEq;
+    received.ct_eq(expected).into()
+}
+
 /// Derive a 32-byte mask for XOR-obfuscating the PeerId.
 /// mask = HKDF-SHA256(discovery_key, epoch_hour_be_bytes, "peer-mask")
 fn derive_peer_mask(discovery_key: &[u8; 32], epoch_hour: u64) -> [u8; 32] {
@@ -132,9 +139,9 @@ impl PeerDiscovery for UdpDiscovery {
                     match result {
                         Ok((len, addr)) if len >= 42 => {
                             // Try current hour tag, then previous hour tag
-                            let matched_mask = if buf[..8] == tag {
+                            let matched_mask = if tag_matches(&buf[..8], &tag) {
                                 Some(mask)
-                            } else if buf[..8] == prev_tag {
+                            } else if tag_matches(&buf[..8], &prev_tag) {
                                 Some(prev_mask)
                             } else {
                                 None
@@ -185,7 +192,7 @@ impl PeerDiscovery for UdpDiscovery {
                             let prev_tag = derive_tag(&self.discovery_key, hour.wrapping_sub(1));
 
                             // Verify the tag matches current or previous hour
-                            if buf[..8] == tag || buf[..8] == prev_tag {
+                            if tag_matches(&buf[..8], &tag) | tag_matches(&buf[..8], &prev_tag) {
                                 let mask = derive_peer_mask(&self.discovery_key, hour);
                                 let masked_id = xor_peer_id(&self.our_peer_id.0, &mask);
 

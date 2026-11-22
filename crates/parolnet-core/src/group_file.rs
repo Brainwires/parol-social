@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::sync::Mutex;
+use subtle::ConstantTimeEq;
 
 use crate::CoreError;
 
@@ -200,7 +201,8 @@ impl GroupFileReceiver {
         hasher.update(&data);
         let computed: [u8; 32] = hasher.finalize().into();
 
-        if computed != self.expected_hash {
+        // PNP-009-MUST-069: constant time.
+        if !bool::from(computed.ct_eq(&self.expected_hash)) {
             return Err(CoreError::GroupError(
                 "SHA-256 integrity check failed".into(),
             ));

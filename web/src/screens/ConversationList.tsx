@@ -7,6 +7,7 @@ import { Line } from "../components/Line.tsx";
 import { Panel } from "../components/Panel.tsx";
 import { UpdateNotice } from "../components/UpdateNotice.tsx";
 import { t } from "../i18n/index.ts";
+import { backupHintDismissed, dismissBackupHint } from "../platform/backup-hint.ts";
 import { dismissInstall, install, installAvailable } from "../platform/install.ts";
 import { updateReady } from "../platform/service-worker.ts";
 import { hrefOf, navigate, type Route } from "../router.ts";
@@ -193,6 +194,29 @@ export function ConversationList({ current }: { current: Route }) {
           </section>
         )}
       </nav>
+      {contacts.length > 0 && store.lastBackupMs.value === null && !backupHintDismissed.value && (
+        // Once there is someone to lose: suggest a backup. It blocks nothing.
+        <footer className="list__footer" data-testid="backup-hint">
+          <p className="list__hint">{t("backup.hint")}</p>
+          <div className="list__hint-actions">
+            <a
+              className="btn btn--quiet"
+              href={hrefOf({ name: "settings" })}
+              data-testid="backup-hint-action"
+            >
+              {t("backup.hint.action")}
+            </a>
+            <button
+              type="button"
+              className="btn btn--quiet"
+              data-testid="backup-hint-later"
+              onClick={dismissBackupHint}
+            >
+              {t("install.later")}
+            </button>
+          </div>
+        </footer>
+      )}
       {installAvailable.value && contacts.length > 0 && (
         <footer className="list__footer" data-testid="install-hint">
           <p className="list__hint">{t("install.hint")}</p>

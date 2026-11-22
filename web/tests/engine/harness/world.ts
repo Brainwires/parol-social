@@ -11,6 +11,7 @@ import type {
   Logger,
   MediaDevices,
   Platform,
+  Storage,
   WasmApi,
 } from "../../../src/engine/platform.ts";
 import { MemoryStorage } from "../../../src/engine/storage.ts";
@@ -54,6 +55,8 @@ export const RELAY_URL = "ws://relay.test/ws";
 
 export interface DeviceOptions {
   storage?: MemoryStorage;
+  /** What the engine is given instead of `storage` (a `SealedStorage` over it, say). */
+  engineStorage?: Storage;
   config?: Partial<EngineConfig>;
   /** Give the device a microphone and camera. */
   media?: boolean;
@@ -165,7 +168,7 @@ export class World {
       : undefined;
     const platform: Platform = {
       wasm,
-      storage,
+      storage: options.engineStorage ?? storage,
       sockets: this.relay.factory,
       peerConnections: (config) => {
         const pc = this.rtc.factory(config);

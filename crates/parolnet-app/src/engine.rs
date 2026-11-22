@@ -15,27 +15,28 @@ use parolnet_protocol::PeerId;
 use parolnet_protocol::ProtocolCodec as _;
 use parolnet_protocol::channel_binding::{BindingError, ChannelBinding};
 use parolnet_protocol::codec::CborCodec;
-use parolnet_rtc::rtc::peer_connection::sdp::RTCSessionDescription;
+use parolnet_rtc::rtc::peer_connection::sdp::{RTCSdpType, RTCSessionDescription};
 use parolnet_rtc::rtc::peer_connection::state::RTCPeerConnectionState;
 use parolnet_rtc::rtc::peer_connection::transport::RTCIceCandidateInit;
 use parolnet_rtc::rtc::rtp_transceiver::rtp_sender::RtpCodecKind;
 use parolnet_rtc::{
-    IcePolicy, MediaConfig, MediaKind, RtcConfig, RtcError, RtcEvent, RtcHandle, TurnServer,
+    Gather, IcePolicy, MediaKind, NetworkMonitor, RtcConfig, RtcError, RtcEvent, RtcHandle,
+    SystemNetwork, TurnServer,
 };
 use rand::Rng as _;
 use tokio::sync::mpsc;
 use zeroize::Zeroize;
 
 use crate::call::{
-    CallEnd, CallInfo, CallMedia, CallSignal, CallState, FrameSink, MediaEvent, OutFrame,
-    new_call_id,
+    CallEnd, CallInfo, CallMedia, CallQuality, CallSignal, CallState, FrameSink, MediaEvent,
+    OfferDecision, OutFrame, ReofferDecision, VideoChange, local_features, new_call_id,
 };
 use crate::reconnect::ProbeSchedule;
 use crate::signaling::{self, SigEvent, SigHandle, Signer};
 use crate::store::{QueuedEnvelope, State, Store};
 use crate::wire::{
-    ClientFrame, DATA_CHANNEL_LABEL, DcFrame, SdpJson, ServerFrame, SignalKind, is_peer_id,
-    msg_type, should_initiate,
+    ClientFrame, DATA_CHANNEL_LABEL, DcFrame, RestartExpiry, RestartOffer, SdpJson, ServerFrame,
+    SignalKind, is_peer_id, msg_type, same_dtls_session, should_initiate,
 };
 use crate::{
     AppConfig, AppError, AppEvent, AppHandle, ChatMessage, Command, Contact, ContactView,
@@ -64,12 +65,14 @@ const PENDING_ICE_MAX: usize = 32;
 /// opens, or the connection is closed.
 const BINDING_TIMEOUT: Duration = Duration::from_secs(20);
 /// An unanswered call rings this long (as the PWA).
-const CALL_RING_TIMEOUT: Duration = Duration::from_secs(60);
+const CALL_RING_TIMEOUT: Duration = crate::call::RING_TIMEOUT;
 /// From accepting (or the answer) to media flowing.
-const CALL_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
-const CALL_PENDING_ICE_MAX: usize = 64;
+const CALL_CONNECT_TIMEOUT: Duration = crate::call::CONNECT_TIMEOUT;
+const CALL_PENDING_ICE_MAX: usize = crate::call::MAX_PENDING_CANDIDATES;
 /// Media events waiting for the client (RTP beyond this is dropped).
 const CALL_MEDIA_CAPACITY: usize = 2048;
+const RESTART_TIMEOUT: Duration = crate::wire::RESTART_TIMEOUT;
+const CALL_REOFFER_TIMEOUT: Duration = crate::call::REOFFER_TIMEOUT;
 
 pub(crate) enum Input {
     Command(Command),
@@ -87,6 +90,8 @@ pub(crate) enum Input {
     },
     Timer(Timer),
     Tick,
+    /// The machine's usable addresses changed (the interface watch).
+    NetworkChanged,
     CallRtcReady {
         call_id: String,
         result: Result<RtcHandle, StartFailure>,
@@ -150,6 +155,15 @@ pub(crate) enum Timer {
         peer: String,
         epoch: u64,
     },
+    RestartTimeout {
+        peer: String,
+        epoch: u64,
+        generation: u64,
+    },
+    CallReoffer {
+        call_id: String,
+        generation: u64,
+    },
     CallRing {
         call_id: String,
     },
@@ -208,6 +222,27 @@ struct Conn {
     binding_sent: bool,
     /// The peer's CHANNEL_BINDING verified (PNP-001 §10.5.1): only now is the path direct.
     verified: bool,
+    /// Our first description (the one the binding covers) went out; later ones belong to an
+    /// ICE restart.
+    described: bool,
+    /// The peer's identity frame listed `ice-restart`: a restart offer is applied to this
+    /// connection instead of replacing it.
+    peer_restarts: bool,
+    /// An ICE restart we asked for.
+    restart: Option<Restart>,
+    /// A restart's offer or answer made while the relay was away: sent when it is back.
+    unsent: Option<(SignalKind, String)>,
+    /// ICE restarts completed on this connection (ours and the peer's).
+    restarts_done: u32,
+    /// The peer's restart offer was applied and the connection has not come back yet.
+    peer_restarting: bool,
+}
+
+/// An ICE restart of a data connection that we started.
+struct Restart {
+    generation: u64,
+    /// The peer's answer was applied.
+    answered: bool,
 }
 
 impl Conn {
@@ -245,6 +280,15 @@ struct Call {
     /// The client's media end, until taken.
     media: Option<CallMedia>,
     media_tx: mpsc::Sender<MediaEvent>,
+    /// Our first description (the `offer` or `answer`) went out; later ones are `reoffer` /
+    /// `reanswer`.
+    described: bool,
+    /// The call is set up: the first offer and answer are applied on our side.
+    established: bool,
+    /// Our `reoffer` that is not answered yet.
+    reoffer: Option<u64>,
+    /// A `reoffer` / `reanswer` that could not be sent (no verified channel at that moment).
+    unsent: Option<CallSignal>,
 }
 
 struct PeerState {
@@ -302,6 +346,8 @@ struct Engine {
     pending_bootstrap: Option<PendingBootstrap>,
     pairing_until: Option<Instant>,
     stun: Vec<String>,
+    /// How connections bind: one address, or every interface.
+    gather: Gather,
     bind_ip: IpAddr,
     next_epoch: u64,
     offer_history: VecDeque<Instant>,
@@ -356,10 +402,11 @@ pub(crate) async fn start(
             .map_err(|e| AppError::Store(format!("sessions: {e}")))?;
     }
 
-    let bind_ip = cfg
-        .bind_ip
-        .or_else(|| parolnet_rtc::default_local_ip(false))
-        .unwrap_or(IpAddr::V4(Ipv4Addr::LOCALHOST));
+    // One pinned address, or every interface (the driver picks and orders the addresses).
+    let (gather, bind_ip) = match cfg.bind_ip {
+        Some(ip) => (Gather::Bound, ip),
+        None => (Gather::Interfaces, IpAddr::V4(Ipv4Addr::UNSPECIFIED)),
+    };
 
     let (input_tx, input_rx) = mpsc::unbounded_channel();
     let (events_tx, events_rx) = mpsc::unbounded_channel();
@@ -408,6 +455,23 @@ pub(crate) async fn start(
         });
     }
 
+    if gather == Gather::Interfaces {
+        // Watch the interfaces: a change restarts ICE instead of waiting for the old path
+        // to time out.
+        let input = input_tx.clone();
+        tokio::spawn(async move {
+            let mut monitor = NetworkMonitor::start(
+                Arc::new(SystemNetwork),
+                parolnet_rtc::net::DEFAULT_POLL_INTERVAL,
+            );
+            while monitor.changed().await.is_some() {
+                if input.send(Input::NetworkChanged).is_err() {
+                    break;
+                }
+            }
+        });
+    }
+
     let reconnect = cfg.reconnect.clone();
     let xfer = transfers::Transfers::new(&cfg);
     let handle = AppHandle {
@@ -431,6 +495,7 @@ pub(crate) async fn start(
         pending_bootstrap: None,
         pairing_until: None,
         stun,
+        gather,
         bind_ip,
         next_epoch: 0,
         offer_history: VecDeque::new(),
@@ -491,6 +556,7 @@ impl Engine {
                 Input::Rtc { peer, epoch, event } => self.on_rtc_event(&peer, epoch, event),
                 Input::Timer(t) => self.on_timer(t),
                 Input::Tick => self.on_tick(),
+                Input::NetworkChanged => self.on_network_changed(),
                 Input::CallRtcReady { call_id, result } => self.on_call_ready(&call_id, result),
                 Input::CallRtc { call_id, event } => self.on_call_rtc(&call_id, event),
                 Input::FileChannel {
@@ -684,6 +750,10 @@ impl Engine {
                 };
                 let _ = reply.send(r);
             }
+            Command::SetCallVideo(id, enabled, reply) => {
+                let _ = reply.send(self.set_call_video(&id, enabled));
+            }
+            Command::NetworkChanged => self.on_network_changed(),
             Command::TurnSettings(reply) => {
                 let _ = reply.send(self.state.turn.clone());
             }
@@ -723,6 +793,11 @@ impl Engine {
                         .map(|p| p.path)
                         .unwrap_or(PathState::Unknown),
                     queued: self.state.queued_for(&c.peer_id),
+                    ice_restarts: self
+                        .peers
+                        .get(&c.peer_id)
+                        .and_then(|p| p.conn.as_ref())
+                        .map_or(0, |conn| conn.restarts_done),
                 })
                 .collect(),
             pairing_open: self.pairing_open(),
@@ -748,6 +823,20 @@ impl Engine {
                 },
             ),
             None => (None, IcePolicy::All),
+        }
+    }
+
+    /// What every connection's configuration starts from: how it binds, STUN, and the
+    /// user's TURN server and policy.
+    fn rtc_base(&self) -> RtcConfig {
+        let (turn, ice_policy) = self.ice_setup();
+        RtcConfig {
+            bind: SocketAddr::new(self.bind_ip, 0),
+            gather: self.gather,
+            stun_servers: self.stun.clone(),
+            turn,
+            ice_policy,
+            ..Default::default()
         }
     }
 
@@ -1089,6 +1178,7 @@ impl Engine {
                 self.set_path(peer, PathState::Direct);
                 self.flush_queue(peer);
                 self.transfers_on_verified(peer);
+                self.flush_call_signals(peer);
             }
             Err(e) => {
                 tracing::warn!(peer = %crate::short_id(peer), %e, "channel binding refused");
@@ -1155,6 +1245,7 @@ impl Engine {
                 for p in waiting {
                     self.connect(&p, false);
                 }
+                self.flush_unsent_descriptions();
                 self.run_probes();
             }
             SigEvent::Disconnected { reason } => {
@@ -1283,6 +1374,43 @@ impl Engine {
                     tracing::debug!("malformed offer");
                     return;
                 };
+                // An offer for a connection we hold may be an ICE restart of it: the
+                // verified connection, with the certificate its binding covers. It is
+                // applied in place. When it crosses a restart of ours the designated
+                // initiator's stands: that side drops the other's offer, the other side
+                // drops its own and answers. Anything else is an offer for a new connection.
+                let designated = should_initiate(&self.me, from);
+                let renegotiation = self.cfg.renegotiation;
+                if let Some(conn) = self.peers.get_mut(from).and_then(|p| p.conn.as_mut()) {
+                    let decision = crate::wire::on_restart_offer(
+                        renegotiation,
+                        conn.is_verified(),
+                        same_dtls_session(conn.remote_sdp.as_deref(), &offer.sdp),
+                        conn.restart.is_some(),
+                        designated,
+                    );
+                    match decision {
+                        RestartOffer::NewConnection => {}
+                        RestartOffer::KeepOurs => {
+                            tracing::debug!(peer = %crate::short_id(from), "crossing ICE restarts; keeping ours");
+                            return;
+                        }
+                        RestartOffer::Apply | RestartOffer::Yield => {
+                            if decision == RestartOffer::Yield {
+                                conn.restart = None;
+                                conn.unsent = None;
+                            }
+                            tracing::info!(peer = %crate::short_id(from), "ICE restart offered by the contact");
+                            if let Some(h) = conn.handle.as_ref()
+                                && h.set_remote_description(offer).is_ok()
+                            {
+                                conn.peer_restarting = true;
+                            }
+                            self.mark_online(from);
+                            return;
+                        }
+                    }
+                }
                 if let Some(conn) = self.peers.get(from).and_then(|p| p.conn.as_ref()) {
                     if conn.initiator && !conn.remote_set && should_initiate(&self.me, from) {
                         // Glare: the designated initiator keeps its own offer.
@@ -1299,7 +1427,8 @@ impl Engine {
                 let Some(conn) = self.peers.get_mut(from).and_then(|p| p.conn.as_mut()) else {
                     return;
                 };
-                if !conn.initiator || conn.remote_set {
+                let restarting = conn.restart.as_ref().is_some_and(|r| !r.answered);
+                if !restarting && (!conn.initiator || conn.remote_set) {
                     return;
                 }
                 let Some(answer) = serde_json::from_str::<SdpJson>(payload)
@@ -1310,6 +1439,23 @@ impl Engine {
                     tracing::debug!("malformed answer");
                     return;
                 };
+                if restarting {
+                    // The answer to our ICE restart. It has to be the session we hold: an
+                    // answer with another certificate comes from a connection the contact
+                    // made anew, and ours is rebuilt to meet it.
+                    if !same_dtls_session(conn.remote_sdp.as_deref(), &answer.sdp) {
+                        tracing::info!(peer = %crate::short_id(from), "the restart was answered by another session; rebuilding");
+                        self.conn_failed(from, FailReason::Error);
+                        return;
+                    }
+                    if let Some(h) = conn.handle.as_ref()
+                        && h.set_remote_description(answer).is_ok()
+                        && let Some(restart) = conn.restart.as_mut()
+                    {
+                        restart.answered = true;
+                    }
+                    return;
+                }
                 let answer_sdp = answer.sdp.clone();
                 if let Some(h) = conn.handle.as_ref()
                     && h.set_remote_description(answer).is_ok()
@@ -1440,6 +1586,12 @@ impl Engine {
             remote_sdp: None,
             binding_sent: false,
             verified: false,
+            described: false,
+            peer_restarts: false,
+            restart: None,
+            unsent: None,
+            restarts_done: 0,
+            peer_restarting: false,
         });
         st.fallback_armed = false;
         // A background probe of a contact believed offline shows nothing until it is answered.
@@ -1447,17 +1599,14 @@ impl Engine {
         if !quiet && !matches!(st.path, PathState::NoDirectPath | PathState::BindingFailed) {
             self.set_path(peer, PathState::Connecting);
         }
-        let (turn, ice_policy) = self.ice_setup();
         let config = RtcConfig {
-            bind: SocketAddr::new(self.bind_ip, 0),
-            stun_servers: self.stun.clone(),
-            turn,
-            ice_policy,
             data_channel: initiator.then(|| DATA_CHANNEL_LABEL.to_owned()),
+            // When ICE restarts cross, the designated initiator's stands.
+            polite: !should_initiate(&self.me, peer),
             // No RTP here, and transfer records are 64 KiB each: a short queue, so that a
             // reader that falls behind holds the connection back instead of filling memory.
             event_capacity: 64,
-            ..Default::default()
+            ..self.rtc_base()
         };
         let input = self.input.clone();
         let peer_owned = peer.to_owned();
@@ -1546,29 +1695,42 @@ impl Engine {
 
     fn on_rtc_event(&mut self, peer: &str, epoch: u64, event: RtcEvent) {
         let me = self.me.clone();
+        let renegotiation = self.cfg.renegotiation;
         let Some(conn) = self.conn_mut(peer, epoch) else {
             return;
         };
         match event {
             RtcEvent::LocalDescription(desc) => {
-                conn.local_sdp = Some(desc.sdp.clone());
-                let initiator = conn.initiator;
+                // The first description is the one the channel binding covers; later ones
+                // (same certificate, new ICE credentials) belong to an ICE restart.
+                let first = !conn.described;
+                if first {
+                    conn.described = true;
+                    conn.local_sdp = Some(desc.sdp.clone());
+                }
+                let is_offer = desc.sdp_type == RTCSdpType::Offer;
                 let payload = serde_json::to_string(&SdpJson {
-                    sdp_type: if initiator { "offer" } else { "answer" }.to_owned(),
+                    sdp_type: if is_offer { "offer" } else { "answer" }.to_owned(),
                     sdp: desc.sdp.clone(),
                 })
                 .unwrap_or_default();
-                let kind = if initiator {
+                let kind = if is_offer {
                     SignalKind::Offer
                 } else {
                     SignalKind::Answer
                 };
-                if !self.signal(kind, peer, payload) {
-                    tracing::debug!(peer = %crate::short_id(peer), "relay down; description not sent");
-                    self.conn_failed(peer, FailReason::Error);
+                if !self.signal(kind, peer, payload.clone()) {
+                    if first {
+                        tracing::debug!(peer = %crate::short_id(peer), "relay down; description not sent");
+                        self.conn_failed(peer, FailReason::Error);
+                    } else if let Some(conn) = self.conn_mut(peer, epoch) {
+                        // The network change that asked for the restart usually took the
+                        // relay's socket with it: the description goes out when it is back.
+                        conn.unsent = Some((kind, payload));
+                    }
                     return;
                 }
-                if initiator {
+                if first && is_offer {
                     self.after(
                         ANSWER_TIMEOUT,
                         Timer::AnswerTimeout {
@@ -1580,14 +1742,40 @@ impl Engine {
             }
             RtcEvent::ConnectionState(state) => {
                 conn.last_state = Some(state);
+                let (verified, restarts) = (conn.is_verified(), conn.peer_restarts);
                 match state {
-                    RTCPeerConnectionState::Disconnected => self.after(
-                        DISCONNECT_GRACE,
-                        Timer::DisconnectGrace {
-                            peer: peer.to_owned(),
-                            epoch,
-                        },
-                    ),
+                    RTCPeerConnectionState::Disconnected => {
+                        // No path right now: say so, whatever happens next.
+                        if verified {
+                            self.set_path(peer, PathState::Connecting);
+                        }
+                        if verified && restarts {
+                            // Look for a new path before giving the connection up; the
+                            // restart's own deadline replaces the grace period.
+                            self.restart_conn(peer);
+                        } else {
+                            self.after(
+                                DISCONNECT_GRACE,
+                                Timer::DisconnectGrace {
+                                    peer: peer.to_owned(),
+                                    epoch,
+                                },
+                            );
+                        }
+                    }
+                    RTCPeerConnectionState::Connected => {
+                        if conn.restart.as_ref().is_some_and(|r| r.answered) {
+                            tracing::info!(peer = %crate::short_id(peer), "ICE restart complete");
+                            conn.restart = None;
+                            conn.restarts_done += 1;
+                        } else if std::mem::take(&mut conn.peer_restarting) {
+                            conn.restarts_done += 1;
+                        }
+                        if verified {
+                            self.set_path(peer, PathState::Direct);
+                            self.flush_call_signals(peer);
+                        }
+                    }
                     RTCPeerConnectionState::Failed => self.conn_failed(peer, FailReason::IceFailed),
                     RTCPeerConnectionState::Closed => self.conn_failed(peer, FailReason::Closed),
                     _ => {}
@@ -1600,7 +1788,7 @@ impl Engine {
                 }
                 conn.dc = Some(id);
                 if let Some(h) = conn.handle.as_ref() {
-                    let _ = h.send_text(id, DcFrame::identity(&me));
+                    let _ = h.send_text(id, DcFrame::identity(&me, renegotiation));
                 }
                 self.mark_online(peer);
                 tracing::info!(peer = %crate::short_id(peer), "data channel open; binding");
@@ -1635,7 +1823,89 @@ impl Engine {
             | RtcEvent::Rtp { .. }
             | RtcEvent::KeyframeRequested
             | RtcEvent::DataChannelClose { .. }
-            | RtcEvent::DataChannelBufferedLow { .. } => {}
+            | RtcEvent::DataChannelBufferedLow { .. }
+            | RtcEvent::RemoteMedia { .. }
+            | RtcEvent::LocalMedia { .. }
+            | RtcEvent::TargetBitrate { .. }
+            | RtcEvent::Quality(_)
+            | RtcEvent::RemoteOfferIgnored => {}
+        }
+    }
+
+    // ── Network changes ───────────────────────────────────────────
+
+    /// The machine's addresses changed. The relay is asked at once whether its socket still
+    /// lives; every verified connection whose contact takes an ICE restart gets one, and so
+    /// does a call. A contact whose app does not restart is left alone: its connection
+    /// either still works or fails and is rebuilt as before.
+    fn on_network_changed(&mut self) {
+        tracing::info!("the network changed");
+        self.sig.nudge();
+        let restartable: Vec<String> = self
+            .peers
+            .iter()
+            .filter(|(_, st)| {
+                st.conn
+                    .as_ref()
+                    .is_some_and(|c| c.is_verified() && c.peer_restarts)
+            })
+            .map(|(peer, _)| peer.clone())
+            .collect();
+        for peer in restartable {
+            self.restart_conn(&peer);
+        }
+        let calls: Vec<String> = self.calls.keys().cloned().collect();
+        for call_id in calls {
+            self.restart_call(&call_id);
+        }
+    }
+
+    /// Restart ICE on the contact's data connection (no-op while one is under way). The
+    /// session and the path it has are kept until the restart finds a new one; without an
+    /// answer and a connection in [`RESTART_TIMEOUT`] the connection is rebuilt.
+    fn restart_conn(&mut self, peer: &str) {
+        self.next_epoch += 1;
+        let generation = self.next_epoch;
+        let Some(conn) = self.peers.get_mut(peer).and_then(|p| p.conn.as_mut()) else {
+            return;
+        };
+        if conn.restart.is_some() || !conn.is_verified() || !conn.peer_restarts {
+            return;
+        }
+        let Some(h) = conn.handle.as_ref() else {
+            return;
+        };
+        if h.restart_ice().is_err() {
+            return;
+        }
+        tracing::info!(peer = %crate::short_id(peer), "restarting ICE");
+        conn.restart = Some(Restart {
+            generation,
+            answered: false,
+        });
+        let epoch = conn.epoch;
+        self.after(
+            RESTART_TIMEOUT,
+            Timer::RestartTimeout {
+                peer: peer.to_owned(),
+                epoch,
+                generation,
+            },
+        );
+    }
+
+    /// The relay is back: send the restart descriptions made while it was away.
+    fn flush_unsent_descriptions(&mut self) {
+        let unsent: Vec<(String, SignalKind, String)> = self
+            .peers
+            .iter_mut()
+            .filter_map(|(peer, st)| {
+                let (kind, payload) = st.conn.as_mut()?.unsent.take()?;
+                Some((peer.clone(), kind, payload))
+            })
+            .collect();
+        for (peer, kind, payload) in unsent {
+            self.signal(kind, &peer, payload);
         }
     }
 
@@ -1784,6 +2054,53 @@ impl Engine {
                     );
                 }
             }
+            Timer::RestartTimeout {
+                peer,
+                epoch,
+                generation,
+            } => {
+                let Some(conn) = self.conn_mut(&peer, epoch) else {
+                    return;
+                };
+                let Some(restart) = conn.restart.as_ref().filter(|r| r.generation == generation)
+                else {
+                    return;
+                };
+                let connected = conn.last_state == Some(RTCPeerConnectionState::Connected);
+                match crate::wire::on_restart_expiry(connected, restart.answered) {
+                    RestartExpiry::Done => conn.restart = None,
+                    RestartExpiry::TakeBack => {
+                        // The path works and the contact's app did not answer: the offer
+                        // is taken back and the connection goes on as it was.
+                        if let Some(h) = conn.handle.as_ref() {
+                            let _ = h.rollback();
+                        }
+                        conn.restart = None;
+                        conn.unsent = None;
+                    }
+                    RestartExpiry::Rebuild => {
+                        tracing::info!(peer = %crate::short_id(&peer), "the ICE restart found no path; rebuilding");
+                        self.conn_failed(&peer, FailReason::Timeout);
+                    }
+                }
+            }
+            Timer::CallReoffer {
+                call_id,
+                generation,
+            } => {
+                let Some(c) = self.calls.get_mut(&call_id) else {
+                    return;
+                };
+                if c.reoffer != Some(generation) {
+                    return;
+                }
+                tracing::info!(call = %call_id, "the call's reoffer was not answered; taking it back");
+                c.reoffer = None;
+                c.unsent = None;
+                if let Some(h) = c.handle.as_ref() {
+                    let _ = h.rollback();
+                }
+            }
             Timer::BindingTimeout { peer, epoch } => {
                 if self.conn_mut(&peer, epoch).is_some_and(|c| !c.verified) {
                     tracing::info!(peer = %crate::short_id(&peer), "no channel binding; closing");
@@ -1916,7 +2233,11 @@ impl Engine {
 
     fn on_data(&mut self, peer: &str, payload: &[u8]) {
         match DcFrame::parse(payload) {
-            DcFrame::Identity { peer_id } => {
+            DcFrame::Identity { peer_id, features } => {
+                let ours = self.cfg.renegotiation;
+                if let Some(conn) = self.peers.get_mut(peer).and_then(|p| p.conn.as_mut()) {
+                    conn.peer_restarts = crate::wire::restarts(ours, &features);
+                }
                 if !peer_id.eq_ignore_ascii_case(peer) {
                     tracing::warn!(
                         peer = %crate::short_id(peer),
@@ -2056,6 +2377,10 @@ impl Engine {
             } else {
                 CallState::Outgoing
             },
+            // As offered, until the descriptions say otherwise.
+            local_video: video,
+            remote_video: video,
+            renegotiable: false,
         };
         self.calls.insert(
             call_id.clone(),
@@ -2071,6 +2396,10 @@ impl Engine {
                     events: media_rx,
                 }),
                 media_tx,
+                described: false,
+                established: false,
+                reoffer: None,
+                unsent: None,
             },
         );
         self.after(CALL_RING_TIMEOUT, Timer::CallRing { call_id });
@@ -2216,22 +2545,11 @@ impl Engine {
             return;
         };
         let video = c.info.video;
+        // When `reoffer`s cross, the caller's stands and the callee yields (PNP-011).
+        let polite = c.info.incoming;
         let frames_rx = c.frames_rx.take();
         let media_tx = c.media_tx.clone();
-        let (turn, ice_policy) = self.ice_setup();
-        let config = RtcConfig {
-            bind: SocketAddr::new(self.bind_ip, 0),
-            stun_servers: self.stun.clone(),
-            turn,
-            ice_policy,
-            media: MediaConfig {
-                recv_opus: true,
-                send_opus: true,
-                recv_vp8: video,
-                send_vp8: video,
-            },
-            ..Default::default()
-        };
+        let config = crate::call::connection_config(video, polite, self.rtc_base());
         let input = self.input.clone();
         let id = call_id.to_owned();
         tracing::info!(call = %call_id, initiator, video, "starting the call connection");
@@ -2283,6 +2601,9 @@ impl Engine {
                     }
                     RtcEvent::KeyframeRequested => {
                         let _ = media_tx.try_send(MediaEvent::KeyframeRequested);
+                    }
+                    RtcEvent::TargetBitrate { bps } => {
+                        let _ = media_tx.try_send(MediaEvent::TargetBitrate { bps });
                     }
                     other => {
                         if input
@@ -2345,29 +2666,72 @@ impl Engine {
         let video = c.info.video;
         match event {
             RtcEvent::LocalDescription(desc) => {
-                let sig = if c.info.incoming {
-                    CallSignal::Answer {
+                let first = !c.described;
+                let incoming = c.info.incoming;
+                let is_offer = desc.sdp_type == RTCSdpType::Offer;
+                let sig = match (first, is_offer) {
+                    (true, false) => CallSignal::Answer {
                         call_id: call_id.to_owned(),
                         video,
                         sdp: desc.sdp.clone(),
-                    }
-                } else {
-                    CallSignal::Offer {
+                        features: local_features(self.cfg.renegotiation),
+                    },
+                    (true, true) => CallSignal::Offer {
                         call_id: call_id.to_owned(),
                         video,
                         sdp: desc.sdp.clone(),
-                    }
+                        features: local_features(self.cfg.renegotiation),
+                    },
+                    (false, true) => CallSignal::Reoffer {
+                        call_id: call_id.to_owned(),
+                        sdp: desc.sdp.clone(),
+                    },
+                    (false, false) => CallSignal::Reanswer {
+                        call_id: call_id.to_owned(),
+                        sdp: desc.sdp.clone(),
+                    },
                 };
-                if !self.send_call_signal(&peer, &sig) {
-                    self.end_call(
-                        call_id,
-                        CallEnd::Failed("no verified connection to the contact".into()),
+                self.next_epoch += 1;
+                let generation = self.next_epoch;
+                if let Some(c) = self.calls.get_mut(call_id) {
+                    c.described = true;
+                    if first && incoming {
+                        // Our answer is made: the call is set up on our side.
+                        c.established = true;
+                    }
+                    if !first && is_offer {
+                        c.reoffer = Some(generation);
+                    }
+                }
+                if !first && is_offer {
+                    self.after(
+                        CALL_REOFFER_TIMEOUT,
+                        Timer::CallReoffer {
+                            call_id: call_id.to_owned(),
+                            generation,
+                        },
                     );
+                }
+                if !self.send_call_signal(&peer, &sig) {
+                    if first {
+                        self.end_call(
+                            call_id,
+                            CallEnd::Failed("no verified connection to the contact".into()),
+                        );
+                    } else if let Some(c) = self.calls.get_mut(call_id) {
+                        // The data connection is being rebuilt: the signal goes out when
+                        // it is verified again.
+                        c.unsent = Some(sig);
+                    }
                 }
             }
             RtcEvent::ConnectionState(state) => match state {
                 RTCPeerConnectionState::Connected => {
                     self.set_call_state(call_id, CallState::Active);
+                }
+                RTCPeerConnectionState::Disconnected => {
+                    // The media path is gone: look for another before ICE gives up.
+                    self.restart_call(call_id);
                 }
                 RTCPeerConnectionState::Failed | RTCPeerConnectionState::Closed => {
                     self.signal_call_end(call_id, false);
@@ -2384,12 +2748,106 @@ impl Engine {
                     CallEnd::Failed(error.unwrap_or_else(|| "media connection closed".into())),
                 );
             }
+            RtcEvent::RemoteMedia {
+                kind: MediaKind::Video,
+                sending,
+            } => {
+                if let Some(c) = self.calls.get_mut(call_id) {
+                    let _ = c.media_tx.try_send(MediaEvent::RemoteVideo { sending });
+                    if c.info.remote_video != sending || (sending && !c.info.video) {
+                        c.info.remote_video = sending;
+                        c.info.video |= sending;
+                        self.emit_call(call_id);
+                    }
+                }
+            }
+            RtcEvent::LocalMedia {
+                kind: MediaKind::Video,
+                sending,
+            } => {
+                if let Some(c) = self.calls.get_mut(call_id) {
+                    let _ = c.media_tx.try_send(MediaEvent::LocalVideo { sending });
+                    if c.info.local_video != sending || (sending && !c.info.video) {
+                        c.info.local_video = sending;
+                        c.info.video |= sending;
+                        self.emit_call(call_id);
+                    }
+                }
+            }
+            RtcEvent::Quality(stats) => {
+                if c.info.state == CallState::Active {
+                    self.emit(AppEvent::CallQuality {
+                        call_id: call_id.to_owned(),
+                        quality: CallQuality::new(stats),
+                    });
+                }
+            }
             _ => {}
+        }
+    }
+
+    /// Restart ICE on a call's connection (the network changed, or its path is gone): only
+    /// with a contact whose app renegotiates, once the call is set up, and not while another
+    /// `reoffer` of ours is unanswered.
+    fn restart_call(&mut self, call_id: &str) {
+        let Some(c) = self.calls.get(call_id) else {
+            return;
+        };
+        if c.info.is_over() || !c.established || !c.info.renegotiable || c.reoffer.is_some() {
+            return;
+        }
+        if let Some(h) = c.handle.as_ref() {
+            tracing::info!(call = %call_id, "restarting the call's ICE");
+            let _ = h.restart_ice();
+        }
+    }
+
+    /// Turn our video on or off in a call that is set up.
+    fn set_call_video(&mut self, call_id: &str, enabled: bool) -> Result<VideoChange, AppError> {
+        let Some(c) = self.calls.get(call_id) else {
+            return Err(AppError::UnknownCall(call_id.to_owned()));
+        };
+        if c.info.is_over() || !c.established {
+            return Err(AppError::UnknownCall(call_id.to_owned()));
+        }
+        // With a contact whose app does not renegotiate the call stays as it was set up: a
+        // video call's stream stays (black is sent for a camera that is off), an audio call
+        // stays audio.
+        match crate::call::video_change(c.info.renegotiable, c.info.local_video, enabled) {
+            None => Err(AppError::CannotRenegotiate),
+            Some(VideoChange::Unchanged) => Ok(VideoChange::Unchanged),
+            Some(VideoChange::Renegotiating) => {
+                let Some(h) = c.handle.as_ref() else {
+                    return Err(AppError::UnknownCall(call_id.to_owned()));
+                };
+                h.set_sending(MediaKind::Video, enabled)
+                    .map_err(|_| AppError::UnknownCall(call_id.to_owned()))?;
+                Ok(VideoChange::Renegotiating)
+            }
+        }
+    }
+
+    /// The contact's data connection is verified (again): send the call signals that had
+    /// to wait for it.
+    fn flush_call_signals(&mut self, peer: &str) {
+        let waiting: Vec<(String, CallSignal)> = self
+            .calls
+            .iter_mut()
+            .filter(|(_, c)| c.info.peer_id == peer)
+            .filter_map(|(id, c)| Some((id.clone(), c.unsent.take()?)))
+            .collect();
+        for (call_id, sig) in waiting {
+            if !self.send_call_signal(peer, &sig)
+                && let Some(c) = self.calls.get_mut(&call_id)
+            {
+                c.unsent = Some(sig);
+            }
         }
     }
 
     fn on_call_signal(&mut self, peer: &str, sig: CallSignal) {
         let call_id = sig.call_id().to_owned();
+        let ours = self.cfg.renegotiation;
         if let Some(c) = self.calls.get(&call_id)
             && c.info.peer_id != peer
         {
@@ -2397,21 +2855,72 @@ impl Engine {
             return;
         }
         match sig {
-            CallSignal::Offer { video, sdp, .. } => {
-                if self.calls.contains_key(&call_id) {
-                    return; // a duplicate
-                }
-                if self.busy() {
-                    let _ = self.send_call_signal(peer, &CallSignal::Reject { call_id });
-                    return;
+            CallSignal::Offer {
+                video,
+                sdp,
+                features,
+                ..
+            } => {
+                match crate::call::on_offer(self.calls.contains_key(&call_id), self.busy()) {
+                    OfferDecision::Duplicate => return,
+                    OfferDecision::Busy => {
+                        let _ = self.send_call_signal(peer, &CallSignal::Reject { call_id });
+                        return;
+                    }
+                    OfferDecision::Ring => {}
                 }
                 self.new_call(call_id.clone(), peer, video, true);
                 if let Some(c) = self.calls.get_mut(&call_id) {
                     c.remote_offer = Some(sdp);
+                    c.info.renegotiable = crate::call::renegotiates(ours, &features);
                 }
                 self.emit_call(&call_id);
             }
-            CallSignal::Answer { sdp, .. } => {
+            CallSignal::Reoffer { sdp, .. } => {
+                let Some(c) = self.calls.get_mut(&call_id) else {
+                    return;
+                };
+                // Only for a call that is set up, and only when we said we take them. When
+                // it crosses a `reoffer` of ours the caller's stands: the caller drops the
+                // callee's, the callee drops its own and answers (what it wanted is offered
+                // again afterwards by the driver).
+                match crate::call::on_reoffer(
+                    ours,
+                    c.established,
+                    c.info.is_over(),
+                    c.reoffer.is_some(),
+                    c.info.incoming,
+                ) {
+                    ReofferDecision::Ignore => return,
+                    ReofferDecision::KeepOurs => {
+                        tracing::debug!(call = %call_id, "crossing reoffers; keeping ours");
+                        return;
+                    }
+                    ReofferDecision::Yield => {
+                        c.reoffer = None;
+                        c.unsent = None;
+                    }
+                    ReofferDecision::Answer => {}
+                }
+                if let (Some(h), Ok(desc)) = (c.handle.as_ref(), RTCSessionDescription::offer(sdp))
+                {
+                    let _ = h.set_remote_description(desc);
+                }
+            }
+            CallSignal::Reanswer { sdp, .. } => {
+                let Some(c) = self.calls.get_mut(&call_id) else {
+                    return;
+                };
+                if c.reoffer.is_none() || c.info.is_over() {
+                    return; // nobody waits for it
+                }
+                if let (Some(h), Ok(desc)) = (c.handle.as_ref(), RTCSessionDescription::answer(sdp))
+                    && h.set_remote_description(desc).is_ok()
+                {
+                    c.reoffer = None;
+                }
+            }
+            CallSignal::Answer { sdp, features, .. } => {
                 let Some(c) = self.calls.get_mut(&call_id) else {
                     return;
                 };
@@ -2428,6 +2937,8 @@ impl Engine {
                     return;
                 }
                 c.remote_set = true;
+                c.established = true;
+                c.info.renegotiable = crate::call::renegotiates(ours, &features);
                 if let Some(h) = c.handle.as_ref() {
                     for cand in c.pending_ice.drain(..) {
                         let _ = h.add_remote_candidate(cand);

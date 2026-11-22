@@ -360,6 +360,23 @@ export function Lab({ controls: store }: { controls: AppStore & FakeControls }) 
             Someone uses my code
           </Button>
         </div>
+        <div className="lab__choice">
+          <Button
+            testId="lab-phase-locked"
+            onClick={() => controls.setPhase({ kind: "locked", retryAtMs: 0 })}
+          >
+            Locked with a passphrase
+          </Button>
+          <Button
+            testId="lab-phase-first-run"
+            onClick={() => controls.setPhase({ kind: "first-run" })}
+          >
+            First run
+          </Button>
+          <Button testId="lab-phase-ready" onClick={() => controls.setPhase({ kind: "ready" })}>
+            Running
+          </Button>
+        </div>
       </section>
 
       <div className="lab__grid">

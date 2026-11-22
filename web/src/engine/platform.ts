@@ -74,6 +74,18 @@ export interface WasmApi {
   process_scanned_qr(payloadHex: string): ScannedCode;
   safety_number(peerAHex: string, peerBHex: string): string;
   version(): string;
+  /**
+   * Argon2id (RFC 9106): `len` bytes of key from a passphrase. Secret. Throws on parameters
+   * out of range. The passphrase lock and the backup file use it (./vault.ts).
+   */
+  argon2id(
+    passphrase: Uint8Array,
+    salt: Uint8Array,
+    memoryKiB: number,
+    passes: number,
+    lanes: number,
+    len: number,
+  ): Uint8Array;
   /** Clears the identity, sessions and pending bootstrap from wasm memory. */
   panic_wipe?(): void;
   /** Drops one peer's session (its keys are zeroized). Feature-detected: older cores lack it. */

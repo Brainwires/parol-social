@@ -89,6 +89,17 @@ once the directory is copied. Deleting all data removes the key first, then the 
 storage old blocks may persist until reused, but without the key they are noise. SQLCipher's
 cipher is a C library (CommonCrypto, or OpenSSL's libcrypto), outside the pure-Rust E2EE layer.
 
+The web app has no OS keychain to rely on (`docs/web-port/at-rest.md`). It seals every row of
+its IndexedDB database with AES-256-GCM under a WebCrypto key that script cannot export; the
+key is stored in the same browser profile. That stops what reads the database as data, and only
+partly stops an attacker who copies the whole profile (how well depends on the browser). The
+protection against a seized device in a browser is the optional passphrase: with it the profile
+holds no key, only one wrapped under Argon2id (64 MiB, 3 passes) of the passphrase, and the app
+asks for it at every start. Neither protects against script running in the app's origin (a
+compromised server serving a changed app): section 3.5 and the Content-Security-Policy are the
+defences there. A forgotten passphrase is not recoverable; an encrypted backup file
+(`docs/web-port/backup.md`) is the person's own safeguard against losing the device.
+
 ### 3.5 Malicious update channel and supply chain
 A compromised build host, release server, dependency or update feed. Releases and update manifests
 are signed with a key held offline; clients verify before installing; builds are reproducible;

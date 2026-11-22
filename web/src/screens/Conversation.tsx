@@ -354,6 +354,11 @@ export function Conversation({ peerId, showBack = true }: { peerId: string; show
         {blocker && callHint ? t(blocker, { name }) : ""}
       </p>
       {asksForName(contact) && <NamePrompt key={peerId} peerId={peerId} />}
+      {contact.restoredMs !== undefined && line !== "blocked" && (
+        <p className="conversation__verify" role="note" data-testid="restored-note">
+          {t("restored.note", { name })}
+        </p>
+      )}
       {contact.verified === "no" && (
         <div className="conversation__verify" data-testid="verify-prompt">
           <span>{t("verify.prompt")}</span>
@@ -400,7 +405,28 @@ export function Conversation({ peerId, showBack = true }: { peerId: string; show
           </Panel>
         </div>
       )}
-      {line === "blocked" && (
+      {line === "blocked" && contact.restoredMs !== undefined && (
+        // The contact came from a backup and the connection failed its check: the backup's
+        // session is older than the one their device has. Trying again cannot help.
+        <div className="conversation__panel">
+          <Panel
+            tone="red"
+            testId="panel-restored"
+            title={t("panel.restored.title", { name })}
+            actions={[
+              {
+                label: t("details.remove"),
+                testId: "panel-restored-remove",
+                primary: true,
+                onClick: () => setSheet("remove"),
+              },
+            ]}
+          >
+            {t("panel.restored.body", { name })}
+          </Panel>
+        </div>
+      )}
+      {line === "blocked" && contact.restoredMs === undefined && (
         <div className="conversation__panel">
           <Panel
             tone="red"
@@ -493,6 +519,7 @@ export function Conversation({ peerId, showBack = true }: { peerId: string; show
         >
           <p>{t("sheet.blocked.body1")}</p>
           <p>{t("sheet.blocked.body2")}</p>
+          <p>{t("sheet.blocked.body3")}</p>
         </Sheet>
       )}
     </div>

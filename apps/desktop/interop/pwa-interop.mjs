@@ -12,7 +12,7 @@
 //        behind it at the same origin. The cases and what they assert are the same; only how
 //        the browser side is driven differs (see `class Web`): actions go through the
 //        interface (first run, the add-a-contact screen, the composer, the call buttons), and
-//        state is read from the app's database and its `window.__parolnetTest` hooks, which
+//        state is read from its `window.__parolnetTest` hooks, which
 //        only the test build has. Where a case read old-PWA internals the web target has an
 //        equivalent, listed at `class Web`. In this file "the PWA" means the browser side
 //        under test, whichever it is.
@@ -57,7 +57,10 @@
 //
 // Cases (the same in every browser; none is skipped anywhere)
 //   1. PWA presents its code, the desktop enters it (bot `pair`): bootstrap over the data
-//      channel, messages both ways.
+//      channel, messages both ways. Then the desktop is told its network changed (bot
+//      `network-changed`): the browser side does not take ICE restarts (PNP-011 section 8.2:
+//      it lists no `ice-restart`), so the desktop must send none and leave the connection
+//      alone; messages both ways again.
 //   2. The desktop presents its code, the PWA pastes it ("Paste Code" tab): the paste path
 //      pairs like a camera scan, messages both ways.
 //   3. Sender queue: with case 2's pair, the PWA's browser closes; the bot's message waits in
@@ -67,7 +70,10 @@
 //      see (as if a relay had swapped the desktop's), and the desktop must refuse the channel.
 //   5. The desktop video-calls the PWA (the browser's fake camera and microphone); the PWA
 //      accepts; the desktop sends its test pattern (VP8) and a tone (Opus): RTP flows both
-//      ways and the browser decodes the desktop's video and audio; the desktop hangs up.
+//      ways and the browser decodes the desktop's video and audio. The browser side does not
+//      renegotiate (it lists no `renegotiate`, PNP-011 section 7.5): the desktop's "camera
+//      off" must leave the call as it was set up, and a network change must send no
+//      `reoffer`; media goes on both ways. The desktop hangs up.
 //   6. The PWA video-calls the desktop; the same checks; the PWA hangs up. The browser is then
 //      the ICE controlling side (it offers). Chromium, holding media permission, gathers on
 //      every interface and may move its nomination to another pair a moment after connecting;
@@ -684,7 +690,7 @@ class Pwa extends Client {
 }
 
 /// The web app in web/ (its test build). Actions go through the interface, as a person's
-/// would; state is read from the app's own database and from `window.__parolnetTest`
+/// would; state is read from `window.__parolnetTest`
 /// (docs/web-port/interop.md §11.4), which exposes nothing the interface does not show.
 ///
 /// Where the cases read old-PWA internals, this is what the web target checks instead:
@@ -754,37 +760,14 @@ class Web extends Client {
     await this.page.click('[data-testid="pairing-code-submit"]');
   }
 
-  async idbAll(store) {
-    return this.page.evaluate(
-      (store) =>
-        new Promise((res, rej) => {
-          const open = indexedDB.open("parolnet-web");
-          open.onerror = () => rej(open.error);
-          open.onsuccess = () => {
-            const db = open.result;
-            if (!db.objectStoreNames.contains(store)) {
-              db.close();
-              return res([]);
-            }
-            const req = db.transaction(store, "readonly").objectStore(store).getAll();
-            req.onsuccess = () => {
-              db.close();
-              res(req.result);
-            };
-            req.onerror = () => rej(req.error);
-          };
-        }),
-      store,
-    );
-  }
-
+  // The web app's database is sealed at rest (docs/web-port/at-rest.md), so nothing can be
+  // read from it here: what the app holds is asked of its test hooks.
   async hasContact(peerId) {
-    return (await this.idbAll("contacts")).some((c) => c.peerId === peerId);
+    return (await this.hook("contacts")).includes(peerId);
   }
 
   async waitReceived(from, text, ms = 30_000) {
     await until(`web ${this.name}: message ${JSON.stringify(text)}`, ms, async () =>
-      (await this.idbAll("messages")).some((m) => m.peerId === from && m.direction === "Received" && m.text === text) &&
       (await this.hook("messages", from)).some((m) => m.direction === "received" && m.text === text),
     );
   }
@@ -910,6 +893,16 @@ async function caseDesktopEntersPwaCode(ctx) {
   await bothVerified(bot, pwa, tag);
   log(`${tag}: paired, direct data channel, bindings verified`);
   await chatBothWays(bot, pwa, tag);
+  // The desktop's network "changes". With a peer that takes ICE restarts it would send a
+  // second rtc_offer; the browser side lists no such feature, would take that offer for a
+  // new connection, and must not get one: nothing happens to the path.
+  const mark = bot.events.length;
+  bot.send("network-changed");
+  await sleep(1500);
+  const moved = bot.events.slice(mark).filter((e) => e.event === "path" || e.event === "notice");
+  if (moved.length) throw new Error(`${tag}: the connection changed after a network change: ${JSON.stringify(moved)}`);
+  if (bot.stderr.some((l) => l.includes("restarting ICE"))) throw new Error(`${tag}: the desktop restarted ICE with a peer that does not take restarts`);
+  await chatBothWays(bot, pwa, `${tag}, after a network change`);
   await bot.quit();
   await closing(pwa, tag);
   await browser.close();
@@ -1031,6 +1024,20 @@ async function caseCalls(ctx) {
   const m6 = await botMedia(bot, out.call_id, 50, `${tag}: the desktop receives ${Browser}'s VP8 and Opus`);
   const s6 = await pwaDecodes(pwa, `${tag}: ${Browser} decodes the desktop's VP8 and Opus`);
   log(`${tag}: desktop got audio ${m6.audio_rx} / video ${m6.video_rx} packets; PWA decoded ${s6.videoFrames} frames, ${s6.audioSamples} audio samples`);
+  // The browser side does not renegotiate: the call is not renegotiable, "camera off" leaves
+  // the stream as it was set up, a network change sends no reoffer, and media goes on.
+  const active = bot.events.slice(mark).filter((e) => e.event === "call" && e.call_id === out.call_id && e.state === "Active").pop();
+  if (active.renegotiable !== false) throw new Error(`${tag}: the call with a browser must not be renegotiable: ${JSON.stringify(active)}`);
+  bot.send(`video off ${out.call_id}`);
+  const change = await bot.wait("the camera toggle's answer", (e) => e.event === "video-change" && e.call_id === out.call_id, 10_000, mark);
+  if (change.how !== "Unchanged") throw new Error(`${tag}: camera off renegotiated with a browser: ${JSON.stringify(change)}`);
+  bot.send("network-changed");
+  const more = await botMedia(bot, out.call_id, Math.max(m6.audio_rx, m6.video_rx) + 60, `${tag}: media goes on after camera off and a network change`);
+  if (bot.stderr.some((l) => l.includes("restarting the call's ICE"))) throw new Error(`${tag}: the desktop sent a reoffer to a peer that does not renegotiate`);
+  const estimate = bot.events.slice(mark).filter((e) => e.event === "bitrate" && e.call_id === out.call_id);
+  const quality = bot.events.slice(mark).filter((e) => e.event === "quality" && e.call_id === out.call_id).pop();
+  if (!estimate.length || !quality) throw new Error(`${tag}: no bitrate estimate or quality report from the call`);
+  log(`${tag}: not renegotiable; camera off left the stream; ${more.audio_rx} / ${more.video_rx} packets after a network change; estimate ${estimate[0].bps} -> ${estimate[estimate.length - 1].bps} bit/s; rtt ${quality.rtt_ms} ms, pair ${quality.local_candidate}/${quality.remote_candidate}`);
   bot.send(`hangup ${out.call_id}`);
   await bot.wait("ended", (e) => e.event === "call" && e.call_id === out.call_id && e.state === "Ended(HungUp)", 10_000, mark);
   await until(`${tag}: the PWA closes its call connection`, 15_000, async () => (await pwa.openCallPcs()) === 0);

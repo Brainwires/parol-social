@@ -15,13 +15,18 @@ import {
 import type { FileSource } from "../../src/engine/platform.ts";
 import {
   createEngineStore,
+  type DeviceVault,
   ENDED_CALL_MS,
   type EnginePort,
   type EngineStore,
+  type Locked,
   StartError,
   type StoreEnv,
+  type Unlocked,
 } from "../../src/state/engine-store.ts";
 import type { SaveOutcome } from "../../src/state/save-file.ts";
+import { BackupError } from "../../src/engine/backup.ts";
+import { VaultError } from "../../src/engine/vault.ts";
 
 const ALICE = "a1".repeat(32);
 const BOB = "b2".repeat(32);
@@ -265,9 +270,19 @@ interface Harness {
   takeoverFlag: boolean;
   /** Run the timers that are due, as a clock would. */
   runTimers(): Promise<void>;
+  /** What `prepare` gives once storage can be read. */
+  unlocked: Unlocked;
 }
 
-function harness(options: { hasIdentity?: boolean; prepare?: () => never } = {}): Harness {
+function harness(
+  options: {
+    hasIdentity?: boolean;
+    prepare?: () => never;
+    device?: DeviceVault;
+    /** Start locked: `unlock` gets what the person typed. */
+    locked?: Locked["locked"];
+  } = {},
+): Harness {
   const engine = new FakeEngine();
   let handOver = () => {};
   const h: Harness = {
@@ -290,14 +305,17 @@ function harness(options: { hasIdentity?: boolean; prepare?: () => never } = {})
       await new Promise((done) => setTimeout(done, 0));
     },
     store: undefined as unknown as EngineStore,
+    unlocked: {
+      hasIdentity: options.hasIdentity ?? true,
+      device: options.device,
+      start: () => (h.starts.shift() ?? (() => Promise.resolve(engine)))(),
+    },
   };
   const env: StoreEnv = {
     prepare() {
       options.prepare?.();
-      return Promise.resolve({
-        hasIdentity: options.hasIdentity ?? true,
-        start: () => (h.starts.shift() ?? (() => Promise.resolve(engine)))(),
-      });
+      if (options.locked) return Promise.resolve({ locked: options.locked });
+      return Promise.resolve(h.unlocked);
     },
     tabs: {
       askToTakeOver: () => void h.askedToTakeOver++,
@@ -787,4 +805,208 @@ Deno.test("store: saving hands the engine's blob, under the transfer's name, to 
   assertEquals(missing.code, "UnknownTransfer");
   const unknown = await assertRejects(() => h.store.saveTransfer("nope"), EngineError);
   assertEquals(unknown.code, "UnknownTransfer");
+});
+
+Deno.test("store: switching the camera off lets the self view go before the track is disabled", async () => {
+  const h = harness();
+  h.engine.view(ALICE, "Alice");
+  await h.store.start();
+  const local = { id: "local" } as unknown as MediaStream;
+  const remote = { id: "remote" } as unknown as MediaStream;
+  h.engine.callMedia = () => ({ local, remote });
+  h.engine.emit({ kind: "Call", call: call("Active") });
+  h.engine.emit({ kind: "CallMedia", callId: "ca11" });
+
+  // What had been allowed to play at the moment the engine was told.
+  const allowedWhenTold: Array<readonly unknown[] | undefined> = [];
+  const tell = h.engine.setCameraOff.bind(h.engine);
+  h.engine.setCameraOff = (callId, off) => {
+    allowedWhenTold.push(h.kept.at(-1));
+    tell(callId, off);
+  };
+  h.kept.length = 0;
+  h.store.setCameraOff(true);
+  // Off: only their video may play by the time the camera's track is switched off.
+  assertEquals(h.kept, [[remote]]);
+  assertEquals(allowedWhenTold, [[remote]]);
+  h.store.setCameraOff(false);
+  assertEquals(h.kept.at(-1), [local, remote]);
+  assertEquals(h.engine.calls.slice(-2), ["camera:true", "camera:false"]);
+});
+
+/** A scripted protected storage: one passphrase, a count of what was asked of it. */
+function fakeDevice(passphrase: string | null = null) {
+  const device = {
+    passphrase,
+    asked: [] as string[],
+    restored: null as Uint8Array | null,
+    lastMs: null as number | null,
+    hasPassphrase: () => device.passphrase !== null,
+    setPassphrase(next: string) {
+      if (next.length < 8) return Promise.reject(new VaultError("Weak", "short"));
+      device.passphrase = next;
+      return Promise.resolve();
+    },
+    changePassphrase(current: string, next: string) {
+      if (current !== device.passphrase) {
+        return Promise.reject(new VaultError("WrongPassphrase", "wrong"));
+      }
+      device.passphrase = next;
+      return Promise.resolve();
+    },
+    removePassphrase(current: string) {
+      if (current !== device.passphrase) {
+        return Promise.reject(new VaultError("WrongPassphrase", "wrong"));
+      }
+      device.passphrase = null;
+      return Promise.resolve();
+    },
+    backup(typed: string, options: { history: boolean; peerId: string }) {
+      device.asked.push(`backup:${typed}:${options.history}:${options.peerId.slice(0, 2)}`);
+      return Promise.resolve({ bytes: new Uint8Array([1, 2, 3]), madeMs: 777 });
+    },
+    restore(file: Uint8Array, typed: string) {
+      if (typed !== "of the backup") {
+        return Promise.reject(new BackupError("WrongPassphrase", "wrong"));
+      }
+      device.restored = file;
+      return Promise.resolve();
+    },
+    lastBackupMs: () => Promise.resolve(device.lastMs),
+  };
+  return device;
+}
+
+Deno.test("store: locked with a passphrase, nothing starts until it is typed", async () => {
+  let retryAt = 0;
+  let wiped = 0;
+  // deno-lint-ignore prefer-const
+  let h: Harness;
+  const device = fakeDevice("the right one");
+  let started = 0;
+  const door: Locked["locked"] = {
+    retryAtMs: () => Promise.resolve(retryAt),
+    unlock(passphrase) {
+      if (retryAt > 0) return Promise.reject(new VaultError("TooSoon", "wait", retryAt));
+      if (passphrase !== "the right one") {
+        retryAt = 5000;
+        return Promise.reject(new VaultError("WrongPassphrase", "wrong"));
+      }
+      return Promise.resolve(h.unlocked);
+    },
+    destroy: () => Promise.resolve(void wiped++),
+  };
+  h = harness({ locked: door, device });
+  h.starts.push(() => {
+    started++;
+    return Promise.resolve(h.engine);
+  });
+  await h.store.start();
+  assertEquals(h.store.phase.value, { kind: "locked", retryAtMs: 0 });
+  assertEquals(started, 0);
+  assertEquals(h.engines, []);
+
+  // A wrong passphrase: still locked, and the screen learns how long to wait.
+  const wrong = await assertRejects(() => h.store.unlock("a guess"), VaultError);
+  assertEquals(wrong.code, "WrongPassphrase");
+  assertEquals(h.store.phase.value, { kind: "locked", retryAtMs: 5000 });
+  assertEquals(
+    (await assertRejects(() => h.store.unlock("the right one"), VaultError)).code,
+    "TooSoon",
+  );
+  assertEquals(started, 0);
+
+  retryAt = 0;
+  await h.store.unlock("the right one");
+  assertEquals(h.store.phase.value.kind, "ready");
+  assertEquals(started, 1);
+  assertEquals(h.store.passphraseSet.value, true);
+
+  // "Lock now": the engine stops and the page starts over, at the passphrase.
+  h.store.lock();
+  await new Promise((done) => setTimeout(done, 0));
+  assertEquals(h.engine.stopped, true);
+  assertEquals(h.reloads, 1);
+  assertEquals(wiped, 0);
+});
+
+Deno.test("store: a forgotten passphrase leaves one way on: delete everything", async () => {
+  let wiped = 0;
+  const h = harness({
+    locked: {
+      retryAtMs: () => Promise.resolve(0),
+      unlock: () => Promise.reject(new VaultError("WrongPassphrase", "wrong")),
+      destroy: () => Promise.resolve(void wiped++),
+    },
+  });
+  await h.store.start();
+  await h.store.forget();
+  assertEquals([wiped, h.cleared, h.reloads], [1, 1, 1]);
+});
+
+Deno.test("store: setting, changing and removing the passphrase", async () => {
+  const device = fakeDevice();
+  const h = harness({ device });
+  await h.store.start();
+  assertEquals(h.store.passphraseSet.value, false);
+  // Without a passphrase there is nothing to lock.
+  h.store.lock();
+  await new Promise((done) => setTimeout(done, 0));
+  assertEquals(h.reloads, 0);
+
+  assertEquals(
+    (await assertRejects(() => h.store.setPassphrase("short"), VaultError)).code,
+    "Weak",
+  );
+  assertEquals(h.store.passphraseSet.value, false);
+  await h.store.setPassphrase("long enough");
+  assertEquals(h.store.passphraseSet.value, true);
+  await assertRejects(() => h.store.changePassphrase("not it", "another one"), VaultError);
+  await h.store.changePassphrase("long enough", "another one");
+  assertEquals(device.passphrase, "another one");
+  await assertRejects(() => h.store.removePassphrase("long enough"), VaultError);
+  assertEquals(h.store.passphraseSet.value, true);
+  await h.store.removePassphrase("another one");
+  assertEquals(h.store.passphraseSet.value, false);
+  // The engine ran through all of it.
+  assertEquals(h.engine.stopped, false);
+});
+
+Deno.test("store: a backup is made of this identity and its date is shown", async () => {
+  const device = fakeDevice();
+  device.lastMs = 123;
+  const h = harness({ device });
+  await h.store.start();
+  await new Promise((done) => setTimeout(done, 0));
+  assertEquals(h.store.lastBackupMs.value, 123);
+  const file = await h.store.makeBackup("for the file", { history: true });
+  assertEquals([...file.bytes], [1, 2, 3]);
+  assertEquals(device.asked, ["backup:for the file:true:ee"]);
+  assertEquals(h.store.lastBackupMs.value, 777);
+});
+
+Deno.test("store: restoring replaces what is here and starts over; a wrong passphrase changes nothing", async () => {
+  const device = fakeDevice();
+  const h = harness({ device });
+  await h.store.start();
+  const file = new Uint8Array([9, 9]);
+  const wrong = await assertRejects(() => h.store.restore(file, "a guess"), BackupError);
+  assertEquals(wrong.code, "WrongPassphrase");
+  assertEquals([device.restored, h.reloads, h.store.phase.value.kind], [null, 0, "ready"]);
+  await h.store.restore(file, "of the backup");
+  assertEquals(device.restored, file);
+  assertEquals(h.reloads, 1);
+  // The engine that ran on the old rows is let go of.
+  assertEquals(h.engines.at(-1), null);
+});
+
+Deno.test("store: a backup can be restored on first run, before any identity is made", async () => {
+  const device = fakeDevice();
+  const h = harness({ device, hasIdentity: false });
+  let started = 0;
+  h.starts.push(() => Promise.resolve((started++, h.engine)));
+  await h.store.start();
+  assertEquals(h.store.phase.value.kind, "first-run");
+  await h.store.restore(new Uint8Array([1]), "of the backup");
+  assertEquals([started, h.reloads], [0, 1]);
 });

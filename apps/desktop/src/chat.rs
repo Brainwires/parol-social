@@ -141,6 +141,12 @@ pub fn call_status_text(call: &CallInfo, name: &str) -> String {
     }
 }
 
+/// Whether the call panel has a camera button: a call with video has one, and an audio call
+/// has one when the contact's app can add video to it.
+pub fn camera_button(session_has_video: bool, call: &CallInfo) -> bool {
+    session_has_video || call.video || (call.renegotiable && call.state == CallState::Active)
+}
+
 /// (microphone muted, camera off) of a running call.
 fn muted_or_off(session: &CallSession) -> (bool, bool) {
     (
@@ -261,6 +267,8 @@ enum Pane {
 /// The call the window shows (one at a time).
 struct UiCall {
     info: CallInfo,
+    /// One line of words while the connection is weak.
+    quality: Option<String>,
     session: Option<CallSession>,
     video: Option<Entity<VideoView>>,
     /// What we send (video calls).
@@ -467,7 +475,15 @@ impl ChatView {
                     row.path = state;
                 }
             }
-            AppEvent::Call(info) => self.on_call(info),
+            AppEvent::Call(info) => {
+                self.on_call(info);
+                self.sync_call_video(cx);
+            }
+            AppEvent::CallQuality { call_id, quality } => {
+                if let Some(call) = self.call.as_mut().filter(|c| c.info.call_id == call_id) {
+                    call.quality = quality.summary();
+                }
+            }
             AppEvent::Message(m) => {
                 let list = self.messages.entry(m.peer_id.clone()).or_default();
                 if !list.iter().any(|x| x.id == m.id) {
@@ -678,6 +694,7 @@ impl ChatView {
                 }
                 self.call = Some(UiCall {
                     info,
+                    quality: None,
                     session: None,
                     video: None,
                     self_view: None,
@@ -685,6 +702,69 @@ impl ChatView {
                 });
             }
         }
+    }
+
+    /// The call gained video after its media started (the contact turned a camera on, or we
+    /// did): give it its tiles.
+    fn sync_call_video(&mut self, cx: &mut Context<Self>) {
+        let Some(call) = self.call.as_mut() else {
+            return;
+        };
+        let Some(session) = call.session.as_mut() else {
+            return;
+        };
+        if !call.info.video || call.video.is_some() {
+            return;
+        }
+        session.mark_video();
+        session.set_renegotiated(call.info.renegotiable);
+        // Our own camera stays off until the user turns it on.
+        if !session.sends_video() {
+            session.set_camera_enabled(false);
+        }
+        let (slot, stats) = (session.slot.clone(), session.stats.video.clone());
+        call.video = Some(cx.new(|cx| VideoView::new(slot, stats, None, cx)));
+        let self_slot = session.self_slot.clone();
+        call.self_view = Some(cx.new(|cx| VideoView::preview(self_slot, cx)));
+    }
+
+    /// The camera button: turn our video on or off. With a contact whose app renegotiates
+    /// the stream is started or stopped (an audio call gains video this way); with any
+    /// other the stream stays and black is sent while the camera is off.
+    fn toggle_camera(&mut self, cx: &mut Context<Self>) {
+        let Some(call) = self.call.as_mut() else {
+            return;
+        };
+        let Some(session) = call.session.as_mut() else {
+            return;
+        };
+        let turn_on = !(session.sends_video() && session.camera_enabled());
+        let (app, call_id) = (self.app.clone(), call.info.call_id.clone());
+        cx.spawn(async move |this, cx| {
+            let result = app.set_call_video(&call_id, turn_on).await;
+            let _ = this.update(cx, |view, cx| {
+                let Some(call) = view.call.as_mut().filter(|c| c.info.call_id == call_id) else {
+                    return;
+                };
+                let Some(session) = call.session.as_mut() else {
+                    return;
+                };
+                match result {
+                    Ok(change) => {
+                        session
+                            .set_renegotiated(change == parolnet_app::VideoChange::Renegotiating);
+                        if turn_on {
+                            session.start_video();
+                        }
+                        session.set_camera_enabled(turn_on);
+                    }
+                    Err(e) => view.notice = Some(format!("The camera stays off: {e}.")),
+                }
+                view.sync_call_video(cx);
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     /// Start the call's media and its video tile.
@@ -698,6 +778,7 @@ impl ChatView {
             self.call_media.clone(),
             &self.runtime,
         );
+        session.set_renegotiated(call.info.renegotiable);
         if call.info.video {
             let (slot, stats) = (session.slot.clone(), session.stats.video.clone());
             call.video = Some(cx.new(|cx| VideoView::new(slot, stats, None, cx)));
@@ -925,15 +1006,19 @@ impl ChatView {
                         cx.notify();
                     })),
             );
-            if let Some(session) = call.session.as_ref().filter(|s| s.has_video()) {
-                let on = session.camera_enabled();
+            // A video call has the button; an audio call has it when the contact's app can
+            // add video to a call that is under way.
+            if let Some(session) = call
+                .session
+                .as_ref()
+                .filter(|s| camera_button(s.has_video(), &call.info))
+            {
+                let on = session.sends_video() && session.camera_enabled();
                 controls = controls.child(
                     Button::new("camera")
                         .label(if on { "Camera off" } else { "Camera on" })
                         .on_click(cx.listener(|this, _, _, cx| {
-                            if let Some(s) = this.call.as_ref().and_then(|c| c.session.as_ref()) {
-                                s.set_camera_enabled(!s.camera_enabled());
-                            }
+                            this.toggle_camera(cx);
                             cx.notify();
                         })),
                 );
@@ -985,6 +1070,19 @@ impl ChatView {
                     .text_xs()
                     .text_color(rgb(0x8b949e))
                     .child(media_status_text(&session.status(), muted_or_off(session))),
+            );
+        }
+        // One line while the connection is weak, nothing while it is fine.
+        if let Some(weak) = call
+            .quality
+            .as_ref()
+            .filter(|_| call.info.state == CallState::Active)
+        {
+            panel = panel.child(
+                div()
+                    .text_xs()
+                    .text_color(rgb(0xd29922))
+                    .child(weak.clone()),
             );
         }
         if call.show_devices && call.session.is_some() {
@@ -1742,7 +1840,11 @@ mod tests {
             video: true,
             incoming: true,
             state: CallState::Incoming,
+            local_video: true,
+            remote_video: true,
+            renegotiable: false,
         };
+        assert!(camera_button(false, &c), "a video call has the button");
         assert_eq!(
             call_status_text(&c, "Pat"),
             "Pat is calling you (video call)"
@@ -1752,6 +1854,15 @@ mod tests {
         c.video = false;
         c.state = CallState::Outgoing;
         assert_eq!(call_status_text(&c, "Pat"), "Calling Pat (call)…");
+        // An audio call: no camera button with a contact that cannot add video, one with a
+        // contact that can once the call is active, and always once the session has video.
+        c.state = CallState::Active;
+        assert!(!camera_button(false, &c));
+        c.renegotiable = true;
+        assert!(camera_button(false, &c));
+        c.state = CallState::Connecting;
+        assert!(!camera_button(false, &c));
+        assert!(camera_button(true, &c));
         assert_eq!(
             call_end_text(&CallEnd::RemoteHungUp, "Pat"),
             "Pat ended the call."

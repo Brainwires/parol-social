@@ -7,6 +7,7 @@ import { t } from "../i18n/index.ts";
 import { wasmStatus } from "../platform/wasm.ts";
 import { navigate } from "../router.ts";
 import { useStore } from "../state/context.ts";
+import { ForgetSheet, RestoreSheet, UnlockForm } from "./Protection.tsx";
 
 /** Reserved height, so nothing moves when encryption is ready. */
 export function Loading() {
@@ -29,6 +30,7 @@ export function Loading() {
 export function FirstRun() {
   const store = useStore();
   const [starting, setStarting] = useState(false);
+  const [restoring, setRestoring] = useState(false);
   const heading = useRef<HTMLHeadingElement>(null);
   useEffect(() => {
     heading.current?.focus();
@@ -51,6 +53,26 @@ export function FirstRun() {
       <Button variant="primary" testId="first-run-start" disabled={starting} onClick={start}>
         {t("firstRun.start")}
       </Button>
+      <Button testId="first-run-restore" onClick={() => setRestoring(true)}>
+        {t("firstRun.restore")}
+      </Button>
+      {restoring && <RestoreSheet replaces={false} onClose={() => setRestoring(false)} />}
+      <UpdateNotice />
+    </main>
+  );
+}
+
+/** What is on this device is locked with a passphrase: ask for it. */
+export function Locked({ retryAtMs }: { retryAtMs: number }) {
+  const [forgetting, setForgetting] = useState(false);
+  return (
+    <main className="start" data-testid="locked">
+      <h1 className="start__title">{t("unlock.title")}</h1>
+      <UnlockForm retryAtMs={retryAtMs} />
+      <Button testId="unlock-forgot" onClick={() => setForgetting(true)}>
+        {t("unlock.forgot")}
+      </Button>
+      {forgetting && <ForgetSheet onClose={() => setForgetting(false)} />}
       <UpdateNotice />
     </main>
   );

@@ -72,6 +72,33 @@ impl Group {
     pub fn is_member(&self, peer_id: &PeerId) -> bool {
         self.metadata.members.iter().any(|m| m.peer_id == *peer_id)
     }
+
+    /// PNP-009-MUST-019: refuse a change that would take the group's last admin away.
+    fn ensure_not_last_admin(&self, peer_id: &PeerId) -> Result<(), CoreError> {
+        let admins = self
+            .metadata
+            .members
+            .iter()
+            .filter(|m| m.role == GroupRole::Admin)
+            .count();
+        if admins == 1 && self.is_admin(peer_id) {
+            return Err(CoreError::GroupError(
+                "a group must keep at least one admin".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn set_role(&mut self, peer_id: &PeerId, role: GroupRole) -> Result<(), CoreError> {
+        let member = self
+            .metadata
+            .members
+            .iter_mut()
+            .find(|m| m.peer_id == *peer_id)
+            .ok_or_else(|| CoreError::GroupError("target is not a member".into()))?;
+        member.role = role;
+        Ok(())
+    }
 }
 
 /// Manages all groups the local user is a member of.
@@ -245,8 +272,9 @@ impl GroupManager {
 
     /// Add a member to the group (admin only).
     ///
-    /// Returns an unsigned `GroupOperation` whose signature must be filled
-    /// by the caller who holds the signing key.
+    /// Returns an unsigned `GroupOperation`: the caller, who holds the admin's
+    /// identity key, signs it with [`GroupOperation::sign`] before it goes to
+    /// anyone (PNP-009-MUST-020).
     pub fn add_member(
         &self,
         group_id: &GroupId,
@@ -292,8 +320,9 @@ impl GroupManager {
     /// Remove a member from the group (admin only).
     ///
     /// After removal, our sender key is rotated so the removed member cannot
-    /// decrypt new messages. Returns the operation and our new sender key
-    /// distribution.
+    /// decrypt new messages. Returns the operation, unsigned (the caller signs
+    /// it with [`GroupOperation::sign`], PNP-009-MUST-020), and our new sender
+    /// key distribution. The group's last admin cannot be removed (MUST-019).
     pub fn remove_member(
         &self,
         group_id: &GroupId,
@@ -308,12 +337,13 @@ impl GroupManager {
             return Err(CoreError::NotGroupAdmin);
         }
 
-        // Remove from member list
-        let before_len = group.metadata.members.len();
-        group.metadata.members.retain(|m| m.peer_id != *target);
-        if group.metadata.members.len() == before_len {
+        if !group.is_member(target) {
             return Err(CoreError::GroupError("target is not a member".into()));
         }
+        group.ensure_not_last_admin(target)?;
+
+        // Remove from member list
+        group.metadata.members.retain(|m| m.peer_id != *target);
 
         // Remove their sender key
         group.member_sender_keys.remove(target);
@@ -337,6 +367,97 @@ impl GroupManager {
         };
 
         Ok((op, dist))
+    }
+
+    /// Apply a `GroupOperation` received from another member (PNP-009 §6.3, §6.4).
+    ///
+    /// `admin_public_key` is the Ed25519 identity key the caller knows for
+    /// `op.admin_peer_id` (from its contacts). The operation is applied only if:
+    ///
+    /// - we are in the group (MUST-025);
+    /// - its `version` is above the highest this group has seen (MUST-024);
+    /// - `admin_peer_id` is a current admin of the group (MUST-021);
+    /// - the signature verifies under that admin's key (MUST-022, MUST-071);
+    /// - the group keeps an admin afterwards (MUST-019).
+    ///
+    /// Anything else is an error and changes nothing (MUST-023).
+    ///
+    /// Returns `Some(distribution)` when the operation made us rotate our
+    /// sender key (a member was removed, MUST-026, or an admin asked for a
+    /// rotation): the caller sends it to every remaining member. When the
+    /// removed member is us, the group's state is dropped and `None` returned.
+    pub fn apply_operation(
+        &self,
+        op: &GroupOperation,
+        admin_public_key: &[u8; 32],
+        now_secs: u64,
+    ) -> Result<Option<SenderKeyDistribution>, CoreError> {
+        let mut groups = self.groups.lock().unwrap_or_else(|e| e.into_inner());
+        let group = groups
+            .get_mut(&op.group_id)
+            .ok_or(CoreError::GroupNotFound)?;
+
+        if op.version <= group.metadata.version {
+            return Err(CoreError::GroupError(
+                "stale group operation version".into(),
+            ));
+        }
+        if !group.is_admin(&op.admin_peer_id) {
+            return Err(CoreError::NotGroupAdmin);
+        }
+        op.verify_signature(admin_public_key)
+            .map_err(CoreError::Crypto)?;
+
+        let mut rotated = false;
+        match &op.op {
+            GroupOpType::AddMember { peer_id } => {
+                if group.is_member(peer_id) {
+                    return Err(CoreError::GroupError("peer is already a member".into()));
+                }
+                if group.metadata.members.len() >= usize::from(group.metadata.max_members) {
+                    return Err(CoreError::GroupFull);
+                }
+                group.metadata.members.push(GroupMember {
+                    peer_id: *peer_id,
+                    role: GroupRole::Member,
+                    joined_at: now_secs,
+                });
+            }
+            GroupOpType::RemoveMember { peer_id } => {
+                if !group.is_member(peer_id) {
+                    return Err(CoreError::GroupError("target is not a member".into()));
+                }
+                group.ensure_not_last_admin(peer_id)?;
+                if *peer_id == group.our_peer_id {
+                    groups.remove(&op.group_id);
+                    return Ok(None);
+                }
+                group.metadata.members.retain(|m| m.peer_id != *peer_id);
+                group.member_sender_keys.remove(peer_id);
+                group.rotate_sender_key(now_secs);
+                rotated = true;
+            }
+            GroupOpType::PromoteAdmin { peer_id } => group.set_role(peer_id, GroupRole::Admin)?,
+            GroupOpType::DemoteAdmin { peer_id } => {
+                if !group.is_member(peer_id) {
+                    return Err(CoreError::GroupError("target is not a member".into()));
+                }
+                group.ensure_not_last_admin(peer_id)?;
+                group.set_role(peer_id, GroupRole::Member)?;
+            }
+            GroupOpType::UpdateName { name } => group.metadata.name = name.clone(),
+            GroupOpType::RotateKeys => {
+                group.rotate_sender_key(now_secs);
+                rotated = true;
+            }
+        }
+        group.metadata.version = op.version;
+
+        Ok(rotated.then(|| {
+            group
+                .our_sender_key
+                .create_distribution(group.our_peer_id.0)
+        }))
     }
 
     /// List all members of a group.
@@ -586,5 +707,23 @@ mod tests {
         assert_eq!(mgr.group_count(), 2);
         mgr.wipe_all();
         assert_eq!(mgr.group_count(), 0);
+    }
+
+    /// PNP-009-MUST-019: a group keeps at least one admin.
+    #[test]
+    fn test_last_admin_cannot_be_removed() {
+        let mgr = GroupManager::new();
+        let alice = make_peer_id(0x01);
+        let bob = make_peer_id(0x02);
+        let (group_id, _) = mgr.create_group("Chat".into(), alice, 1000).unwrap();
+        mgr.add_member(&group_id, &alice, bob, 1001).unwrap();
+
+        assert!(mgr.remove_member(&group_id, &alice, &alice, 1002).is_err());
+        let members = mgr.get_members(&group_id).unwrap();
+        assert_eq!(members.len(), 2);
+        assert!(members.iter().any(|m| m.role == GroupRole::Admin));
+
+        // Removing a plain member is still fine.
+        mgr.remove_member(&group_id, &alice, &bob, 1003).unwrap();
     }
 }
