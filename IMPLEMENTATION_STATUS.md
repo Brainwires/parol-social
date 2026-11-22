@@ -201,8 +201,8 @@ This path provides end-to-end content encryption when a Double Ratchet session e
 
 - 3-hop relay circuits: library primitives exist and are now wired into the WASM/relay-server path via single-relay MVP mode; multi-relay path selection with real network hops is not yet used for normal PWA chat.
 - Relay-to-relay directory sync uses bidirectional pull+push with dynamic peer discovery; the broader PNP-008 federation plan (consensus, voting) is not fully implemented.
-- TLS camouflage is an approximation using rustls settings. Full browser ClientHello mimicry, HTTP/2 DATA framing, GREASE behavior, and updatable fingerprint profiles are not implemented.
-- Traffic shaping exists as constants/helpers and some jitter, but constant-rate padding and dummy traffic are not applied end-to-end to the current PWA relay path.
+- TLS camouflage is an approximation using rustls settings: cipher suite order, key exchange group order, ALPN and SNI follow a fingerprint profile, and profiles are loadable CBOR files (PNP-006 §5.4). Full browser ClientHello mimicry (extension order, GREASE, signature algorithms) is not possible with rustls and is not implemented. The library TLS transport frames its traffic as HTTP/2 DATA; the shipped clients' relay socket is a WebSocket over HTTP/1.1.
+- Traffic shaping: the native client paces what it sends on direct data channels (one frame per padding interval, with jitter); constant-rate padding and dummy traffic exist for library circuits (`parolnet_relay::shaped`) and are not applied to the PWA relay path or by the web app.
 - Mesh discovery is implemented as obfuscated UDP broadcast, not mDNS/BLE as written in older spec text.
 - File, call, group call, and group file APIs: core/WASM primitives exist and PWA UI is wired for basic flows; messages are not yet routed through the full onion circuit protocol stack.
 - WebRTC data channels connect directly over STUN by default; pairs behind NATs that block a direct path need a user-supplied TURN server (no TURN on the signaling-only public relay). Offline delivery is the sender-side queue; there is no relay mailbox in the default profile.
