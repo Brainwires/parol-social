@@ -89,7 +89,9 @@ fn bucket_selection_picks_smallest_fit() {
 
 // -- §3.2 Cleartext Header — coarsened timestamp ------------------------------
 
-#[clause("PNP-001-MUST-006")]
+// (Timestamp coarsening is MUST-027; MUST-006 is the session nonce, pinned in
+// pnp_001_session_nonce.rs.)
+#[clause("PNP-001-MUST-027")]
 #[test]
 fn cleartext_header_coarsens_timestamp_to_300s_boundary() {
     for raw in [0u64, 1, 299, 300, 301, 1_700_000_123, u64::MAX / 2] {

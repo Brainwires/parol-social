@@ -23,7 +23,9 @@ tokio.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tracing.workspace = true
-tracing-subscriber.workspace = true
+# `env-filter` here, not only through feature unification: without it the default level
+# depended on which other crates shared the build (see `main`).
+tracing-subscriber = { workspace = true, features = ["env-filter"] }
 tower-http.workspace = true
 futures-util.workspace = true
 rand.workspace = true

@@ -47,6 +47,9 @@ serde_json = { workspace = true }
 ciborium = { workspace = true }
 hex = { workspace = true }
 tokio = { workspace = true }
+# The black-box harness (tests/common): a scripted peer on the relay and on a data channel.
+tokio-tungstenite = { workspace = true }
+futures-util = { workspace = true }
 # The mock guard connection of the PNP-004 counter tests implements `Connection`.
 async-trait = { workspace = true }
 rand = { workspace = true }

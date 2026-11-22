@@ -17,7 +17,7 @@
 
 **v0.16 (2026-11-21) — Nonce catalog matches the session and sender-key layers**
 
-- §3.3 (**PNP-001-MUST-006**, same clause ID) and the `N-SESSION` row of §9 now state the nonce the session layer has used throughout and PNP-002 §5.7 already describes: the first 8 bytes of the message's ratchet public key followed by `msg_number` (4 bytes, big-endian). The former text (`chain_index (4B) || seq_number (8B)`) described no implementation and named counters that do not exist in the Double Ratchet state. The `N-SENDERKEY` row of §9 now agrees with PNP-009 §5.4: the first 8 bytes of `SHA-256(signing_public_key)` followed by `chain_index` (4 bytes, big-endian). No wire change.
+- §3.3 (**PNP-001-MUST-006**, same clause ID) and the `N-SESSION` row of §9 now state the nonce the session layer has used throughout and PNP-002 §5.7 already describes: the first 8 bytes of the message's ratchet public key followed by `msg_number` (4 bytes, big-endian). The former text (`chain_index (4B) || seq_number (8B)`) described no implementation and named counters that do not exist in the Double Ratchet state. §6 item 2 no longer derives uniqueness from `chain_index` and `sequence_number`: every message has its own message key, and `msg_number` varies the nonce within a chain. The `N-SENDERKEY` row of §9 now agrees with PNP-009 §5.4: the first 8 bytes of `SHA-256(signing_public_key)` followed by `chain_index` (4 bytes, big-endian). No wire change.
 - §9 points to the limits of the counters that feed these nonces: PNP-002 §5.9, PNP-009 §5.9 and PNP-004 §5.1. No counter wraps.
 
 **v0.15 (2026-11-21) — Message type 0x15 FILE_TRANSFER**
@@ -467,7 +467,7 @@ QR-code freshness (30 minutes) is defined in PNP-003 §5.1.6 and is unrelated to
 
 1. **Indistinguishability**: The bucket padding scheme ensures that message lengths do not leak content type or size. Implementations MUST NOT compress payloads before encryption, as compression ratios can leak information about plaintext content (CRIME/BREACH-style attacks). **PNP-001-MUST-040**
 
-2. **Nonce Reuse**: The nonce construction from chain_index and sequence_number guarantees uniqueness within a Double Ratchet session. Implementations MUST NOT reuse a (key, nonce) pair. **PNP-001-MUST-041** If the sequence number overflows 2^64, the session MUST be rekeyed. **PNP-001-MUST-042**
+2. **Nonce Reuse**: Every message is encrypted under its own message key (the Double Ratchet derives one per message from the chain key and uses it once), and within one sending chain the nonce differs from message to message through `msg_number` (§3.3), so no (key, nonce) pair repeats within a Double Ratchet session. Implementations MUST NOT reuse a (key, nonce) pair. **PNP-001-MUST-041** If the sequence number overflows 2^64, the session MUST be rekeyed. **PNP-001-MUST-042**
 
 3. **Replay Protection**: The combination of message_id uniqueness checking and timestamp windowing prevents replay attacks. The seen-message cache MUST be persisted across brief restarts (up to 60 minutes of downtime). **PNP-001-MUST-043**
 
