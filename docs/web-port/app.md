@@ -147,8 +147,8 @@ All nine catalogues are complete: every key of `en` is in every locale.
 
 | Locale | Keys | Coverage | Translation |
 |---|---|---|---|
-| `en` | 306 / 306 | 100% | source |
-| `ar`, `de`, `es`, `fa`, `fr`, `it`, `ja`, `ko` | 306 / 306 | 100% | **machine, not yet reviewed by a native speaker** |
+| `en` | 344 / 344 | 100% | source |
+| `ar`, `de`, `es`, `fa`, `fr`, `it`, `ja`, `ko` | 344 / 344 | 100% | **machine, not yet reviewed by a native speaker** |
 
 **The eight translated catalogues are machine translations** (made with a language model from
 the English catalogue, the design rules of [docs/ux/web-app.md](../ux/web-app.md) and a
