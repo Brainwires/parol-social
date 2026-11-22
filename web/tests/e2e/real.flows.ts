@@ -393,17 +393,47 @@ async function nameContact(page: Page, name: string): Promise<void> {
   await expect(page.getByTestId("conversation-name")).toHaveText(name);
 }
 
-/** `presenter` shows its code, `scanner` pastes it; each names the other. */
+/** A pairing code as text: base45 (PNP-003), with an underscore for every blank. */
+const CODE_AS_TEXT = /^[0-9A-Z_$%*+\-./:]{100,}$/;
+
+/**
+ * The two devices reached each other and both show the verification code (PNP-003 §5.5):
+ * the same digits and the same five pictures. Each person says it matches; only then is
+ * the contact added.
+ */
+async function compareCodes(a: Page, b: Page): Promise<void> {
+  const shown = async (page: Page) => {
+    await expect(page.getByTestId("sas-digits")).toBeVisible(CONNECT);
+    return [
+      await page.getByTestId("sas-digits").getAttribute("data-digits"),
+      await page.getByTestId("sas-emoji").textContent(),
+    ];
+  };
+  const [onA, onB] = [await shown(a), await shown(b)];
+  expect(onA[0]).toMatch(/^\d{6}$/);
+  expect([...(onA[1] ?? "")].length).toBe(5);
+  expect(onA).toEqual(onB);
+  await a.getByTestId("sas-match").click();
+  // One answer is not enough: the first to say yes waits for the other.
+  await expect(a.getByTestId("sas-waiting")).toBeVisible();
+  await b.getByTestId("sas-match").click();
+}
+
+/**
+ * `presenter` shows its code, `scanner` pastes it, both confirm the verification code; each
+ * names the other.
+ */
 async function pairByPaste(
   presenter: Page,
   scanner: Page,
   names: { presenter: string; scanner: string },
 ): Promise<void> {
   const code = await ownCode(presenter);
-  expect(code).toMatch(/^[0-9a-f]{100,}$/);
+  expect(code).toMatch(CODE_AS_TEXT);
   await scanner.getByTestId("pairing-paste-open").click();
   await scanner.getByTestId("pairing-code-input").fill(code);
   await scanner.getByTestId("pairing-code-submit").click();
+  await compareCodes(presenter, scanner);
   await nameContact(scanner, names.presenter);
   await nameContact(presenter, names.scanner);
 }
@@ -457,13 +487,10 @@ test("first run, add a contact by pasted code, name them, talk both ways", async
   await openLine(ana.page, ben.page);
   await expect(lineOf(ben.page)).toHaveText("Direct, end-to-end encrypted");
 
-  // A pasted code is not verified, on either side, until numbers are compared.
-  await expect(ben.page.getByTestId("verify-prompt")).toContainText(
-    "Not verified yet",
-  );
-  await expect(ana.page.getByTestId("verify-prompt")).toContainText(
-    "Not verified yet",
-  );
+  // Both confirmed the verification code while adding each other: neither is asked to
+  // verify anything more.
+  await expect(ben.page.getByTestId("verify-prompt")).toHaveCount(0);
+  await expect(ana.page.getByTestId("verify-prompt")).toHaveCount(0);
 
   await send(ben.page, "Hello Ana, Ben here.");
   await expect(bubble(ana.page, "Hello Ana, Ben here.")).toHaveAttribute(
@@ -489,9 +516,15 @@ test("first run, add a contact by pasted code, name them, talk both ways", async
     "received",
   );
 
-  // The same safety number on both devices; "They match" verifies.
-  await ben.page.getByTestId("verify-open").click();
-  await ana.page.getByTestId("verify-open").click();
+  // The contact's details say how it was verified, and offer the safety numbers: the same
+  // on both devices; "They match" records that they were compared.
+  for (const page of [ben.page, ana.page]) {
+    await page.getByTestId("conversation-details").click();
+    await expect(page.getByTestId("details-verified")).toHaveText(
+      "Verified: you both confirmed the verification code.",
+    );
+    await page.getByTestId("details-verify").click();
+  }
   const digits = async (page: Page) =>
     ((await page.getByTestId("safety-number").textContent()) ?? "").replace(
       /\D/g,
@@ -500,8 +533,12 @@ test("first run, add a contact by pasted code, name them, talk both ways", async
   expect(await digits(ben.page)).toMatch(/^\d{60}$/);
   expect(await digits(ben.page)).toBe(await digits(ana.page));
   await ben.page.getByTestId("verify-match").click();
-  await expect(ben.page.getByTestId("verify-prompt")).toHaveCount(0);
   await ana.page.getByTestId("sheet-verify-close").click();
+  await ben.page.getByTestId("conversation-details").click();
+  await expect(ben.page.getByTestId("details-verified")).toHaveText(
+    "Verified: you compared safety numbers.",
+  );
+  await ben.page.getByTestId("sheet-details-close").click();
 
   // The code was used once: going back to the add screen shows a fresh one.
   await ben.page.getByTestId("add-contact").click();
@@ -545,9 +582,10 @@ test("a code works only while its screen is open; someone who used it is asked f
   await ben.page.getByTestId("pairing-paste-open").click();
   await ben.page.getByTestId("pairing-code-input").fill(second);
   await ben.page.getByTestId("pairing-code-submit").click();
+  await compareCodes(ana.page, ben.page);
   await nameContact(ben.page, "Ana");
   await expect(ana.page.getByTestId("pairing-name-body")).toHaveText(
-    "Someone used your code. Compare safety numbers with them when you can.",
+    "You both confirmed the verification code, so this contact is verified.",
     CONNECT,
   );
   await ana.page.getByTestId("add-screen-back").click();
@@ -562,9 +600,8 @@ test("a code works only while its screen is open; someone who used it is asked f
   await expect(ana.page.getByTestId("name-prompt-text")).toHaveText(
     "Someone used your code. Give them a name.",
   );
-  await expect(ana.page.getByTestId("verify-prompt")).toContainText(
-    "Not verified yet",
-  );
+  // The verification code was confirmed on both devices.
+  await expect(ana.page.getByTestId("verify-prompt")).toHaveCount(0);
   await ana.page.getByTestId("name-prompt-input").fill("Ben");
   await ana.page.getByTestId("name-prompt-save").click();
   await expect(ana.page.getByTestId("conversation-name")).toHaveText("Ben");
@@ -692,6 +729,7 @@ for (
     );
 
     await ben.page.getByTestId("pairing-scan-open").click();
+    await compareCodes(ana.page, ben.page);
     await expect(ben.page.getByTestId("pairing-name-body")).toHaveText(
       "You scanned their code in person, so this contact is verified.",
       CONNECT,
@@ -702,14 +740,17 @@ for (
     await nameContact(ana.page, "Ben");
     await openLine(ana.page, ben.page);
 
-    // Ben scanned: verified in person, nothing to compare. Ana did not see Ben's code.
+    // Ben scanned: verified in person. Ana did not see Ben's code, but both confirmed the
+    // verification code: nothing is left to compare on either device.
     await expect(ben.page.getByTestId("verify-prompt")).toHaveCount(0);
+    await expect(ana.page.getByTestId("verify-prompt")).toHaveCount(0);
     await ben.page.getByTestId("conversation-details").click();
     await expect(ben.page.getByTestId("details-verified")).toHaveText(
       "Verified in person: you scanned their code.",
     );
-    await expect(ana.page.getByTestId("verify-prompt")).toContainText(
-      "Not verified yet",
+    await ana.page.getByTestId("conversation-details").click();
+    await expect(ana.page.getByTestId("details-verified")).toHaveText(
+      "Verified: you both confirmed the verification code.",
     );
     await allClean(ana, ben);
   });

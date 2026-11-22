@@ -15,7 +15,13 @@ import { showToast } from "../components/Toast.tsx";
 import { type MessageKey, t } from "../i18n/index.ts";
 import { hrefOf, navigate } from "../router.ts";
 import { useStore } from "../state/context.ts";
-import { type ContactView, type LineState, lineState, type TransferInfo } from "../state/model.ts";
+import {
+  type ContactView,
+  isVerified,
+  type LineState,
+  lineState,
+  type TransferInfo,
+} from "../state/model.ts";
 import { asksForName, shownName } from "../state/names.ts";
 import { type AppStore, contactOf, messagesOf, transfersOf } from "../state/store.ts";
 import { ContactDetailsSheet, RemoveContactSheet, VerifySheet } from "./ContactSheets.tsx";
@@ -359,15 +365,14 @@ export function Conversation({ peerId, showBack = true }: { peerId: string; show
           {t("restored.note", { name })}
         </p>
       )}
-      {contact.verified === "no" && (
+      {!isVerified(contact) && (
         <div className="conversation__verify" data-testid="verify-prompt">
           <span>{t("verify.prompt")}</span>
           <button
             type="button"
             className="link-btn"
             data-testid="verify-open"
-            onClick={() =>
-              setSheet("verify")}
+            onClick={() => setSheet("verify")}
           >
             {t("verify.open")}
           </button>

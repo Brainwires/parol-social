@@ -11,6 +11,7 @@ import type {
   ContactView,
   PairingCode,
   RelayState,
+  SasCheck,
   TransferInfo,
 } from "./model.ts";
 import { saveFile as saveWithBrowser, type SaveOutcome } from "./save-file.ts";
@@ -25,6 +26,9 @@ export type EnginePort = Pick<
   | "createPairingCode"
   | "cancelPairing"
   | "pairWithCode"
+  | "confirmSas"
+  | "rejectSas"
+  | "stopPairing"
   | "sendText"
   | "takeBack"
   | "editQueued"
@@ -169,6 +173,7 @@ export function createEngineStore(env: StoreEnv): EngineStore {
   const call = signal<CallInfo | null>(null);
   const callMedia = signal<CallMediaStreams>(NO_MEDIA);
   const pairing = signal<PairingCode | null>(null);
+  const sas = signal<SasCheck | null>(null);
   const turn = signal<TurnView | null>(null);
   const notice = signal<Notice | null>(null);
 
@@ -228,6 +233,13 @@ export function createEngineStore(env: StoreEnv): EngineStore {
       selfOnline.value = snap.relay.kind === "Registered";
       contacts.value = snap.contacts;
       pairing.value = snap.pairing;
+      // A new object at every snapshot: keep the one on screen while nothing changed.
+      const shown = sas.value;
+      const next = snap.sas;
+      if (
+        shown?.peerId !== next?.peerId || shown?.digits !== next?.digits ||
+        shown?.confirmed !== next?.confirmed
+      ) sas.value = next;
       // An ended call is not in the snapshot; it stays until its timer or `dismissCall`.
       if (snap.call) call.value = snap.call;
     });
@@ -319,6 +331,15 @@ export function createEngineStore(env: StoreEnv): EngineStore {
       case "CallMedia":
         syncMedia(event.callId);
         break;
+      case "PairingFailed":
+        // What the person stopped themselves needs no words.
+        if (event.reason !== "Cancelled") {
+          notice.value = { code: "Pairing", peerId: event.peerId, pairing: event.reason };
+        }
+        break;
+      case "PairingComplete":
+        if (notice.value?.code === "Pairing") notice.value = null;
+        break;
       case "Notice":
         // A failed security check is already what the conversation's line and panel say.
         if (event.code !== "BindingFailed") {
@@ -372,6 +393,7 @@ export function createEngineStore(env: StoreEnv): EngineStore {
       call.value = null;
       callMedia.value = NO_MEDIA;
       pairing.value = null;
+      sas.value = null;
     });
     env.onEngine?.(null);
   }
@@ -436,6 +458,7 @@ export function createEngineStore(env: StoreEnv): EngineStore {
     call,
     callMedia,
     pairing,
+    sas,
     turn,
     notice,
 
@@ -572,6 +595,9 @@ export function createEngineStore(env: StoreEnv): EngineStore {
     createPairingCode: () => live().createPairingCode(),
     cancelPairing: () => engine?.cancelPairing() ?? Promise.resolve(),
     pair: (code, via) => live().pairWithCode(code, { via }),
+    confirmSas: (peerId) => live().confirmSas(peerId),
+    rejectSas: (peerId) => live().rejectSas(peerId),
+    stopPairing: (peerId) => live().stopPairing(peerId),
     async rename(peerId, name) {
       await live().renameContact(peerId, name);
     },

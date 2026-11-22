@@ -11,8 +11,10 @@ import type {
   ContactView,
   NoticeCode,
   PairingCode,
+  PairingFailure,
   PathState,
   RelayState,
+  SasCheck,
   TransferInfo,
 } from "./model.ts";
 import { shownName } from "./names.ts";
@@ -36,9 +38,11 @@ export type Phase =
 
 /** Something the app has to say on its own; shown as a panel until dismissed. */
 export interface Notice {
-  code: NoticeCode;
+  /** `Pairing`: adding a contact did not work out (`pairing` says why). */
+  code: NoticeCode | "Pairing";
   /** The contact it is about, when there is one. */
   peerId?: string;
+  pairing?: PairingFailure;
 }
 
 /** The streams of the current call, for the media elements. */
@@ -91,6 +95,11 @@ export interface AppStore {
   readonly callMedia: ReadonlySignal<CallMediaStreams>;
   /** The code this device is showing, while it can still be used. */
   readonly pairing: ReadonlySignal<PairingCode | null>;
+  /**
+   * The verification code of a contact that is being added, while it waits to be compared
+   * with the one on the contact's device. Null: nothing to compare.
+   */
+  readonly sas: ReadonlySignal<SasCheck | null>;
   /** The person's own relay server: null when none is set. */
   readonly turn: ReadonlySignal<TurnView | null>;
   readonly notice: ReadonlySignal<Notice | null>;
@@ -153,8 +162,18 @@ export interface AppStore {
   createPairingCode(): Promise<PairingCode>;
   /** The code being shown stops working (the person left the screen that shows it). */
   cancelPairing(): Promise<void>;
-  /** Add the contact whose code this is. `via` says whether it was scanned or pasted. */
+  /**
+   * Add the contact whose code this is. `via` says whether it was scanned or pasted. The
+   * contact comes back at once, still being added (`contact.pairing`): the two devices have
+   * to reach each other, and the verification code has to be confirmed on both.
+   */
   pair(code: string, via: "scan" | "paste"): Promise<Contact>;
+  /** The verification code on screen is the one the contact's device shows. */
+  confirmSas(peerId: string): Promise<void>;
+  /** The codes differ: the contact is not added. */
+  rejectSas(peerId: string): Promise<void>;
+  /** Stop adding a contact that is still being added. */
+  stopPairing(peerId: string): Promise<void>;
   rename(peerId: string, name: string): Promise<void>;
   /** The person compared safety numbers (`true`), or takes that back. */
   setCompared(peerId: string, compared: boolean): Promise<void>;
@@ -190,6 +209,8 @@ export interface FakeControls {
   setCall(call: CallInfo | null): void;
   /** Someone used this device's code: a contact with no name appears. Returns its id. */
   someoneUsedCode(): string;
+  /** Put a verification code to compare on screen (null: none). */
+  setSas(sas: SasCheck | null): void;
   /** Remove every contact and message: the empty state. */
   clear(): void;
   reset(): void;

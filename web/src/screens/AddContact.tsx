@@ -1,11 +1,14 @@
 // Add a contact: one screen for both directions. This device's code as a picture to scan and
-// as text; and two ways to take theirs, the camera or a paste. Whoever was added is then
-// given a name. A scanned code means the two devices were together, so that contact is
-// verified in person; a pasted one is not verified until safety numbers are compared.
+// as text; and two ways to take theirs, the camera or a paste. Then the two devices reach
+// each other and both show a verification code, which the two people compare (PNP-003 §5.5);
+// only then is the contact added, and given a name. A scanned code means the two devices
+// were together, so that contact is verified in person; so is one whose verification code
+// both confirmed.
 import { useEffect, useId, useRef, useState } from "denext";
 import { Button } from "../components/Button.tsx";
 import { CodeBlock } from "../components/Codes.tsx";
 import { Icon } from "../components/Icon.tsx";
+import { Panel } from "../components/Panel.tsx";
 import { QrCode } from "../components/QrCode.tsx";
 import { Screen } from "../components/Screen.tsx";
 import { showToast } from "../components/Toast.tsx";
@@ -17,7 +20,8 @@ import { hrefOf, navigate } from "../router.ts";
 import { useStore } from "../state/context.ts";
 import { rememberAddedHere } from "../state/names.ts";
 import { contactOf } from "../state/store.ts";
-import { errorText } from "./errors.ts";
+import { errorText, PAIRING_FAILED } from "./errors.ts";
+import { SasPanel } from "./SasCheck.tsx";
 
 type How = "scan" | "paste" | "theirs";
 type Mode = "code" | "scan" | "paste";
@@ -78,9 +82,10 @@ function OwnCode() {
   }
 
   const minutes = Math.max(1, Math.ceil((pairing.expiresAtMs - now) / MINUTE));
+  // As text the code goes without blanks (`text`); the picture holds the code itself.
   const copy = async () => {
     try {
-      await navigator.clipboard.writeText(pairing.code);
+      await navigator.clipboard.writeText(pairing.text);
       showToast(t("toast.codeCopied"));
     } catch {
       showToast(t("add.copyFailed"));
@@ -88,7 +93,7 @@ function OwnCode() {
   };
   const share = async () => {
     try {
-      await navigator.share({ text: pairing.code });
+      await navigator.share({ text: pairing.text });
     } catch {
       // The person closed the share sheet.
     }
@@ -107,7 +112,7 @@ function OwnCode() {
           <Button testId="pairing-share" icon="share" onClick={share}>{t("add.share")}</Button>
         )}
       </div>
-      <CodeAsText code={pairing.code} />
+      <CodeAsText code={pairing.text} />
       <p className="pairing__help" data-testid="pairing-help">{t("add.help")}</p>
     </div>
   );
@@ -276,6 +281,46 @@ function PasteTheirs({ pair, onCancel }: { pair: Pair; onCancel: () => void }) {
   );
 }
 
+/** Why the last try to add a contact came to nothing, until it is dismissed. */
+function PairingProblem() {
+  const store = useStore();
+  const notice = store.notice.value;
+  if (notice?.code !== "Pairing") return null;
+  const reason = notice.pairing ?? "Failed";
+  return (
+    <Panel
+      tone={reason === "SasRejected" || reason === "SasMismatch" ? "red" : "amber"}
+      testId="pairing-failed"
+      title={t("notice.pairing.title")}
+      actions={[
+        {
+          label: t("action.dismiss"),
+          testId: "pairing-failed-dismiss",
+          onClick: store.dismissNotice,
+        },
+      ]}
+    >
+      {t(PAIRING_FAILED[reason])}
+    </Panel>
+  );
+}
+
+/** The two devices are reaching each other: nothing to do but wait, or stop. */
+function Connecting({ peerId }: { peerId: string }) {
+  const store = useStore();
+  return (
+    <div className="pairing__own" data-testid="pairing-connecting">
+      <p role="status">{t("pairing.waiting")}</p>
+      <Button
+        testId="pairing-stop"
+        onClick={() => void store.stopPairing(peerId).catch(() => {})}
+      >
+        {t("pairing.stop")}
+      </Button>
+    </div>
+  );
+}
+
 function NameContact({ peerId, how }: { peerId: string; how: How }) {
   const store = useStore();
   const [name, setName] = useState("");
@@ -306,9 +351,13 @@ function NameContact({ peerId, how }: { peerId: string; how: How }) {
     navigate({ name: "conversation", peerId });
   };
 
+  // Both confirmed the verification code: that is worth more than how the code travelled.
+  const verified = how !== "scan" && contactOf(store, peerId)?.contact.sasVerified === true;
   return (
     <form className="pairing__name" onSubmit={submit} noValidate data-testid="pairing-name">
-      <p data-testid="pairing-name-body" data-how={how}>{t(NAMING_BODY[how])}</p>
+      <p data-testid="pairing-name-body" data-how={how} data-sas={verified ? "true" : "false"}>
+        {t(verified ? "name.bodyVerified" : NAMING_BODY[how])}
+      </p>
       <label className="field">
         <span className="field__label">{t("name.label")}</span>
         <input
@@ -339,6 +388,12 @@ export function AddContact() {
   // coming back makes a fresh one.
   useEffect(() => () => void store.cancelPairing().catch(() => {}), []);
   const [added, setAdded] = useState<{ peerId: string; how: How } | null>(null);
+  // A pairing that came to nothing leaves the person at their own code, with the reason
+  // above it (and the camera off: the code it was looking at is spent).
+  const failed = store.notice.value?.code === "Pairing";
+  useEffect(() => {
+    if (failed) setMode("code");
+  }, [failed]);
   // Who was already a contact when this screen opened: anyone new after that used our code.
   const known = useRef<Set<string> | null>(null);
   const contacts = store.contacts.value;
@@ -348,6 +403,8 @@ export function AddContact() {
   const adding = useRef<How | null>(null);
   const pair: Pair = async (code, via) => {
     adding.current = via;
+    // A new try: what the last one came to is no longer the news.
+    if (store.notice.value?.code === "Pairing") store.dismissNotice();
     try {
       const contact = await store.pair(code, via);
       rememberAddedHere(contact.peerId);
@@ -361,7 +418,31 @@ export function AddContact() {
   const naming = added ??
     (newcomer ? { peerId: newcomer.contact.peerId, how: adding.current ?? "theirs" } : null);
 
-  if (naming && contactOf(store, naming.peerId)) {
+  // The verification code comes first, whoever it is with: nothing else can be done about a
+  // contact that is being added until it was compared.
+  const sas = store.sas.value;
+  if (sas) {
+    return (
+      <Screen title={t("sas.title")} testId="add-screen" focusKey={`sas-${sas.peerId}`}>
+        <div className="pairing">
+          <SasPanel key={sas.peerId} sas={sas} />
+        </div>
+      </Screen>
+    );
+  }
+
+  const beingAdded = naming ? contactOf(store, naming.peerId) : undefined;
+  if (naming && beingAdded?.contact.pairing !== undefined) {
+    return (
+      <Screen title={t("pairing.waitTitle")} testId="add-screen" focusKey="connecting">
+        <div className="pairing">
+          <Connecting peerId={naming.peerId} />
+        </div>
+      </Screen>
+    );
+  }
+
+  if (naming && beingAdded) {
     return (
       <Screen title={t("name.title")} testId="add-screen" focusKey="name" focusTitle={false}>
         <NameContact key={naming.peerId} peerId={naming.peerId} how={naming.how} />
@@ -377,6 +458,7 @@ export function AddContact() {
       focusTitle={mode !== "paste"}
     >
       <div className="pairing">
+        <PairingProblem />
         {mode === "code" && <OwnCode />}
         {mode === "scan" && <ScanTheirs pair={pair} onStop={() => setMode("code")} />}
         {mode === "paste" && <PasteTheirs pair={pair} onCancel={() => setMode("code")} />}

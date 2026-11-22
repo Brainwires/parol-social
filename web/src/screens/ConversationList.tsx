@@ -12,6 +12,7 @@ import { dismissInstall, install, installAvailable } from "../platform/install.t
 import { updateReady } from "../platform/service-worker.ts";
 import { hrefOf, navigate, type Route } from "../router.ts";
 import { useStore } from "../state/context.ts";
+import { PAIRING_FAILED } from "./errors.ts";
 import { type ChatMessage, type ContactView, isOnline, sortContacts } from "../state/model.ts";
 import { messagesOf, transfersOf } from "../state/store.ts";
 import { type Entry, lastEntry } from "./thread.ts";
@@ -60,6 +61,23 @@ function NoticePanel() {
           ]}
         >
           {t("notice.transfer.body")}
+        </Panel>
+      </div>
+    );
+  }
+  if (notice.code === "Pairing") {
+    const reason = notice.pairing ?? "Failed";
+    return (
+      <div className="list__notice">
+        <Panel
+          tone={reason === "SasRejected" || reason === "SasMismatch" ? "red" : "amber"}
+          testId="notice-pairing"
+          title={t("notice.pairing.title")}
+          actions={[
+            { label: t("action.dismiss"), testId: "notice-dismiss", onClick: store.dismissNotice },
+          ]}
+        >
+          {t(PAIRING_FAILED[reason])}
         </Panel>
       </div>
     );

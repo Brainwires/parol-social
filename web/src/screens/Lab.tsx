@@ -359,6 +359,18 @@ export function Lab({ controls: store }: { controls: AppStore & FakeControls }) 
           <Button testId="lab-someone-used-code" onClick={() => controls.someoneUsedCode()}>
             Someone uses my code
           </Button>
+          <Button
+            testId="lab-sas"
+            onClick={() =>
+              controls.setSas({
+                peerId: "5a".repeat(32),
+                digits: "042917",
+                emoji: "\u{1F400}\u{1F340}\u{1F3A0}\u{1F680}\u{1F41F}",
+                confirmed: false,
+              })}
+          >
+            Show a verification code
+          </Button>
         </div>
         <div className="lab__choice">
           <Button
