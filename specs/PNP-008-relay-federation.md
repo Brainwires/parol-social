@@ -1,11 +1,12 @@
 # PNP-008: Relay Federation & Network Resilience
 
-**Version:** 0.7
+**Version:** 0.8
 **Status:** CANDIDATE
-**Last-Updated:** 2026-04-18
+**Last-Updated:** 2026-11-21
 
 ## Changelog
 
+- **v0.8 (2026-11-21):** Presence and lookup are no longer public. §10.5 – §10.7 answered `GET /peers/presence` and `GET /peers/lookup` to anyone, which made every relay an oracle for "is this PeerId online right now". Added §10.8 "Who May Ask" with `PNP-008-MUST-099` through `PNP-008-MUST-102`: a signaling-only relay serves neither endpoint; a relay-profile relay answers only requests signed with Ed25519 for that relay (label, kind, time, target, the relay's name), `/peers/presence` only to federation peers its operator configured and `/peers/lookup` only to those and to peers registered on it. `PNP-008-MUST-063` and `PNP-008-MUST-069` are restated accordingly (same clause IDs). **Wire-incompatible** for callers of the two endpoints, which now send an `Authorization` header. Separately, §3 gains a note on `PNP-008-MUST-002` (clause text unchanged): the reference implementation now does what the clause says. An endorsement is an authority's signature over the deterministic CBOR encoding of the descriptor it endorses, the relay's signature included, where it used to be a signature over `SHA-256(peer_id || endorsed_at || expires_at)`; the `AuthorityEndorsement` structure loses its `relay_peer_id`, `endorsed_at` and `expires_at` fields. **Wire-incompatible** for endorsements: those made before do not verify.
 - **v0.7 (2026-04-18):** Locked the §9.2 Pluggable Transport contract so bridge relays can ship obfuscated wire protocols without each implementation re-inventing the trait boundary. Added `PNP-008-MUST-091` through `PNP-008-MUST-098` covering: bidirectional reliable stream invariant (091), session-to-transport affinity (092), transport registry identifiers (093), domain-fronting SNI/Host split (094), obfuscation randomness + length distribution (095/096), mandatory `direct_tls` baseline (097), and per-session uniform transport selection (098). The registry codifies `domain_front`, `obfs`, `direct_tls` as the v1 identifiers; new transports extend the registry in later spec versions.
 - **v0.6 (2026-04-17):** Tightened §9 Bridge Relays with explicit probe-resistance and audit-log normatives. Added §9.1.1 "Cover-Page Probe Resistance" with `PNP-008-MUST-085` through `PNP-008-MUST-088` (HTTP 200 + text/html cover body, forbidden tokens, 250 ms latency budget, no probe-source state). Added §9.1.2 "Disclosure Rate Limiting & Audit Log" with `PNP-008-MUST-089` (ephemeral in-memory disclosure counter, no cross-restart persistence) and `PNP-008-MUST-090` (scheduled ≤3600 s IP-log scrubber enforcing the 24 h purge). Clarifies MUST-052/053/054 into implementable requirements. No wire-format changes.
 - **v0.5 (2026-04-17):** Locked the federation-link on-wire shape. Added §5.5 "On-Wire Framing" with `PNP-008-MUST-077` through `PNP-008-MUST-082` (WSS on `/federation/v1`, length-prefixed CBOR frames, 2 MiB cap, unknown-type = close, initial FederationSync ordering, mid-SYNC heartbeat policy). Added §5.6 "Link Deduplication & Close" with `PNP-008-MUST-083` and `PNP-008-MUST-084` (one link per peer, close semantics). No new payload types — these clauses lock what implementations must send on an already-allocated 0x06/0x07 frame.
@@ -49,6 +50,8 @@ All primitives are those specified in PNP-001 §2. In particular:
 **PNP-008-MUST-001**: Relay descriptor signatures MUST be Ed25519 over the deterministic CBOR encoding of the descriptor body (excluding the signature field).
 
 **PNP-008-MUST-002**: Authority endorsement signatures MUST be Ed25519 computed over the deterministic CBOR encoding of the descriptor *including* the relay's own signature but *excluding* the `endorsements` array.
+
+> **Note on MUST-002 (v0.8).** An endorsement is the pair `{ authority_pubkey: bstr32, signature: bstr64 }`. The signed bytes are the descriptor's CBOR data model in the deterministic encoding of RFC 8949 §4.2.1: map entries sorted by the bytewise order of their encoded keys, definite lengths, integers and lengths in their shortest form. They contain the relay's own `signature` field and nothing of the `endorsements` array, so adding or removing other authorities' endorsements does not disturb one. Three things follow. (1) An endorsement stands for one descriptor: change the address, a key, the timestamp or the relay's signature and it no longer verifies, even when the relay itself signed the change. A relay that publishes a new descriptor needs new endorsements. (2) An endorsement carries no lifetime of its own, because a field outside the signed bytes could be rewritten by whoever passes it on; it is valid for as long as its descriptor is, which §6.3 bounds at seven days from the descriptor's `timestamp`. (3) Holding a relay's identity key is no longer enough to move an endorsed relay to another address or to give it other onion keys.
 
 **PNP-008-MUST-003**: Federation peer identity MUST be authenticated using the peer's relay descriptor public key via the PNP-002 handshake, layered inside the PNP-006 TLS camouflage.
 
@@ -518,7 +521,7 @@ Bridge relays MUST expose at least one pluggable transport whose wire fingerprin
 
 ## 10.5 Presence
 
-H12 Phase 2 introduces a lightweight presence endpoint so that client libraries and federation peers can answer the question *"which relay is peer X currently connected to?"* without depending on the full PNP-008 federation state machine defined in §§4–7. Presence is intentionally public: any client can query it (subject to rate limiting), because the primary consumer is the end user's own client, and making presence privileged-between-relays only would leak a false privacy claim (see H12 Phase 2 design rationale).
+H12 Phase 2 introduces a lightweight presence endpoint so that client libraries and federation peers can answer the question *"which relay is peer X currently connected to?"* without depending on the full PNP-008 federation state machine defined in §§4–7. The endpoints of §10.5 and §10.6 exist only on a relay in the relay profile (PNP-001 §10.5) and answer only the callers of §10.8. Through v0.7 they answered anyone; that made each relay an oracle for whether a given PeerId was online, which no caller without a relationship to that relay had any need for.
 
 ### 10.5.1 `GET /peers/presence`
 
@@ -532,7 +535,7 @@ struct PresenceEntry {
 }
 ```
 
-**PNP-008-MUST-063**: A relay MUST expose `GET /peers/presence` returning a CBOR-serialized `Vec<PresenceEntry>` covering exactly the peers currently connected to that relay. The endpoint MUST NOT include peers buffered-for-delivery-only, peers from the federation cache, or historical entries.
+**PNP-008-MUST-063**: A relay in the relay profile MUST expose `GET /peers/presence` to its federation peers (§10.8), returning a CBOR-serialized `Vec<PresenceEntry>` covering exactly the peers currently connected to that relay. The endpoint MUST NOT include peers buffered-for-delivery-only, peers from the federation cache, or historical entries.
 
 **PNP-008-MUST-064**: Each `PresenceEntry` MUST carry an Ed25519 signature by the relay's identity key over the canonical 32-byte hash `SHA-256(relay_peer_id || peer_id || last_seen.to_be_bytes())`. Clients and federation peers MUST verify this signature against the relay's authority-verified directory entry before trusting the entry; entries that fail to verify MUST be dropped.
 
@@ -576,13 +579,51 @@ The signature is the same signature carried by the corresponding `PresenceEntry`
 
 ## 10.7 Federation Presence Fetch
 
-Relays populate their federation-cache by polling each configured peer relay's `/peers/presence` endpoint.
+Relays populate their federation-cache by polling each configured peer relay's `/peers/presence` endpoint, signing each request per §10.8 with their relay identity key for the relay they ask.
 
-**PNP-008-MUST-069**: Each relay MUST poll every entry of its `PEER_RELAY_URLS` configuration for `/peers/presence` at an interval of at most 300 seconds. Fetch failures MUST be logged and MUST NOT crash the relay.
+**PNP-008-MUST-069**: Each relay in the relay profile MUST poll every entry of its `PEER_RELAY_URLS` configuration for `/peers/presence` at an interval of at most 300 seconds, each request signed per §10.8. Fetch failures (a refusal by a peer that has not listed this relay among its federation peers included) MUST be logged and MUST NOT crash the relay.
 
 **PNP-008-MUST-070**: Federation-cache entries MUST expire at a TTL of at most 3600 seconds measured from the time they were fetched. A relay answering `GET /peers/lookup?id=` MUST treat expired federation-cache entries as misses.
 
 Relays verify each fetched `PresenceEntry` signature against the home relay's Ed25519 verifying key (resolved through the authority-verified directory cache) before inserting it into the federation cache. Entries with invalid signatures MUST be rejected — this is a direct corollary of PNP-008-MUST-064.
+
+## 10.8 Who May Ask
+
+`/peers/presence` lists every PeerId connected to a relay and `/peers/lookup` says whether one PeerId is online and where. Neither is answered to an anonymous caller.
+
+**PNP-008-MUST-099**: A relay MUST NOT disclose, over any HTTP endpoint, which PeerIds are connected to it, to a caller that has not authenticated per this section (an endpoint that only the relay's own operator can use, behind an operator credential, is not such a disclosure). A relay in the signaling-only profile MUST NOT serve `GET /peers/presence` or `GET /peers/lookup` at all (HTTP 404, whatever the request carries; PNP-001-MUST-071): there, whether a peer is online is learned only over a registered client socket (PNP-001 §10.5). A relay in the relay profile MUST answer the two endpoints only as MUST-100 through MUST-102 allow.
+
+### 10.8.1 Request Signature
+
+The request carries the header
+
+```
+Authorization: PNP-Ed25519 key=<64 hex>,ts=<decimal>,relay=<relay name>,sig=<128 hex>
+```
+
+with each of the four parameters exactly once: `key` is the requester's Ed25519 public key, `ts` the Unix time in seconds at which the request was signed, `relay` the canonical name of the relay the request is sent to (`host:port` as defined in PNP-001 §10.7, derived from the URL the requester dials) and `sig` the signature.
+
+**PNP-008-MUST-100**: `sig` MUST be the Ed25519 signature, by the key in `key`, over exactly these bytes:
+
+```
+peers_request =
+    label      (24 bytes)  ASCII "PNP-008-peers-request-v1"
+ || kind       ( 1 byte )  0x01 for /peers/presence, 0x02 for /peers/lookup
+ || timestamp  ( 8 bytes)  the value of ts, big-endian
+ || target     (32 bytes)  the PeerId in the id parameter of a lookup; 32 zero bytes for presence
+ || name_len   ( 2 bytes)  length of name in bytes, big-endian
+ || name       (name_len)  the value of relay, ASCII
+```
+
+Every field but the last has a fixed length and the last is length-prefixed. The signature therefore covers what is asked, about whom, when and of which relay.
+
+**PNP-008-MUST-101**: Before it reads any presence state for the request, the relay MUST verify that the header is well formed, that `relay` is one of its own configured names (PNP-001-MUST-086), that `ts` is within 60 seconds of its own clock in either direction, and that `sig` verifies for the kind of the endpoint and, for a lookup, for the PeerId in `id`. A request that fails any of these MUST be answered HTTP 401 and nothing else: the answer MUST be the same whether or not the PeerId asked about is online. A request signed for another relay, for another PeerId or more than a minute ago is thereby of no use.
+
+### 10.8.2 Authorization
+
+**PNP-008-MUST-102**: A relay MUST answer an authenticated `GET /peers/presence` only when `key` is the relay identity key of a federation peer that its operator configured (`FEDERATION_PEER_KEYS` in the reference relay; none by default). It MUST answer an authenticated `GET /peers/lookup` only when `key` is such a federation peer's key or the identity key of a peer registered on this relay at that moment (the SHA-256 of `key` is a currently registered PeerId). Any other authenticated request MUST be answered HTTP 403, again the same whether or not the PeerId asked about is online.
+
+Registration is free (PNP-001 §10.7), so MUST-102 does not hide a peer's presence on a relay-profile relay from a party that registers there; it removes the anonymous, unmetered query, and it stops a party with no socket on the relay from enumerating everyone connected to it. The 60-second window of MUST-101 is not a replay cache: within it, whoever can read the header (the relay's own TLS terminator) can repeat the same question to the same relay and gets the answer the requester got.
 
 ## 11. Versioning
 
@@ -596,7 +637,7 @@ Relays verify each fetched `PresenceEntry` signature against the home relay's Ed
 
 This specification declares:
 
-- **98 MUST** clauses (`PNP-008-MUST-001` through `PNP-008-MUST-098`)
+- **102 MUST** clauses (`PNP-008-MUST-001` through `PNP-008-MUST-102`)
 - **11 SHOULD** clauses (`PNP-008-SHOULD-001` through `PNP-008-SHOULD-011`)
 - **3 MAY** clauses (`PNP-008-MAY-001` through `PNP-008-MAY-003`)
 
