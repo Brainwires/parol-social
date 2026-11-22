@@ -24,6 +24,7 @@ unsafe extern "C" {
         out_len: *mut usize,
         is_keyframe: *mut c_int,
     ) -> c_int;
+    fn pn_vp8enc_set_bitrate(e: *mut c_void, kbps: c_uint) -> c_int;
     fn pn_vp8enc_free(e: *mut c_void);
 }
 
@@ -63,6 +64,19 @@ impl Vp8Encoder {
             pts: 0,
             out: vec![0; (width * height * 3) as usize + 4096],
         })
+    }
+
+    /// Change the target bitrate (kbit/s) from the next frame on, without a keyframe: what a
+    /// call does when the congestion controller's estimate moves.
+    pub fn set_bitrate(&mut self, kbps: u32) -> Result<(), MediaError> {
+        // SAFETY: the context is ours; the shim validates the value.
+        let rc = unsafe { pn_vp8enc_set_bitrate(self.raw, kbps) };
+        if rc != 0 {
+            return Err(MediaError::Codec(format!(
+                "VP8 encoder: cannot set the bitrate to {kbps} kbit/s"
+            )));
+        }
+        Ok(())
     }
 
     /// Encode the next frame; `None` when the rate control dropped it.
@@ -156,6 +170,51 @@ mod tests {
         assert!(decoded >= 25, "decoded {decoded} of 30");
         let forced = enc.encode(&pattern.next_frame(), true).unwrap().unwrap();
         assert!(forced.keyframe);
+    }
+
+    /// The rate follows `set_bitrate` mid-stream, without a keyframe.
+    #[test]
+    fn the_bitrate_can_be_changed_while_encoding() {
+        // A picture with enough moving detail that the rate control has to work for either
+        // target: two drifting wave patterns and a little noise.
+        let (mut seed, mut t) = (1u32, 0f32);
+        let mut noisy = |frame: &mut I420Frame| {
+            t += 1.0;
+            for (i, value) in frame.plane_mut(0).iter_mut().enumerate() {
+                let (x, y) = ((i % 320) as f32, (i / 320) as f32);
+                seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                let noise = (seed >> 28) as f32 - 8.0;
+                let v = 128.0
+                    + 60.0 * ((x + 3.0 * t) / 7.0).sin()
+                    + 40.0 * ((y * 1.3 - 2.0 * t) / 5.0).sin()
+                    + noise;
+                *value = v.clamp(0.0, 255.0) as u8;
+            }
+        };
+        let mut enc = Vp8Encoder::new(320, 240, 30, 1000).unwrap();
+        let mut frame = I420Frame::new(320, 240);
+        let mut bytes = |enc: &mut Vp8Encoder, frames: usize| -> (usize, usize) {
+            let (mut total, mut keys) = (0, 0);
+            for _ in 0..frames {
+                noisy(&mut frame);
+                if let Some(e) = enc.encode(&frame, false).unwrap() {
+                    total += e.data.len();
+                    keys += usize::from(e.keyframe);
+                }
+            }
+            (total, keys)
+        };
+        let _ = bytes(&mut enc, 30); // the first second, with its keyframe
+        let (high, _) = bytes(&mut enc, 60);
+        enc.set_bitrate(100).unwrap();
+        let _ = bytes(&mut enc, 30); // the rate control's buffer settling
+        let (low, keys) = bytes(&mut enc, 60);
+        assert_eq!(keys, 0, "no keyframe was forced by the change");
+        // Two seconds each: about 250 kB at 1000 kbit/s, 25 kB at 100 kbit/s.
+        assert!(high > 120_000, "{high} bytes at 1000 kbit/s");
+        assert!(low < high / 3, "{low} bytes at 100 kbit/s after {high}");
+        enc.set_bitrate(100).unwrap();
+        assert!(enc.set_bitrate(0).is_err());
     }
 
     /// Writes the bot's test pattern (crates/parolnet-app/examples/testpattern.ivf):

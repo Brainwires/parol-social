@@ -17,10 +17,10 @@ use rtc::sansio::Protocol;
 use rtc::shared::{TaggedBytesMut, TransportContext, TransportProtocol};
 use rtc::stun::message::TransactionId;
 use rtc::turn::client::{Client, ClientConfig, Event};
-use tokio::net::UdpSocket;
 use zeroize::Zeroize;
 
 use crate::RtcError;
+use crate::net::{self, DatagramSocket};
 
 /// The default TURN port (RFC 8656).
 const DEFAULT_PORT: u16 = 3478;
@@ -140,7 +140,7 @@ fn turn_error(what: &str, err: impl std::fmt::Display) -> RtcError {
 /// Allocate a relayed address on `server` through `socket` (before the connection's loop
 /// reads it). Fails after `timeout` in total.
 pub(crate) async fn allocate(
-    socket: &UdpSocket,
+    socket: &dyn DatagramSocket,
     server: &TurnServer,
     timeout: Duration,
     keepalive: Duration,
@@ -171,13 +171,13 @@ pub(crate) async fn allocate(
     )
     .map_err(|e| turn_error("TURN client", e))?;
     client
-        .allocate(Instant::now())
+        .allocate(crate::now())
         .map_err(|e| turn_error("TURN allocate", e))?;
 
     let mut buf = vec![0u8; 2048];
     loop {
         while let Some(out) = client.poll_write() {
-            let _ = socket.send_to(&out.message, out.transport.peer_addr).await;
+            let _ = net::send_to(socket, &out.message, out.transport.peer_addr).await;
         }
         while let Some(event) = client.poll_event() {
             match event {
@@ -209,7 +209,7 @@ pub(crate) async fn allocate(
             .poll_timeout()
             .map(tokio::time::Instant::from_std)
             .map_or(deadline, |t| t.min(deadline));
-        match tokio::time::timeout_at(wake, socket.recv_from(&mut buf)).await {
+        match tokio::time::timeout_at(wake, net::recv_from(socket, &mut buf)).await {
             Ok(Ok((n, from))) if from == server_addr => {
                 if let Err(err) = client.handle_read(tagged(local, from, &buf[..n])) {
                     tracing::debug!(%err, "TURN datagram rejected");
@@ -220,7 +220,7 @@ pub(crate) async fn allocate(
             }
             Ok(Err(err)) => tracing::debug!(%err, "TURN receive failed"),
             Err(_) => {
-                let _ = client.handle_timeout(Instant::now());
+                let _ = client.handle_timeout(crate::now());
             }
         }
     }
@@ -228,7 +228,7 @@ pub(crate) async fn allocate(
 
 fn tagged(local: SocketAddr, from: SocketAddr, data: &[u8]) -> TaggedBytesMut {
     TaggedBytesMut {
-        now: Instant::now(),
+        now: crate::now(),
         transport: TransportContext {
             local_addr: local,
             peer_addr: from,
@@ -248,6 +248,11 @@ impl Relay {
 
     pub(crate) fn server(&self) -> SocketAddr {
         self.server
+    }
+
+    /// The local address of the socket the allocation lives on.
+    pub(crate) fn local(&self) -> SocketAddr {
+        self.local
     }
 
     /// Send `data` to `peer` through the relay. The first datagram to an address asks for
@@ -362,11 +367,11 @@ impl Relay {
     /// Release the allocation (a Refresh with lifetime 0) and wait briefly for the server
     /// to confirm it, retransmitting meanwhile. Best effort: an allocation whose release is
     /// lost expires on the server by its lifetime.
-    pub(crate) async fn release(mut self, socket: &UdpSocket) {
+    pub(crate) async fn release(mut self, socket: &dyn DatagramSocket) {
         let released = self
             .client
             .relay(self.relayed)
-            .and_then(|mut relay| relay.close(Instant::now()));
+            .and_then(|mut relay| relay.close(crate::now()));
         if released.is_err() {
             return;
         }
@@ -374,7 +379,7 @@ impl Relay {
         let mut buf = vec![0u8; 2048];
         loop {
             while let Some((data, to)) = self.poll_write() {
-                let _ = socket.send_to(&data, to).await;
+                let _ = net::send_to(socket, &data, to).await;
             }
             while self.client.poll_event().is_some() {}
             // The client forgets the allocation when the server confirms the release.
@@ -390,10 +395,10 @@ impl Relay {
             if tokio::time::Instant::now() >= deadline {
                 return;
             }
-            match tokio::time::timeout_at(wake, socket.recv_from(&mut buf)).await {
+            match tokio::time::timeout_at(wake, net::recv_from(socket, &mut buf)).await {
                 Ok(Ok((n, from))) if from == self.server => self.handle_datagram(&buf[..n]),
                 Ok(_) => {}
-                Err(_) => self.handle_timeout(Instant::now()),
+                Err(_) => self.handle_timeout(crate::now()),
             }
         }
     }

@@ -9,7 +9,10 @@
 //! - **Data-channel frames** on the `parolnet` channel: JSON text, `{"type":"identity",
 //!   "peerId"}` once on open and `{"type":"chat","payload":<envelope hex>}` for every PNP-001
 //!   envelope (chat, bootstrap, and later file and call signals). This is what
-//!   `pwa/src/webrtc.js` sends and accepts.
+//!   `pwa/src/webrtc.js` sends and accepts. Our identity frame also lists `"features"`:
+//!   [`FEATURE_ICE_RESTART`] says that a later `rtc_offer` for this connection is applied to
+//!   it (an ICE restart) instead of replacing it. A peer that lists nothing is never sent
+//!   one.
 
 use serde::{Deserialize, Serialize};
 
@@ -26,6 +29,90 @@ pub mod msg_type {
     pub const CALL_SIGNAL: u8 = 0x0B;
     /// 0x14 CHANNEL_BINDING: the data channel's DTLS fingerprints (PNP-001 §10.5.1).
     pub const CHANNEL_BINDING: u8 = 0x14;
+}
+
+/// An ICE restart of a data connection gets this long to be answered and to connect again;
+/// after it the connection is rebuilt (PNP-011 section 8.3).
+pub const RESTART_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// Whether a description belongs to the DTLS session `known` describes: the same
+/// certificate fingerprints (what the channel binding of PNP-001 section 10.5.1 covers),
+/// and at least one.
+pub fn same_dtls_session(known: Option<&str>, sdp: &str) -> bool {
+    use parolnet_protocol::channel_binding::sdp_fingerprints;
+    let Some(known) = known else {
+        return false;
+    };
+    let (mut a, mut b) = (sdp_fingerprints(known), sdp_fingerprints(sdp));
+    a.sort();
+    a.dedup();
+    b.sort();
+    b.dedup();
+    !a.is_empty() && a == b
+}
+
+/// Whether ICE restarts may be exchanged with a peer on a data connection: both sides listed
+/// [`FEATURE_ICE_RESTART`] in their identity frames (`ours` is whether we did).
+pub fn restarts(ours: bool, peer_features: &[String]) -> bool {
+    ours && peer_features.iter().any(|f| f == FEATURE_ICE_RESTART)
+}
+
+/// What to do with an `rtc_offer` from a peer we hold a connection to (PNP-011 section 8.2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RestartOffer {
+    /// An ICE restart of the connection we have: apply it there and answer.
+    Apply,
+    /// It crossed a restart of ours and the peer is the designated initiator: drop ours,
+    /// then apply it and answer.
+    Yield,
+    /// It crossed a restart of ours and we are the designated initiator: drop it.
+    KeepOurs,
+    /// Not a restart of the connection we have: an offer for a new connection, handled as
+    /// before restarts existed.
+    NewConnection,
+}
+
+/// Decide about an `rtc_offer` when a connection to its sender exists: `renegotiation` is
+/// whether we take restarts at all, `verified` whether the connection's channel binding
+/// verified, `same_session` whether the offer carries that connection's DTLS fingerprints
+/// ([`same_dtls_session`]), `ours` whether a restart of ours is unanswered, `designated`
+/// whether we are the pair's designated initiator ([`should_initiate`]).
+pub fn on_restart_offer(
+    renegotiation: bool,
+    verified: bool,
+    same_session: bool,
+    ours: bool,
+    designated: bool,
+) -> RestartOffer {
+    if !renegotiation || !verified || !same_session {
+        RestartOffer::NewConnection
+    } else if !ours {
+        RestartOffer::Apply
+    } else if designated {
+        RestartOffer::KeepOurs
+    } else {
+        RestartOffer::Yield
+    }
+}
+
+/// What to do when a restart's deadline ([`RESTART_TIMEOUT`]) passes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RestartExpiry {
+    /// Answered and connected: nothing to do.
+    Done,
+    /// The path works but the peer never answered: take the offer back and go on.
+    TakeBack,
+    /// No working path: rebuild the connection.
+    Rebuild,
+}
+
+/// Decide at a restart's deadline.
+pub fn on_restart_expiry(connected: bool, answered: bool) -> RestartExpiry {
+    match (connected, answered) {
+        (true, true) => RestartExpiry::Done,
+        (true, false) => RestartExpiry::TakeBack,
+        (false, _) => RestartExpiry::Rebuild,
+    }
 }
 
 /// A frame the client sends to the relay.
@@ -183,7 +270,11 @@ pub struct SdpJson {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DcFrame {
     /// Sent once by each side when the channel opens.
-    Identity { peer_id: String },
+    Identity {
+        peer_id: String,
+        /// What the peer's app supports on this connection (empty from the PWA).
+        features: Vec<String>,
+    },
     /// A hex-encoded PNP-001 envelope.
     Envelope { hex: String },
     /// Anything else (the PWA's mesh `gossip` frames, future types).
@@ -198,11 +289,28 @@ struct RawDcFrame {
     peer_id: Option<String>,
     #[serde(default)]
     payload: Option<serde_json::Value>,
+    #[serde(default)]
+    features: Option<serde_json::Value>,
 }
 
+/// The identity-frame feature of a peer that takes an ICE restart of the data connection: a
+/// second `rtc_offer` with the connection's DTLS fingerprint and new ICE credentials.
+pub const FEATURE_ICE_RESTART: &str = "ice-restart";
+
 impl DcFrame {
-    pub fn identity(peer_id: &str) -> String {
-        serde_json::json!({ "type": "identity", "peerId": peer_id }).to_string()
+    /// The identity frame; with `ice_restart` it lists that feature, without it is exactly
+    /// the PWA's.
+    pub fn identity(peer_id: &str, ice_restart: bool) -> String {
+        if ice_restart {
+            serde_json::json!({
+                "type": "identity",
+                "peerId": peer_id,
+                "features": [FEATURE_ICE_RESTART],
+            })
+        } else {
+            serde_json::json!({ "type": "identity", "peerId": peer_id })
+        }
+        .to_string()
     }
 
     pub fn chat(envelope_hex: &str) -> String {
@@ -218,7 +326,23 @@ impl DcFrame {
         match serde_json::from_str::<RawDcFrame>(text) {
             Ok(raw) => match raw.msg_type.as_str() {
                 "identity" => match raw.peer_id {
-                    Some(peer_id) => DcFrame::Identity { peer_id },
+                    Some(peer_id) => DcFrame::Identity {
+                        peer_id,
+                        // A list of strings; anything else is no feature.
+                        features: raw
+                            .features
+                            .as_ref()
+                            .and_then(serde_json::Value::as_array)
+                            .map(|list| {
+                                list.iter()
+                                    .filter_map(serde_json::Value::as_str)
+                                    .filter(|f| !f.is_empty() && f.len() <= 32)
+                                    .take(16)
+                                    .map(str::to_owned)
+                                    .collect()
+                            })
+                            .unwrap_or_default(),
+                    },
                     None => DcFrame::Other,
                 },
                 "chat" => match raw.payload {
@@ -335,10 +459,15 @@ mod tests {
     #[test]
     fn data_channel_frames_match_the_pwa() {
         assert_eq!(
-            DcFrame::parse(DcFrame::identity("abc").as_bytes()),
+            DcFrame::parse(DcFrame::identity("abc", true).as_bytes()),
             DcFrame::Identity {
-                peer_id: "abc".into()
+                peer_id: "abc".into(),
+                features: vec![FEATURE_ICE_RESTART.into()],
             }
+        );
+        assert_eq!(
+            DcFrame::identity("abc", false),
+            r#"{"peerId":"abc","type":"identity"}"#
         );
         assert_eq!(
             DcFrame::parse(DcFrame::chat("00ff").as_bytes()),
@@ -348,7 +477,23 @@ mod tests {
         assert_eq!(
             DcFrame::parse(br#"{"type":"identity","peerId":"p"}"#),
             DcFrame::Identity {
-                peer_id: "p".into()
+                peer_id: "p".into(),
+                features: vec![],
+            }
+        );
+        // Features that are not a list of strings are no features.
+        assert_eq!(
+            DcFrame::parse(br#"{"type":"identity","peerId":"p","features":"ice-restart"}"#),
+            DcFrame::Identity {
+                peer_id: "p".into(),
+                features: vec![],
+            }
+        );
+        assert_eq!(
+            DcFrame::parse(br#"{"type":"identity","peerId":"p","features":["x",1,"ice-restart"]}"#),
+            DcFrame::Identity {
+                peer_id: "p".into(),
+                features: vec!["x".into(), "ice-restart".into()],
             }
         );
         assert_eq!(

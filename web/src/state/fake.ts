@@ -2,7 +2,9 @@
 // test builds only). It behaves like the engine where the screens can tell: a message sent on
 // an open line is delivered, anything else waits; when a line opens, what waited is delivered.
 import { batch, signal } from "denext/signals";
+import { BackupError } from "../engine/backup.ts";
 import { EngineError } from "../engine/types.ts";
+import { VaultError } from "../engine/vault.ts";
 import type {
   Attachment,
   CallInfo,
@@ -134,6 +136,8 @@ export interface FakeStoreOptions {
 export function createFakeStore(options: FakeStoreOptions = {}): AppStore & FakeControls {
   const retryDelayMs = options.retryDelayMs ?? 1500;
   const phase = signal<Phase>({ kind: "ready" });
+  const passphraseSet = signal(false);
+  const lastBackupMs = signal<number | null>(null);
   const relay = signal<RelayState>({ kind: "Registered", profile: "signaling-only" });
   const selfOnline = signal(true);
   const people = signal<readonly Contact[]>(options.empty ? [] : seedContacts());
@@ -219,7 +223,54 @@ export function createFakeStore(options: FakeStoreOptions = {}): AppStore & Fake
     turn,
     notice,
 
+    passphraseSet,
+    lastBackupMs,
     begin: () => Promise.resolve(),
+    // The lab's passphrase rules: "wrong" is the wrong one, anything else is right.
+    unlock(passphrase) {
+      if (passphrase === "wrong") {
+        phase.value = { kind: "locked", retryAtMs: 0 };
+        return Promise.reject(new VaultError("WrongPassphrase", "that is not the passphrase"));
+      }
+      phase.value = { kind: "ready" };
+      return Promise.resolve();
+    },
+    forget() {
+      this.clear();
+      phase.value = { kind: "first-run" };
+      return Promise.resolve();
+    },
+    lock() {
+      if (passphraseSet.value) phase.value = { kind: "locked", retryAtMs: 0 };
+    },
+    setPassphrase() {
+      passphraseSet.value = true;
+      return Promise.resolve();
+    },
+    changePassphrase(current) {
+      return current === "wrong"
+        ? Promise.reject(new VaultError("WrongPassphrase", "that is not the passphrase"))
+        : Promise.resolve();
+    },
+    removePassphrase(current) {
+      if (current === "wrong") {
+        return Promise.reject(new VaultError("WrongPassphrase", "that is not the passphrase"));
+      }
+      passphraseSet.value = false;
+      return Promise.resolve();
+    },
+    makeBackup() {
+      const madeMs = Date.now();
+      lastBackupMs.value = madeMs;
+      return Promise.resolve({ bytes: new TextEncoder().encode("a made-up backup"), madeMs });
+    },
+    restore(_file, passphrase) {
+      if (passphrase === "wrong") {
+        return Promise.reject(new BackupError("WrongPassphrase", "wrong passphrase"));
+      }
+      phase.value = { kind: "ready" };
+      return Promise.resolve();
+    },
     takeOver() {},
 
     send(peer, text) {
@@ -389,6 +440,10 @@ export function createFakeStore(options: FakeStoreOptions = {}): AppStore & Fake
     },
 
     setPath,
+
+    setPhase(next) {
+      phase.value = next;
+    },
 
     setCall(next) {
       call.value = next;

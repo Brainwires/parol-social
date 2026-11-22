@@ -105,6 +105,25 @@ impl RelayDescriptor {
         buf
     }
 
+    /// Whether this descriptor is its relay's own statement (PNP-008-MUST-027 item 1):
+    /// `peer_id` is the hash of `identity_key`, and `signature` is that key's over
+    /// [`Self::signable_bytes`]. Without the first half a descriptor signed with any key
+    /// could claim any relay's PeerId, endorsements and directory entry with it.
+    pub fn verify_self_signature(&self) -> bool {
+        if PeerId::from_public_key(&self.identity_key) != self.peer_id {
+            return false;
+        }
+        let Ok(verifying_key) = VerifyingKey::from_bytes(&self.identity_key) else {
+            return false;
+        };
+        verifying_key
+            .verify(
+                &self.signable_bytes(),
+                &Signature::from_bytes(&self.signature),
+            )
+            .is_ok()
+    }
+
     /// Convert to a RelayInfo for circuit building.
     pub fn to_relay_info(&self) -> RelayInfo {
         RelayInfo {
@@ -507,16 +526,8 @@ impl RelayDirectory {
             return false;
         }
 
-        // Verify Ed25519 signature
-        let verifying_key = match VerifyingKey::from_bytes(&desc.identity_key) {
-            Ok(vk) => vk,
-            Err(_) => return false,
-        };
-        let signature = Signature::from_bytes(&desc.signature);
-        if verifying_key
-            .verify(&desc.signable_bytes(), &signature)
-            .is_err()
-        {
+        // The relay's own Ed25519 signature, by the key its PeerId is the hash of
+        if !desc.verify_self_signature() {
             return false;
         }
 
@@ -533,8 +544,11 @@ impl RelayDirectory {
 
     /// Process an authority-endorsed descriptor.
     ///
-    /// Verifies that the descriptor has sufficient authority endorsements
-    /// (meeting the configured threshold), then inserts it into the directory.
+    /// Verifies the descriptor (its relay's signature and its age) and that it
+    /// has sufficient authority endorsements (meeting the configured threshold),
+    /// then inserts it into the directory unless a descriptor at least as recent
+    /// is already there (PNP-008-MUST-030): an endorsement outlives the
+    /// descriptors it was issued under, and an old one must not come back.
     pub fn handle_endorsed_descriptor(
         &mut self,
         desc: EndorsedDescriptor,
@@ -544,11 +558,23 @@ impl RelayDirectory {
             trust_roots::AUTHORITY_THRESHOLD,
         )? {
             return Err(crate::RelayError::CellError(
-                "endorsed descriptor did not meet authority threshold".into(),
+                "endorsed descriptor did not pass validation or meet authority threshold".into(),
             ));
         }
-        self.insert(desc.descriptor);
+        self.insert_if_newer(desc.descriptor);
         Ok(())
+    }
+
+    /// Insert a validated descriptor unless one with the same PeerId and an equal or
+    /// later timestamp is held. Returns whether it was inserted.
+    fn insert_if_newer(&mut self, descriptor: RelayDescriptor) -> bool {
+        if let Some(existing) = self.descriptors.get(&descriptor.peer_id)
+            && existing.timestamp >= descriptor.timestamp
+        {
+            return false;
+        }
+        self.insert(descriptor);
+        true
     }
 
     /// Process a signed directory snapshot from an authority.

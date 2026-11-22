@@ -92,9 +92,18 @@ impl AuthorityEndorsement {
     }
 }
 
+/// PNP-008-MUST-027 item 3: a descriptor older than this is rejected.
+pub const MAX_ENDORSED_DESCRIPTOR_AGE_SECS: u64 = 7 * 86400;
+
 impl EndorsedDescriptor {
-    /// Check that at least `threshold` valid, non-expired endorsements exist
-    /// from distinct authorities in the trusted set.
+    /// Validate the descriptor (PNP-008-MUST-027) and check that at least
+    /// `threshold` valid, non-expired endorsements of it exist from distinct
+    /// authorities in the trusted set.
+    ///
+    /// An endorsement names a PeerId, not a descriptor. What ties it to this
+    /// descriptor's keys and address is the descriptor itself: its PeerId is
+    /// the hash of its identity key and that key signed the rest. Both are
+    /// checked here, with the descriptor's age, before any endorsement counts.
     pub fn verify_threshold(
         &self,
         authority_pubkeys: &[[u8; 32]],
@@ -104,6 +113,13 @@ impl EndorsedDescriptor {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
+
+        if now_secs.saturating_sub(self.descriptor.timestamp) >= MAX_ENDORSED_DESCRIPTOR_AGE_SECS {
+            return Ok(false);
+        }
+        if !self.descriptor.verify_self_signature() {
+            return Ok(false);
+        }
 
         let mut valid_authorities: Vec<[u8; 32]> = Vec::new();
 
@@ -202,19 +218,26 @@ mod tests {
         endorsement
     }
 
-    fn make_descriptor(peer_id: PeerId) -> RelayDescriptor {
-        RelayDescriptor {
-            peer_id,
-            identity_key: [0xAA; 32],
-            x25519_key: [0xBB; 32],
-            addr: "127.0.0.1:9000".parse().unwrap(),
-            bandwidth_class: 1,
-            uptime_secs: 3600,
-            timestamp: 1000,
-            signature: [0u8; 64],
-            bandwidth_estimate: 1000,
-            next_pubkey: None,
-        }
+    fn now_secs() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+    }
+
+    /// A descriptor signed by `relay_key`, for the PeerId that key hashes to.
+    fn make_descriptor(relay_key: &SigningKey, addr: &str, timestamp: u64) -> RelayDescriptor {
+        let identity_key = relay_key.verifying_key().to_bytes();
+        crate::directory::RelayDirectory::create_descriptor(
+            PeerId::from_public_key(&identity_key),
+            identity_key,
+            [0xBB; 32],
+            addr.parse().unwrap(),
+            1,
+            3600,
+            timestamp,
+            relay_key,
+        )
     }
 
     #[test]
@@ -247,11 +270,10 @@ mod tests {
     fn test_endorsed_descriptor_threshold() {
         let sk1 = make_signing_key(1);
         let sk2 = make_signing_key(2);
-        let peer_id = PeerId([0x42; 32]);
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
+        let relay = make_signing_key(7);
+        let now = now_secs();
+        let descriptor = make_descriptor(&relay, "127.0.0.1:9000", now);
+        let peer_id = descriptor.peer_id;
 
         let authority_pubkeys = [
             sk1.verifying_key().to_bytes(),
@@ -260,7 +282,7 @@ mod tests {
 
         // Two valid endorsements -> threshold 2 passes
         let desc = EndorsedDescriptor {
-            descriptor: make_descriptor(peer_id),
+            descriptor: descriptor.clone(),
             endorsements: vec![
                 make_endorsement(&sk1, peer_id, now, now + 86400),
                 make_endorsement(&sk2, peer_id, now, now + 86400),
@@ -270,10 +292,73 @@ mod tests {
 
         // Only one endorsement -> threshold 2 fails
         let desc_one = EndorsedDescriptor {
-            descriptor: make_descriptor(peer_id),
+            descriptor,
             endorsements: vec![make_endorsement(&sk1, peer_id, now, now + 86400)],
         };
         assert!(!desc_one.verify_threshold(&authority_pubkeys, 2).unwrap());
+    }
+
+    /// An endorsement names a PeerId. It must not carry over to a descriptor that
+    /// claims that PeerId with other keys or another address (PNP-008-MUST-027).
+    #[test]
+    fn test_endorsement_does_not_carry_to_a_forged_descriptor() {
+        let authority = make_signing_key(1);
+        let authority_pubkeys = [authority.verifying_key().to_bytes()];
+        let relay = make_signing_key(7);
+        let attacker = make_signing_key(66);
+        let now = now_secs();
+
+        let genuine = make_descriptor(&relay, "198.51.100.7:443", now);
+        let endorsements = vec![make_endorsement(
+            &authority,
+            genuine.peer_id,
+            now,
+            now + 86400,
+        )];
+        let endorsed = |descriptor: RelayDescriptor| EndorsedDescriptor {
+            descriptor,
+            endorsements: endorsements.clone(),
+        };
+        assert!(
+            endorsed(genuine.clone())
+                .verify_threshold(&authority_pubkeys, 1)
+                .unwrap()
+        );
+
+        // The attacker's keys and address under the endorsed PeerId, signed by the attacker.
+        let mut forged = make_descriptor(&attacker, "203.0.113.66:443", now + 1);
+        forged.peer_id = genuine.peer_id;
+        forged.signature = attacker.sign(&forged.signable_bytes()).to_bytes();
+        assert!(
+            !endorsed(forged)
+                .verify_threshold(&authority_pubkeys, 1)
+                .unwrap()
+        );
+
+        // The genuine descriptor with the address or the onion key changed: the relay's
+        // signature no longer covers it.
+        let mut moved = genuine.clone();
+        moved.addr = "203.0.113.66:443".parse().unwrap();
+        assert!(
+            !endorsed(moved)
+                .verify_threshold(&authority_pubkeys, 1)
+                .unwrap()
+        );
+        let mut rekeyed = genuine.clone();
+        rekeyed.x25519_key = [0xEE; 32];
+        assert!(
+            !endorsed(rekeyed)
+                .verify_threshold(&authority_pubkeys, 1)
+                .unwrap()
+        );
+
+        // Item 3 of MUST-027: older than seven days.
+        let stale = make_descriptor(&relay, "198.51.100.7:443", now - 7 * 86400 - 1);
+        assert!(
+            !endorsed(stale)
+                .verify_threshold(&authority_pubkeys, 1)
+                .unwrap()
+        );
     }
 
     #[test]

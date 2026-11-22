@@ -7,7 +7,7 @@ import { CallLayer } from "./screens/Call.tsx";
 import { Conversation, ConversationPlaceholder } from "./screens/Conversation.tsx";
 import { ConversationList } from "./screens/ConversationList.tsx";
 import { Settings } from "./screens/Settings.tsx";
-import { FirstRun, Loading, OtherTab, StartFailed } from "./screens/Start.tsx";
+import { FirstRun, Loading, Locked, OtherTab, StartFailed } from "./screens/Start.tsx";
 import { StoreProvider } from "./state/context.ts";
 import type { AppStore } from "./state/store.ts";
 
@@ -46,6 +46,8 @@ function Phases({ store }: { store: AppStore }) {
   switch (phase.kind) {
     case "loading":
       return <Loading />;
+    case "locked":
+      return <Locked retryAtMs={phase.retryAtMs} />;
     case "first-run":
       return <FirstRun />;
     case "other-tab":

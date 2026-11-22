@@ -7,9 +7,12 @@ with the design in [`docs/ux/web-app.md`](../docs/ux/web-app.md). It replaces th
 **What it is today:** the whole client. The screens of the design run on the engine in `src/engine/`
 (identity, relay, pairing, the bound data channel, chat with its queue, verification, 1:1 calls,
 IndexedDB storage; see [`docs/web-port/engine.md`](../docs/web-port/engine.md)): first run, adding a
-contact by QR code or pasted code, conversations, comparing safety numbers, calls, settings. How the
-two are joined, the test layers, the languages and what is still owed before it replaces `pwa/` in
-production: [`docs/web-port/app.md`](../docs/web-port/app.md).
+contact by QR code or pasted code, conversations, comparing safety numbers, calls, settings. What it
+keeps on the device is encrypted at rest and can be locked with a passphrase
+([`docs/web-port/at-rest.md`](../docs/web-port/at-rest.md)); a device can be backed up to one
+encrypted file and restored from it ([`docs/web-port/backup.md`](../docs/web-port/backup.md)). How
+the two are joined, the test layers, the languages and what is still owed before it replaces `pwa/`
+in production: [`docs/web-port/app.md`](../docs/web-port/app.md).
 
 ## Commands
 
@@ -60,9 +63,13 @@ and `wasm-pack`. Run from `web/`.
   depend on the order the bundler concatenates them in. No `@import` between CSS files (the SPA
   bundler leaves it unresolved); `src/main.tsx` imports each one.
 - **Languages.** `src/i18n/`: English is bundled, the other eight locales (ar, de, es, fa, fr, it,
-  ja, ko) are JSON chunks loaded on demand. They hold what could be taken from the old PWA's
-  translations; a missing key falls back to English, key by key (coverage:
-  [`docs/web-port/app.md`](../docs/web-port/app.md)).
+  ja, ko) are JSON chunks loaded on demand. All are complete; the eight are machine translations
+  awaiting review by native speakers, and each file says so (`"@meta.translation": "machine"`; see
+  [`docs/web-port/app.md`](../docs/web-port/app.md)). `scripts/i18n-check.ts` and a unit test hold
+  every locale to every key and the same arguments.
+- **Storage.** The engine's rows go through `SealedStorage` (`src/engine/sealed-storage.ts`): each
+  is sealed with AES-256-GCM under a key the browser will not export, or, with a passphrase set,
+  under keys only Argon2id of the passphrase (from the wasm core) can unwrap.
 - **State.** `src/state/store.ts` is the one interface the screens know. `engine-store.ts`
   implements it over the engine; `fake.ts` is the state lab's made-up version.
 - **Two entries.** `src/main.tsx` is the production entry. `src/main.dev.tsx` adds the state lab
@@ -84,7 +91,9 @@ and `wasm-pack`. Run from `web/`.
   the catalogue and its fallback, the state model, the store adapter against a scripted engine, the
   lab's fake store, the thread logic, the QR encoder against the scanner's decoder for every
   version, the build scripts, component rendering.
-- `tests/engine/`: the engine over real wasm with a fake socket, peer connection and clock.
+- `tests/engine/`: the engine over real wasm with a fake socket, peer connection and clock; the
+  sealed storage, the migration from the plaintext database, the passphrase lock and the backup file
+  (`vault_test.ts`, `backup_test.ts`).
 - `tests/e2e/`: Playwright. Each test serves an export itself under `/pwa/` with the CSP header
   (`static-server.mjs`).
   - `platform.spec.ts`, on the production export: CSP clean, first run, no lab and no test hooks,

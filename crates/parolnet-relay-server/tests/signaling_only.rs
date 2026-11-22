@@ -406,6 +406,154 @@ async fn reconnect_overlap_keeps_the_newer_socket_routable() {
     assert_eq!(got["payload"], "still here");
 }
 
+/// A `register` answer: the credentials a client sends for `nonce_hex`.
+fn signed_register(id: &Identity, nonce_hex: &str) -> Value {
+    use ed25519_dalek::Signer;
+    let sig = id.key.sign(&hex::decode(nonce_hex).unwrap());
+    json!({
+        "type": "register",
+        "peer_id": id.peer_id,
+        "pubkey": hex::encode(id.key.verifying_key().to_bytes()),
+        "signature": hex::encode(sig.to_bytes()),
+        "nonce": nonce_hex,
+    })
+}
+
+/// The reply to a credentialed `register`: `registered` or `error`.
+async fn register_reply(ws: &mut Ws) -> Value {
+    loop {
+        let v = recv(ws, 3000).await.expect("register reply");
+        if v["type"] == "registered" || v["type"] == "error" {
+            return v;
+        }
+    }
+}
+
+async fn challenge_nonce(ws: &mut Ws, peer_id: &str) -> String {
+    send(ws, json!({"type": "register", "peer_id": peer_id})).await;
+    let ch = recv_type(ws, "challenge", 3000).await.expect("challenge");
+    ch["nonce"].as_str().unwrap().to_owned()
+}
+
+#[tokio::test]
+async fn a_captured_register_answer_cannot_be_replayed() {
+    let relay = Relay::start(&[]).await;
+    let p = Identity::new();
+
+    // P registers on connection 1. Whoever sees this frame (a relay P used,
+    // or anyone on the path) holds a (pubkey, signature, nonce) triple.
+    let mut c1 = relay.ws().await;
+    let nonce = challenge_nonce(&mut c1, &p.peer_id).await;
+    let captured = signed_register(&p, &nonce);
+    send(&mut c1, captured.clone()).await;
+    assert_eq!(register_reply(&mut c1).await["type"], "registered");
+
+    // Connection 2 has no key. It replays the triple without asking for a
+    // challenge at all.
+    let mut c2 = relay.ws().await;
+    send(&mut c2, captured.clone()).await;
+    let r = register_reply(&mut c2).await;
+    assert_eq!(r["type"], "error", "replay without a challenge: {r}");
+    assert_eq!(r["code"], "register_failed", "{r}");
+    // The refusal carries no challenge to try next.
+    assert!(recv_type(&mut c2, "challenge", 300).await.is_none());
+
+    // Connection 3 asks for its own challenge first and then replays.
+    let mut c3 = relay.ws().await;
+    let fresh = challenge_nonce(&mut c3, &p.peer_id).await;
+    assert_ne!(fresh, nonce, "every socket gets its own nonce");
+    send(&mut c3, captured.clone()).await;
+    let r = register_reply(&mut c3).await;
+    assert_eq!(r["type"], "error", "replay against another challenge: {r}");
+    assert_eq!(r["code"], "register_failed", "{r}");
+
+    // P's own socket cannot be made to accept its triple a second time
+    // either (a second register of the same id on a registered socket is a
+    // no-op, not an answer), and P is still the one who gets P's signaling.
+    let (mut b, idb) = registered_peer(&relay).await;
+    send(
+        &mut b,
+        json!({"type": "rtc_offer", "to": p.peer_id, "payload": "for the real P"}),
+    )
+    .await;
+    let got = recv_type(&mut c1, "rtc_offer", 3000)
+        .await
+        .expect("P keeps its registration");
+    assert_eq!(got["from"], idb.peer_id);
+    assert!(recv_type(&mut c2, "rtc_offer", 300).await.is_none());
+    assert!(recv_type(&mut c3, "rtc_offer", 100).await.is_none());
+
+    // The replaying sockets are not registered: they may not signal as P.
+    send(
+        &mut c3,
+        json!({"type": "rtc_offer", "to": idb.peer_id, "payload": "from a fake P"}),
+    )
+    .await;
+    let e = recv_type(&mut c3, "error", 3000).await.unwrap();
+    assert_eq!(e["code"], "not_registered");
+    assert!(recv_type(&mut b, "rtc_offer", 300).await.is_none());
+}
+
+#[tokio::test]
+async fn a_challenge_is_answered_once_and_only_with_its_own_nonce() {
+    let relay = Relay::start(&[]).await;
+
+    // A wrong signature spends the challenge: the right one, sent next for
+    // the same nonce, is refused, and a new plain register gets a new nonce.
+    // (Four register frames: the most one socket may send.)
+    let id = Identity::new();
+    let mut ws = relay.ws().await;
+    let nonce = challenge_nonce(&mut ws, &id.peer_id).await;
+    let mut bad = signed_register(&id, &nonce);
+    bad["signature"] = json!(hex::encode([0u8; 64]));
+    send(&mut ws, bad.clone()).await;
+    assert_eq!(register_reply(&mut ws).await["code"], "register_failed");
+    send(&mut ws, signed_register(&id, &nonce)).await;
+    let r = register_reply(&mut ws).await;
+    assert_eq!(r["code"], "register_failed", "{r}");
+    let again = challenge_nonce(&mut ws, &id.peer_id).await;
+    assert_ne!(again, nonce);
+
+    // After a refusal, asking again and answering the new nonce registers.
+    let id = Identity::new();
+    let mut ws = relay.ws().await;
+    let nonce = challenge_nonce(&mut ws, &id.peer_id).await;
+    let mut bad = signed_register(&id, &nonce);
+    bad["signature"] = json!(hex::encode([0u8; 64]));
+    send(&mut ws, bad).await;
+    assert_eq!(register_reply(&mut ws).await["code"], "register_failed");
+    let again = challenge_nonce(&mut ws, &id.peer_id).await;
+    assert_ne!(again, nonce);
+    send(&mut ws, signed_register(&id, &again)).await;
+    assert_eq!(register_reply(&mut ws).await["type"], "registered");
+
+    // A nonce the client made up, validly signed, is refused.
+    let id = Identity::new();
+    let mut ws = relay.ws().await;
+    let _ = challenge_nonce(&mut ws, &id.peer_id).await;
+    send(&mut ws, signed_register(&id, &hex::encode([0x5a; 32]))).await;
+    let r = register_reply(&mut ws).await;
+    assert_eq!(r["code"], "register_failed", "{r}");
+}
+
+#[tokio::test]
+async fn two_plain_registers_before_the_answer_still_register() {
+    // The legacy PWA sends a second plain `register` on boot and answers
+    // every challenge it is sent. Both challenges carry one nonce; the first
+    // answer registers and the second is a no-op.
+    let relay = Relay::start(&[]).await;
+    let id = Identity::new();
+    let mut ws = relay.ws().await;
+    let n1 = challenge_nonce(&mut ws, &id.peer_id).await;
+    let n2 = challenge_nonce(&mut ws, &id.peer_id).await;
+    assert_eq!(n1, n2);
+    send(&mut ws, signed_register(&id, &n1)).await;
+    send(&mut ws, signed_register(&id, &n2)).await;
+    assert_eq!(register_reply(&mut ws).await["type"], "registered");
+    // No error follows for the second answer.
+    assert!(recv_type(&mut ws, "error", 300).await.is_none());
+}
+
 #[tokio::test]
 async fn per_ip_connection_and_identity_caps() {
     let relay = Relay::start(&[

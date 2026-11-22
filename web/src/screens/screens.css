@@ -409,6 +409,30 @@
   .start .btn {
     min-inline-size: 10rem;
   }
+  .start__form {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-3);
+    inline-size: 100%;
+  }
+  /* A checkbox with its words: the whole row is the target. */
+  .check {
+    display: flex;
+    align-items: center;
+    gap: var(--space-3);
+    min-block-size: var(--target-min);
+  }
+  .check__box {
+    inline-size: 1.25rem;
+    block-size: 1.25rem;
+    flex: none;
+    accent-color: var(--ink);
+  }
+  .field__file {
+    min-block-size: var(--target-min);
+    max-inline-size: 100%;
+    color: var(--ink);
+  }
 
   /* Add a contact */
   .pairing,

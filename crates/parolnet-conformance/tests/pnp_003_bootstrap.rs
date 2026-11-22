@@ -147,19 +147,53 @@ fn bootstrap_nonce_replay_window_is_60_minutes() {
 
 // -- §3.2 QR timestamp validity window ---------------------------------------
 
-#[clause("PNP-003-MUST-011")]
+#[clause("PNP-003-MUST-010", "PNP-003-MUST-011")]
 #[test]
 fn qr_payload_age_limit_is_30_minutes() {
-    let qr_max_age_secs: u64 = 30 * 60;
-    assert_eq!(qr_max_age_secs, 1800);
+    use parolnet_core::bootstrap::{QR_MAX_AGE_SECS, QrPayload, parse_qr_payload_at};
+    assert_eq!(QR_MAX_AGE_SECS, 30 * 60);
 
-    // Receiver rejects ts outside [now - 1800, now + 1800] approximately.
-    let now: u64 = 10_000;
-    let fresh = now - 600;
-    let stale = now - 1801;
-    let accept = |ts: u64| now.saturating_sub(ts) <= qr_max_age_secs;
-    assert!(accept(fresh));
-    assert!(!accept(stale));
+    let code = |ts: u64| {
+        let payload = QrPayload {
+            v: 1,
+            ik: vec![0x11; 32],
+            seed: vec![0x22; 32],
+            rk: vec![0x33; 32],
+            relay: None,
+            ts,
+            net: 2,
+        };
+        let mut bytes = Vec::new();
+        ciborium::into_writer(&payload, &mut bytes).unwrap();
+        bytes
+    };
+    let accepted = |ts: u64, now: u64| parse_qr_payload_at(&code(ts), now).is_ok();
+
+    // The presenter floors `ts` to 5 minutes; the scanner's clock is 200 s into a bucket.
+    let now: u64 = 1_800_000_200;
+    assert_eq!(now % 300, 200);
+    let bucket = now - 200;
+
+    // A code made this moment, and one as old as it may be.
+    assert!(accepted(bucket, now));
+    assert!(accepted(now - 1800, now));
+    // Older than 30 minutes: rejected.
+    assert!(!accepted(now - 1801, now));
+    assert!(!accepted(bucket - 1800, now));
+    // No timestamp is not a way round the check.
+    assert!(!accepted(0, now));
+
+    // The presenter's clock ahead of ours: fine up to 30 minutes past the current
+    // bucket, rejected beyond.
+    assert!(accepted(bucket + 300, now));
+    assert!(accepted(bucket + 1800, now));
+    assert!(!accepted(bucket + 1801, now));
+    assert!(!accepted(bucket + 2100, now));
+    assert!(!accepted(u64::MAX, now));
+
+    // What the core generates passes its own check (wall clock).
+    let fresh = parolnet_core::bootstrap::generate_qr_payload(&[0x11; 32], None).unwrap();
+    assert!(parolnet_core::bootstrap::parse_qr_payload(&fresh).is_ok());
 }
 
 // -- §3.1 QR encoding: CBOR + base45 + ECC level M ---------------------------

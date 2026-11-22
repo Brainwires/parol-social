@@ -17,7 +17,8 @@ This index is the authoritative registry of ParolNet Protocol (PNP) specificatio
 | PNP-007 | Media & File Transfer | 0.3 | CANDIDATE | 90 | 13 | 3 | 106 | M 90/90 · S 12/13 · MAY 0/3 |
 | PNP-008 | Relay Federation & Network Resilience | 0.7 | CANDIDATE | 98 | 11 | 3 | 112 | M 98/98 · S 11/11 · MAY 0/3 |
 | PNP-009 | Group Communication | 0.2 | CANDIDATE | 77 | 7 | 3 | 87 | M 77/77 · S 7/7 · MAY 0/3 |
-| **Totals** | — | — | — | **595** | **109** | **31** | **735** | **M 592/595 · S 107/109 · MAY 2/31** |
+| PNP-011 | 1:1 Calls | 0.1 | CANDIDATE | 34 | 8 | 1 | 43 | M 34/34 · S 8/8 · MAY 1/1 |
+| **Totals** | — | — | — | **629** | **117** | **32** | **778** | **M 626/629 · S 115/117 · MAY 3/32** |
 
 The CI gate (`cargo xtask clauses --check`) requires a test for every MUST and every SHOULD clause, and that every `#[clause]` id is one a spec publishes. MAY clauses are reported and not required: an implementation need not take an option, and an option it does not take has nothing to test.
 
