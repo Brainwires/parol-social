@@ -3,7 +3,8 @@
 What the current vanilla-JS PWA (`pwa/`) does, so that the TypeScript rewrite works with the
 native client (`crates/parolnet-app`, the reference for current behaviour) and passes
 `apps/desktop/interop/pwa-interop.mjs`. This is documentation only. Every claim cites
-`file:line`. Unless marked otherwise:
+`file:line`. (`pwa/` has since been removed from the repository: `git show bd493e2:pwa/<path>`
+reads a file as cited here.) Unless marked otherwise:
 
 - paths are relative to the repository root;
 - PWA paths are as on `origin/master` `bd493e2`. `pwa/` and `crates/parolnet-wasm` are identical on

@@ -5,7 +5,7 @@
 // (docs/web-port/at-rest.md). Version 2 added the `vault` store, which holds the keys;
 // there is no migration from the old PWA.
 import type { Storage, StoreName } from "./platform.ts";
-import type { DeliveryState, Direction, Verification } from "./types.ts";
+import type { DeliveryState, Direction, PairingMark, Verification } from "./types.ts";
 
 export const DB_NAME = "parolnet-web";
 export const DB_VERSION = 2;
@@ -60,6 +60,8 @@ export interface IdentityRow {
 export interface PendingPairingRow {
   id: "pairing";
   code: string;
+  /** The code in its form for copying. */
+  text: string;
   expiresAtMs: number;
   /** Never logged. */
   pendingHex: string;
@@ -79,6 +81,14 @@ export interface ContactRow {
   addedMs: number;
   verified: Verification;
   verifiedMs: number | null;
+  /** Both people confirmed the pairing's verification code (PNP-003 §5.5). */
+  sasVerified?: boolean;
+  /**
+   * A pairing with this contact is under way. A pairing lives in memory only, so a row found
+   * with this mark at start was never finished: `new` rows are removed, `again` rows lose
+   * their session (`Engine.load`).
+   */
+  pairing?: PairingMark;
   /**
    * Set when this contact came out of a backup (./backup.ts): its session may be older than
    * the one the contact's device has. Removed once a connection to it has passed its check.
@@ -101,25 +111,17 @@ export interface MessageRow {
  * store `outbox`, key `id` (increasing: FIFO per peer), index `peerId`.
  *
  * A `text` entry holds the message as plaintext and is encrypted when it is flushed, so a
- * queued message can be edited or taken back without touching the ratchet. A `bootstrap`
- * entry is the scanner's bootstrap-completing envelope, already encrypted at pairing.
+ * queued message can be edited or taken back without touching the ratchet. (The messages of
+ * a pairing are never stored: a pairing does not outlive the page.)
  */
-export type OutboxRow =
-  | {
-    id: number;
-    peerId: string;
-    kind: "text";
-    messageId: number;
-    text: string;
-    createdMs: number;
-  }
-  | {
-    id: number;
-    peerId: string;
-    kind: "bootstrap";
-    envelopeHex: string;
-    createdMs: number;
-  };
+export interface OutboxRow {
+  id: number;
+  peerId: string;
+  kind: "text";
+  messageId: number;
+  text: string;
+  createdMs: number;
+}
 
 /** store `contactState`, key `peerId`. */
 export interface ContactStateRow {

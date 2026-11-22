@@ -44,7 +44,7 @@ Not verified:
 - The reviewers' verdicts in general. A strict reviewer can under-count: treat a "hollow" or "partial" verdict as a pointer to read that test, not as settled.
 - Every "Shipped?" cell outside PNP-001.
 - Every defect in the next section.
-- Anything in the legacy PWA or the web app's TypeScript. Where a file names `pwa/src/...`, a reviewer read it; nobody ran it.
+- Anything in the legacy PWA or the web app's TypeScript. Where a file names `pwa/src/...`, a reviewer read it; nobody ran it. The legacy PWA has since been removed from the repository, so those paths refer to the tree the audit read, and its "legacy PWA" rows no longer describe anything that ships.
 - MAY clauses: not audited.
 
 ## Reported defects, not verified

@@ -85,6 +85,46 @@ function assert(cond, message) {
   if (!cond) throw new Error(`assertion failed: ${message}`);
 }
 
+/// A pairing code as text: base45 (PNP-003) with an underscore for every blank.
+const CODE_AS_TEXT = /^[0-9A-Z_$%*+\-./:]{100,}$/;
+
+/// The verification code a web client shows for a pairing (PNP-003 §5.5), once it does.
+function shownSas(web) {
+  return until(`${web.name}: its verification code`, 45_000, () => web.hook("sas"));
+}
+
+/// Two web clients show the same verification code, and both people say so.
+async function confirmSasBetween(a, b) {
+  const [onA, onB] = [await shownSas(a), await shownSas(b)];
+  assert(/^\d{6}$/.test(onA.digits) && onA.digits === onB.digits, "the same six digits on both");
+  assert(onA.emoji === onB.emoji && [...onA.emoji].length === 5, "the same five emoji on both");
+  await a.hook("confirmSas");
+  await b.hook("confirmSas");
+}
+
+/// A web client and the desktop show the same verification code; both confirm, and the
+/// desktop reports the pairing as complete with the code confirmed.
+async function confirmSasWithBot(web, bot) {
+  const onWeb = await shownSas(web);
+  const onBot = await bot.wait(
+    "the verification code",
+    (e) => e.event === "sas" && e.peer_id === web.peerId,
+    45_000,
+  );
+  assert(
+    onWeb.digits === onBot.digits && onWeb.emoji === onBot.emoji,
+    "the same verification code on both",
+  );
+  bot.send(`sas-confirm ${web.peerId}`);
+  await web.hook("confirmSas");
+  const done = await bot.wait(
+    "paired",
+    (e) => e.event === "paired" && e.peer_id === web.peerId,
+    45_000,
+  );
+  assert(done.sas_verified === true, "the desktop recorded the confirmed code");
+}
+
 function freePort() {
   return new Promise((res, rej) => {
     const s = netCreateServer();
@@ -487,8 +527,9 @@ async function webToWeb(port) {
   );
 
   const code = await a.hook("showPairingCode");
-  assert(/^[0-9a-f]{100,}$/.test(code), "a pairing code");
+  assert(CODE_AS_TEXT.test(code), "a pairing code");
   await b.hook("pairWithCode", code);
+  await confirmSasBetween(a, b);
   await a.waitPath(b.peerId, "direct");
   await b.waitPath(a.peerId, "direct");
   assert((await a.hook("contacts")).includes(b.peerId), "alice has bob");
@@ -645,7 +686,7 @@ async function webPresentsToDesktop(port, relayPort, bindIp) {
   const web = await Web.open("two", port);
   const code = await web.hook("showPairingCode");
   bot.send(`pair ${code}`);
-  await bot.wait("paired", (e) => e.event === "paired" && e.peer_id === web.peerId);
+  await confirmSasWithBot(web, bot);
   await bot.wait(
     "a direct path",
     (e) => e.event === "path" && e.peer_id === web.peerId && e.state === "Direct",
@@ -678,6 +719,7 @@ async function desktopPresentsToWeb(port, relayPort, bindIp) {
   bot.send("code");
   const { code } = await bot.wait("its code", (e) => e.event === "code");
   await web.hook("pairWithCode", code);
+  await confirmSasWithBot(web, bot);
   await until(
     "the contact on the web client",
     10_000,
@@ -724,35 +766,41 @@ async function tamperedBinding(port, relayPort, bindIp) {
   const web = await Web.open("four", port, { tamperBinding: true });
   const code = await web.hook("showPairingCode");
   bot.send(`pair ${code}`);
-  await bot.wait("paired", (e) => e.event === "paired" && e.peer_id === web.peerId);
   await bot.wait(
     "the end-to-end check to fail",
     (e) => e.event === "notice" && e.text.includes("failed its end-to-end check"),
     45_000,
   );
+  // The pairing was under way on the refused connection: it is over on both sides
+  // (PNP-003 §4), and neither keeps the contact it had added.
   await bot.wait(
-    "BindingFailed",
-    (e) => e.event === "path" && e.peer_id === web.peerId && e.state === "BindingFailed",
+    "the pairing to fail",
+    (e) => e.event === "pairing_failed" && e.peer_id === web.peerId,
+    10_000,
+  );
+  await bot.wait(
+    "the contact to be removed",
+    (e) => e.event === "contact_removed" && e.peer_id === web.peerId,
     10_000,
   );
   assert(
     !bot.events.some((e) => e.event === "path" && e.peer_id === web.peerId && e.state === "Direct"),
     "the desktop never reported a direct path",
   );
+  assert(
+    !bot.events.some((e) => e.event === "paired" && e.peer_id === web.peerId),
+    "the desktop never completed the pairing",
+  );
   // The web client compares the desktop's binding with the same (tampered) description.
   await until(
-    "the web client to refuse too",
+    "the web client to drop the contact too",
     20_000,
-    async () => (await web.hook("pathState", bot.peerId)) === "binding-failed",
+    async () => !(await web.hook("contacts")).includes(bot.peerId),
   );
   assert(
     !web.console.some((l) => l.includes("direct channel verified")),
     "the web client never verified",
   );
-  const held = await bot.sendText(web.peerId, "must not be delivered on a refused channel");
-  assert(held.state === "Queued", `the desktop held its message (${held.state})`);
-  const webHeld = await web.hook("sendText", bot.peerId, "nor this one");
-  assert(webHeld.state === "Queued", `the web client held its message (${webHeld.state})`);
   log(`${tag}: refused on both sides`);
   await bot.quit();
   await web.close();

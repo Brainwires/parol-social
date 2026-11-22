@@ -31,8 +31,8 @@ relying on it.
 - **Content.** Messages, files, calls and data channels are end-to-end encrypted between devices.
   Relays, TURN servers and (from M2) media servers see ciphertext only.
 - **Identity.** An identity is an Ed25519 key; its `PeerId` is the SHA-256 of the public key. You
-  add contacts by QR code or a pairing code and verify them with safety numbers. There is nothing
-  to register.
+  add contacts by QR code or a pairing code, compare a short verification code with them while you
+  do, and can compare safety numbers later. There is nothing to register.
 - **Servers anyone can run.** Relays federate; you choose your home relay or run your own.
 - **Signaling-only public relay.** By default a relay only helps contacts set up direct connections
   (registration, WebRTC offer / answer / ICE between two online contacts, presence, STUN URIs); no
@@ -76,7 +76,7 @@ apps/desktop (GPUI)      web/ (TS + wasm)        later: iOS / Android shells (Un
 | `parolnet-relay-server` | Axum relay: signaling-only by default (register, SDP / ICE, presence, STUN URIs); opt-in relay profile with store-and-forward, federation, TURN credentials | exists |
 | `parolnet-rtc` | Async driver for the sans-I/O [`webrtc-rs-rtc`](https://github.com/Brainwires/webrtc-rs-rtc) engine (native): sockets on every interface (IPv4 and IPv6), STUN and the user's TURN server, data channels, RTP with RTX, ICE restart, track renegotiation, the congestion controller's estimate, a statistics digest; runs on real sockets or, in virtual time, on `parolnet-simnet` | M1 |
 | `parolnet-store` | Encrypted native persistence: SQLite with SQLCipher (bundled), database key in the OS keychain (`keyring`) or an owner-only key file on machines without one; identity, contacts, sessions, messages, sender queue, settings; schema migrations, incremental transactional writes, import of the earlier plaintext data directory, wipe | M1 |
-| `parolnet-app` | Headless client core: identity, PWA-compatible pairing, signaling-only relay client, a direct data channel per contact bound to the E2EE session (DTLS fingerprints, PNP-001 §10.5.1), 1:1 encrypted chat, sender-side queue, 1:1 voice / video calls, file transfer that survives a lost connection and a restart (PNP-010) | M1 |
+| `parolnet-app` | Headless client core: identity, PNP-003 pairing (code or QR, verification code, the same exchange as the web app), signaling-only relay client, a direct data channel per contact bound to the E2EE session (DTLS fingerprints, PNP-001 §10.5.1), 1:1 encrypted chat, sender-side queue, 1:1 voice / video calls, file transfer that survives a lost connection and a restart (PNP-010) | M1 |
 | `apps/desktop` | GPUI desktop client: contacts, pairing, chat (UI v0), 1:1 calls with camera, echo cancellation and device menus; the M0 video spike behind `--spike` | M1 |
 | `parolnet-media` | Call media for native clients (no dependency on the rest of the workspace): frames, the capture traits and synthetic sources, resampling, Opus, echo cancellation / noise suppression / gain (AEC3, pure Rust), the audio duplex path; behind opt-in features, VP8 through libvpx, microphone and speakers (cpal), camera capture (nokhwa) | M1 |
 | `parolnet-transfer` | File transfer (PNP-010) without I/O, for native and wasm: the offer and its answers, sealed 64 KiB records (ChaCha20-Poly1305, STREAM nonces, a key per attempt), resume at the record the receiver names, the final SHA-256 check, limits. `parolnet-app` streams files from and to disk with it; the web app drives it through `parolnet-wasm` | M1 |
@@ -138,10 +138,6 @@ first build takes a while (Rust twice: the relay and the wasm core); later build
 Rust and Denext layers when only the app changes. `scripts/image-smoke.sh http://127.0.0.1:1411`
 checks a running container (CI's `image` job runs it). See [server/README.md](server/README.md).
 
-`pwa/` is the legacy vanilla-JS client. It is no longer built into or served by the image and
-stays in the repository for now (the desktop interop suite still has a `pwa` target); `npm run
-build:all` builds it for that suite.
-
 ### Web app rewrite (`web/`)
 
 The PWA is rewritten as a [Denext](https://denext.dev) app with a new design
@@ -155,9 +151,9 @@ with a passphrase ([docs/web-port/at-rest.md](docs/web-port/at-rest.md), which a
 that does not protect against); a device can be backed up to one encrypted file and restored
 from it ([docs/web-port/backup.md](docs/web-port/backup.md)). Nine languages, eight of them
 machine-translated and awaiting review. It passes the seven desktop ↔ browser interop cases in Chromium,
-Firefox and WebKit. It is the client the relay image serves at `/pwa/`, in place of the legacy
-`pwa/` (what [app.md](docs/web-port/app.md#owed-before-this-replaces-the-old-pwa) lists as owed
-still applies). See [web/README.md](web/README.md).
+Firefox and WebKit. It is the client the relay image serves at `/pwa/`; the legacy vanilla-JS client it replaced
+has been removed from the repository (what [app.md](docs/web-port/app.md#still-owed) lists as
+owed still applies). See [web/README.md](web/README.md).
 
 ```bash
 cd web

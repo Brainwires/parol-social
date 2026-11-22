@@ -21,6 +21,7 @@ No tracking. No phone numbers. No registration. No names. Your identity is a cry
 - Rust toolchain -- install from [https://rustup.rs](https://rustup.rs)
 - `wasm-pack` -- install with: `curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh`
 - Node.js (required by wasm-pack)
+- the `denext` CLI, to build the web app: `curl -fsSL https://denext.dev/install.sh | sh`
 
 **People:**
 
@@ -88,30 +89,18 @@ Give each `.key` file to a DIFFERENT trusted person. They must store it safely a
 
 ## 4. Build the PWA
 
-The PWA (Progressive Web App) is what your users will open in their browser. Building it bakes the authority public keys into the app. Users who download this app can ONLY connect to relays endorsed by your authorities.
+The PWA (Progressive Web App, the web app in `web/`) is what your users will open in their browser. Building it bakes the authority public keys into its wasm core. Users who download this app can ONLY connect to relays endorsed by your authorities.
 
 ```bash
-./pwa/build.sh \
-  --pubkeys KEY1,KEY2,KEY3 \
-  --network-name "YourNetworkName" \
-  --bootstrap-relays wss://relay1.example.com/ws,wss://relay2.example.com/ws \
-  --threshold 2
+cd web
+denext runtime install
+AUTHORITY_PUBKEYS=KEY1,KEY2,KEY3 AUTHORITY_THRESHOLD=2 denext task build-wasm
+denext task build
 ```
 
-Replace `KEY1,KEY2,KEY3` with the actual hex public keys from the previous step (the `AUTHORITY_PUBKEYS` value, without the `AUTHORITY_PUBKEYS=` prefix).
+Replace `KEY1,KEY2,KEY3` with the actual hex public keys from the previous step (the `AUTHORITY_PUBKEYS` value, without the `AUTHORITY_PUBKEYS=` prefix). Empty keys mean the dev placeholder keys. The relay image (section 5, Option B) takes the same two values as build arguments and builds the app itself.
 
-**Options:**
-
-| Flag | Required | Default | Description |
-|------|----------|---------|-------------|
-| `--pubkeys` | Yes | Dev placeholders | Comma-separated 64-char hex Ed25519 public keys |
-| `--network-name` | No | "ParolNet Dev" | Display name for your network |
-| `--bootstrap-relays` | No | Empty | Comma-separated WebSocket URLs of your relays |
-| `--threshold` | No | 2 | How many authorities must endorse a relay |
-
-**Output:** Static files in the `pwa/` directory. This includes HTML, JavaScript, and a WASM binary. These files are ready to host.
-
-The build also generates `pwa/network-config.js` with your network identity baked in.
+**Output:** Static files in `web/out`, to be served under `/pwa/`. This includes HTML, JavaScript, and a WASM binary. The app has no list of bootstrap relays: it uses the relay at the origin it was served from, and a person can name another in its settings.
 
 ---
 
@@ -304,12 +293,11 @@ The PWA is just static files: HTML, JavaScript, and a WASM binary. You can host 
 
 **Options:**
 
-- **Any web server:** Nginx, Apache, Caddy -- just point it at the `pwa/` directory
-- **Cloudflare Pages:** Upload the `pwa/` directory
-- **GitHub Pages:** Push the `pwa/` directory to a GitHub repository with Pages enabled
-- **IPFS:** `ipfs add -r pwa/` -- decentralized and hard to take down
-- **USB stick:** Copy the `pwa/` directory. Users can open `index.html` in their browser for limited use or inspection, but full installable PWA behavior requires HTTPS or `localhost`.
-- **ZIP file:** `cd pwa && zip -r parolnet-pwa.zip .` -- distribute however you can
+- **Any web server:** Nginx, Apache, Caddy -- serve `web/out` under `/pwa/` with the headers in `web/nginx.example.conf` (the Content-Security-Policy, cache rules, `application/wasm`)
+- **Cloudflare Pages:** Upload `web/out` (with the same headers)
+- **GitHub Pages:** Push `web/out` to a GitHub repository with Pages enabled (Pages cannot set custom headers, so the Content-Security-Policy header is not sent)
+- **IPFS:** `ipfs add -r web/out` -- decentralized and hard to take down
+- **USB stick / ZIP file:** Copy or zip `web/out` for someone to re-host. The app does not run from `file://`; installable PWA behavior requires HTTPS or `localhost`.
 
 **The PWA can cache app assets after the first load.** Once a user installs it as a Progressive Web App, cached copies can keep opening if the host disappears. Sending new messages still requires a reachable relay, direct WebRTC connection, or future mesh path.
 
@@ -342,7 +330,7 @@ If the website or source code is removed:
 
 1. **Users export their data.** In the app: Settings -> Data Backup -> Export. The export file is encrypted and looks like random data. Safe to carry on a USB stick.
 
-2. **Someone re-hosts the PWA.** From a backup, a mirror, or by rebuilding from source. If you have a copy of the `pwa/` directory, you can host it again immediately.
+2. **Someone re-hosts the PWA.** From a backup, a mirror, or by rebuilding from source. If you have a copy of the built `web/out` directory, you can host it again immediately.
 
 3. **Same authority public keys = same network.** As long as you build with the same `--pubkeys`, users' data is compatible. Nothing changes for them.
 
@@ -352,7 +340,7 @@ If the website or source code is removed:
 
 **Preparation:** Keep a backup of:
 - The source code (git clone)
-- A built copy of the `pwa/` directory
+- A built copy of the `web/out` directory
 - The `.pub` files (authority public keys)
 - The `AUTHORITY_PUBKEYS` string
 

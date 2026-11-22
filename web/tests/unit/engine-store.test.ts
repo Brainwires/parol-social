@@ -78,6 +78,7 @@ class FakeEngine implements EnginePort {
     contacts: [],
     pairingOpen: false,
     pairing: null,
+    sas: null,
     turnConfigured: false,
     relayOnly: false,
     call: null,
@@ -118,7 +119,19 @@ class FakeEngine implements EnginePort {
   messages = (peerId: string) => Promise.resolve(this.history.get(peerId) ?? []);
   createPairingCode() {
     this.calls.push("createPairingCode");
-    return Promise.resolve({ code: "c0de", expiresAtMs: 1 });
+    return Promise.resolve({ code: "C0 DE", text: "C0_DE", expiresAtMs: 1 });
+  }
+  confirmSas(peerId: string) {
+    this.calls.push(`confirmSas:${peerId.slice(0, 2)}`);
+    return Promise.resolve();
+  }
+  rejectSas(peerId: string) {
+    this.calls.push(`rejectSas:${peerId.slice(0, 2)}`);
+    return Promise.resolve();
+  }
+  stopPairing(peerId: string) {
+    this.calls.push(`stopPairing:${peerId.slice(0, 2)}`);
+    return Promise.resolve();
   }
   cancelPairing() {
     this.calls.push("cancelPairing");
@@ -454,9 +467,12 @@ Deno.test("store: contacts, the line and pairing come from the snapshot on every
     ["Bob", "NoDirectPath", 3],
   ]);
 
-  h.engine.snap = { ...h.engine.snap, pairing: { code: "abcd", expiresAtMs: 5 } };
+  h.engine.snap = {
+    ...h.engine.snap,
+    pairing: { code: "AB CD", text: "AB_CD", expiresAtMs: 5 },
+  };
   h.engine.emit({ kind: "Pairing", pairing: h.engine.snap.pairing });
-  assertEquals(h.store.pairing.value, { code: "abcd", expiresAtMs: 5 });
+  assertEquals(h.store.pairing.value, { code: "AB CD", text: "AB_CD", expiresAtMs: 5 });
   h.engine.snap = { ...h.engine.snap, pairing: null };
   h.engine.emit({ kind: "Pairing", pairing: null });
   assertEquals(h.store.pairing.value, null);
@@ -481,6 +497,9 @@ Deno.test("store: intents become engine commands; a refusal reaches the screen",
   await h.store.createPairingCode();
   await h.store.cancelPairing();
   await h.store.pair("c0de", "scan");
+  await h.store.confirmSas(ALICE);
+  await h.store.rejectSas(ALICE);
+  await h.store.stopPairing(ALICE);
   await h.store.rename(ALICE, "Ally");
   await h.store.setCompared(ALICE, true);
   await h.store.setCompared(ALICE, false);
@@ -494,6 +513,9 @@ Deno.test("store: intents become engine commands; a refusal reaches the screen",
     "createPairingCode",
     "cancelPairing",
     "pair:c0de:scan",
+    "confirmSas:a1",
+    "rejectSas:a1",
+    "stopPairing:a1",
     "rename:Ally",
     "verify:compared",
     "verify:no",
@@ -643,6 +665,42 @@ Deno.test("store: notices; a failed security check is left to the conversation's
   assertEquals(h.store.notice.value, { code: "TurnUnusable", peerId: undefined });
   h.store.dismissNotice();
   assertEquals(h.store.notice.value, null);
+});
+
+Deno.test("store: the verification code of a pairing, and how a pairing ended", async () => {
+  const h = harness();
+  await h.store.start();
+  assertEquals(h.store.sas.value, null);
+
+  // The engine shows a code: the store holds the one of the snapshot.
+  const sas = { peerId: ALICE, digits: "042917", emoji: "abcde", confirmed: false };
+  h.engine.snap = { ...h.engine.snap, sas };
+  h.engine.emit({ kind: "Sas", sas });
+  assertEquals(h.store.sas.value, sas);
+  // Other events do not replace what is on screen while nothing about it changed.
+  const shown = h.store.sas.value;
+  h.engine.snap = { ...h.engine.snap, sas: { ...sas } };
+  h.engine.emit({ kind: "Relay", state: h.engine.snap.relay });
+  assertEquals(h.store.sas.value === shown, true);
+  h.engine.snap = { ...h.engine.snap, sas: { ...sas, confirmed: true } };
+  h.engine.emit({ kind: "Sas", sas: { ...sas, confirmed: true } });
+  assertEquals(h.store.sas.value?.confirmed, true);
+
+  // It ended without a contact: the code goes, and a panel says why.
+  h.engine.snap = { ...h.engine.snap, sas: null };
+  h.engine.emit({ kind: "PairingFailed", peerId: ALICE, reason: "SasMismatch" });
+  assertEquals(h.store.sas.value, null);
+  assertEquals(h.store.notice.value, { code: "Pairing", peerId: ALICE, pairing: "SasMismatch" });
+  // The next one that completes takes that panel away.
+  h.engine.emit({ kind: "PairingComplete", peerId: BOB, sasVerified: true });
+  assertEquals(h.store.notice.value, null);
+  // What the person stopped themselves needs no words.
+  h.engine.emit({ kind: "PairingFailed", peerId: ALICE, reason: "Cancelled" });
+  assertEquals(h.store.notice.value, null);
+  // A notice about something else is not a pairing's to clear.
+  h.engine.emit({ kind: "Notice", code: "TurnUnusable", text: "x" });
+  h.engine.emit({ kind: "PairingComplete", peerId: BOB, sasVerified: false });
+  assertEquals(h.store.notice.value?.code, "TurnUnusable");
 });
 
 Deno.test("store: another tab has ParolNet; 'Use it here' takes it over", async () => {

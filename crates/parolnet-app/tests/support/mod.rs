@@ -106,6 +106,8 @@ pub fn config(dir: &Path, relay: &Relay, name: &str) -> AppConfig {
     cfg.stun_servers = Some(Vec::new());
     cfg.bind_ip = Some("127.0.0.1".parse().unwrap());
     cfg.downloads_dir = Some(dir.join(format!("{name}-downloads")));
+    // No user to compare verification codes: pairings complete without the SAS.
+    cfg.request_sas = false;
     cfg
 }
 

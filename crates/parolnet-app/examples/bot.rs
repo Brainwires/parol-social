@@ -7,11 +7,15 @@
 //! ```
 //!
 //! Prints one JSON object per line on stdout: `ready` (peer id), `code` (with
-//! `--show-code`), `contact`, `path`, `relay`, `message`, `notice`, `call` (state and video
+//! `--show-code`; the pairing code in its text form, without blanks), `pairing` (a pairing
+//! was started with `pair`), `sas` (the verification code to compare), `paired` (the pairing
+//! completed; `sas_verified`), `pairing_failed`, `code_closed`, `contact`,
+//! `contact_removed`, `path`, `relay`, `message`, `notice`, `call` (state and video
 //! changes) and, during a call, once a second `media` (RTP packets received per kind) and
 //! `quality`, plus `bitrate` (the congestion controller's estimate) and `video` (the
 //! contact's or our video starting or stopping). Reads commands on stdin, one per line:
-//! `send <peer-id> <text>`, `code`, `pair <code>`, `call <peer-id> [video]`, `accept
+//! `send <peer-id> <text>`, `code`, `pair <code>`, `sas-confirm <peer-id>`, `sas-reject
+//! <peer-id>` (the answer to a `sas` line), `call <peer-id> [video]`, `accept
 //! [call-id]`, `reject [call-id]`, `hangup [call-id]`, `video on|off [call-id]` (renegotiate
 //! our video), `network-changed` (restart ICE as after an interface change), `quit`. With
 //! `--echo` every received message is answered with `echo: <text>`.
@@ -232,6 +236,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Headless (CI, containers): there is no keychain service, so the store's key is a file
     // in the data directory.
     cfg.key_storage = KeyStorage::File;
+    // No user to compare verification codes; a contact who asks for the SAS still gets it
+    // (the `sas` event) and can be answered with `sas-confirm` / `sas-reject`.
+    cfg.request_sas = false;
     if host_only {
         cfg.stun_servers = Some(Vec::new());
     }
@@ -240,11 +247,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (app, mut events) = parolnet_app::start(cfg).await?;
     out(json!({"event": "ready", "peer_id": app.peer_id(), "public_key": app.public_key()}));
     if show_code {
-        out(json!({"event": "code", "code": app.create_pairing_code().await?}));
+        let code = app.create_pairing_code().await?;
+        out(json!({"event": "code", "code": parolnet_app::pairing_code_text(&code)}));
     }
     if let Some(code) = pair {
         let c = app.pair_with_code(&code).await?;
-        out(json!({"event": "paired", "peer_id": c.peer_id}));
+        out(json!({"event": "pairing", "peer_id": c.peer_id}));
     }
 
     // The latest call (for `accept` / `reject` / `hangup` without an id).
@@ -277,6 +285,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                     AppEvent::Message(_) | AppEvent::MessageState { .. } => {}
                     AppEvent::Notice(n) => out(json!({"event": "notice", "text": n})),
+                    AppEvent::PairingCodeClosed => out(json!({"event": "code_closed"})),
+                    AppEvent::ContactRemoved { peer_id } => {
+                        out(json!({"event": "contact_removed", "peer_id": peer_id}))
+                    }
+                    AppEvent::SasVerification { peer_id, digits, emoji } => out(json!({
+                        "event": "sas", "peer_id": peer_id, "digits": digits, "emoji": emoji
+                    })),
+                    AppEvent::PairingComplete { peer_id, sas_verified } => out(json!({
+                        "event": "paired", "peer_id": peer_id, "sas_verified": sas_verified
+                    })),
+                    AppEvent::PairingFailed { peer_id, reason } => out(json!({
+                        "event": "pairing_failed", "peer_id": peer_id, "reason": reason
+                    })),
                     AppEvent::Call(c) => {
                         let state = match &c.state {
                             CallState::Ended(why) => format!("Ended({why:?})"),
@@ -325,12 +346,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 match words.next() {
                     Some("quit") => break,
                     Some("code") => {
-                        out(json!({"event": "code", "code": app.create_pairing_code().await?}));
+                        // The text form: one word, as `pair` takes it.
+                        let code = app.create_pairing_code().await?;
+                        out(json!({"event": "code", "code": parolnet_app::pairing_code_text(&code)}));
                     }
+                    // `paired` follows when the pairing completes, `pairing_failed` if not.
                     Some("pair") => match app.pair_with_code(words.next().unwrap_or("")).await {
-                        Ok(c) => out(json!({"event": "paired", "peer_id": c.peer_id})),
+                        Ok(c) => out(json!({"event": "pairing", "peer_id": c.peer_id})),
                         Err(e) => out(json!({"event": "error", "text": e.to_string()})),
                     },
+                    Some("sas-confirm") => {
+                        if let Err(e) = app.confirm_sas(words.next().unwrap_or("")).await {
+                            out(json!({"event": "error", "text": e.to_string()}));
+                        }
+                    }
+                    Some("sas-reject") => app.reject_sas(words.next().unwrap_or("")),
                     Some("send") => {
                         let rest = line.strip_prefix("send").unwrap_or("").trim_start();
                         let (peer, text) = rest.split_once(' ').unwrap_or((rest, ""));

@@ -13,8 +13,13 @@ export const DATA_CHANNEL_LABEL = "parolnet";
 export const MsgType = {
   /** TEXT: the plaintext is the raw UTF-8 chat text. */
   TEXT: 0x01,
-  /** CONTROL: the scanner's bootstrap envelope carries an empty CONTROL body. */
+  /** CONTROL: an empty body is the first message of a new PNP-002 session. */
   CONTROL: 0x03,
+  /**
+   * HANDSHAKE: PNP-003 BootstrapHandshake / SASVerify and the PNP-002 handshake messages
+   * (CBOR, built and read in wasm). The scanner's bootstrap envelope is one.
+   */
+  HANDSHAKE: 0x05,
   /** DECOY: dropped silently. */
   DECOY: 0x04,
   CALL_SIGNAL: 0x0b,

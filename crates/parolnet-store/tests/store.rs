@@ -47,6 +47,8 @@ fn contact(peer_id: &str, name: &str, added_ms: u64) -> ContactRecord {
         name: name.into(),
         identity_key: Some("ab".repeat(32)),
         added_ms,
+        sas_verified: false,
+        pairing: 0,
     }
 }
 

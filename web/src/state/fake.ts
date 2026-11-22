@@ -14,6 +14,7 @@ import type {
   PairingCode,
   PathState,
   RelayState,
+  SasCheck,
   TransferInfo,
   Verification,
 } from "./model.ts";
@@ -236,6 +237,7 @@ export function createFakeStore(options: FakeStoreOptions = {}): AppStore & Fake
   const call = signal<CallInfo | null>(null);
   const callMedia = signal<CallMediaStreams>({ local: null, remote: null });
   const pairing = signal<PairingCode | null>(null);
+  const sas = signal<SasCheck | null>(null);
   const turn = signal<TurnView | null>(null);
   const notice = signal<Notice | null>(null);
   let nextId = 1000;
@@ -346,6 +348,7 @@ export function createFakeStore(options: FakeStoreOptions = {}): AppStore & Fake
     call,
     callMedia,
     pairing,
+    sas,
     turn,
     notice,
 
@@ -521,7 +524,11 @@ export function createFakeStore(options: FakeStoreOptions = {}): AppStore & Fake
     },
 
     createPairingCode() {
-      const code: PairingCode = { code: FAKE_CODE, expiresAtMs: Date.now() + 28 * MINUTE };
+      const code: PairingCode = {
+        code: FAKE_CODE,
+        text: FAKE_CODE,
+        expiresAtMs: Date.now() + 28 * MINUTE,
+      };
       pairing.value = code;
       return Promise.resolve(code);
     },
@@ -549,6 +556,22 @@ export function createFakeStore(options: FakeStoreOptions = {}): AppStore & Fake
         person((list) => [...list.filter((c) => c.peerId !== contact.peerId), contact]);
       });
       return Promise.resolve(contact);
+    },
+
+    // The fake adds a contact at once; the lab puts a verification code on screen (`setSas`).
+    confirmSas(peer) {
+      if (sas.value?.peerId === peer) sas.value = { ...sas.value, confirmed: true };
+      return Promise.resolve();
+    },
+
+    rejectSas(peer) {
+      if (sas.value?.peerId === peer) sas.value = null;
+      return Promise.resolve();
+    },
+
+    stopPairing(peer) {
+      if (sas.value?.peerId === peer) sas.value = null;
+      return Promise.resolve();
     },
 
     rename(peer, name) {
@@ -679,8 +702,13 @@ export function createFakeStore(options: FakeStoreOptions = {}): AppStore & Fake
       return contact.peerId;
     },
 
+    setSas(next) {
+      sas.value = next;
+    },
+
     clear() {
       batch(() => {
+        sas.value = null;
         people.value = [];
         paths.value = new Map();
         messages.value = new Map();
@@ -700,6 +728,7 @@ export function createFakeStore(options: FakeStoreOptions = {}): AppStore & Fake
         transfers.value = options.empty ? new Map() : seedTransfers();
         call.value = null;
         pairing.value = null;
+        sas.value = null;
         publish();
       });
     },

@@ -30,9 +30,20 @@ Deno.test(
     assertEquals(ha.pathState(b.id), "offline");
 
     const code = await ha.showPairingCode();
-    assert(/^[0-9a-f]{100,}$/.test(code));
+    // The text form of the code: base45 with an underscore for every blank.
+    assert(/^[0-9A-Z_$%*+\-./:]{100,}$/.test(code), code);
+    assertEquals(ha.sas(), null);
     await hb.pairWithCode(code);
     await w.settle();
+    // Both show the same verification code; each says it matches.
+    assertEquals(ha.sas()?.digits, hb.sas()?.digits);
+    assertEquals([ha.sas()?.peerId, hb.sas()?.peerId], [b.id, a.id]);
+    assertEquals(hb.pathState(a.id), "connecting");
+    await ha.confirmSas();
+    assertEquals(ha.sas()?.confirmed, true);
+    await hb.confirmSas();
+    await w.settle();
+    assertEquals([ha.sas(), hb.sas()], [null, null]);
     assertEquals(await ha.contacts(), [b.id]);
     assertEquals(hb.pathState(a.id), "direct");
     assertEquals(ha.rawPathState(b.id), "Direct");
@@ -62,6 +73,12 @@ Deno.test(
 
     const kinds = new Set(seen.map((d) => (d as { kind: string }).kind));
     assert(kinds.has("path") && kinds.has("message") && kinds.has("call"));
+    assert(kinds.has("sas"));
+    assert(
+      seen.some((d) =>
+        JSON.stringify(d) === JSON.stringify({ kind: "paired", peerId: b.id, sasVerified: true })
+      ),
+    );
     assert(
       seen.some((d) =>
         JSON.stringify(d) === JSON.stringify({ kind: "path", peerId: b.id, state: "direct" })

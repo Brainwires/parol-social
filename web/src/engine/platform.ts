@@ -4,23 +4,54 @@
 
 // ── wasm ─────────────────────────────────────────────────────────
 
-/** What `envelope_decode` and `trial_decrypt` return. */
+/** What `envelope_decode` returns. */
 export interface DecodedEnvelope {
-  /** `trial_decrypt` only: the sender's PeerId (hex). */
-  source_peer_id?: string;
   source_hint: string | null;
   msg_type: number;
   plaintext_hex: string;
   timestamp: number | bigint;
-  /** `trial_decrypt` only: the envelope materialised the presenter's session (PNP-001 §5.3.1). */
-  bootstrapped?: boolean;
 }
 
-export interface ScannedCode {
+/** `pairing_create_code`: a code to show, with its pending half kept in wasm memory. */
+export interface CreatedCode {
+  /** What the QR code encodes: base45 of the CBOR payload. */
+  code: string;
+  /** The same code for copying as text. */
+  text: string;
+  /** The payload's timestamp, seconds. */
+  ts: number | bigint;
+  /** When a scanner stops accepting it, seconds. */
+  expires_secs: number | bigint;
+}
+
+/**
+ * What to do next in a pairing, in order (crates/parolnet-wasm/src/pairing.rs):
+ * - `send`: send `payload_hex` as a HANDSHAKE envelope of the session held with the peer now;
+ * - `sas`: show the verification code and ask whether the contact shows the same;
+ * - `session`: call `pairing_install_session` (after every `send` before it was encrypted);
+ * - `established`: the pairing is over; an initiator sends the session's first message.
+ */
+export type PairingStep =
+  | { kind: "send"; payload_hex: string }
+  | { kind: "sas"; digits: string; emoji: string }
+  | { kind: "session" }
+  | { kind: "established"; sas_verified: boolean };
+
+/** `pairing_initiate`. */
+export interface PairingStarted {
   peer_id: string;
-  their_identity_key: string;
-  /** Secret. The engine never reads, stores or logs it. */
-  bootstrap_secret: string;
+  identity_key: string;
+  /** The BOOTSTRAP_INIT to send first. */
+  init_hex: string;
+}
+
+/** `pairing_respond`: the code is spent either way. */
+export interface PairingAnswered {
+  accepted: boolean;
+  identity_key?: string;
+  /** Why the bootstrap was aborted, when `accepted` is false. */
+  reason?: string;
+  steps: PairingStep[];
 }
 
 /**
@@ -61,8 +92,6 @@ export interface WasmApi {
     sourcePeerIdHex: string,
     envelopeHex: string,
   ): DecodedEnvelope;
-  /** Try every session, then the pending bootstrap. Throws when nothing decrypts. */
-  trial_decrypt(envelopeHex: string): DecodedEnvelope;
   has_session(peerIdHex: string): boolean;
   /** JSON `{peerHex: sessionHex}`, or `""` with no sessions. Secret. */
   export_sessions(): string;
@@ -74,13 +103,41 @@ export interface WasmApi {
     localSdp: string,
     remoteSdp: string,
   ): boolean;
-  /** Creates the presenter's pending bootstrap (in wasm memory only) and returns the code. */
-  generate_qr_payload(
-    identityKeyHex: string,
-    relayHint?: string | null,
-  ): string;
-  /** Scanner side: establishes the initiator session. */
-  process_scanned_qr(payloadHex: string): ScannedCode;
+
+  // ── PNP-003 pairing (crates/parolnet-wasm/src/pairing.rs) ──
+  // One pairing per peer is kept in wasm memory with its secrets; these calls return what
+  // the engine has to carry or show. Errors are short codes in the Error's message.
+  /** Makes a code and keeps its pending half (in wasm memory), replacing an earlier one. */
+  pairing_create_code(relayHint?: string | null): CreatedCode;
+  /**
+   * Scanner side: validates the code (either form), sets up the bootstrap session and starts
+   * the pairing. Throws `code-invalid`, `code-expired` or `own-code`.
+   */
+  pairing_initiate(text: string, requestSas: boolean, nowMs: number): PairingStarted;
+  /**
+   * Presenter side: the scanner's bootstrap envelope, from the peer the connection belongs
+   * to. Throws when it is not that (nothing changed, the code stays valid).
+   */
+  pairing_respond(
+    expectedPeerIdHex: string,
+    envelopeHex: string,
+    requestSas: boolean,
+    nowMs: number,
+  ): PairingAnswered;
+  /** A HANDSHAKE payload from the peer. Throws the reason when the pairing was aborted. */
+  pairing_on_message(peerIdHex: string, payloadHex: string, nowMs: number): PairingStep[];
+  /** An envelope of the peer's session decrypted: a waiting responder is established. */
+  pairing_first_message(peerIdHex: string): PairingStep[];
+  /** The user says the code matches. Throws `wrong-state` when none is waiting. */
+  pairing_confirm_sas(peerIdHex: string, nowMs: number): PairingStep[];
+  /** Carries out a `session` step: the PNP-002 session replaces the bootstrap session. */
+  pairing_install_session(peerIdHex: string): void;
+  /** Aborts a pairing: its secrets and its session are gone. True when there was one. */
+  pairing_abort(peerIdHex: string): boolean;
+  /** The peers whose pairing just timed out (each aborted as by `pairing_abort`). */
+  pairing_timeouts(nowMs: number): string[];
+  /** `secret_shared`, `sas_pending`, `handshaking`, `accepted`, or undefined: no pairing. */
+  pairing_state(peerIdHex: string): string | undefined;
   safety_number(peerAHex: string, peerBHex: string): string;
   version(): string;
   /**
