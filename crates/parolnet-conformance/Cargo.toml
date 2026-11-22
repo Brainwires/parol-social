@@ -43,7 +43,18 @@ serde_bytes = { workspace = true }
 serde_json = { workspace = true }
 ciborium = { workspace = true }
 hex = { workspace = true }
-tokio = { workspace = true }
+# test-util: the paused clock of the PNP-006 timing tests.
+tokio = { workspace = true, features = ["test-util"] }
+async-trait = { workspace = true }
+# PNP-006: a TLS server the transports and the client connect to, HTTP/2 from the other side,
+# and reading socket options back.
+rustls = { workspace = true }
+tokio-rustls = { workspace = true }
+rcgen = { workspace = true }
+h2 = "0.4"
+http = "1"
+bytes = "1"
+socket2 = { version = "0.6", features = ["all"] }
 # The black-box harness (tests/common): a scripted peer on the relay and on a data channel.
 tokio-tungstenite = { workspace = true }
 futures-util = { workspace = true }
