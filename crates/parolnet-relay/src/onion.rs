@@ -5,7 +5,6 @@
 //! - Each relay peels one layer by decrypting with its forward key
 //! - Reverse direction: each relay adds one layer by encrypting with backward key
 
-#[cfg(test)]
 use crate::AEAD_TAG_SIZE;
 use crate::RelayError;
 use parolnet_crypto::Aead;
@@ -54,21 +53,23 @@ impl HopKeys {
         })
     }
 
-    /// Compute the nonce for a given counter by XORing with the seed.
-    fn make_nonce(seed: &[u8; 12], counter: u32) -> [u8; 12] {
+    /// Nonce scheme `N-ONION` (PNP-001 §9): `nonce_seed XOR counter`, the counter taken
+    /// as a big-endian 96-bit integer.
+    pub fn make_nonce(seed: &[u8; 12], counter: u32) -> [u8; 12] {
+        let mut wide = [0u8; 12];
+        wide[8..].copy_from_slice(&counter.to_be_bytes());
         let mut nonce = *seed;
-        let counter_bytes = counter.to_be_bytes();
-        // XOR counter into the last 4 bytes of the nonce
-        for i in 0..4 {
-            nonce[8 + i] ^= counter_bytes[i];
+        for (n, c) in nonce.iter_mut().zip(wide.iter()) {
+            *n ^= c;
         }
         nonce
     }
 }
 
-/// Encrypt a payload with one onion layer (forward direction, OP side).
+/// Encrypt a payload with one onion layer.
 ///
-/// Returns ciphertext with AEAD tag prepended.
+/// The layer is ChaCha20-Poly1305 and nothing else (PNP-004-MUST-013). Returns the
+/// 16-byte AEAD tag followed by the ciphertext (PNP-004-MUST-024: the tag is prepended).
 ///
 /// # Examples
 ///
@@ -89,25 +90,31 @@ pub fn onion_wrap(
     let cipher = ChaCha20Poly1305Cipher::new(key)
         .map_err(|e| RelayError::KeyExchangeFailed(e.to_string()))?;
     let nonce = HopKeys::make_nonce(nonce_seed, counter);
-    cipher
+    // The cipher returns ciphertext || tag; the wire layout is tag || ciphertext.
+    let mut sealed = cipher
         .encrypt(&nonce, payload, &[])
-        .map_err(|_| RelayError::AeadFailed)
+        .map_err(|_| RelayError::AeadFailed)?;
+    sealed.rotate_right(AEAD_TAG_SIZE);
+    Ok(sealed)
 }
 
-/// Decrypt (peel) one onion layer (forward direction, relay side).
-///
-/// Expects ciphertext with AEAD tag appended (as produced by ChaCha20-Poly1305).
+/// Decrypt (peel) one onion layer: the 16-byte tag, then the ciphertext.
 pub fn onion_peel(
     ciphertext: &[u8],
     key: &[u8; 32],
     nonce_seed: &[u8; 12],
     counter: u32,
 ) -> Result<Vec<u8>, RelayError> {
+    if ciphertext.len() < AEAD_TAG_SIZE {
+        return Err(RelayError::AeadFailed);
+    }
     let cipher = ChaCha20Poly1305Cipher::new(key)
         .map_err(|e| RelayError::KeyExchangeFailed(e.to_string()))?;
     let nonce = HopKeys::make_nonce(nonce_seed, counter);
+    let mut sealed = ciphertext.to_vec();
+    sealed.rotate_left(AEAD_TAG_SIZE);
     cipher
-        .decrypt(&nonce, ciphertext, &[])
+        .decrypt(&nonce, &sealed, &[])
         .map_err(|_| RelayError::AeadFailed)
 }
 

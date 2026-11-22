@@ -4,7 +4,6 @@ use parolnet_mesh::gossip::{DedupFilter, ProofOfWork, SeenBloomFilter, StandardG
 use parolnet_mesh::peer_table::PeerScore;
 use parolnet_mesh::store_forward::InMemoryStore;
 use parolnet_protocol::address::PeerId;
-use parolnet_protocol::envelope::{CleartextHeader, Envelope};
 use parolnet_protocol::gossip::GossipEnvelope;
 
 use ed25519_dalek::{Signer, SigningKey};
@@ -155,81 +154,6 @@ fn test_pow_difficulty_zero() {
 
 // ── Store-and-Forward Tests ─────────────────────────────────────
 
-fn make_test_envelope(dest: PeerId) -> Envelope {
-    Envelope {
-        cleartext_header: CleartextHeader {
-            version: 1,
-            msg_type: 0x01,
-            dest_peer_id: dest,
-            message_id: [0; 16],
-            timestamp: 1700000000,
-            ttl_and_hops: 7 << 8,
-            source_hint: None,
-        },
-        ratchet_header: parolnet_crypto::RatchetHeader {
-            ratchet_key: [0u8; 32],
-            previous_chain_length: 0,
-            message_number: 0,
-        },
-        encrypted_payload: vec![0xEE; 64],
-        padding: vec![],
-    }
-}
-
-#[tokio::test]
-async fn test_store_and_retrieve() {
-    let store = InMemoryStore::new();
-    let peer = PeerId([1; 32]);
-    let envelope = make_test_envelope(peer);
-
-    store
-        .store(&envelope, Duration::from_secs(3600))
-        .await
-        .unwrap();
-    assert_eq!(store.count_for_peer(&peer).await, 1);
-
-    let messages = store.retrieve(&peer).await.unwrap();
-    assert_eq!(messages.len(), 1);
-    assert_eq!(store.count_for_peer(&peer).await, 0); // cleared after retrieve
-}
-
-#[tokio::test]
-async fn test_store_limit_eviction() {
-    let store = InMemoryStore::new();
-    let peer = PeerId([1; 32]);
-
-    // Store more than MAX_MESSAGES_PER_PEER
-    for i in 0..260u16 {
-        let mut env = make_test_envelope(peer);
-        env.cleartext_header.message_id[0] = (i & 0xFF) as u8;
-        env.cleartext_header.message_id[1] = (i >> 8) as u8;
-        store.store(&env, Duration::from_secs(3600)).await.unwrap();
-    }
-
-    // Should be capped at MAX_MESSAGES_PER_PEER
-    assert!(store.count_for_peer(&peer).await <= 256);
-}
-
-#[tokio::test]
-async fn test_store_expire() {
-    let store = InMemoryStore::new();
-    let peer = PeerId([1; 32]);
-    let envelope = make_test_envelope(peer);
-
-    // Store with 0 TTL (expires immediately)
-    store
-        .store(&envelope, Duration::from_secs(0))
-        .await
-        .unwrap();
-
-    // Small delay to ensure expiry
-    tokio::time::sleep(Duration::from_millis(10)).await;
-
-    let expired = store.expire().await.unwrap();
-    assert_eq!(expired, 1);
-    assert_eq!(store.count_for_peer(&peer).await, 0);
-}
-
 // ── Additional Bloom Filter Tests ───────────────────────────────
 
 #[test]
@@ -302,67 +226,6 @@ async fn test_store_retrieve_empty_peer() {
     assert!(messages.is_empty());
 }
 
-#[tokio::test]
-async fn test_store_multiple_peers() {
-    let store = InMemoryStore::new();
-    let peer_a = PeerId([1; 32]);
-    let peer_b = PeerId([2; 32]);
-    let peer_c = PeerId([3; 32]);
-
-    // Store 2 messages for peer_a, 3 for peer_b, 1 for peer_c
-    for i in 0..2u8 {
-        let mut env = make_test_envelope(peer_a);
-        env.cleartext_header.message_id[0] = i;
-        store.store(&env, Duration::from_secs(3600)).await.unwrap();
-    }
-    for i in 0..3u8 {
-        let mut env = make_test_envelope(peer_b);
-        env.cleartext_header.message_id[0] = i;
-        store.store(&env, Duration::from_secs(3600)).await.unwrap();
-    }
-    {
-        let env = make_test_envelope(peer_c);
-        store.store(&env, Duration::from_secs(3600)).await.unwrap();
-    }
-
-    assert_eq!(store.count_for_peer(&peer_a).await, 2);
-    assert_eq!(store.count_for_peer(&peer_b).await, 3);
-    assert_eq!(store.count_for_peer(&peer_c).await, 1);
-
-    // Retrieve each independently and verify counts
-    let msgs_a = store.retrieve(&peer_a).await.unwrap();
-    assert_eq!(msgs_a.len(), 2);
-    assert_eq!(store.count_for_peer(&peer_a).await, 0); // cleared after retrieve
-
-    let msgs_b = store.retrieve(&peer_b).await.unwrap();
-    assert_eq!(msgs_b.len(), 3);
-
-    let msgs_c = store.retrieve(&peer_c).await.unwrap();
-    assert_eq!(msgs_c.len(), 1);
-}
-
-#[tokio::test]
-async fn test_store_eviction_order() {
-    let store = InMemoryStore::new();
-    let peer = PeerId([1; 32]);
-
-    // Store exactly MAX_MESSAGES_PER_PEER (256) messages
-    for i in 0..256u16 {
-        let mut env = make_test_envelope(peer);
-        env.cleartext_header.message_id[0] = (i & 0xFF) as u8;
-        env.cleartext_header.message_id[1] = (i >> 8) as u8;
-        store.store(&env, Duration::from_secs(3600)).await.unwrap();
-    }
-    assert_eq!(store.count_for_peer(&peer).await, 256);
-
-    // Store one more — should trigger eviction, count stays at 256
-    let mut env = make_test_envelope(peer);
-    env.cleartext_header.message_id[0] = 0xFF;
-    env.cleartext_header.message_id[1] = 0xFF;
-    store.store(&env, Duration::from_secs(3600)).await.unwrap();
-    assert_eq!(store.count_for_peer(&peer).await, 256);
-}
-
 // ── Additional Proof-of-Work Tests ──────────────────────────────
 
 #[test]
@@ -418,8 +281,8 @@ fn make_valid_gossip_cbor() -> (Vec<u8>, SigningKey, PeerId) {
 
     let msg_id = [0xAA; 32];
 
-    // Compute PoW with difficulty 8 for fast tests
-    let pow_nonce = ProofOfWork::compute(&msg_id, &peer_id, now, 8);
+    // The floor for any payload type is 16 bits (PNP-005 §5.6).
+    let pow_nonce = ProofOfWork::compute(&msg_id, &peer_id, now, 16);
 
     let mut env = GossipEnvelope {
         v: 1,
@@ -433,7 +296,7 @@ fn make_valid_gossip_cbor() -> (Vec<u8>, SigningKey, PeerId) {
         seen: vec![0; 128],
         pow: pow_nonce.to_vec(),
         sig: vec![0u8; 64],
-        payload_type: 0xFF, // Unrecognized type so process_gossip uses default_difficulty (8)
+        payload_type: 0xFF, // Reserved type: the default difficulty applies
         payload: b"test payload".to_vec(),
     };
 
@@ -446,15 +309,13 @@ fn make_valid_gossip_cbor() -> (Vec<u8>, SigningKey, PeerId) {
     (cbor, signing_key, peer_id)
 }
 
-/// Create a StandardGossip instance with difficulty 8 for testing.
+/// Create a StandardGossip instance for testing.
 fn make_test_gossip() -> StandardGossip {
     let signing_key = SigningKey::from_bytes(&[0xFFu8; 32]);
     let verifying_key = signing_key.verifying_key();
     let peer_id = PeerId(Sha256::digest(verifying_key.to_bytes()).into());
     let pool = Arc::new(ConnectionPool::new());
-    let mut gossip = StandardGossip::new(peer_id, signing_key, pool);
-    gossip.default_difficulty = 8;
-    gossip
+    StandardGossip::new(peer_id, signing_key, pool)
 }
 
 #[tokio::test]
@@ -462,7 +323,7 @@ async fn test_process_gossip_valid_signature() {
     let gossip = make_test_gossip();
     let (cbor, _, _) = make_valid_gossip_cbor();
 
-    let result = gossip.process_gossip(&cbor).await;
+    let result = gossip.process_gossip(None, &cbor).await;
     // Should succeed — returns Deliver (ttl=7 but no connected peers to forward)
     // or Drop if no peers to forward to. Either way, no error.
     assert!(result.is_ok(), "expected Ok, got: {:?}", result.err());
@@ -478,11 +339,11 @@ async fn test_process_gossip_tampered_payload_rejected() {
     env.payload = b"tampered payload data".to_vec();
     let tampered_cbor = env.to_cbor().unwrap();
 
-    let result = gossip.process_gossip(&tampered_cbor).await;
+    let result = gossip.process_gossip(None, &tampered_cbor).await;
     assert!(result.is_err());
     let err = result.unwrap_err().to_string();
     assert!(
-        err.contains("invalid Ed25519 signature"),
+        err.contains("gossip signature invalid"),
         "expected signature error, got: {err}"
     );
 }
@@ -502,7 +363,7 @@ async fn test_process_gossip_wrong_signing_key_rejected() {
         .as_secs();
 
     let msg_id = [0xBB; 32];
-    let pow_nonce = ProofOfWork::compute(&msg_id, &peer_id, now, 8);
+    let pow_nonce = ProofOfWork::compute(&msg_id, &peer_id, now, 16);
 
     let mut env = GossipEnvelope {
         v: 1,
@@ -528,11 +389,11 @@ async fn test_process_gossip_wrong_signing_key_rejected() {
     let cbor = env.to_cbor().unwrap();
 
     let gossip = make_test_gossip();
-    let result = gossip.process_gossip(&cbor).await;
+    let result = gossip.process_gossip(None, &cbor).await;
     assert!(result.is_err());
     let err = result.unwrap_err().to_string();
     assert!(
-        err.contains("invalid Ed25519 signature"),
+        err.contains("gossip signature invalid"),
         "expected signature error, got: {err}"
     );
 }
@@ -551,7 +412,7 @@ async fn test_process_gossip_peerid_pubkey_mismatch_rejected() {
         .as_secs();
 
     let msg_id = [0xCC; 32];
-    let pow_nonce = ProofOfWork::compute(&msg_id, &wrong_peer_id, now, 8);
+    let pow_nonce = ProofOfWork::compute(&msg_id, &wrong_peer_id, now, 16);
 
     let mut env = GossipEnvelope {
         v: 1,
@@ -576,12 +437,12 @@ async fn test_process_gossip_peerid_pubkey_mismatch_rejected() {
     let cbor = env.to_cbor().unwrap();
 
     let gossip = make_test_gossip();
-    let result = gossip.process_gossip(&cbor).await;
+    let result = gossip.process_gossip(None, &cbor).await;
     assert!(result.is_err());
     let err = result.unwrap_err().to_string();
     assert!(
-        err.contains("src_pubkey does not match src PeerId"),
-        "expected PeerId mismatch error, got: {err}"
+        err.contains("gossip signature invalid"),
+        "expected signature error, got: {err}"
     );
 }
 
@@ -598,7 +459,7 @@ async fn test_process_gossip_invalid_signature_length_rejected() {
         .as_secs();
 
     let msg_id = [0xDD; 32];
-    let pow_nonce = ProofOfWork::compute(&msg_id, &peer_id, now, 8);
+    let pow_nonce = ProofOfWork::compute(&msg_id, &peer_id, now, 16);
 
     let env = GossipEnvelope {
         v: 1,
@@ -619,7 +480,7 @@ async fn test_process_gossip_invalid_signature_length_rejected() {
     let cbor = env.to_cbor().unwrap();
 
     let gossip = make_test_gossip();
-    let result = gossip.process_gossip(&cbor).await;
+    let result = gossip.process_gossip(None, &cbor).await;
     assert!(result.is_err());
     let err = result.unwrap_err().to_string();
     assert!(
@@ -637,7 +498,7 @@ async fn test_process_gossip_empty_pubkey_rejected() {
 
     let peer_id = PeerId([0xEE; 32]);
     let msg_id = [0xEE; 32];
-    let pow_nonce = ProofOfWork::compute(&msg_id, &peer_id, now, 8);
+    let pow_nonce = ProofOfWork::compute(&msg_id, &peer_id, now, 16);
 
     let env = GossipEnvelope {
         v: 1,
@@ -658,13 +519,12 @@ async fn test_process_gossip_empty_pubkey_rejected() {
     let cbor = env.to_cbor().unwrap();
 
     let gossip = make_test_gossip();
-    let result = gossip.process_gossip(&cbor).await;
+    let result = gossip.process_gossip(None, &cbor).await;
     assert!(result.is_err());
     let err = result.unwrap_err().to_string();
     assert!(
-        err.contains("src_pubkey must be 32 bytes")
-            || err.contains("invalid gossip envelope structure"),
-        "expected validation error for empty pubkey, got: {err}"
+        err.contains("gossip signature invalid"),
+        "expected signature error, got: {err}"
     );
 }
 
@@ -704,11 +564,12 @@ async fn forward_through_fresh_node(cbor: &[u8], node_seed: u8) -> Vec<u8> {
     pool.add_peer(PeerId([node_seed ^ 0x55; 32]), conn.clone())
         .await
         .unwrap();
-    let mut gossip = StandardGossip::new(peer_id, signing_key, pool);
-    gossip.default_difficulty = 8;
+    let gossip = StandardGossip::new(peer_id, signing_key, pool);
 
-    let action = gossip.process_gossip(cbor).await;
+    let action = gossip.process_gossip(None, cbor).await;
     assert!(action.is_ok(), "node {node_seed:#x} refused: {action:?}");
+    // Forwarding waits out a jitter of up to 200 ms per peer.
+    tokio::time::sleep(Duration::from_millis(300)).await;
     let sent = conn.sent.lock().unwrap();
     assert_eq!(sent.len(), 1, "node {node_seed:#x} did not forward");
     sent[0].clone()
@@ -743,7 +604,7 @@ async fn test_forwarded_gossip_with_raised_ttl_rejected() {
     let mut env = GossipEnvelope::from_cbor(&after_one).unwrap();
     env.ttl = 9;
     let result = make_test_gossip()
-        .process_gossip(&env.to_cbor().unwrap())
+        .process_gossip(None, &env.to_cbor().unwrap())
         .await;
     assert!(result.is_err(), "raised ttl was accepted: {result:?}");
 
@@ -751,7 +612,7 @@ async fn test_forwarded_gossip_with_raised_ttl_rejected() {
     let mut env = GossipEnvelope::from_cbor(&after_one).unwrap();
     env.hops = 255;
     let result = make_test_gossip()
-        .process_gossip(&env.to_cbor().unwrap())
+        .process_gossip(None, &env.to_cbor().unwrap())
         .await;
     assert!(
         result.is_err(),

@@ -1,23 +1,29 @@
-//! Local routing table of known peers and link quality.
-//! Also implements peer scoring (PNP-005 Section 5.8).
+//! Local table of known peers: reputation scores and bans (PNP-005 Section 5.8).
 
 use parolnet_protocol::address::PeerId;
 use std::collections::HashMap;
-use std::time::Instant;
+use std::time::Duration;
+use tokio::time::Instant;
 
-/// Default score for new peers.
-const DEFAULT_SCORE: i32 = 100;
-/// Decay factor: score moves toward DEFAULT_SCORE by this amount per decay tick.
+/// Default score for new peers (PNP-005-SHOULD-008).
+pub const DEFAULT_SCORE: i32 = 100;
+/// Highest score.
+pub const MAX_SCORE: i32 = 200;
+/// Decay: a score moves toward [`DEFAULT_SCORE`] by this much per [`DECAY_PERIOD`].
 const DECAY_AMOUNT: i32 = 1;
-/// Default ban duration in seconds.
-const BAN_DURATION_SECS: u64 = 3600;
+/// One decay step per hour (PNP-005-SHOULD-010).
+pub const DECAY_PERIOD: Duration = Duration::from_secs(3600);
+/// A peer whose score fell below zero is refused for this long (PNP-005-SHOULD-009).
+pub const BAN_DURATION: Duration = Duration::from_secs(3600);
 
 /// Peer reputation score (PNP-005 Section 5.8).
 #[derive(Clone, Debug)]
 pub struct PeerScore {
     pub peer_id: PeerId,
-    /// Score in range 0-200, initialized to 100.
+    /// At most 200, initialized to 100. Below zero the peer is disconnected.
     pub score: i32,
+    /// Up to when decay has been applied.
+    decayed_at: Instant,
 }
 
 impl PeerScore {
@@ -25,6 +31,7 @@ impl PeerScore {
         Self {
             peer_id,
             score: DEFAULT_SCORE,
+            decayed_at: Instant::now(),
         }
     }
 
@@ -32,26 +39,40 @@ impl PeerScore {
         self.score < 0
     }
 
+    /// A valid, previously unseen message: +1, up to 200.
     pub fn reward(&mut self) {
-        self.score = (self.score + 1).min(200);
+        self.score = (self.score + 1).min(MAX_SCORE);
     }
+    /// An invalid message (bad signature, bad proof-of-work): -10.
     pub fn penalize_invalid(&mut self) {
         self.score -= 10;
     }
+    /// An expired message: -2.
     pub fn penalize_expired(&mut self) {
         self.score -= 2;
     }
+    /// A duplicate message: -1.
     pub fn penalize_duplicate(&mut self) {
         self.score -= 1;
     }
 
-    /// Decay score toward the default value.
+    /// One decay step toward the default value.
     pub fn decay(&mut self) {
         if self.score > DEFAULT_SCORE {
             self.score = (self.score - DECAY_AMOUNT).max(DEFAULT_SCORE);
         } else if self.score < DEFAULT_SCORE {
             self.score = (self.score + DECAY_AMOUNT).min(DEFAULT_SCORE);
         }
+    }
+
+    /// Apply the decay due since it was last applied: one step per whole hour.
+    pub fn apply_decay(&mut self, now: Instant) {
+        let hours =
+            now.saturating_duration_since(self.decayed_at).as_secs() / DECAY_PERIOD.as_secs();
+        for _ in 0..hours.min(2 * MAX_SCORE as u64) {
+            self.decay();
+        }
+        self.decayed_at += DECAY_PERIOD * (hours.min(u32::MAX as u64) as u32);
     }
 }
 
@@ -77,11 +98,21 @@ impl PeerTable {
         }
     }
 
-    /// Get or create a score entry for a peer.
+    /// Get or create a score entry for a peer, with the decay due applied.
     pub fn get_or_insert(&mut self, peer_id: PeerId) -> &mut PeerScore {
-        self.scores
+        let score = self
+            .scores
             .entry(peer_id)
-            .or_insert_with(|| PeerScore::new(peer_id))
+            .or_insert_with(|| PeerScore::new(peer_id));
+        score.apply_decay(Instant::now());
+        score
+    }
+
+    /// The score of a peer, if it has one, with the decay due applied.
+    pub fn get(&mut self, peer_id: &PeerId) -> Option<&PeerScore> {
+        let score = self.scores.get_mut(peer_id)?;
+        score.apply_decay(Instant::now());
+        Some(score)
     }
 
     /// Check if a peer is currently banned (either by score or explicit ban).
@@ -99,21 +130,39 @@ impl PeerTable {
             .unwrap_or(false)
     }
 
-    /// Explicitly ban a peer for the default duration.
+    /// Ban a peer for an hour. Its score starts over, so that the ban, not the score,
+    /// decides when it may come back.
     pub fn ban(&mut self, peer_id: PeerId) {
-        let until = Instant::now() + std::time::Duration::from_secs(BAN_DURATION_SECS);
-        self.banned_until.insert(peer_id, until);
+        self.banned_until
+            .insert(peer_id, Instant::now() + BAN_DURATION);
+        self.scores.remove(&peer_id);
     }
 
-    /// Decay all scores toward the default. Call periodically.
+    /// Forget a peer's score if it says nothing (the default value).
+    pub fn forget_if_default(&mut self, peer_id: &PeerId) {
+        if self
+            .scores
+            .get(peer_id)
+            .is_some_and(|s| s.score == DEFAULT_SCORE)
+        {
+            self.scores.remove(peer_id);
+        }
+    }
+
+    /// Decay all scores toward the default by one step and drop bans that ran out.
     pub fn decay_scores(&mut self) {
         for score in self.scores.values_mut() {
             score.decay();
         }
-        // Clean up expired bans
         let now = Instant::now();
         self.banned_until.retain(|_, until| *until > now);
         self.last_decay = Instant::now();
+    }
+
+    /// Drop bans that ran out.
+    pub fn prune_bans(&mut self) {
+        let now = Instant::now();
+        self.banned_until.retain(|_, until| *until > now);
     }
 
     /// Time since last decay was run.

@@ -11,62 +11,115 @@ use parolnet_clause::clause;
 use parolnet_protocol::address::PeerId;
 use parolnet_relay::circuit::{EstablishedCircuit, StandardCircuitBuilder};
 use parolnet_relay::handshake::CircuitHandshake;
-use parolnet_relay::onion::{HopKeys, next_counter, next_counters, onion_peel};
+use parolnet_relay::onion::{HopKeys, next_counter, next_counters, onion_peel, onion_wrap};
 use parolnet_relay::{CELL_SIZE, CellType, Circuit, RelayCell, RelayError, RelayInfo};
 use parolnet_transport::{Connection, TransportError};
 use std::collections::{HashSet, VecDeque};
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
-use x25519_dalek::{PublicKey, StaticSecret};
+use x25519_dalek::StaticSecret;
 
-/// A guard relay on the other end of the connection: it answers CREATE and EXTEND as a relay
-/// does and keeps every cell the client sent, with the keys it shares with the client.
+/// The three relays of a circuit behind one connection: CREATE and each RELAY_EARLY
+/// extension are answered as the hops would answer them (§3.4 to §3.6), every forward cell
+/// is peeled hop by hop under the counters a relay keeps, and what the client sent under
+/// the guard's key is kept.
 #[derive(Default)]
-struct Guard {
-    /// The forward key the guard shares with the client (hop 1).
-    keys: Mutex<Option<HopKeys>>,
-    /// Payloads of the cells that were onion-wrapped under the guard's key, in order.
-    wrapped: Mutex<Vec<Vec<u8>>>,
+struct Hops {
+    state: Mutex<HopState>,
     replies: Mutex<VecDeque<Vec<u8>>>,
 }
 
+#[derive(Default)]
+struct HopState {
+    /// Keys each hop shares with the client, guard first.
+    keys: Vec<HopKeys>,
+    /// Forward cells each hop has authenticated: the counter a relay keeps (§5.1 rule 5).
+    forward: Vec<u32>,
+    backward: Vec<u32>,
+    /// The ciphertext of every onion-wrapped cell as the guard received it, in order.
+    wrapped: Vec<Vec<u8>>,
+}
+
+impl HopState {
+    /// Take every established hop's forward layer off, each under that hop's own counter.
+    fn peel(&mut self, sealed: &[u8]) -> Vec<u8> {
+        let mut current = sealed.to_vec();
+        for (keys, counter) in self.keys.iter().zip(self.forward.iter_mut()) {
+            current = onion_peel(
+                &current,
+                &keys.forward_key,
+                &keys.forward_nonce_seed,
+                *counter,
+            )
+            .expect("MUST-059: the cell is under the next counter value of every hop");
+            *counter += 1;
+        }
+        current
+    }
+}
+
 #[async_trait]
-impl Connection for Guard {
+impl Connection for Hops {
     async fn send(&self, data: &[u8]) -> Result<(), TransportError> {
         let mut buf = [0u8; CELL_SIZE];
         buf.copy_from_slice(data);
         let cell = RelayCell::from_bytes(&buf).expect("the client sends well-formed cells");
+        let mut state = self.state.lock().unwrap();
         match cell.cell_type {
             CellType::Create => {
                 let secret = StaticSecret::random_from_rng(rand::rngs::OsRng);
                 let (created, keys) = CircuitHandshake::handle_create(&cell, &secret).unwrap();
-                *self.keys.lock().unwrap() = Some(keys);
+                state.keys.push(keys);
+                state.forward.push(0);
+                state.backward.push(0);
                 self.replies
                     .lock()
                     .unwrap()
                     .push_back(created.to_bytes().to_vec());
             }
-            CellType::Extend => {
-                self.wrapped
-                    .lock()
-                    .unwrap()
-                    .push(cell.payload[..cell.payload_len as usize].to_vec());
-                // The next hop's public key, as its CREATED would carry it.
-                let hop = StaticSecret::random_from_rng(rand::rngs::OsRng);
-                let extended = CircuitHandshake::extended_cell(
-                    cell.circuit_id,
-                    PublicKey::from(&hop).as_bytes(),
-                );
+            CellType::RelayEarly => {
+                // One byte of hop counter in the clear, then the EXTEND request under the
+                // hops established so far.
+                let sealed = &cell.body()[1..];
+                state.wrapped.push(sealed.to_vec());
+                let request = state.peel(sealed);
+                let (_target, client_public, extensions) =
+                    CircuitHandshake::parse_extend_payload(&request).unwrap();
+
+                // The new hop answers the CREATE the last hop sends it.
+                let mut body = client_public.to_vec();
+                body.extend_from_slice(&extensions);
+                let create = RelayCell::new(cell.circuit_id, CellType::Create, &body).unwrap();
+                let secret = StaticSecret::random_from_rng(rand::rngs::OsRng);
+                let (created, keys) = CircuitHandshake::handle_create(&create, &secret).unwrap();
+
+                // Its CREATED payload comes back under every established hop's backward
+                // key, the hop nearest the new one first.
+                let mut sealed = created.body().to_vec();
+                let state = &mut *state;
+                for (keys, counter) in state.keys.iter().zip(state.backward.iter_mut()).rev() {
+                    sealed = onion_wrap(
+                        &sealed,
+                        &keys.backward_key,
+                        &keys.backward_nonce_seed,
+                        *counter,
+                    )
+                    .unwrap();
+                    *counter += 1;
+                }
+                let extended =
+                    RelayCell::new(cell.circuit_id, CellType::Extended, &sealed).unwrap();
+                state.keys.push(keys);
+                state.forward.push(0);
+                state.backward.push(0);
                 self.replies
                     .lock()
                     .unwrap()
                     .push_back(extended.to_bytes().to_vec());
             }
             CellType::Data => {
-                self.wrapped
-                    .lock()
-                    .unwrap()
-                    .push(cell.payload[..cell.payload_len as usize].to_vec());
+                state.wrapped.push(cell.body().to_vec());
+                state.peel(cell.body());
             }
             other => panic!("unexpected cell {other:?}"),
         }
@@ -102,16 +155,18 @@ fn relay(seed: u8) -> RelayInfo {
 }
 
 #[clause("PNP-004-MUST-059")]
-#[tokio::test]
+// A paused clock: the circuit's padding task (one cell per idle interval) stays out of the
+// counts below.
+#[tokio::test(start_paused = true)]
 async fn extend_cells_spend_counter_values_and_data_continues_from_them() {
-    let guard = Arc::new(Guard::default());
+    let hops_end = Arc::new(Hops::default());
     let hops = [relay(1), relay(2), relay(3)];
-    let circuit = StandardCircuitBuilder::build_circuit_with_connection(guard.clone(), &hops)
+    let circuit = StandardCircuitBuilder::build_circuit_with_connection(hops_end.clone(), &hops)
         .await
         .unwrap();
 
-    // Two EXTEND cells went out under the guard's key and one under the middle hop's: the
-    // counters say so, and do not start again at 0 for the data phase.
+    // Two EXTEND requests went out under the guard's key and one under the middle hop's:
+    // the counters say so, and do not start again at 0 for the data phase.
     assert_eq!(
         circuit.forward_counters(),
         [2, 1, 0],
@@ -122,11 +177,16 @@ async fn extend_cells_spend_counter_values_and_data_continues_from_them() {
     circuit.send(b"second data cell").await.unwrap();
     assert_eq!(circuit.forward_counters(), [4, 3, 2]);
 
+    // Every hop authenticated every cell under its own next counter value (`Hops::peel`
+    // fails otherwise), and counted as many cells as the client did.
+    let state = hops_end.state.lock().unwrap();
+    assert_eq!(state.forward, [4, 3, 2]);
+
     // Seen from the guard: the outer layer of the four cells peels under the counter values
     // 0, 1, 2, 3 in the order they were sent, each value once.
-    let keys = guard.keys.lock().unwrap().clone().unwrap();
-    let wrapped = guard.wrapped.lock().unwrap().clone();
-    assert_eq!(wrapped.len(), 4, "two EXTEND cells and two DATA cells");
+    let keys = state.keys[0].clone();
+    let wrapped = state.wrapped.clone();
+    assert_eq!(wrapped.len(), 4, "two EXTEND requests and two DATA cells");
     for (counter, payload) in (0u32..).zip(&wrapped) {
         assert!(
             onion_peel(

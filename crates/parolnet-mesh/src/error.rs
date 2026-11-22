@@ -28,4 +28,16 @@ pub enum MeshError {
 
     #[error("peer connection limit reached")]
     PeerLimitReached,
+
+    #[error("unsupported gossip version")]
+    UnsupportedVersion,
+
+    #[error("gossip signature invalid")]
+    InvalidSignature,
+
+    #[error("gossip payload too large")]
+    PayloadTooLarge,
+
+    #[error("gossip timestamp too far in the future")]
+    FutureTimestamp,
 }

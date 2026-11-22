@@ -2755,10 +2755,14 @@ async fn handle_socket(socket: WebSocket, ctx: WsCtx, client_ip: IpAddr, _conn_s
 
                     // Also feed into PeerManager for proper gossip protocol processing
                     // (CBOR-based dedup, bloom filters, PoW validation, score tracking)
-                    if let Ok(bytes) = hex::decode(&payload) {
+                    if let Ok(bytes) = hex::decode(&payload)
+                        && let Some(sender) = parse_peer_id(&from)
+                    {
                         let pm = pm.clone();
                         tokio::spawn(async move {
-                            match pm.handle_incoming(&bytes).await {
+                            // The sending peer is named: it is the one left out of the
+                            // fan-out and the one scored (PNP-005 §5.2, §5.8).
+                            match pm.handle_incoming(&sender, &bytes).await {
                                 Ok(Some(_delivered)) => {
                                     tracing::debug!("Gossip message delivered to relay");
                                 }
