@@ -20,6 +20,7 @@
 pub mod circuit;
 pub mod federation;
 pub mod storage;
+pub mod transfer;
 pub mod websocket;
 
 use std::collections::HashMap;

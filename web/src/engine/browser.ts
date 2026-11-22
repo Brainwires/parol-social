@@ -17,6 +17,7 @@ import type {
   Storage,
   WasmApi,
 } from "./platform.ts";
+import { OpfsFileStore } from "./files.ts";
 import { SealedStorage } from "./sealed-storage.ts";
 import { DB_NAME, type IdbFactory, IdbStorage } from "./storage.ts";
 import { EngineError } from "./types.ts";
@@ -121,6 +122,22 @@ const WASM_EXPORTS: readonly (keyof WasmApi)[] = [
   "process_scanned_qr",
   "safety_number",
   "version",
+  "pnp010_new_offer",
+  "pnp010_encode_offer",
+  "pnp010_encode_control",
+  "pnp010_decode_control",
+  "pnp010_on_control",
+  "pnp010_admit_channel",
+  "pnp010_label_id",
+  "pnp010_label",
+  "pnp010_admit_offer",
+  "pnp010_sanitize_file_name",
+  "pnp010_numbered_file_name",
+  "pnp010_limits",
+  "TransferOfferLimiter",
+  "TransferHasher",
+  "TransferSender",
+  "TransferReceiver",
   "argon2id",
 ];
 
@@ -208,10 +225,14 @@ export async function browserPlatform(
     random: browserRandom,
     fetch: browserFetch,
     sha256: browserSha256,
+    subtle: g.crypto.subtle,
     log: options.log ?? consoleLogger,
     media: options.media ??
       (g.navigator?.mediaDevices ? browserMedia : undefined),
     lock: browserLock(`${dbName}-engine`),
+    // Received files, sealed by the engine before they get here: OPFS where this browser
+    // can write it from a page (a part then survives a reload); otherwise memory.
+    files: (await OpfsFileStore.open()) ?? undefined,
   };
 }
 

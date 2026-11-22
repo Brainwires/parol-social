@@ -14,9 +14,11 @@ import {
 } from "./bytes.ts";
 import { PAIRING_CODE_LIFETIME_SECS } from "./bytes.ts";
 import { CallManager } from "./calls.ts";
+import { TransferManager } from "./transfers.ts";
 import { fetchStun, hasCandidates, peerConfig, validateTurn } from "./ice.ts";
 import type {
   DataChannel,
+  FileSource,
   IceCandidateInit,
   IceServer,
   MediaStreamLike,
@@ -50,6 +52,7 @@ import {
   type RelayState,
   shortId,
   type Snapshot,
+  type TransferInfo,
   type TurnSettings,
   type Verification,
 } from "./types.ts";
@@ -126,6 +129,8 @@ export interface EngineConfig {
   reconnect?: ReconnectConfig;
   /** Name given to new contacts (default: the first 8 hex digits of the PeerId). */
   defaultContactName?: string;
+  /** File offers above this size are declined without asking (PNP-010 §8; default 4 GiB). */
+  maxAcceptSize?: number;
 }
 
 type FailReason =
@@ -203,6 +208,7 @@ export class Engine {
   private readonly cfg: EngineConfig;
   private readonly relay: RelayClient;
   private readonly calls: CallManager;
+  private readonly files: TransferManager;
   private readonly listeners = new Set<(ev: AppEvent) => void>();
   private tail: Promise<unknown> = Promise.resolve();
   private stopped = false;
@@ -268,6 +274,29 @@ export class Engine {
       after: (ms, fn) => this.after(ms, fn),
       cancel: (h) => this.cancel(h),
       internal: (fn) => void this.internal(fn),
+    });
+    this.files = new TransferManager({
+      platform,
+      isContact: (peer) => this.contacts.has(peer),
+      hasSession: (peer) => platform.wasm.has_session(peer),
+      verified: (peer) => this.verifiedConn(peer),
+      openChannel: (peer, label) =>
+        this.verifiedConn(peer)?.pc.createDataChannel(label, { ordered: true }) ?? null,
+      sendControl: (peer, body) => this.sendTransferControl(peer, body),
+      connect: (peer) => {
+        this.dial(peer, false);
+        this.armProbeWake();
+      },
+      noteIncoming: async (peer) => {
+        await this.save([this.activityOp(peer, 1)]);
+        this.emitActivity(peer);
+      },
+      save: (ops) => this.save(ops),
+      emit: (ev) => this.emit(ev),
+      after: (ms, fn) => this.after(ms, fn),
+      cancel: (h) => this.cancel(h),
+      internal: (fn) => void this.internal(fn),
+      maxAcceptSize: cfg.maxAcceptSize,
     });
   }
 
@@ -357,6 +386,7 @@ export class Engine {
     }
     if (this.cfg.stunServers) this.stun = [...this.cfg.stunServers];
     await this.restorePairing();
+    await this.files.load();
     // Entries that outlived the queue's age limit while the app was closed.
     const ops = await this.dropOps(this.expired(clock.now()));
     if (ops.length > 0) await storage.write(ops);
@@ -702,6 +732,7 @@ export class Engine {
       const ops: WriteOp[] = [
         { op: "delete", store: "contacts", key: peerId },
         { op: "delete", store: "contactState", key: peerId },
+        ...(await this.files.forgetPeer(peerId)),
         {
           op: "put",
           store: "sessions",
@@ -1411,6 +1442,7 @@ export class Engine {
     this.setPath(peer, "Direct");
     this.connTimer(peer, conn, RESTORED_PROVEN_MS, () => this.restoredProven(peer));
     await this.flushQueue(peer);
+    if (this.live(peer, conn)) await this.files.onVerified(peer);
   }
 
   /**
@@ -1457,7 +1489,10 @@ export class Engine {
       // Probe contacts we hold messages for (presence only comes from mutual watchers, so
       // a fresh pairing gets no push).
       for (const c of this.contacts.values()) {
-        if (this.queuedFor(c.peerId) > 0 || this.hasBootstrapQueued(c.peerId)) {
+        if (
+          this.queuedFor(c.peerId) > 0 || this.hasBootstrapQueued(c.peerId) ||
+          this.files.wants(c.peerId)
+        ) {
           this.dial(c.peerId, false);
         }
       }
@@ -1801,18 +1836,26 @@ export class Engine {
         conn,
         pc.createDataChannel(DATA_CHANNEL_LABEL, { ordered: true }),
       );
-    } else {
-      pc.ondatachannel = (ev) => {
-        // Only the `parolnet` channel, and only one.
-        if (ev.channel.label !== DATA_CHANNEL_LABEL || conn.dc) {
-          try {
-            ev.channel.close();
-          } catch { /* nothing to close */ }
-          return;
-        }
-        this.attachChannel(peer, conn, ev.channel);
-      };
     }
+    pc.ondatachannel = (ev) => {
+      const channel = ev.channel;
+      // The answerer's one `parolnet` channel.
+      if (!initiator && channel.label === DATA_CHANNEL_LABEL && !conn.dc) {
+        this.attachChannel(peer, conn, channel);
+        return;
+      }
+      // Anything else is a file-transfer channel the contact opened (PNP-010 §5.1), or is
+      // closed: the transfers decide, in the mailbox, with the connection as it is then.
+      const early = this.files.adopt(channel);
+      void this.internal(() =>
+        this.files.onRemoteChannel(
+          peer,
+          this.live(peer, conn) && conn.open && conn.verified ? conn : null,
+          channel,
+          early,
+        )
+      );
+    };
     this.connTimer(peer, conn, CONNECT_TIMEOUT_MS, () => {
       if (!conn.open) this.connFailed(peer, conn, "Timeout");
     });
@@ -1976,6 +2019,7 @@ export class Engine {
       const conn = st.conn;
       st.conn = null;
       this.closeConn(conn);
+      void this.internal(() => this.files.onConnGone(peer));
     }
   }
 
@@ -1983,6 +2027,7 @@ export class Engine {
     if (!this.live(peer, conn)) return;
     this.peer(peer).conn = null;
     this.closeConn(conn);
+    void this.internal(() => this.files.onConnGone(peer));
     this.p.log.info(
       `[WebRTC] connection to ${shortId(peer)} ended (${reason})`,
     );
@@ -2064,6 +2109,7 @@ export class Engine {
 
   private probeActive = (peer: string): boolean =>
     this.queuedFor(peer) > 0 || this.hasBootstrapQueued(peer) ||
+    this.files.wants(peer) ||
     this.peers.get(peer)?.wanted === true;
 
   private probeReady = (peer: string): boolean => {
@@ -2132,7 +2178,8 @@ export class Engine {
         }
         if (
           st.online === null &&
-          (this.queuedFor(c.peerId) > 0 || this.hasBootstrapQueued(c.peerId))
+          (this.queuedFor(c.peerId) > 0 || this.hasBootstrapQueued(c.peerId) ||
+            this.files.wants(c.peerId))
         ) {
           this.dial(c.peerId, false);
         }
@@ -2280,6 +2327,13 @@ export class Engine {
       const bytes = fromHex(plaintextHex);
       const sig = bytes ? parseCallSignal(fromUtf8(bytes)) : null;
       if (sig) await this.calls.onSignal(peer, sig);
+    } else if (msgType === MsgType.FILE_TRANSFER && conn.verified) {
+      const body = fromHex(plaintextHex);
+      if (body) {
+        await this.files.onControl(peer, body);
+        // An offer carries the file key.
+        wipe(body);
+      }
     }
     // CONTROL carries nothing; DECOY and unknown types are discarded (PNP-001-MUST-008).
   }
@@ -2308,6 +2362,78 @@ export class Engine {
     }
     await this.save([this.sessionsOp()]);
     return this.verifiedConn(peer) === conn && this.sendRaw(conn, envelope);
+  }
+
+  // ── File transfer (PNP-010) ──────────────────────────────────────
+
+  /** A FILE_TRANSFER message on the contact's verified channel; false when there is none. */
+  private async sendTransferControl(peer: string, body: Uint8Array): Promise<boolean> {
+    const conn = this.verifiedConn(peer);
+    if (!conn) return false;
+    let envelope: string;
+    try {
+      envelope = this.p.wasm.envelope_encode(
+        peer,
+        MsgType.FILE_TRANSFER,
+        body,
+        this.nowSecs(),
+        null,
+      );
+    } catch {
+      return false;
+    }
+    await this.save([this.sessionsOp()]);
+    return this.verifiedConn(peer) === conn && this.sendRaw(conn, envelope);
+  }
+
+  /**
+   * Offer a file to a contact. The file is read once for its SHA-256 before the offer is
+   * made, then slice by slice while it is sent; the page must stay open until the transfer
+   * is over (a reload cancels it: a web page keeps no handle on the file). The offer goes
+   * out at once over a verified direct connection, else when one comes up.
+   */
+  async offerFile(peerId: string, file: FileSource): Promise<TransferInfo> {
+    if (this.stopped) throw new EngineError("Stopped", "the engine has stopped");
+    const sha256 = await this.files.hash(file);
+    return this.post(() => this.files.offer(peerId, file, sha256));
+  }
+
+  /** Accept a file a contact offered: it arrives whenever a direct connection exists. */
+  acceptTransfer(id: string): Promise<TransferInfo> {
+    return this.post(() => this.files.accept(id));
+  }
+
+  /** Decline a file a contact offered. */
+  declineTransfer(id: string): Promise<TransferInfo> {
+    return this.post(() => this.files.decline(id));
+  }
+
+  /** Stop a transfer for good, as sender or receiver. What was received of it is removed. */
+  cancelTransfer(id: string): Promise<TransferInfo> {
+    return this.post(() => this.files.cancelTransfer(id));
+  }
+
+  /** The transfers with one contact (or all), oldest first, finished ones included. */
+  transfers(peerId?: string): Promise<TransferInfo[]> {
+    return this.post(() => this.files.list(peerId));
+  }
+
+  /** A received, complete file as a Blob over what is stored on this device; null otherwise. */
+  transferFile(id: string): Promise<Blob | null> {
+    return this.post(() => this.files.file(id));
+  }
+
+  /** Take a finished transfer out of the conversation and delete its stored file. */
+  removeTransfer(id: string): Promise<void> {
+    return this.post(() => this.files.remove(id));
+  }
+
+  /**
+   * Whether a file being received survives a reload of the page: true where the browser
+   * lets a page write its origin private file system, false where parts are kept in memory.
+   */
+  receivedFilesPersist(): boolean {
+    return this.files.persistent;
   }
 
   /** Call a contact over a verified direct connection: audio, plus video when `video`. */
@@ -2413,6 +2539,7 @@ export class Engine {
   private async halt(): Promise<void> {
     // The contact hears the hangup while the data channel is still there.
     await this.calls.shutdown();
+    await this.files.shutdown();
     this.stopped = true;
     for (const peer of [...this.peers.keys()]) this.dropConn(peer);
     for (const t of [...this.timers]) this.cancel(t);
@@ -2451,6 +2578,7 @@ export class Engine {
     this.contactState.clear();
     this.outbox = [];
     this.turn = null;
+    await this.files.clear();
     try {
       await this.p.storage.destroy();
     } finally {

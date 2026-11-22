@@ -32,6 +32,11 @@
 //!   change by ICE restart, gains or loses video by renegotiation
 //!   ([`AppHandle::set_call_video`]), tells the encoder what the path carries
 //!   ([`MediaEvent::TargetBitrate`]) and reports its quality ([`AppEvent::CallQuality`]).
+//! - **Files** ([`transfer`], PNP-010): [`AppHandle::offer_file`], accept / decline /
+//!   cancel, progress as [`AppEvent::Transfer`]. The offer travels in the session; the file
+//!   flows as sealed 64 KiB records on a data channel of its own on the contact's direct
+//!   connection, streamed from and to disk, and resumes after a lost connection or a
+//!   restart of either app. Nothing of a file ever goes through a relay.
 //!
 //! The core runs as one tokio task (an actor): [`start`] returns an [`AppHandle`] for
 //! commands and a channel of [`AppEvent`]s.
@@ -42,6 +47,7 @@ pub mod ice;
 pub mod reconnect;
 mod signaling;
 pub mod store;
+pub mod transfer;
 pub mod wire;
 
 use std::collections::HashMap;
@@ -59,6 +65,7 @@ pub use call::{
 pub use parolnet_rtc::{CandidateKind, ConnectionQuality, MediaKind};
 pub use reconnect::ReconnectConfig;
 pub use store::KeyStorage;
+pub use transfer::{CancelReason, TransferInfo, TransferState};
 
 /// Errors surfaced to the client.
 #[derive(Debug, thiserror::Error)]
@@ -85,6 +92,11 @@ pub enum AppError {
     Busy,
     #[error("unknown call {0}")]
     UnknownCall(String),
+    /// No such transfer, or it is not in a state the command applies to.
+    #[error("unknown transfer {0}")]
+    UnknownTransfer(String),
+    #[error("file transfer: {0}")]
+    Transfer(String),
     #[error("the contact's app cannot change a call that is under way")]
     CannotRenegotiate,
     #[error("the app core has stopped")]
@@ -116,6 +128,11 @@ pub struct AppConfig {
     pub default_contact_name: Option<String>,
     /// How contacts the relay called offline are re-probed.
     pub reconnect: ReconnectConfig,
+    /// Where received files go (and their parts while they arrive). `None`: `downloads`
+    /// inside the data directory. A desktop app sets the user's downloads folder.
+    pub downloads_dir: Option<PathBuf>,
+    /// Offers above this size are declined without asking (PNP-010 §8; default 4 GiB).
+    pub max_accept_size: u64,
     /// Take part in ICE restarts and call renegotiation (PNP-011 sections 7 and 8): list the
     /// features, send and answer `reoffer`s and restart offers. Off, this peer behaves as
     /// one that knows neither (the PWA, the web app today): a network change waits for the
@@ -134,6 +151,8 @@ impl AppConfig {
             pairing_window: Duration::from_secs(30 * 60),
             default_contact_name: None,
             reconnect: ReconnectConfig::default(),
+            downloads_dir: None,
+            max_accept_size: transfer::DEFAULT_MAX_ACCEPT_SIZE,
             renegotiation: true,
         }
     }
@@ -232,6 +251,9 @@ pub enum AppEvent {
     Notice(String),
     /// A call started, changed state or ended, or its video changed.
     Call(CallInfo),
+    /// A file transfer appeared, changed state or moved on (progress comes a few times a
+    /// second while records flow).
+    Transfer(TransferInfo),
     /// The quality of an active call's connection, about once a second.
     CallQuality {
         call_id: String,
@@ -326,6 +348,7 @@ pub(crate) enum Command {
     Snapshot(oneshot::Sender<Snapshot>),
     RenameContact(String, String, oneshot::Sender<Result<Contact, AppError>>),
     Connect(String),
+    Disconnect(String),
     StartCall(String, bool, oneshot::Sender<Result<CallInfo, AppError>>),
     AcceptCall(String, oneshot::Sender<Result<CallInfo, AppError>>),
     RejectCall(String),
@@ -335,6 +358,15 @@ pub(crate) enum Command {
     NetworkChanged,
     TurnSettings(oneshot::Sender<Option<TurnSettings>>),
     SetTurnSettings(Option<TurnSettings>, oneshot::Sender<Result<(), AppError>>),
+    OfferFile(
+        String,
+        PathBuf,
+        oneshot::Sender<Result<TransferInfo, AppError>>,
+    ),
+    AcceptTransfer(String, oneshot::Sender<Result<TransferInfo, AppError>>),
+    DeclineTransfer(String, oneshot::Sender<Result<TransferInfo, AppError>>),
+    CancelTransfer(String, oneshot::Sender<Result<TransferInfo, AppError>>),
+    Transfers(Option<String>, oneshot::Sender<Vec<TransferInfo>>),
     Shutdown(oneshot::Sender<()>),
 }
 
@@ -413,6 +445,15 @@ impl AppHandle {
             .send(engine::Input::Command(Command::Connect(peer_id.to_owned())));
     }
 
+    /// Close the direct connection to a contact now. It is built again like after any lost
+    /// connection (at once with [`AppHandle::connect`]); queued messages and file transfers
+    /// continue on the new one.
+    pub fn disconnect(&self, peer_id: &str) {
+        let _ = self.tx.send(engine::Input::Command(Command::Disconnect(
+            peer_id.to_owned(),
+        )));
+    }
+
     /// Call a contact over a verified direct connection: audio, plus video when `video`.
     pub async fn start_call(&self, peer_id: &str, video: bool) -> Result<CallInfo, AppError> {
         let p = peer_id.to_owned();
@@ -488,6 +529,44 @@ impl AppHandle {
     /// Forget the TURN server: connections are direct again.
     pub async fn clear_turn_settings(&self) -> Result<(), AppError> {
         self.ask(|tx| Command::SetTurnSettings(None, tx)).await?
+    }
+
+    /// Offer a file to a contact (PNP-010). The file is read once for its SHA-256 before
+    /// this returns, then on demand while it is sent; it must stay where it is, unchanged,
+    /// until the transfer is over. The offer is delivered at once over a verified direct
+    /// connection, else when one comes up.
+    pub async fn offer_file(
+        &self,
+        peer_id: &str,
+        path: impl Into<PathBuf>,
+    ) -> Result<TransferInfo, AppError> {
+        let (p, path) = (peer_id.to_owned(), path.into());
+        self.ask(|tx| Command::OfferFile(p, path, tx)).await?
+    }
+
+    /// Accept a file a contact offered: it arrives in [`AppConfig::downloads_dir`] whenever
+    /// a direct connection to the contact exists, and resumes where it stopped.
+    pub async fn accept_transfer(&self, id: &str) -> Result<TransferInfo, AppError> {
+        let id = id.to_owned();
+        self.ask(|tx| Command::AcceptTransfer(id, tx)).await?
+    }
+
+    /// Decline a file a contact offered.
+    pub async fn decline_transfer(&self, id: &str) -> Result<TransferInfo, AppError> {
+        let id = id.to_owned();
+        self.ask(|tx| Command::DeclineTransfer(id, tx)).await?
+    }
+
+    /// Stop a transfer for good, as sender or receiver. What was received of it is removed.
+    pub async fn cancel_transfer(&self, id: &str) -> Result<TransferInfo, AppError> {
+        let id = id.to_owned();
+        self.ask(|tx| Command::CancelTransfer(id, tx)).await?
+    }
+
+    /// The transfers with one contact (or all), oldest first, finished ones included.
+    pub async fn transfers(&self, peer_id: Option<&str>) -> Result<Vec<TransferInfo>, AppError> {
+        let p = peer_id.map(str::to_owned);
+        self.ask(|tx| Command::Transfers(p, tx)).await
     }
 
     /// Close every connection, save state and stop the core.

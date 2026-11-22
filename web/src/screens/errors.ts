@@ -13,6 +13,10 @@ const WORDS: Partial<Record<EngineError["code"], MessageKey>> = {
   Media: "call.error.media",
   NotConnected: "call.error.notConnected",
   Busy: "call.error.busy",
+  Transfer: "error.transfer",
+  NoSession: "error.noSession",
+  UnknownContact: "error.unknownContact",
+  UnknownTransfer: "error.unknownTransfer",
 };
 
 /** `fallback` is used for anything without words of its own. */

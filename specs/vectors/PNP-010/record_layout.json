@@ -1,0 +1,54 @@
+{
+  "clause": "PNP-010-MUST-016",
+  "description": "How a file of a given size is cut: record count and the plaintext length of the last record.",
+  "input": {
+    "chunk_size": 65519
+  },
+  "expected": [
+    {
+      "size": 0,
+      "record_count": 1,
+      "last_record_len": 0
+    },
+    {
+      "size": 1,
+      "record_count": 1,
+      "last_record_len": 1
+    },
+    {
+      "size": 65518,
+      "record_count": 1,
+      "last_record_len": 65518
+    },
+    {
+      "size": 65519,
+      "record_count": 1,
+      "last_record_len": 65519
+    },
+    {
+      "size": 65520,
+      "record_count": 2,
+      "last_record_len": 1
+    },
+    {
+      "size": 131038,
+      "record_count": 2,
+      "last_record_len": 65519
+    },
+    {
+      "size": 104857600,
+      "record_count": 1601,
+      "last_record_len": 27200
+    },
+    {
+      "size": 2147483648,
+      "record_count": 32777,
+      "last_record_len": 32904
+    },
+    {
+      "size": 1099511627776,
+      "record_count": 16781570,
+      "last_record_len": 8465
+    }
+  ]
+}

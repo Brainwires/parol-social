@@ -96,6 +96,165 @@ export interface WasmApi {
   import_pending_bootstrap?(blobHex: string): void;
   /** Forgets the pending bootstrap: the code shown for it stops working. */
   clear_pending_bootstrap?(): void;
+
+  // ── PNP-010 file transfer (crates/parolnet-wasm/src/transfer.rs) ──
+  /** A new offer with a fresh id and file key. Throws when a field is outside the limits. */
+  pnp010_new_offer(name: string, size: number, mime: string, sha256Hex: string): TransferControl;
+  pnp010_encode_offer(
+    idHex: string,
+    name: string,
+    size: number,
+    mime: string,
+    sha256Hex: string,
+    keyHex: string,
+  ): Uint8Array;
+  /** `kind`: accept, decline, cancel (with `reason`) or complete. */
+  pnp010_encode_control(kind: string, idHex: string, reason: number): Uint8Array;
+  /** Throws when the body is not a well-formed PNP-010 message. */
+  pnp010_decode_control(body: Uint8Array): TransferControl;
+  /** `ignore`, `new`, or the phase the transfer moves to. */
+  pnp010_on_control(
+    role: string | undefined,
+    phase: string | undefined,
+    kind: string,
+  ): string;
+  /** The transfer id to serve, `close`, or `foreign`. */
+  pnp010_admit_channel(
+    label: string,
+    verified: boolean,
+    open: number,
+    role: string | undefined,
+    phase: string | undefined,
+  ): string;
+  pnp010_label_id(label: string): string | undefined;
+  pnp010_label(idHex: string): string;
+  pnp010_admit_offer(
+    size: number,
+    maxSize: number,
+    pending: number,
+    withinRate: boolean,
+  ): boolean;
+  pnp010_sanitize_file_name(offered: string): string;
+  pnp010_numbered_file_name(name: string, n: number): string;
+  pnp010_limits(): TransferLimits;
+  TransferOfferLimiter: new (nowMs: number) => WasmOfferLimiter;
+  TransferHasher: new () => WasmTransferHasher;
+  TransferSender: new (idHex: string, size: number, keyHex: string) => WasmTransferSender;
+  TransferReceiver: new (
+    idHex: string,
+    size: number,
+    sha256Hex: string,
+    keyHex: string,
+    next: number,
+  ) => WasmTransferReceiver;
+}
+
+/** A decoded `FILE_TRANSFER` message. `key` is secret: stored, never logged. */
+export interface TransferControl {
+  t: "offer" | "accept" | "decline" | "cancel" | "complete";
+  id: string;
+  name?: string;
+  size?: number;
+  mime?: string;
+  sha256?: string;
+  key?: string;
+  reason?: number;
+}
+
+/** The constants of PNP-010 (`pnp010_limits`). */
+export interface TransferLimits {
+  msgType: number;
+  chunkSize: number;
+  messageMax: number;
+  bufferHigh: number;
+  bufferLow: number;
+  maxConcurrent: number;
+  maxPendingOffers: number;
+  defaultMaxAcceptSize: number;
+  maxFileSize: number;
+  maxRecordFailures: number;
+  transferMaxAgeMs: number;
+  labelPrefix: string;
+  reservedPrefix: string;
+}
+
+export interface WasmOfferLimiter {
+  allow(nowMs: number): boolean;
+  free(): void;
+}
+
+export interface WasmTransferHasher {
+  update(bytes: Uint8Array): void;
+  length(): number;
+  /** Consumes the hasher. */
+  finalize(): string;
+}
+
+export interface WasmTransferSender {
+  /** Throws: close the channel. */
+  begin(resume: Uint8Array): Uint8Array;
+  /** -1 when there is nothing (more) to send in this attempt. */
+  next_offset(): number;
+  next_len(): number;
+  seal(chunk: Uint8Array): Uint8Array;
+  is_finished(): boolean;
+  sent_bytes(): number;
+  end_attempt(): void;
+  free(): void;
+}
+
+export interface WasmTransferReceiver {
+  absorb_stored(bytes: Uint8Array): void;
+  begin(): Uint8Array;
+  /** The plaintext to store, or undefined for START. Throws: close the channel. */
+  on_message(message: Uint8Array): Uint8Array | undefined;
+  end_attempt(): void;
+  next_record(): number;
+  stored_bytes(): number;
+  is_complete(): boolean;
+  record_failures(): number;
+  finish(): boolean;
+  free(): void;
+}
+
+// ── files ────────────────────────────────────────────────────────
+
+/** A file to send: the part of a browser `File` the engine uses. */
+export interface FileSource {
+  readonly name: string;
+  readonly size: number;
+  readonly type: string;
+  slice(start: number, end: number): { arrayBuffer(): Promise<ArrayBuffer> };
+}
+
+/** One segment of a received file being written. */
+export interface SegmentWriter {
+  write(chunk: Uint8Array): Promise<void>;
+  /** Finish the segment: from here on it is stored (durably, where the store is). */
+  close(): Promise<void>;
+  /** Drop what was written. */
+  abort(): Promise<void>;
+}
+
+/**
+ * Where a received file is kept while it arrives and until the user saves it: a sequence of
+ * segments per transfer, each written once, front to back. A file is never held in one
+ * piece in memory. The engine hands a store only ciphertext (./sealed-files.ts): a segment
+ * is opaque bytes to it, and `blob` is not what the person saves.
+ */
+export interface FileStore {
+  /** Stored parts survive a reload (OPFS), or not (memory). */
+  readonly persistent: boolean;
+  /** How many segments 0..n-1 are stored for a transfer. */
+  segments(id: string): Promise<number>;
+  readSegment(id: string, index: number): Promise<Uint8Array>;
+  /** Start segment `index`, dropping any stored segment from `index` on. */
+  writer(id: string, index: number): Promise<SegmentWriter>;
+  /** Segments 0..count-1 as one Blob of the given MIME type. */
+  blob(id: string, count: number, type: string): Promise<Blob>;
+  remove(id: string): Promise<void>;
+  /** Remove every stored part ("delete all data on this device"). */
+  clear(): Promise<void>;
 }
 
 // ── storage ──────────────────────────────────────────────────────
@@ -176,7 +335,11 @@ export interface DataChannel {
   onopen: (() => void) | null;
   onmessage: ((ev: { data: unknown }) => void) | null;
   onclose: (() => void) | null;
-  send(data: string): void;
+  /** Transfer channels: `"arraybuffer"`. */
+  binaryType?: string;
+  bufferedAmountLowThreshold?: number;
+  onbufferedamountlow?: (() => void) | null;
+  send(data: string | Uint8Array): void;
   close(): void;
 }
 
@@ -311,9 +474,15 @@ export interface Platform {
   random: Random;
   fetch: Fetch;
   sha256: Sha256;
+  /** WebCrypto: received files are sealed with it before they are stored (./sealed-files.ts). */
+  subtle: SubtleCrypto;
   log: Logger;
   /** Optional: calls need it. */
   media?: MediaDevices;
   /** Optional: single-instance guard. */
   lock?: InstanceLock;
+  /**
+   * Optional: where received files are kept, sealed (default: memory, lost on reload).
+   */
+  files?: FileStore;
 }

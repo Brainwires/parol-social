@@ -1,0 +1,16 @@
+{
+  "clause": "PNP-010-MUST-016",
+  "description": "An empty file is one record with an empty plaintext and the last-record flag: the RECORD frame is the type byte and the 16-byte tag.",
+  "input": {
+    "file_key": "4242424242424242424242424242424242424242424242424242424242424242",
+    "id": "01010101010101010101010101010101",
+    "size": 0,
+    "receiver_nonce": "05050505050505050505050505050505",
+    "sender_salt": "06060606060606060606060606060606"
+  },
+  "expected": {
+    "record_count": 1,
+    "record_frame": "03fc3bea188fe4f7b9757755afc0e81e50",
+    "file_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+  }
+}
