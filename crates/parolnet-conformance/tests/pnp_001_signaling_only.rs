@@ -85,7 +85,7 @@ fn signaling_only_accepts_only_signaling_frames() {
     assert_eq!(p.stun_uris, vec!["stun:a:3478".to_string()]);
 }
 
-/// MUST-071 (v0.15): a signaling-only relay serves none of the relay-profile
+/// MUST-071 (v0.17): a signaling-only relay serves none of the relay-profile
 /// HTTP endpoints, the two that say who is online among them.
 #[clause("PNP-001-MUST-071", "PNP-008-MUST-099")]
 #[test]

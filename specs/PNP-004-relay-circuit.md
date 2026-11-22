@@ -1,12 +1,17 @@
 # PNP-004: ParolNet Relay Circuit Protocol
 
 ### Status: CANDIDATE
-### Version: 0.2
-### Date: 2026-04-17
+### Version: 0.3
+### Date: 2026-11-21
 
 ---
 
 ## Changelog
+
+**v0.3 (2026-11-21) — One counter per key, from derivation to destruction**
+
+- §5.1 rule 5: the nonce counter of a hop key counts every cell encrypted under that key since the key was derived, the EXTEND cells of circuit construction included; it is never reset, and taking a value and advancing the counter is one step. Allocated **PNP-004-MUST-059**. The limit of **PNP-004-MUST-019** / **MUST-056** is unchanged; the counter arithmetic is checked.
+- Before, the text let an implementation start the data phase at counter 0 after it had already wrapped EXTEND cells at counter 0 under the same hop key, which repeats a (key, nonce) pair.
 
 **v0.2 (2026-04-17) — Harmonization pass**
 
@@ -249,6 +254,10 @@ The onion-layer AEAD cipher is **ChaCha20-Poly1305 ONLY** and is NOT negotiable.
    - Bytes 64-75: Forward nonce seed (12 bytes)
    - Bytes 76-87: Backward nonce seed (12 bytes)
 5. Nonces MUST be constructed per scheme `N-ONION` in PNP-001 §9 Nonce Construction Catalog: `nonce_seed XOR counter (big-endian uint96)`. **PNP-004-MUST-018** The counter starts at 0 and increments by 1 for each cell encrypted in that direction. A node MUST destroy the circuit if the counter reaches 2^32 (approximately 2 TB of cell data). **PNP-004-MUST-019**
+
+   There is one counter per hop key and direction, and it lives as long as the key. It MUST count every cell encrypted under that key since the key was derived, whatever the cell type: an EXTEND cell that the OP wraps under the keys of the hops it already has during circuit construction (§5.3) spends a counter value of each of those keys, and the first DATA cell continues from there. A counter MUST NOT be reset or set back while its key is in use, a counter value MUST NOT be used for more than one cell, and taking the value for a cell and advancing the counter MUST be a single step, so that two cells sent at the same time cannot be given the same value. The addition MUST be checked: at the limit of MUST-019 the counter does not advance and does not wrap, and the circuit is destroyed. **PNP-004-MUST-059**
+
+   The hop keys are fixed for the life of the circuit, so here, unlike in the session layer (PNP-002 §5.9), the counter alone keeps a (key, nonce) pair from repeating. A repeated pair under ChaCha20-Poly1305 reveals the XOR of the two plaintexts and lets the authentication key be recovered.
 6. The key confirmation in CREATED MUST be verified before the OP proceeds. Failure to verify MUST result in circuit destruction. **PNP-004-MUST-020**
 
 ### 5.2 Layer Encryption

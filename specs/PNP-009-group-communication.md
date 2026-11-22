@@ -1,12 +1,19 @@
 # PNP-009: ParolNet Group Communication Protocol
 
 ### Status: CANDIDATE
-### Version: 0.2
-### Date: 2026-04-17
+### Version: 0.3
+### Date: 2026-11-21
 
 ---
 
 ## Changelog
+
+**v0.3 (2026-11-21) — Counter limits**
+
+- Added §5.9 "Counter Limits". A sender key chain carries at most `MAX_SENDER_CHAIN_LENGTH` = 2^16 messages: a sender at that length does not encrypt and rotates its sender key (**PNP-009-MUST-078**), a receiver rejects a SenderKeyMessage (**PNP-009-MUST-079**) or a SenderKeyDistribution (**PNP-009-MUST-080**) whose `chain_index` is 2^16 or more, no counter wraps and a send that fails changes no state (**PNP-009-MUST-081**).
+- §6.4: a group `version` is at most `MAX_GROUP_VERSION` = 2^53 - 1. An admin does not issue an operation past it (**PNP-009-MUST-082**) and a recipient rejects one (**PNP-009-MUST-083**). MUST count: 83.
+- Before, the specification said nothing about either counter at the end of its range.
+- Wire format unchanged. A `chain_index` of 2^16 or more and a `version` of 2^53 or more were valid under v0.2 and are rejected now.
 
 **v0.2 (2026-04-17) — Harmonization pass**
 
@@ -199,6 +206,21 @@ Messages may arrive out of order due to network conditions. Implementations MUST
 
 The chain index is monotonically increasing. Implementations MUST track the highest chain index received from each sender and MUST reject any message with a chain index that has already been processed (either directly or via a stored skipped key). **PNP-009-MUST-017** Duplicate messages MUST be silently discarded. **PNP-009-MUST-018**
 
+### 5.9 Counter Limits
+
+The sender key chain has one counter, the `chain_index`: an unsigned 32-bit integer in the sender's state, in each receiver's state, in the SenderKeyMessage (§5.6) and in the SenderKeyDistribution (§5.2). It is the index of the message key in the chain and the last four bytes of the AEAD nonce (§5.4).
+
+`MAX_SENDER_CHAIN_LENGTH` = 2^16 = 65,536.
+
+1. A sender key chain MUST NOT carry more than `MAX_SENDER_CHAIN_LENGTH` messages: its chain indexes are 0 to `MAX_SENDER_CHAIN_LENGTH` - 1. A sender whose chain has reached that length MUST NOT encrypt another message under it and MUST NOT derive another message key from it; it MUST report the condition as an error of its own and MUST rotate its sender key (§7.3) before it sends to the group again. **PNP-009-MUST-078**
+2. A recipient MUST reject a SenderKeyMessage whose `chain_index` is `MAX_SENDER_CHAIN_LENGTH` or more, before any other processing of the message and without any change to its state for that sender. **PNP-009-MUST-079**
+3. A recipient MUST reject a SenderKeyDistribution whose `chain_index` is `MAX_SENDER_CHAIN_LENGTH` or more, and keeps the sender key state it had for that member. **PNP-009-MUST-080** A chain that starts at its limit can carry no message; a sender at the limit distributes the rotated key, not the exhausted one.
+4. The `chain_index` MUST NOT wrap. Every addition to it MUST be checked, an implementation MUST NOT narrow it to a smaller type, and a send that fails (rule 1, or any other failure) MUST leave the sender's chain key and `chain_index` exactly as they were. **PNP-009-MUST-081** The chain key and the index advance together, once the message has been produced.
+
+**Why 2^16.** Rotation is the sender's own act: a new chain key, a new signing key and one SenderKeyDistribution to each member (§7.3), with no round trip to wait for. §7.2 recommends it every 1000 messages or 24 hours. A limit of 65,536 is 65 times that recommendation, so a sender that follows §7.2 never meets it, and it is 65,536 times below the range of the 32-bit field, so the counter cannot come near wrapping. A chain this short also bounds what a member who was given the chain key at index 0 can read without a rotation (§11.1).
+
+Nonce uniqueness does not rest on the limit: each message key comes from one chain step and encrypts one message. What the limit rules out is a wrapped index, which would repeat index 0 under the same signing key with a receiver that has already consumed it.
+
 ## 6. Group Membership Management
 
 ### 6.1 Roles
@@ -248,6 +270,13 @@ GroupOperation = {
 ### 6.4 Version Ordering
 
 The `version` field is a monotonically increasing counter. Recipients MUST reject any GroupOperation with a `version` less than or equal to the highest version they have already processed for that group. **PNP-009-MUST-024** This prevents replay of stale operations.
+
+`version` is an unsigned 64-bit integer. `MAX_GROUP_VERSION` = 2^53 - 1 = 9,007,199,254,740,991.
+
+1. An admin MUST NOT issue a GroupOperation whose `version` is above `MAX_GROUP_VERSION`. The version of a new operation is the current version plus one, computed with checked arithmetic; when the current version is `MAX_GROUP_VERSION` the admin MUST NOT issue the operation, MUST leave the group state unchanged and MUST report an error. **PNP-009-MUST-082** The group can then no longer be changed, and its members move to a new group.
+2. A recipient MUST reject a GroupOperation, or group metadata offered to it for joining, whose `version` is above `MAX_GROUP_VERSION`, without any change to the group. **PNP-009-MUST-083**
+
+The version orders operations and is in no key or nonce. The limit is the largest integer that every implementation holds exactly, including one whose numbers are IEEE 754 doubles (the web client); at one operation every millisecond it is reached after 285,000 years, and the 64-bit field is 2048 times wider. Without rule 2, a single operation with `version` = 2^64 - 1 would leave the group with no next version: the admin's next operation would overflow, and every recipient would reject anything else as stale. With it, the highest version an admin can force is one that rule 1 already handles without overflow.
 
 ### 6.5 Distribution
 

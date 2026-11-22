@@ -27,7 +27,7 @@ explained there. Desktop-core references are to `crates/parolnet-app/src/` on ma
 |---|---|---|
 | open | client → `{"type":"register","peer_id":"<64hex>"}` | `sw.source.js:483-485` |
 | relay | ← `{"type":"challenge","nonce":"<hex>"}` | handled `messaging.js:302-325` |
-| client | → `{"type":"register","peer_id":"<64hex>","pubkey":"<Ed25519 pk hex>","signature":"<hex, Ed25519 over the register message: label, nonce, pin, relay name; PNP-001 §10.7>","nonce":"<same hex>","relay":"<host:port the socket was opened to>"}` (since PNP-001 v0.15; before, the signature was over the bare nonce and there was no `relay`) | page signs (`messaging.js:306-315`), SW sends (`sw.source.js:671-680`) |
+| client | → `{"type":"register","peer_id":"<64hex>","pubkey":"<Ed25519 pk hex>","signature":"<hex, Ed25519 over the register message: label, nonce, pin, relay name; PNP-001 §10.7>","nonce":"<same hex>","relay":"<host:port the socket was opened to>"}` (since PNP-001 v0.17; before, the signature was over the bare nonce and there was no `relay`) | page signs (`messaging.js:306-315`), SW sends (`sw.source.js:671-680`) |
 | relay | ← `{"type":"registered", "profile":"signaling-only"\|"relay", "online_peers":…}`; a missing `profile` is treated as `"relay"` | `messaging.js:327-333`, `relay-profile.js:28-30` |
 | on `registered` | client → `watch` (§3.3), the discovery tick, refetch of `/turn-credentials` | `connection.js:576-581`, `webrtc.js:238-241` |
 | keepalive | → `{"type":"ping","ts":<ms>}` every 20 s; `pong` ignored; any inbound frame resets liveness; closed with code 4000 after 40 s of silence (checked every 5 s) | `sw.source.js:404-458,495-513` |

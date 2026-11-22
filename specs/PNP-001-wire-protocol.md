@@ -1,19 +1,28 @@
 # PNP-001: ParolNet Wire Protocol
 
 ### Status: CANDIDATE
-### Version: 0.15
+### Version: 0.17
 ### Date: 2026-11-21
 
 ---
 
 ## Changelog
 
-**v0.15 (2026-11-21) — Registration is bound to the relay; no presence over HTTP on a signaling-only relay (wire-incompatible)**
+**v0.17 (2026-11-21) — Registration is bound to the relay; no presence over HTTP on a signaling-only relay (wire-incompatible)**
 
 - Added §10.7 "Registration". It specifies the register challenge, which earlier revisions left to the reference implementation, and changes what the client signs: no longer the relay's bare nonce but a register message made of a domain-separation label, the nonce, an optional pinned relay identity key and the **canonical name of the relay the client dialed** (`host:port`). A relay accepts an answer only for a name it is configured to serve. Before, a relay E that a client connected to could open a socket to another relay R in the client's name, pass R's nonce on as its own challenge and present the client's answer at R: E was then registered at R as that client and received its signaling. New clauses: **PNP-001-MUST-083** … **PNP-001-MUST-087**, **PNP-001-MAY-006**.
 - §10.5: a signaling-only relay no longer serves `GET /peers/presence` and `GET /peers/lookup` (PNP-008 §10.5, §10.6). Both answered anyone, so anyone could ask whether a given PeerId was online. Presence on a signaling-only relay is now learned only over a registered socket. **PNP-001-MUST-071** is restated accordingly (same clause ID); relay-profile relays keep the endpoints behind request signatures (PNP-008 v0.8 §10.8).
 - §10.5 (SHOULD-017): the reference relay's `GET /bootstrap` now returns an empty list in the relay profile too. It listed up to 20 online PeerIds to any caller: the same disclosure, unauthenticated.
-- **Wire-incompatible** with v0.14 and earlier: the `register` answer carries a new `relay` field and a signature over a different message, so a v0.14 client cannot register at a v0.15 relay or the reverse. No deployed implementation of an earlier revision has to be kept working. MUST count: 87.
+- **Wire-incompatible** with v0.16 and earlier: the `register` answer carries a new `relay` field and a signature over a different message, so a v0.14 client cannot register at a v0.15 relay or the reverse. No deployed implementation of an earlier revision has to be kept working. MUST count: 87.
+
+**v0.16 (2026-11-21) — Nonce catalog matches the session and sender-key layers**
+
+- §3.3 (**PNP-001-MUST-006**, same clause ID) and the `N-SESSION` row of §9 now state the nonce the session layer has used throughout and PNP-002 §5.7 already describes: the first 8 bytes of the message's ratchet public key followed by `msg_number` (4 bytes, big-endian). The former text (`chain_index (4B) || seq_number (8B)`) described no implementation and named counters that do not exist in the Double Ratchet state. The `N-SENDERKEY` row of §9 now agrees with PNP-009 §5.4: the first 8 bytes of `SHA-256(signing_public_key)` followed by `chain_index` (4 bytes, big-endian). No wire change.
+- §9 points to the limits of the counters that feed these nonces: PNP-002 §5.9, PNP-009 §5.9 and PNP-004 §5.1. No counter wraps.
+
+**v0.15 (2026-11-21) — Message type 0x15 FILE_TRANSFER**
+
+- §3.4: code `0x15 FILE_TRANSFER` is allocated to PNP-010 (File Transfer): the offer and the accept / decline / cancel / complete messages of a transfer whose records flow on a data channel of their own. The reserved range is now `0x16–0xFF`. Codes 0x02, 0x09 and 0x0A stay allocated; the file transfer they belonged to (PNP-007 §7) is superseded by PNP-010. No clause changes.
 
 **v0.14 (2026-11-21) — The whole ratchet header is associated data (wire-incompatible)**
 
@@ -219,10 +228,12 @@ Flags bitfield:
 The AEAD nonce for the session layer MUST be constructed per scheme `N-SESSION` defined in §9:
 
 ```
-nonce (12 bytes) = chain_index (4 bytes, big-endian) || seq_number (8 bytes, big-endian)
+nonce (12 bytes) = ratchet_public_key[0..8] (8 bytes) || msg_number (4 bytes, big-endian)
 ```
 
 **PNP-001-MUST-006**
+
+`ratchet_public_key` and `msg_number` are the fields of the message's ratchet header (§3.1). `msg_number` never reaches 2^24 and never wraps (PNP-002 §5.9), and every message is encrypted under a message key of its own, so no (key, nonce) pair repeats.
 
 The AEAD additional authenticated data (AAD) MUST be the concatenation of the encoded Double Ratchet header of the message (all three fields of the wire ratchet header, in the fixed 40-byte encoding of PNP-002 §5.7) followed by the serialized CBOR bytes of the cleartext header:
 
@@ -240,7 +251,7 @@ This construction makes the AEAD tag tamper-evident with respect to (a) every re
 
 ### 3.4 Message Types
 
-Codes 0x01–0x06 and 0x14 are allocated by this specification. Codes 0x07–0x0B are allocated by PNP-007 (Media & File Transfer). Codes 0x0C–0x12 are allocated by PNP-009 (Group Communication). Code 0x13 is allocated by PNP-002 (Handshake Protocol) for identity rotation. PNP-001 is the canonical registry — new message types MUST be assigned here in future revisions.
+Codes 0x01–0x06 and 0x14 are allocated by this specification. Codes 0x07–0x0B are allocated by PNP-007 (Media & File Transfer). Codes 0x0C–0x12 are allocated by PNP-009 (Group Communication). Code 0x13 is allocated by PNP-002 (Handshake Protocol) for identity rotation. Code 0x15 is allocated by PNP-010 (File Transfer). PNP-001 is the canonical registry — new message types MUST be assigned here in future revisions.
 
 | Code | Name | Allocated By | Description |
 |------|------|-------------|-------------|
@@ -264,8 +275,9 @@ Codes 0x01–0x06 and 0x14 are allocated by this specification. Codes 0x07–0x0
 | 0x12 | GROUP_ADMIN | PNP-009 | Group admin operation (invite, member add/remove; see PNP-009 §6.2) |
 | 0x13 | IDENTITY_ROTATE | PNP-002 | Signed identity rotation notification (see PNP-002 §7) |
 | 0x14 | CHANNEL_BINDING | PNP-001 | DTLS fingerprints of a direct data channel (§10.5.1) |
+| 0x15 | FILE_TRANSFER | PNP-010 | File transfer offer and control (accept, decline, cancel, complete); the records flow on the transfer's own data channel |
 
-Codes 0x15–0xFF are reserved for future assignment.
+Codes 0x16–0xFF are reserved for future assignment.
 
 Implementations MUST treat unrecognized message type codes as DECOY and silently discard them after decryption. **PNP-001-MUST-008**
 
@@ -492,6 +504,7 @@ QR-code freshness (30 minutes) is defined in PNP-003 §5.1.6 and is unrelated to
 | PNP-008 (Relay Federation) | Directory-sync messages are PNP-001 envelopes with RELAY_CONTROL (0x06). |
 | PNP-009 (Group Communication) | Allocates message-type codes 0x0C–0x12 (§3.4). |
 | PNP-002 (Handshake Protocol) | Allocates message-type code 0x13 IDENTITY_ROTATE (§3.4) for H5 identity rotation. |
+| PNP-010 (File Transfer) | Allocates message-type code 0x15 FILE_TRANSFER (§3.4); reserves data-channel labels under `pn-` on the direct connection of §10.5. |
 
 ## 9. Nonce Construction Catalog
 
@@ -499,10 +512,12 @@ Multiple independently scoped AEAD contexts exist in the ParolNet stack. Each us
 
 | Scheme | Context | Construction | Size | Defined |
 |--------|---------|--------------|------|---------|
-| `N-SESSION` | Session-layer envelope AEAD (§3.3) | `chain_index (4B BE) \|\| seq_number (8B BE)` | 12 bytes | PNP-001 §3.3 |
+| `N-SESSION` | Session-layer envelope AEAD (§3.3) | `ratchet_public_key[0..8] \|\| msg_number (4B BE)` | 12 bytes | PNP-001 §3.3, PNP-002 §5.7 |
 | `N-HANDSHAKE` | PNP-002 X3DH-derived handshake AEAD | HKDF-SHA-256 of shared secret with context label | 12 bytes | PNP-002 §5.2 |
 | `N-ONION` | PNP-004 onion-layer AEAD (per hop) | `nonce_seed (12B) XOR counter (12B BE)` | 12 bytes | PNP-004 §5.1.5 |
-| `N-SENDERKEY` | PNP-009 group sender-key AEAD | `SHA-256(signing_public_key)[0..4] \|\| chain_index (8B BE)` | 12 bytes | PNP-009 §5.4 |
+| `N-SENDERKEY` | PNP-009 group sender-key AEAD | `SHA-256(signing_public_key)[0..8] \|\| chain_index (4B BE)` | 12 bytes | PNP-009 §5.4 |
+
+The counters in these constructions have limits, and none may wrap: `msg_number` in PNP-002 §5.9 (**PNP-002-MUST-045** to **MUST-048**), `chain_index` in PNP-009 §5.9 (**PNP-009-MUST-078** to **MUST-081**), the onion `counter` in PNP-004 §5.1 (**PNP-004-MUST-019**, **MUST-056**, **MUST-059**).
 
 Implementations MUST NOT construct an AEAD nonce by any scheme other than those listed here in the context specified. **PNP-001-MUST-047** Future nonce schemes MUST be added to this catalog in a future revision of PNP-001.
 

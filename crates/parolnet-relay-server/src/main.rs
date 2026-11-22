@@ -2085,15 +2085,25 @@ fn handle_relay_cell(
                 return None;
             }
             if let Some(state) = table.get_mut(&cell.circuit_id) {
-                // Peel the onion layer from the EXTEND payload
+                // Peel the onion layer from the EXTEND payload. The counter is spent whether
+                // or not the cell authenticates; at its limit the circuit is destroyed
+                // (PNP-004-MUST-019 / MUST-056) and the counter never wraps.
+                let Ok(counter) = parolnet_relay::onion::next_counter(&mut state.forward_counter)
+                else {
+                    table.remove(&cell.circuit_id);
+                    tracing::warn!(
+                        circuit_id = cell.circuit_id,
+                        "onion counter exhausted: circuit destroyed"
+                    );
+                    return None;
+                };
                 let payload_data = &cell.payload[..cell.payload_len as usize];
                 let peeled = parolnet_relay::onion::onion_peel(
                     payload_data,
                     &state.keys.forward_key,
                     &state.keys.forward_nonce_seed,
-                    state.forward_counter,
+                    counter,
                 );
-                state.forward_counter += 1;
 
                 match peeled {
                     Ok(inner) => {
@@ -2154,14 +2164,24 @@ fn handle_relay_cell(
             // Peel one onion layer and deliver the payload
             let mut table = circuit_table.lock().unwrap();
             if let Some(state) = table.get_mut(&cell.circuit_id) {
+                // As for EXTEND: one counter value per cell, and no wrap (PNP-004-MUST-019 /
+                // MUST-056).
+                let Ok(counter) = parolnet_relay::onion::next_counter(&mut state.forward_counter)
+                else {
+                    table.remove(&cell.circuit_id);
+                    tracing::warn!(
+                        circuit_id = cell.circuit_id,
+                        "onion counter exhausted: circuit destroyed"
+                    );
+                    return None;
+                };
                 let payload_data = &cell.payload[..cell.payload_len as usize];
                 let peeled = parolnet_relay::onion::onion_peel(
                     payload_data,
                     &state.keys.forward_key,
                     &state.keys.forward_nonce_seed,
-                    state.forward_counter,
+                    counter,
                 );
-                state.forward_counter += 1;
 
                 match peeled {
                     Ok(plaintext) => {

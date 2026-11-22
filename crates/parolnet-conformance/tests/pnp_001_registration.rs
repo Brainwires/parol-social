@@ -144,7 +144,7 @@ fn the_register_message_is_label_nonce_pin_key_and_length_prefixed_name() {
     assert_eq!(register_signable(&NONCE, &relay, None), by_hand);
 
     // It is not the nonce, and does not start with it: a signature over the
-    // bare nonce (what clients sent before v0.15) is not a register answer.
+    // bare nonce (what clients sent before v0.17) is not a register answer.
     let c = Client::new(1);
     let bare = c.key.sign(&NONCE);
     assert!(

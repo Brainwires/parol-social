@@ -5,7 +5,12 @@ import { locale, t } from "../i18n/index.ts";
 import type { Attachment } from "../state/model.ts";
 import { Icon } from "./Icon.tsx";
 
-export type BubbleKind = "received" | "delivered" | "held" | "dropped";
+/**
+ * `stopped`: a file that will not reach their device (declined, cancelled, failed). Outlined,
+ * because it is not there; dotted in `ink-2`, because nothing is waiting and nothing is wrong
+ * with the connection. Its status line says what happened.
+ */
+export type BubbleKind = "received" | "delivered" | "held" | "dropped" | "stopped";
 
 /** "184 kB", "2.4 MB": decimal units, formatted for the locale. */
 export function formatBytes(bytes: number, localeCode: string): string {
@@ -60,6 +65,9 @@ function Body({ content }: { content: BubbleContent }) {
 function className(kind: BubbleKind, tail: "start" | "end" | null): string {
   return `bubble bubble--${kind}${tail ? ` bubble--tail-${tail}` : ""}`;
 }
+
+/** The class names of a bubble of this kind (a file bubble draws its own). */
+export const bubbleClass = className;
 
 export function Bubble({ kind, content, tail = null, fill = false, testId }: {
   kind: BubbleKind;

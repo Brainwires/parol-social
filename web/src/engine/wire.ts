@@ -19,6 +19,8 @@ export const MsgType = {
   DECOY: 0x04,
   CALL_SIGNAL: 0x0b,
   CHANNEL_BINDING: 0x14,
+  /** FILE_TRANSFER: PNP-010 offer and control messages (CBOR, built and parsed in wasm). */
+  FILE_TRANSFER: 0x15,
 } as const;
 
 /** Relay caps the client checks before sending (PNP-001-MUST-072). */

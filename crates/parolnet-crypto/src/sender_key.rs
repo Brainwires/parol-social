@@ -21,6 +21,24 @@ use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 /// Maximum number of skipped message keys to store.
 const MAX_SKIP: u32 = 1000;
 
+/// Maximum number of messages in one sender key chain (PNP-009-MUST-078): a chain carries the
+/// indexes `0 ..= MAX_SENDER_CHAIN_LENGTH - 1`, after which its sender rotates (PNP-009 §7.3).
+/// Rotation is the sender's own to do and is recommended every 1000 messages, so the limit
+/// sits 65 times above that and 65,536 times below the range of the `u32` wire field.
+pub const MAX_SENDER_CHAIN_LENGTH: u32 = 1 << 16;
+
+/// Refuse a chain index a message cannot carry (PNP-009-MUST-079 / MUST-080).
+fn check_chain_index(chain_index: u32) -> Result<(), CryptoError> {
+    if chain_index >= MAX_SENDER_CHAIN_LENGTH {
+        return Err(CryptoError::CounterOutOfRange {
+            counter: "chain_index",
+            value: u64::from(chain_index),
+            limit: u64::from(MAX_SENDER_CHAIN_LENGTH - 1),
+        });
+    }
+    Ok(())
+}
+
 /// State for one sender in a group's sender key chain.
 ///
 /// The sender holds `signing_key = Some(...)` and can encrypt.
@@ -95,6 +113,9 @@ impl SenderKeyState {
     ///
     /// The resulting state can decrypt and verify messages but cannot encrypt.
     pub fn from_distribution(dist: &SenderKeyDistribution) -> Result<Self, CryptoError> {
+        // A chain that starts at or past its limit can carry no message (PNP-009-MUST-080).
+        check_chain_index(dist.chain_index)?;
+
         // Validate the public key is a valid Ed25519 point
         VerifyingKey::from_bytes(&dist.signing_public_key).map_err(|_| {
             CryptoError::SenderKeyError {
@@ -133,17 +154,24 @@ impl SenderKeyState {
                 reason: "receiver-only state cannot encrypt".into(),
             })?;
 
-        // The index after this message must exist: a chain at u32::MAX is used up, and the
-        // sender has to rotate (PNP-009 §7). Checked before anything is derived.
-        let next_index = self
-            .chain_index
-            .checked_add(1)
-            .ok_or(CryptoError::SenderKeyError {
-                reason: "sender key chain exhausted: rotate".into(),
-            })?;
+        // A chain carries `MAX_SENDER_CHAIN_LENGTH` messages and no more (PNP-009-MUST-078):
+        // at the limit the sender rotates (PNP-009 §7.3). Checked before anything is derived.
+        if self.chain_index >= MAX_SENDER_CHAIN_LENGTH {
+            return Err(CryptoError::SenderKeyChainExhausted {
+                limit: MAX_SENDER_CHAIN_LENGTH,
+            });
+        }
+        let next_index =
+            self.chain_index
+                .checked_add(1)
+                .ok_or(CryptoError::SenderKeyChainExhausted {
+                    limit: MAX_SENDER_CHAIN_LENGTH,
+                })?;
 
-        // Derive the message key and advance the chain.
-        let message_key = Zeroizing::new(Self::chain_step(&mut self.chain_key)?);
+        // Derive the message key on a copy of the chain: the state takes the new chain key
+        // and the new index together, once the message exists (PNP-009-MUST-081).
+        let mut next_chain_key = Zeroizing::new(self.chain_key);
+        let message_key = Zeroizing::new(Self::chain_step(&mut next_chain_key)?);
 
         // Build nonce: SHA-256(signing_public_key)[0..8] || chain_index.to_be_bytes()
         let nonce = Self::build_nonce(&self.signing_public_key, self.chain_index);
@@ -158,7 +186,9 @@ impl SenderKeyState {
         signed_data.extend_from_slice(&ciphertext);
         let signature = signing_key.sign(&signed_data);
 
+        // Commit.
         let old_index = self.chain_index;
+        self.chain_key.copy_from_slice(&next_chain_key[..]);
         self.chain_index = next_index;
 
         Ok(SenderKeyMessage {
@@ -174,6 +204,10 @@ impl SenderKeyState {
     /// this returns `Err` the state, skipped keys included, is exactly what it was before
     /// the call.
     pub fn decrypt(&mut self, msg: &SenderKeyMessage) -> Result<Vec<u8>, CryptoError> {
+        // An index past the limit is refused before anything else is done with the message
+        // (PNP-009-MUST-079): no sender produces one (`encrypt` stops at the limit).
+        check_chain_index(msg.chain_index)?;
+
         // Verify Ed25519 signature
         let verifying_key = VerifyingKey::from_bytes(&self.signing_public_key).map_err(|_| {
             CryptoError::SenderKeyError {
@@ -216,26 +250,30 @@ impl SenderKeyState {
             return Ok(plaintext);
         }
 
-        // The index this message would leave the chain at. No sender produces a message at
-        // u32::MAX (`encrypt` refuses), so one that claims it is refused in place of wrapping.
+        // The index this message leaves the chain at: at most `MAX_SENDER_CHAIN_LENGTH`
+        // after the check above. The addition is checked anyway.
         let next_index = msg
             .chain_index
             .checked_add(1)
-            .ok_or(CryptoError::SenderKeyError {
-                reason: "chain index out of range".into(),
+            .ok_or(CryptoError::CounterOutOfRange {
+                counter: "chain_index",
+                value: u64::from(msg.chain_index),
+                limit: u64::from(MAX_SENDER_CHAIN_LENGTH - 1),
             })?;
 
         // Ratchet a copy of the chain forward, collecting the keys of the skipped messages.
-        let skip_count = msg.chain_index - self.chain_index;
+        let skip_count = msg.chain_index.saturating_sub(self.chain_index);
+        let skip_len = usize::try_from(skip_count).unwrap_or(usize::MAX);
         if skip_count > MAX_SKIP
-            || self.skipped_keys.len() + skip_count as usize > MAX_SKIP as usize
+            || self.skipped_keys.len().saturating_add(skip_len)
+                > usize::try_from(MAX_SKIP).unwrap_or(usize::MAX)
         {
             return Err(CryptoError::SenderKeyError {
                 reason: "too many skipped message keys".into(),
             });
         }
         let mut chain_key = Zeroizing::new(self.chain_key);
-        let mut new_skipped = Zeroizing::new(Vec::with_capacity(skip_count as usize));
+        let mut new_skipped = Zeroizing::new(Vec::with_capacity(skip_len));
         for _ in 0..skip_count {
             let mut mk = Self::chain_step(&mut chain_key)?;
             new_skipped.push(mk);
@@ -289,6 +327,16 @@ impl SenderKeyState {
             value.zeroize();
         }
         self.skipped_keys.clear();
+    }
+
+    /// Test hook: put the chain at `chain_index` without sending that many messages, so the
+    /// limit (`MAX_SENDER_CHAIN_LENGTH`) can be reached in a test. The chain key is not
+    /// moved: a receiver built from [`Self::create_distribution`] afterwards is in step.
+    /// Compiled only for this crate's tests and under the `test-hooks` feature, which no
+    /// production crate enables.
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn set_chain_index_for_test(&mut self, chain_index: u32) {
+        self.chain_index = chain_index;
     }
 
     /// Build a 12-byte nonce from the signing public key and chain index.
@@ -485,34 +533,35 @@ mod tests {
     #[test]
     fn chain_index_does_not_wrap() {
         let mut sender = SenderKeyState::new();
-        sender.chain_index = u32::MAX - 1;
+        sender.chain_index = MAX_SENDER_CHAIN_LENGTH - 1;
         let mut receiver =
             SenderKeyState::from_distribution(&sender.create_distribution([0x42; 32])).unwrap();
 
         // The last usable index.
         let last = sender.encrypt(b"last").unwrap();
-        assert_eq!(last.chain_index, u32::MAX - 1);
-        assert_eq!(sender.chain_index, u32::MAX);
+        assert_eq!(last.chain_index, MAX_SENDER_CHAIN_LENGTH - 1);
+        assert_eq!(sender.chain_index, MAX_SENDER_CHAIN_LENGTH);
 
         // At the limit: an error, and the state is untouched.
         let chain_key = sender.chain_key;
         assert!(sender.encrypt(b"one too many").is_err());
-        assert_eq!(sender.chain_index, u32::MAX);
+        assert_eq!(sender.chain_index, MAX_SENDER_CHAIN_LENGTH);
         assert_eq!(sender.chain_key, chain_key);
 
-        // A sender that ignores the limit: the receiver refuses index u32::MAX unchanged.
+        // A sender that ignores the limit: the receiver refuses the index, unchanged.
         let mut step = receiver.chain_key;
         SenderKeyState::chain_step(&mut step).unwrap();
         let key_at_max = SenderKeyState::chain_step(&mut step).unwrap();
-        let nonce = SenderKeyState::build_nonce(&sender.signing_public_key, u32::MAX);
+        let nonce =
+            SenderKeyState::build_nonce(&sender.signing_public_key, MAX_SENDER_CHAIN_LENGTH);
         let ciphertext = ChaCha20Poly1305Cipher::new(&key_at_max)
             .unwrap()
             .encrypt(&nonce, b"wrapped", &[])
             .unwrap();
-        let mut signed = u32::MAX.to_be_bytes().to_vec();
+        let mut signed = MAX_SENDER_CHAIN_LENGTH.to_be_bytes().to_vec();
         signed.extend_from_slice(&ciphertext);
         let at_max = SenderKeyMessage {
-            chain_index: u32::MAX,
+            chain_index: MAX_SENDER_CHAIN_LENGTH,
             signature: sender
                 .signing_key
                 .as_ref()
@@ -526,7 +575,7 @@ mod tests {
 
         // The genuine last message still decrypts.
         assert_eq!(receiver.decrypt(&last).unwrap(), b"last");
-        assert_eq!(receiver.chain_index, u32::MAX);
+        assert_eq!(receiver.chain_index, MAX_SENDER_CHAIN_LENGTH);
     }
 
     // ── Atomic decrypt ──────────────────────────────────────────────────

@@ -3030,21 +3030,25 @@ dependencies = [
 name = "parolnet-app"
 version = "0.1.0"
 dependencies = [
+ "bytes",
  "ciborium",
  "ed25519-dalek",
  "futures-util",
  "hex",
  "opus-rs",
+ "parolnet-app",
  "parolnet-core",
  "parolnet-crypto",
  "parolnet-protocol",
  "parolnet-rtc",
  "parolnet-store",
+ "parolnet-transfer",
  "rand 0.8.5",
  "reqwest",
  "rustls",
  "serde",
  "serde_json",
+ "sha2 0.11.0",
  "thiserror 2.0.21",
  "tokio",
  "tokio-tungstenite 0.26.2",
@@ -3110,6 +3114,7 @@ dependencies = [
 name = "parolnet-conformance"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "ciborium",
  "curve25519-dalek",
  "ed25519-dalek",
@@ -3125,6 +3130,7 @@ dependencies = [
  "parolnet-relay",
  "parolnet-relay-server",
  "parolnet-rtc",
+ "parolnet-transfer",
  "parolnet-transport",
  "proptest",
  "rand 0.8.5",
@@ -3343,6 +3349,7 @@ dependencies = [
  "bytes",
  "parolnet-media",
  "parolnet-rtc",
+ "parolnet-transfer",
  "tokio",
  "tracing",
 ]
@@ -3360,6 +3367,23 @@ dependencies = [
  "subtle",
  "thiserror 2.0.21",
  "tracing",
+ "zeroize",
+]
+
+[[package]]
+name = "parolnet-transfer"
+version = "0.1.0"
+dependencies = [
+ "chacha20poly1305",
+ "ciborium",
+ "hex",
+ "hkdf",
+ "proptest",
+ "rand_core 0.6.4",
+ "serde_json",
+ "sha2 0.11.0",
+ "subtle",
+ "thiserror 2.0.21",
  "zeroize",
 ]
 
@@ -3398,6 +3422,7 @@ dependencies = [
  "parolnet-core",
  "parolnet-crypto",
  "parolnet-protocol",
+ "parolnet-transfer",
  "rand 0.8.5",
  "serde",
  "serde-wasm-bindgen",

@@ -790,7 +790,7 @@ async fn a_signature_over_the_bare_nonce_or_without_a_relay_name_is_refused() {
     let relay = Relay::start(&[]).await;
     let id = Identity::new();
 
-    // What clients sent before PNP-001 v0.15: the nonce itself, signed.
+    // What clients sent before PNP-001 v0.17: the nonce itself, signed.
     let mut ws = relay.ws().await;
     let nonce = challenge_nonce(&mut ws, &id.peer_id).await;
     let bare = id.key.sign(&hex::decode(&nonce).unwrap());

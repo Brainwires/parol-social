@@ -5,7 +5,15 @@
 import { batch, signal } from "denext/signals";
 import type { Engine } from "../engine/engine.ts";
 import { type AppEvent, EngineError } from "../engine/types.ts";
-import type { CallInfo, ChatMessage, ContactView, PairingCode, RelayState } from "./model.ts";
+import type {
+  CallInfo,
+  ChatMessage,
+  ContactView,
+  PairingCode,
+  RelayState,
+  TransferInfo,
+} from "./model.ts";
+import { saveFile as saveWithBrowser, type SaveOutcome } from "./save-file.ts";
 import type { AppStore, BackupFile, CallMediaStreams, Notice, Phase, TurnView } from "./store.ts";
 
 /** The part of the engine the store uses. `Engine` satisfies it. */
@@ -39,6 +47,14 @@ export type EnginePort = Pick<
   | "setTurnSettings"
   | "shutdown"
   | "wipe"
+  | "offerFile"
+  | "acceptTransfer"
+  | "declineTransfer"
+  | "cancelTransfer"
+  | "transfers"
+  | "transferFile"
+  | "removeTransfer"
+  | "receivedFilesPersist"
 >;
 
 /** Why the app could not start. */
@@ -115,6 +131,11 @@ export interface StoreEnv {
    * (src/platform/playback.ts says why it cannot wait for the screen to render).
    */
   keepPlaying?(streams: readonly (MediaStream | null)[]): void;
+  /**
+   * Hand a file to the person (src/state/save-file.ts; the default is the browser's save
+   * dialog or a download). Tests replace it.
+   */
+  saveFile?(name: string, getBlob: () => Promise<Blob | null>): Promise<SaveOutcome>;
   /** The engine started (or stopped: null). For lifecycle listeners and test hooks. */
   onEngine?(engine: EnginePort | null): void;
   /** Every engine event, after the store has applied it. For notifications. */
@@ -143,6 +164,8 @@ export function createEngineStore(env: StoreEnv): EngineStore {
   const selfOnline = signal(false);
   const contacts = signal<readonly ContactView[]>([]);
   const messages = signal<ReadonlyMap<string, readonly ChatMessage[]>>(new Map());
+  const transfers = signal<ReadonlyMap<string, readonly TransferInfo[]>>(new Map());
+  const filesPersist = signal(true);
   const call = signal<CallInfo | null>(null);
   const callMedia = signal<CallMediaStreams>(NO_MEDIA);
   const pairing = signal<PairingCode | null>(null);
@@ -180,6 +203,21 @@ export function createEngineStore(env: StoreEnv): EngineStore {
     next.set(peerId, change(next.get(peerId) ?? []));
     messages.value = next;
   }
+
+  /** Oldest first, as the engine lists them. */
+  const byCreation = (a: TransferInfo, b: TransferInfo) => a.createdMs - b.createdMs;
+
+  function transferThread(
+    peerId: string,
+    change: (list: readonly TransferInfo[]) => TransferInfo[],
+  ): void {
+    const next = new Map(transfers.value);
+    next.set(peerId, change(next.get(peerId) ?? []).sort(byCreation));
+    transfers.value = next;
+  }
+
+  /** Ids removed since this engine started, so a list loaded meanwhile does not bring one back. */
+  const removedTransfers = new Set<string>();
 
   /** Everything the snapshot carries. */
   function sync(): void {
@@ -257,9 +295,24 @@ export function createEngineStore(env: StoreEnv): EngineStore {
       case "ContactRemoved": {
         const next = new Map(messages.value);
         next.delete(event.peerId);
-        messages.value = next;
+        const files = new Map(transfers.value);
+        files.delete(event.peerId);
+        batch(() => {
+          messages.value = next;
+          transfers.value = files;
+        });
         break;
       }
+      case "Transfer": {
+        const info = event.transfer;
+        removedTransfers.delete(info.id);
+        transferThread(info.peerId, (list) => [...list.filter((t) => t.id !== info.id), info]);
+        break;
+      }
+      case "TransferRemoved":
+        removedTransfers.add(event.id);
+        transferThread(event.peerId, (list) => list.filter((t) => t.id !== event.id));
+        break;
       case "Call":
         onCall(event.call);
         break;
@@ -290,7 +343,19 @@ export function createEngineStore(env: StoreEnv): EngineStore {
       if (engine !== started) return;
       const have = new Set(stored.map((m) => m.id));
       thread(peer, (list) => [...stored, ...list.filter((m) => !have.has(m.id))]);
+      // The same for its file transfers; one an event delivered meanwhile is newer, so the
+      // event's copy wins, and one removed meanwhile stays removed.
+      const files = await started.transfers(peer);
+      if (engine !== started) return;
+      transferThread(peer, (live) => {
+        const fresh = new Set(live.map((t) => t.id));
+        return [
+          ...files.filter((t) => !fresh.has(t.id) && !removedTransfers.has(t.id)),
+          ...live,
+        ];
+      });
     }
+    filesPersist.value = started.receivedFilesPersist();
     await syncTurn();
     sync();
     phase.value = { kind: "ready" };
@@ -366,6 +431,8 @@ export function createEngineStore(env: StoreEnv): EngineStore {
     selfOnline,
     contacts,
     messages,
+    transfers,
+    filesPersist,
     call,
     callMedia,
     pairing,
@@ -479,6 +546,28 @@ export function createEngineStore(env: StoreEnv): EngineStore {
     markRead(peerId) {
       void engine?.markRead(peerId).catch(() => {});
     },
+
+    offerFile: (peerId, file) => live().offerFile(peerId, file),
+    async acceptTransfer(id) {
+      await live().acceptTransfer(id);
+    },
+    async declineTransfer(id) {
+      await live().declineTransfer(id);
+    },
+    async cancelTransfer(id) {
+      await live().cancelTransfer(id);
+    },
+    async saveTransfer(id) {
+      const running = live();
+      const info = [...transfers.value.values()].flat().find((t) => t.id === id);
+      if (!info) throw new EngineError("UnknownTransfer", "no such transfer");
+      const save = env.saveFile ?? saveWithBrowser;
+      const outcome = await save(info.name, () => running.transferFile(id));
+      if (outcome === "missing") {
+        throw new EngineError("UnknownTransfer", "the file is no longer on this device");
+      }
+    },
+    removeTransfer: (id) => live().removeTransfer(id),
 
     createPairingCode: () => live().createPairingCode(),
     cancelPairing: () => engine?.cancelPairing() ?? Promise.resolve(),

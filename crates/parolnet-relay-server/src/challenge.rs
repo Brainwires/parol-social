@@ -408,7 +408,7 @@ mod tests {
 
     #[test]
     fn refuses_a_signature_over_the_bare_nonce() {
-        // What clients signed before PNP-001 v0.15.
+        // What clients signed before PNP-001 v0.17.
         let c = Client::new(1);
         let bare = hex::encode(c.key.sign(&NONCE).to_bytes());
         let r = names("relay-r.example");
