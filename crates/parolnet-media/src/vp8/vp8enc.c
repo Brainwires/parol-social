@@ -11,6 +11,7 @@
 
 typedef struct pn_vp8enc {
     vpx_codec_ctx_t ctx;
+    vpx_codec_enc_cfg_t cfg;
     vpx_image_t img;
     unsigned w, h;
 } pn_vp8enc;
@@ -67,9 +68,28 @@ pn_vp8enc *pn_vp8enc_new(unsigned w, unsigned h, unsigned fps, unsigned kbps, ch
     vpx_codec_control(&e->ctx, VP8E_SET_CPUUSED, 8);
     vpx_codec_control(&e->ctx, VP8E_SET_STATIC_THRESHOLD, 1);
     vpx_codec_control(&e->ctx, VP8E_SET_MAX_INTRA_BITRATE_PCT, 300);
+    e->cfg = cfg;
     e->w = w;
     e->h = h;
     return e;
+}
+
+// Change the target bitrate of a running encoder (the congestion controller's estimate moved).
+// Takes effect from the next frame; no keyframe is forced. Returns 0, or -1 on an encoder error.
+int pn_vp8enc_set_bitrate(pn_vp8enc *e, unsigned kbps) {
+    if (kbps == 0) {
+        return -1;
+    }
+    if (e->cfg.rc_target_bitrate == kbps) {
+        return 0;
+    }
+    vpx_codec_enc_cfg_t cfg = e->cfg;
+    cfg.rc_target_bitrate = kbps;
+    if (vpx_codec_enc_config_set(&e->ctx, &cfg) != VPX_CODEC_OK) {
+        return -1;
+    }
+    e->cfg = cfg;
+    return 0;
 }
 
 // Encode one I420 frame (`i420` holds Y, then U, then V, tightly packed). The encoded frame

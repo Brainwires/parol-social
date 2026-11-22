@@ -15,8 +15,11 @@
 //! - **Signaling**: the relay's signaling-only profile (register by challenge, `watch` /
 //!   `presence`, non-trickle `rtc_offer` / `rtc_answer`, `rtc_ice` for late candidates).
 //! - **Transport**: one direct WebRTC connection per contact through `parolnet-rtc`, with
-//!   the `parolnet` data channel and the PWA's JSON frames on it. ICE is host + STUN (from
-//!   the relay's `/turn-credentials`). TURN is never taken from a relay: only the server the
+//!   the `parolnet` data channel and the PWA's JSON frames on it. ICE is host candidates on
+//!   every interface, IPv4 and IPv6, and STUN (from the relay's `/turn-credentials`). When
+//!   the machine's network changes ([`AppHandle::network_changed`], called by the core's own
+//!   interface watch) connections restart ICE in place where the contact's app can, and are
+//!   rebuilt where it cannot or the restart fails. TURN is never taken from a relay: only the server the
 //!   user configured ([`TurnSettings`], [`AppHandle::set_turn_settings`]) is used, as one
 //!   more candidate or, with `relay_only`, as the only path (the contact then sees that
 //!   server's address instead of ours).
@@ -25,7 +28,10 @@
 //! - **Chat**: 1:1 text as PNP-001 TEXT envelopes, interoperable with the PWA; a sender-side
 //!   queue holds envelopes until the contact's data channel opens and verifies.
 //! - **Calls** ([`call`]): 1:1 voice / video on their own connection, signalled inside the
-//!   session; the client encodes and decodes (see [`CallMedia`]).
+//!   session; the client encodes and decodes (see [`CallMedia`]). A call follows a network
+//!   change by ICE restart, gains or loses video by renegotiation
+//!   ([`AppHandle::set_call_video`]), tells the encoder what the path carries
+//!   ([`MediaEvent::TargetBitrate`]) and reports its quality ([`AppEvent::CallQuality`]).
 //!
 //! The core runs as one tokio task (an actor): [`start`] returns an [`AppHandle`] for
 //! commands and a channel of [`AppEvent`]s.
@@ -46,8 +52,11 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, oneshot};
 
-pub use call::{CallEnd, CallInfo, CallMedia, CallState, FrameSink, MediaEvent};
-pub use parolnet_rtc::MediaKind;
+pub use call::{
+    CallEnd, CallInfo, CallMedia, CallQuality, CallState, FrameSink, MediaEvent, VideoChange,
+    Weakness, video_bitrate_for,
+};
+pub use parolnet_rtc::{CandidateKind, ConnectionQuality, MediaKind};
 pub use reconnect::ReconnectConfig;
 pub use store::KeyStorage;
 
@@ -76,6 +85,8 @@ pub enum AppError {
     Busy,
     #[error("unknown call {0}")]
     UnknownCall(String),
+    #[error("the contact's app cannot change a call that is under way")]
+    CannotRenegotiate,
     #[error("the app core has stopped")]
     Stopped,
 }
@@ -94,8 +105,9 @@ pub struct AppConfig {
     /// STUN servers. `None` fetches them from the relay's `/turn-credentials`; `Some(vec![])`
     /// uses host candidates only (tests, one network).
     pub stun_servers: Option<Vec<String>>,
-    /// The interface address for host candidates. `None` picks the default-route interface
-    /// (loopback when there is none).
+    /// The one interface address to use for host candidates (tests, a pinned interface).
+    /// `None`: every usable address of every interface, IPv4 and IPv6, and the core watches
+    /// the interfaces and restarts ICE when they change.
     pub bind_ip: Option<IpAddr>,
     /// How long a contact's code stays acceptable after it is shown (and offers from
     /// strangers are accepted).
@@ -104,6 +116,11 @@ pub struct AppConfig {
     pub default_contact_name: Option<String>,
     /// How contacts the relay called offline are re-probed.
     pub reconnect: ReconnectConfig,
+    /// Take part in ICE restarts and call renegotiation (PNP-011 sections 7 and 8): list the
+    /// features, send and answer `reoffer`s and restart offers. Off, this peer behaves as
+    /// one that knows neither (the PWA, the web app today): a network change waits for the
+    /// connection to fail and rebuilds it, and a call stays as it was set up.
+    pub renegotiation: bool,
 }
 
 impl AppConfig {
@@ -117,6 +134,7 @@ impl AppConfig {
             pairing_window: Duration::from_secs(30 * 60),
             default_contact_name: None,
             reconnect: ReconnectConfig::default(),
+            renegotiation: true,
         }
     }
 }
@@ -212,8 +230,13 @@ pub enum AppEvent {
     },
     /// Something the user should know (a failed pairing, an unsupported message).
     Notice(String),
-    /// A call started, changed state or ended.
+    /// A call started, changed state or ended, or its video changed.
     Call(CallInfo),
+    /// The quality of an active call's connection, about once a second.
+    CallQuality {
+        call_id: String,
+        quality: CallQuality,
+    },
 }
 
 /// A contact with its live state.
@@ -222,6 +245,9 @@ pub struct ContactView {
     pub contact: Contact,
     pub path: PathState,
     pub queued: usize,
+    /// ICE restarts completed on the contact's current connection (a diagnostic: the
+    /// connection followed that many network changes without being rebuilt).
+    pub ice_restarts: u32,
 }
 
 /// A consistent picture of the core's state.
@@ -305,6 +331,8 @@ pub(crate) enum Command {
     RejectCall(String),
     Hangup(String),
     TakeCallMedia(String, oneshot::Sender<Result<CallMedia, AppError>>),
+    SetCallVideo(String, bool, oneshot::Sender<Result<VideoChange, AppError>>),
+    NetworkChanged,
     TurnSettings(oneshot::Sender<Option<TurnSettings>>),
     SetTurnSettings(Option<TurnSettings>, oneshot::Sender<Result<(), AppError>>),
     Shutdown(oneshot::Sender<()>),
@@ -416,6 +444,31 @@ impl AppHandle {
     pub async fn take_call_media(&self, call_id: &str) -> Result<CallMedia, AppError> {
         let c = call_id.to_owned();
         self.ask(|tx| Command::TakeCallMedia(c, tx)).await?
+    }
+
+    /// Turn our video on or off in a call that is set up. With a contact whose app
+    /// renegotiates ([`CallInfo::renegotiable`]) the call is renegotiated: an audio call
+    /// gains video, and a camera that is turned off stops its stream
+    /// ([`VideoChange::Renegotiating`]). With any other contact a video call keeps its
+    /// stream ([`VideoChange::Unchanged`]: send black for "off") and an audio call cannot
+    /// gain video ([`AppError::CannotRenegotiate`]).
+    pub async fn set_call_video(
+        &self,
+        call_id: &str,
+        enabled: bool,
+    ) -> Result<VideoChange, AppError> {
+        let c = call_id.to_owned();
+        self.ask(|tx| Command::SetCallVideo(c, enabled, tx)).await?
+    }
+
+    /// The machine's network changed (an interface came or went, another Wi-Fi): reconnect
+    /// to the relay now and restart ICE on the connections and the call. The core calls this
+    /// itself when it watches the interfaces ([`AppConfig::bind_ip`] is `None`); a client
+    /// that learns of a change another way (the system woke up) may call it too.
+    pub fn network_changed(&self) {
+        let _ = self
+            .tx
+            .send(engine::Input::Command(Command::NetworkChanged));
     }
 
     /// The user's TURN server, if they configured one (for the settings view; snapshots

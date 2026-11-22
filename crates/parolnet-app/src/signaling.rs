@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
-use tokio::sync::mpsc;
+use tokio::sync::{Notify, mpsc};
 use tokio_tungstenite::tungstenite::Message;
 
 use crate::wire::{ClientFrame, ServerFrame};
@@ -40,6 +40,9 @@ const KEEPALIVE: Keepalive = Keepalive {
     ping_every: Duration::from_secs(20),
     dead_after: Duration::from_secs(40),
 };
+/// After a nudge (the network changed) the relay has this long to send anything, a pong to
+/// the ping sent at once included, before the socket is taken for dead.
+const NUDGE_DEAD_AFTER: Duration = Duration::from_secs(6);
 const BACKOFF_MIN: Duration = Duration::from_secs(1);
 const BACKOFF_MAX: Duration = Duration::from_secs(30);
 
@@ -69,12 +72,20 @@ impl Backoff {
 
 pub struct SigHandle {
     tx: mpsc::UnboundedSender<ClientFrame>,
+    nudge: Arc<Notify>,
     task: tokio::task::JoinHandle<()>,
 }
 
 impl SigHandle {
     pub fn send(&self, frame: ClientFrame) {
         let _ = self.tx.send(frame);
+    }
+
+    /// The network changed: reconnect now when the socket is down (instead of waiting out
+    /// the backoff), and when it looks up, find out quickly whether it still is (a ping at
+    /// once, and a short wait for anything from the relay).
+    pub fn nudge(&self) {
+        self.nudge.notify_one();
     }
 
     pub fn stop(&self) {
@@ -90,6 +101,7 @@ pub fn spawn(
     events: mpsc::UnboundedSender<SigEvent>,
 ) -> SigHandle {
     let (tx, rx) = mpsc::unbounded_channel();
+    let nudge = Arc::new(Notify::new());
     let task = tokio::spawn(run(
         url,
         peer_id,
@@ -98,10 +110,12 @@ pub fn spawn(
         events,
         rx,
         KEEPALIVE,
+        nudge.clone(),
     ));
-    SigHandle { tx, task }
+    SigHandle { tx, nudge, task }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run(
     url: String,
     peer_id: String,
@@ -110,6 +124,7 @@ async fn run(
     events: mpsc::UnboundedSender<SigEvent>,
     mut outgoing: mpsc::UnboundedReceiver<ClientFrame>,
     keepalive: Keepalive,
+    nudge: Arc<Notify>,
 ) {
     let mut backoff = Backoff::new();
     loop {
@@ -123,6 +138,7 @@ async fn run(
             &events,
             &mut outgoing,
             keepalive,
+            &nudge,
             &mut registered,
         )
         .await
@@ -146,6 +162,11 @@ async fn run(
         loop {
             tokio::select! {
                 _ = &mut sleep => break,
+                // The network is back: try now, and start the backoff over.
+                _ = nudge.notified() => {
+                    backoff = Backoff::new();
+                    break;
+                }
                 f = outgoing.recv() => if f.is_none() { return },
             }
         }
@@ -163,6 +184,7 @@ async fn session(
     events: &mpsc::UnboundedSender<SigEvent>,
     outgoing: &mut mpsc::UnboundedReceiver<ClientFrame>,
     keepalive: Keepalive,
+    nudge: &Notify,
     registered: &mut bool,
 ) -> Result<(), String> {
     crate::install_crypto_provider();
@@ -249,6 +271,18 @@ async fn session(
                     .await
                     .map_err(|e| format!("send: {e}"))?;
             }
+            _ = nudge.notified() => {
+                // The network changed under a socket that looks alive: ask, and do not wait
+                // the full keepalive for the answer.
+                sink.send(send(&ClientFrame::Ping { ts: crate::now_ms() }))
+                    .await
+                    .map_err(|e| format!("send: {e}"))?;
+                let soon = tokio::time::Instant::now()
+                    + NUDGE_DEAD_AFTER.min(keepalive.dead_after);
+                if soon < silence.deadline() {
+                    silence.as_mut().reset(soon);
+                }
+            }
             _ = &mut silence => {
                 // Dropping the socket tears it down; `run` reconnects after its backoff.
                 return Err(format!(
@@ -286,6 +320,10 @@ mod tests {
     async fn relay(answering: Arc<AtomicBool>) -> (String, Arc<Seen>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("ws://{}", listener.local_addr().unwrap());
+        (url, relay_on(listener, answering))
+    }
+
+    fn relay_on(listener: TcpListener, answering: Arc<AtomicBool>) -> Arc<Seen> {
         let seen = Arc::new(Seen::default());
         let counters = seen.clone();
         tokio::spawn(async move {
@@ -313,7 +351,7 @@ mod tests {
                 });
             }
         });
-        (url, seen)
+        seen
     }
 
     fn client(
@@ -324,9 +362,23 @@ mod tests {
         mpsc::UnboundedSender<ClientFrame>,
         tokio::task::JoinHandle<()>,
     ) {
+        let (events, tx, task, _) = nudgeable_client(url, keepalive);
+        (events, tx, task)
+    }
+
+    fn nudgeable_client(
+        url: String,
+        keepalive: Keepalive,
+    ) -> (
+        mpsc::UnboundedReceiver<SigEvent>,
+        mpsc::UnboundedSender<ClientFrame>,
+        tokio::task::JoinHandle<()>,
+        Arc<Notify>,
+    ) {
         let (events_tx, events) = mpsc::unbounded_channel();
         let (tx, rx) = mpsc::unbounded_channel();
         let signer: Signer = Arc::new(|_| [0u8; 64]);
+        let nudge = Arc::new(Notify::new());
         let task = tokio::spawn(run(
             url,
             "00".repeat(32),
@@ -335,8 +387,48 @@ mod tests {
             events_tx,
             rx,
             keepalive,
+            nudge.clone(),
         ));
-        (events, tx, task)
+        (events, tx, task, nudge)
+    }
+
+    /// A network change does not wait out the reconnect backoff, and a socket that looks
+    /// alive is checked at once.
+    #[tokio::test]
+    async fn a_nudge_reconnects_now_and_checks_a_live_socket() {
+        // Nobody listens: attempts fail and the backoff grows (1 s, 2 s, 4 s).
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+        let (mut events, _tx, task, nudge) = nudgeable_client(format!("ws://{addr}"), FAST);
+        let mut failed = 0;
+        while failed < 3 {
+            if matches!(next_event(&mut events).await, SigEvent::Disconnected { .. }) {
+                failed += 1;
+            }
+        }
+        // The next attempt is 4 s away. The relay comes back and the network says so.
+        let answering = Arc::new(AtomicBool::new(true));
+        let seen = relay_on(TcpListener::bind(addr).await.unwrap(), answering.clone());
+        let nudged = Instant::now();
+        nudge.notify_one();
+        loop {
+            if matches!(next_event(&mut events).await, SigEvent::Registered { .. }) {
+                break;
+            }
+        }
+        assert!(
+            nudged.elapsed() < Duration::from_secs(2),
+            "registered {:?} after the nudge",
+            nudged.elapsed()
+        );
+
+        // Registered and quiet. A nudge sends a ping at once.
+        let before = seen.pings.load(Ordering::SeqCst);
+        nudge.notify_one();
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        assert!(seen.pings.load(Ordering::SeqCst) > before);
+        task.abort();
     }
 
     async fn next_event(events: &mut mpsc::UnboundedReceiver<SigEvent>) -> SigEvent {

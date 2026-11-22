@@ -6,17 +6,22 @@
 //! ```
 //!
 //! Prints one JSON object per line on stdout: `ready` (peer id), `code` (with
-//! `--show-code`), `contact`, `path`, `relay`, `message`, `notice`, `call` (state changes) and,
-//! once a second during a call, `media` (RTP packets received per kind). Reads commands on
-//! stdin, one per line: `send <peer-id> <text>`, `code`, `pair <code>`, `call <peer-id>
-//! [video]`, `accept [call-id]`, `reject [call-id]`, `hangup [call-id]`, `quit`. With `--echo`
-//! every received message is answered with `echo: <text>`.
+//! `--show-code`), `contact`, `path`, `relay`, `message`, `notice`, `call` (state and video
+//! changes) and, during a call, once a second `media` (RTP packets received per kind) and
+//! `quality`, plus `bitrate` (the congestion controller's estimate) and `video` (the
+//! contact's or our video starting or stopping). Reads commands on stdin, one per line:
+//! `send <peer-id> <text>`, `code`, `pair <code>`, `call <peer-id> [video]`, `accept
+//! [call-id]`, `reject [call-id]`, `hangup [call-id]`, `video on|off [call-id]` (renegotiate
+//! our video), `network-changed` (restart ICE as after an interface change), `quit`. With
+//! `--echo` every received message is answered with `echo: <text>`.
 //!
 //! In a call the bot sends a 440 Hz tone (Opus, encoded with opus-rs) and, for a video call,
 //! loops `testpattern.ivf` (VP8, 160x120, 30 fps: colour bars, a moving box and a frame
 //! counter, written by the desktop app's encoder test `write_bot_ivf`).
 
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use parolnet_app::KeyStorage;
@@ -52,8 +57,9 @@ fn ivf_frames(data: &[u8]) -> Vec<Vec<u8>> {
     frames
 }
 
-/// Send the tone and the test pattern; report what arrives.
-async fn run_media(call_id: String, media: CallMedia, video: bool) {
+/// Send the tone and the test pattern; report what arrives. `video` says whether the test
+/// pattern is produced (the core drops it while our video is not negotiated).
+async fn run_media(call_id: String, media: CallMedia, video: Arc<AtomicBool>) {
     let CallMedia { frames, mut events } = media;
     let sender = {
         let frames = frames.clone();
@@ -83,7 +89,7 @@ async fn run_media(call_id: String, media: CallMedia, video: bool) {
                 {
                     return;
                 }
-                if video && !pattern.is_empty() {
+                if video.load(Ordering::Relaxed) && !pattern.is_empty() {
                     let due = (start.elapsed().as_millis() as u64 * 30) / 1000;
                     let sent = (tick * 20 * 30) / 1000;
                     if due >= sent {
@@ -109,6 +115,15 @@ async fn run_media(call_id: String, media: CallMedia, video: bool) {
                     "event": "track", "call_id": call_id, "kind": format!("{kind:?}"), "mime_type": mime_type
                 })),
                 Some(MediaEvent::KeyframeRequested) => {}
+                Some(MediaEvent::TargetBitrate { bps }) => out(json!({
+                    "event": "bitrate", "call_id": call_id, "bps": bps
+                })),
+                Some(MediaEvent::RemoteVideo { sending }) => out(json!({
+                    "event": "video", "call_id": call_id, "who": "remote", "sending": sending
+                })),
+                Some(MediaEvent::LocalVideo { sending }) => out(json!({
+                    "event": "video", "call_id": call_id, "who": "local", "sending": sending
+                })),
                 None => break,
             },
             _ = report.tick() => out(json!({
@@ -123,7 +138,7 @@ async fn run_media(call_id: String, media: CallMedia, video: bool) {
     let _ = sender.await;
 }
 
-async fn start_media(app: &AppHandle, call_id: &str, video: bool) {
+async fn start_media(app: &AppHandle, call_id: &str, video: Arc<AtomicBool>) {
     match app.take_call_media(call_id).await {
         Ok(media) => {
             tokio::spawn(run_media(call_id.to_owned(), media, video));
@@ -181,6 +196,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // The latest call (for `accept` / `reject` / `hangup` without an id).
     let mut last_call: Option<(String, bool)> = None;
+    // Whether the test pattern is produced for the call under way.
+    let mut sending_video = Arc::new(AtomicBool::new(false));
     let mut stdin = BufReader::new(tokio::io::stdin()).lines();
     loop {
         tokio::select! {
@@ -209,12 +226,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         };
                         out(json!({
                             "event": "call", "call_id": c.call_id, "peer_id": c.peer_id,
-                            "state": state, "video": c.video, "incoming": c.incoming
+                            "state": state, "video": c.video, "incoming": c.incoming,
+                            "local_video": c.local_video, "remote_video": c.remote_video,
+                            "renegotiable": c.renegotiable
                         }));
                         if c.state == CallState::Incoming {
                             last_call = Some((c.call_id.clone(), c.video));
                         }
                     }
+                    AppEvent::CallQuality { call_id, quality } => out(json!({
+                        "event": "quality", "call_id": call_id,
+                        "rtt_ms": quality.stats.rtt_ms,
+                        "loss_sent": quality.stats.loss_sent,
+                        "loss_received": quality.stats.loss_received,
+                        "send_bps": quality.stats.send_bps,
+                        "recv_bps": quality.stats.recv_bps,
+                        "available_bps": quality.stats.available_bps,
+                        "local_candidate": quality.stats.local_candidate.map(|k| format!("{k:?}")),
+                        "remote_candidate": quality.stats.remote_candidate.map(|k| format!("{k:?}")),
+                        "weak": quality.summary(),
+                    })),
                 }
             }
             line = stdin.next_line() => {
@@ -244,7 +275,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         match app.start_call(peer, video).await {
                             Ok(c) => {
                                 last_call = Some((c.call_id.clone(), video));
-                                start_media(&app, &c.call_id, video).await;
+                                sending_video = Arc::new(AtomicBool::new(video));
+                                start_media(&app, &c.call_id, sending_video.clone()).await;
                             }
                             Err(e) => out(json!({"event": "error", "text": e.to_string()})),
                         }
@@ -256,10 +288,41 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             continue;
                         };
                         match app.accept_call(&id).await {
-                            Ok(c) => start_media(&app, &id, c.video).await,
+                            Ok(c) => {
+                                last_call = Some((id.clone(), c.video));
+                                sending_video = Arc::new(AtomicBool::new(c.video));
+                                start_media(&app, &id, sending_video.clone()).await;
+                            }
                             Err(e) => out(json!({"event": "error", "text": e.to_string()})),
                         }
                     }
+                    Some("video") => {
+                        let on = match words.next() {
+                            Some("on") => true,
+                            Some("off") => false,
+                            _ => {
+                                out(json!({"event": "error", "text": "video on|off [call-id]"}));
+                                continue;
+                            }
+                        };
+                        let id = words.next().map(str::to_owned).or_else(|| last_call.as_ref().map(|c| c.0.clone()));
+                        let Some(id) = id else {
+                            out(json!({"event": "error", "text": "no call"}));
+                            continue;
+                        };
+                        match app.set_call_video(&id, on).await {
+                            Ok(change) => {
+                                // With a contact that does not renegotiate the stream stays
+                                // as it is (a real client sends black for "off").
+                                if change == parolnet_app::VideoChange::Renegotiating {
+                                    sending_video.store(on, Ordering::Relaxed);
+                                }
+                                out(json!({"event": "video-change", "call_id": id, "on": on, "how": format!("{change:?}")}));
+                            }
+                            Err(e) => out(json!({"event": "error", "text": e.to_string()})),
+                        }
+                    }
+                    Some("network-changed") => app.network_changed(),
                     Some(cmd @ ("reject" | "hangup")) => {
                         let id = words.next().map(str::to_owned).or_else(|| last_call.as_ref().map(|c| c.0.clone()));
                         match id {
