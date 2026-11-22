@@ -12,7 +12,7 @@
 //        behind it at the same origin. The cases and what they assert are the same; only how
 //        the browser side is driven differs (see `class Web`): actions go through the
 //        interface (first run, the add-a-contact screen, the composer, the call buttons), and
-//        state is read from the app's database and its `window.__parolnetTest` hooks, which
+//        state is read from its `window.__parolnetTest` hooks, which
 //        only the test build has. Where a case read old-PWA internals the web target has an
 //        equivalent, listed at `class Web`. In this file "the PWA" means the browser side
 //        under test, whichever it is.
@@ -684,7 +684,7 @@ class Pwa extends Client {
 }
 
 /// The web app in web/ (its test build). Actions go through the interface, as a person's
-/// would; state is read from the app's own database and from `window.__parolnetTest`
+/// would; state is read from `window.__parolnetTest`
 /// (docs/web-port/interop.md §11.4), which exposes nothing the interface does not show.
 ///
 /// Where the cases read old-PWA internals, this is what the web target checks instead:
@@ -754,37 +754,14 @@ class Web extends Client {
     await this.page.click('[data-testid="pairing-code-submit"]');
   }
 
-  async idbAll(store) {
-    return this.page.evaluate(
-      (store) =>
-        new Promise((res, rej) => {
-          const open = indexedDB.open("parolnet-web");
-          open.onerror = () => rej(open.error);
-          open.onsuccess = () => {
-            const db = open.result;
-            if (!db.objectStoreNames.contains(store)) {
-              db.close();
-              return res([]);
-            }
-            const req = db.transaction(store, "readonly").objectStore(store).getAll();
-            req.onsuccess = () => {
-              db.close();
-              res(req.result);
-            };
-            req.onerror = () => rej(req.error);
-          };
-        }),
-      store,
-    );
-  }
-
+  // The web app's database is sealed at rest (docs/web-port/at-rest.md), so nothing can be
+  // read from it here: what the app holds is asked of its test hooks.
   async hasContact(peerId) {
-    return (await this.idbAll("contacts")).some((c) => c.peerId === peerId);
+    return (await this.hook("contacts")).includes(peerId);
   }
 
   async waitReceived(from, text, ms = 30_000) {
     await until(`web ${this.name}: message ${JSON.stringify(text)}`, ms, async () =>
-      (await this.idbAll("messages")).some((m) => m.peerId === from && m.direction === "Received" && m.text === text) &&
       (await this.hook("messages", from)).some((m) => m.direction === "received" && m.text === text),
     );
   }

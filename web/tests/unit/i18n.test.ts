@@ -10,6 +10,7 @@ import fr from "../../src/i18n/locales/fr.json" with { type: "json" };
 import it from "../../src/i18n/locales/it.json" with { type: "json" };
 import ja from "../../src/i18n/locales/ja.json" with { type: "json" };
 import ko from "../../src/i18n/locales/ko.json" with { type: "json" };
+import { coverage, META_PREFIX, problems } from "./catalogue.ts";
 
 Deno.test("format: named arguments", () => {
   assertEquals(formatMessage("Message {name}", { name: "Mira" }, "en"), "Message Mira");
@@ -41,26 +42,53 @@ Deno.test("format: arguments inside a plural branch", () => {
   assertEquals(formatMessage(message, { n: 2, name: "Jun" }, "en"), "2 notes for Jun");
 });
 
-/** The argument names a message uses. */
-function argumentsOf(message: string): string[] {
-  const names = new Set<string>();
-  for (const match of message.matchAll(/\{(\w+)(?=[,}])/g)) names.add(match[1]);
-  return [...names].sort();
-}
-
 const LOCALES = { ar, de, es, fa, fr, it, ja, ko } as Record<string, Record<string, string>>;
 
-Deno.test("catalogue: a locale only has keys English has, with the same arguments", () => {
-  // A locale may lack keys (each falls back to English), but never invents or misuses one.
+Deno.test("catalogue: every locale has every key, with the same arguments used the same way", () => {
+  // Also: no key English lacks, no empty message, balanced braces, and for a plural a
+  // branch for every category the language has (tests/unit/catalogue.ts).
   for (const [code, catalogue] of Object.entries(LOCALES)) {
-    for (const [key, message] of Object.entries(catalogue)) {
-      assertEquals(key in en, true, `${code}: unknown key ${key}`);
-      assertEquals(
-        argumentsOf(message),
-        argumentsOf(en[key as keyof typeof en]),
-        `${code}: ${key}`,
-      );
-    }
+    assertEquals(problems(code, catalogue, en), [], code);
+    assertEquals(coverage(catalogue, en), Object.keys(en).length, code);
+  }
+});
+
+Deno.test("catalogue: the checker notices what can go wrong in a translation", () => {
+  const english = { a: "Hello {name}", b: "{n, plural, one {# day} other {# days}}", c: "Plain" };
+  const found = (catalogue: Record<string, string>, code = "de") =>
+    problems(code, catalogue, english).map((line) => line.replace(/^\w+: /, ""));
+  const good = { a: "Hallo {name}", b: "{n, plural, one {# Tag} other {# Tage}}", c: "Schlicht" };
+  assertEquals(found(good), []);
+  assertEquals(found({ ...good, [`${META_PREFIX}translation`]: "machine" }), []);
+  assertEquals(found({ a: good.a, b: good.b }), ["c is missing"]);
+  assertEquals(found({ ...good, d: "x" }), ["d is not a key of the English catalogue"]);
+  assertEquals(found({ ...good, c: " " }), ["c is empty"]);
+  assertEquals(found({ ...good, a: "Hallo {nom}" }), ["a has arguments [nom], English has [name]"]);
+  assertEquals(found({ ...good, a: "Hallo" }), ["a has arguments [], English has [name]"]);
+  assertEquals(found({ ...good, a: "Hallo {name" }), ["a: a brace is never closed"]);
+  assertEquals(found({ ...good, b: "{n} Tage" }), ["b has arguments [n], English has [n:plural]"]);
+  assertEquals(found({ ...good, b: "{n, plural, one {# Tag}}" }), [
+    'b has a plural without "other"',
+    'b lacks the plural branch "other"',
+  ]);
+  assertEquals(found({ ...good, b: "{n, plural, other {# Tage}}" }), [
+    'b lacks the plural branch "one"',
+  ]);
+  assertEquals(found({ ...good, b: "{n, plural, one {# Tag} few {# Tage} other {# Tage}}" }), [
+    'b has a plural branch "few" the language does not use',
+  ]);
+  // Japanese has one category; an exact case is always allowed.
+  assertEquals(found({ ...good, b: "{n, plural, =0 {なし} other {#日}}" }, "ja"), []);
+});
+
+Deno.test("catalogue: every translated catalogue says how it was translated", () => {
+  // Machine-translated until a native speaker has reviewed it (docs/web-port/app.md).
+  for (const [code, catalogue] of Object.entries(LOCALES)) {
+    assertEquals(
+      ["machine", "reviewed"].includes(catalogue[`${META_PREFIX}translation`]),
+      true,
+      code,
+    );
   }
 });
 
@@ -71,22 +99,40 @@ Deno.test("catalogue: every language the settings offer has a catalogue, and the
   );
 });
 
+/** Run `fn` with `key` taken out of a catalogue (the one the app itself has loaded). */
+async function without(
+  catalogue: Record<string, string>,
+  key: string,
+  fn: () => void | Promise<void>,
+): Promise<void> {
+  const kept = catalogue[key];
+  delete catalogue[key];
+  try {
+    await fn();
+  } finally {
+    catalogue[key] = kept;
+  }
+}
+
 Deno.test("catalogue: a missing key falls back to English, key by key", async () => {
+  // Every catalogue is complete; a key added to English before it is translated is not.
   await setLocale("de");
-  // Ported from the old PWA.
-  assertEquals(t("composer.send"), de["composer.send" as keyof typeof de]);
-  // Not translated yet.
-  assertEquals("firstRun.start" in de, false);
-  assertEquals(t("firstRun.start"), "Start");
+  assertEquals(t("composer.send"), LOCALES.de["composer.send"]);
+  await without(LOCALES.de, "firstRun.start", () => {
+    assertEquals(t("firstRun.start"), "Start");
+    assertEquals(t("composer.send"), LOCALES.de["composer.send"]);
+  });
+  assertEquals(t("firstRun.start"), LOCALES.de["firstRun.start"]);
   await setLocale("en");
 });
 
 Deno.test("catalogue: an English fallback in a right-to-left locale is isolated", async () => {
   await setLocale("ar");
-  assertEquals("firstRun.start" in ar, false);
-  // LRI … PDI: the sentence keeps its own direction (and its full stop at its own end).
-  assertEquals(t("firstRun.start"), "\u2066Start\u2069");
-  assertEquals(t("composer.send"), ar["composer.send" as keyof typeof ar]);
+  await without(LOCALES.ar, "firstRun.start", () => {
+    // LRI … PDI: the sentence keeps its own direction (and its full stop at its own end).
+    assertEquals(t("firstRun.start"), "\u2066Start\u2069");
+  });
+  assertEquals(t("composer.send"), LOCALES.ar["composer.send"]);
   await setLocale("en");
 });
 

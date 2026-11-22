@@ -146,7 +146,11 @@ The PWA is rewritten as a [Denext](https://denext.dev) app with a new design
 IndexedDB storage; [docs/web-port/engine.md](docs/web-port/engine.md)) and the screens on it
 (first run, adding a contact by QR code or pasted code, conversations, safety numbers, calls,
 settings; [docs/web-port/app.md](docs/web-port/app.md)), exported as static files that run under
-`/pwa/` behind a strict CSP. It passes the seven desktop ↔ browser interop cases in Chromium,
+`/pwa/` behind a strict CSP. What it keeps on a device is encrypted at rest and can be locked
+with a passphrase ([docs/web-port/at-rest.md](docs/web-port/at-rest.md), which also says what
+that does not protect against); a device can be backed up to one encrypted file and restored
+from it ([docs/web-port/backup.md](docs/web-port/backup.md)). Nine languages, eight of them
+machine-translated and awaiting review. It passes the seven desktop ↔ browser interop cases in Chromium,
 Firefox and WebKit. It is the client the relay image serves at `/pwa/`, in place of the legacy
 `pwa/` (what [app.md](docs/web-port/app.md#owed-before-this-replaces-the-old-pwa) lists as owed
 still applies). See [web/README.md](web/README.md).

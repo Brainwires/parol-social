@@ -153,14 +153,27 @@ newest first. Amber "{n} waiting" chips, and a count of unread messages. "Add a 
 primary action. With no contacts, the list invites adding the first. The list also carries what
 the app has to say on its own: "You are offline", "A new version is ready", a failed save, a
 relay server that cannot be reached, and (once there is a contact, where the browser can
-install the app) one unobtrusive line offering to install it.
+install the app) one unobtrusive line offering to install it. Once there is a contact and no
+backup was ever made on the device, one more such line: "Make a backup, so that losing this
+device does not lose your contacts." with [Back up] and [Not now].
 
 ### First run
 
 "ParolNet" / "Private calls and messages, straight from your device to theirs." / "No account,
 no phone number, no email. Nothing is stored on a server." / [Start]. Start makes this device's
-identity and goes straight to "Add a contact". No name, no passphrase, no tour. Nothing is
-created and nothing is contacted before Start.
+identity and goes straight to "Add a contact". No name, no passphrase, no tour. No identity
+is made and nothing is contacted before Start. Under Start, a quiet [Restore from a backup]:
+the backup file, its passphrase, [Restore]; the app then starts as the person the backup
+holds.
+
+### Locked
+
+With a passphrase set, every start shows "ParolNet is locked": one passphrase field,
+[Unlock], and "Forgot your passphrase?". A wrong passphrase is said in words under the
+field; from the third wrong try on, the next try has to wait, and the wait is counted down
+("Too many wrong tries. Try again in 5 seconds."). "Forgot your passphrase?" says that it
+cannot be recovered and offers the one thing left: delete everything on this device, after
+typing "delete".
 
 ### Add a contact
 
@@ -226,8 +239,19 @@ interacted with the page.
 
 Five plain groups.
 
-- **You**: "Your code" (opens "Add a contact"); "Delete all data on this device", which asks
-  for the word "delete" to be typed, then returns to first run.
+- **You**: "Your code" (opens "Add a contact").
+  "Lock ParolNet with a passphrase": two honest sentences on what encryption on the device
+  does without one, then [Set a passphrase] (typed twice, at least 8 characters, and "If you
+  forget this passphrase, nobody can recover it…"). Once set: [Lock now], [Change passphrase]
+  and [Remove passphrase], the last two asking for the current one.
+  "Back up this device": what a backup is and when the last one was made, then a sheet: a
+  passphrase for the file (typed twice), "Include message history" (off), [Make the backup],
+  and then a link, [Save the backup file], with "Use a backup on one device at a time: two
+  devices with the same identity keep cutting each other off."
+  "Restore from a backup": as on first run, and because it replaces what is on the device,
+  the word "replace" is typed first.
+  "Delete all data on this device", which asks for the word "delete" to be typed, then
+  returns to first run.
 - **Connection**: the connection in words; "Relay through my own TURN server" (address,
   username, password, "Use only this server", Save / Remove) with the IP sentence. A saved
   password is never shown back: the field is empty and says one is saved. Under "Advanced":
@@ -294,3 +318,11 @@ These were not in the brief; each is the smallest reading that keeps the rules.
 - Toasts moved from the bottom to the top (decided in review: one covered the composer).
 - The naming prompt's "Not now" lasts until the app is next opened; nothing about it is
   stored.
+- A contact that came out of a backup says so in a line under the conversation's header
+  until a connection to it has held; if the connection fails its check, the red panel says
+  that the backup is older than the conversation and offers "Remove contact", instead of the
+  general explanation and "Try again", which could not help.
+- "Lock now" and a restore reload the page. Nothing else would be honest: the keys must leave
+  the page's memory, and a restored identity needs a fresh start.
+- The backup's passphrase is asked for separately from the lock's, even when one is set: the
+  file leaves the device and may be kept for years.

@@ -14,9 +14,13 @@ import type {
   Sha256,
   Socket,
   SocketFactory,
+  Storage,
   WasmApi,
 } from "./platform.ts";
+import { SealedStorage } from "./sealed-storage.ts";
 import { DB_NAME, type IdbFactory, IdbStorage } from "./storage.ts";
+import { EngineError } from "./types.ts";
+import { Vault, type VaultCrypto } from "./vault.ts";
 
 // deno-lint-ignore no-explicit-any
 const g = globalThis as any;
@@ -117,6 +121,7 @@ const WASM_EXPORTS: readonly (keyof WasmApi)[] = [
   "process_scanned_qr",
   "safety_number",
   "version",
+  "argon2id",
 ];
 
 /**
@@ -144,9 +149,40 @@ export interface BrowserPlatformOptions {
   wasm: WasmApi;
   /** Database name; the default is the app's. */
   dbName?: string;
+  /**
+   * The storage to run on. The default opens the database's vault (`openBrowserVault`) and
+   * uses its sealed storage; that fails when the vault is locked with a passphrase, so an
+   * app that offers the lock opens the vault itself and passes the storage in.
+   */
+  storage?: Storage;
   /** Media capture for calls (default: `navigator.mediaDevices`). */
   media?: MediaDevices;
   log?: Logger;
+}
+
+/** WebCrypto, randomness and the clock of this browser, and Argon2id from the wasm core. */
+export function browserVaultCrypto(wasm: WasmApi): VaultCrypto {
+  return {
+    subtle: g.crypto.subtle,
+    random: (n) => g.crypto.getRandomValues(new Uint8Array(n)),
+    argon2id: (passphrase, salt, memoryKiB, passes, lanes, len) =>
+      wasm.argon2id(passphrase, salt, memoryKiB, passes, lanes, len),
+    now: () => Date.now(),
+  };
+}
+
+/**
+ * Open (or create) the database and its vault. A database that is not sealed yet is sealed
+ * here. The vault may be locked: `vault.locked` says so, and `vault.unlock` opens it.
+ */
+export async function openBrowserVault(wasm: WasmApi, dbName: string = DB_NAME): Promise<Vault> {
+  const raw = await IdbStorage.open(g.indexedDB as IdbFactory, dbName);
+  try {
+    return await Vault.open(raw, browserVaultCrypto(wasm));
+  } catch (error) {
+    raw.close();
+    throw error;
+  }
 }
 
 /** Everything the engine needs, from this browser. Opens (or creates) the database. */
@@ -154,9 +190,18 @@ export async function browserPlatform(
   options: BrowserPlatformOptions,
 ): Promise<Platform> {
   const dbName = options.dbName ?? DB_NAME;
+  let storage = options.storage;
+  if (!storage) {
+    const vault = await openBrowserVault(options.wasm, dbName);
+    if (vault.locked) {
+      vault.raw.close();
+      throw new EngineError("Storage", "this device's storage is locked with a passphrase");
+    }
+    storage = new SealedStorage(vault);
+  }
   return {
     wasm: options.wasm,
-    storage: await IdbStorage.open(g.indexedDB as IdbFactory, dbName),
+    storage,
     sockets: browserSockets,
     peerConnections: browserPeerConnections,
     clock: browserClock,
