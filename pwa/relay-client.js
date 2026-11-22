@@ -11,51 +11,56 @@ const BRIDGE_RELAYS_DB_KEY = 'bridge_relays';
 /**
  * Verify a descriptor against the baked-in authority set.
  *
- * H12 Phase 1 rule (from PNP-008 §3): a relay descriptor is accepted only
- * if ≥ AUTHORITY_THRESHOLD distinct authority pubkeys have signed it with
- * a non-expired endorsement. Unsigned / insufficient / expired entries
+ * A relay descriptor is accepted only if ≥ AUTHORITY_THRESHOLD distinct
+ * authority pubkeys have signed it. An endorsement signs the whole
+ * descriptor (PNP-008-MUST-002: its deterministic CBOR encoding, the relay's
+ * own signature included), so it stands for that descriptor only and for as
+ * long as the descriptor is valid: seven days from its timestamp
+ * (PNP-008-MUST-027). Unsigned / insufficiently endorsed / too old entries
  * are dropped silently.
  *
- * Verification uses `wasm.verify_authority_signature(pubkey, msg, sig)`
- * per-endorsement. The signable bytes are SHA-256(peer_id || endorsed_at
- * || expires_at) — matched between `parolnet_relay::authority::AuthorityEndorsement::signable_bytes`
- * and `parolnet_wasm::federation::AuthorityEndorsement::signable_bytes`.
+ * The signed bytes come from `wasm.descriptor_endorsement_message(descriptor)`
+ * and each signature is checked with
+ * `wasm.verify_authority_signature(pubkey, msg, sig)`.
  *
- * @param {Object} desc - Parsed descriptor, possibly endorsed.
- * @param {Object} wasm - WASM module (needs `verify_authority_signature`).
+ * @param {Object} desc - Parsed EndorsedDescriptor.
+ * @param {Object} wasm - WASM module (needs `descriptor_endorsement_message`
+ *   and `verify_authority_signature`).
  * @param {number} nowSecs - Current Unix timestamp (seconds).
  * @returns {boolean} true iff authority threshold is met.
  */
 export function verifyAuthorityEndorsements(desc, wasm, nowSecs) {
     if (!desc || typeof desc !== 'object') return false;
-    if (!wasm || typeof wasm.verify_authority_signature !== 'function') return false;
+    if (!wasm || typeof wasm.verify_authority_signature !== 'function'
+        || typeof wasm.descriptor_endorsement_message !== 'function') return false;
 
     const endorsements = Array.isArray(desc.endorsements) ? desc.endorsements : null;
     if (!endorsements || endorsements.length === 0) return false;
 
-    const relayPeerId = desc.descriptor && desc.descriptor.peer_id;
-    if (!relayPeerId) return false;
-    // peer_id may arrive as Uint8Array (CBOR) or hex string (JSON) — normalize.
-    const peerIdBytes = _normalizeBytes(relayPeerId);
-    if (!peerIdBytes || peerIdBytes.length !== 32) return false;
+    const fields = _descriptorFields(desc.descriptor);
+    if (!fields) return false;
+    // PNP-008-MUST-027 item 3: a descriptor older than seven days is rejected,
+    // and its endorsements with it.
+    if (nowSecs - fields.timestamp >= MAX_ENDORSED_DESCRIPTOR_AGE_SECS) return false;
+
+    let msgHex;
+    try {
+        msgHex = wasm.descriptor_endorsement_message(fields);
+    } catch (_) {
+        return false;
+    }
+    if (typeof msgHex !== 'string' || msgHex.length === 0) return false;
 
     const distinctAuthorities = new Set();
     for (const e of endorsements) {
         if (!e || typeof e !== 'object') continue;
         const pub = _normalizeBytes(e.authority_pubkey);
         const sig = _normalizeBytes(e.signature);
-        const endorsedAt = Number(e.endorsed_at);
-        const expiresAt = Number(e.expires_at);
         if (!pub || pub.length !== 32) continue;
         if (!sig || sig.length !== 64) continue;
-        if (!Number.isFinite(endorsedAt) || !Number.isFinite(expiresAt)) continue;
-        if (nowSecs >= expiresAt) continue; // expired
 
-        // Signable bytes = SHA-256(peer_id || endorsed_at_be || expires_at_be)
-        const signable = _sha256AuthoritySignable(peerIdBytes, endorsedAt, expiresAt);
         const pubHex = _bytesToHex(pub);
         const sigHex = _bytesToHex(sig);
-        const msgHex = _bytesToHex(signable);
 
         // Authority set membership + signature verify, both inside WASM
         // (verify_authority_signature rejects pubkeys outside the set).
@@ -69,6 +74,42 @@ export function verifyAuthorityEndorsements(desc, wasm, nowSecs) {
     }
 
     return distinctAuthorities.size >= AUTHORITY_THRESHOLD;
+}
+
+const MAX_ENDORSED_DESCRIPTOR_AGE_SECS = 7 * 86400;
+
+/**
+ * The fields of a parsed RelayDescriptor in the shape
+ * `wasm.descriptor_endorsement_message` takes: byte fields as hex, `addr` as
+ * "ip:port". Returns null when a field is missing or malformed.
+ */
+function _descriptorFields(d) {
+    if (!d || typeof d !== 'object') return null;
+    const hexOf = (v, len) => {
+        const b = _normalizeBytes(v);
+        return b && b.length === len ? _bytesToHex(b) : null;
+    };
+    const num = (v) => (Number.isSafeInteger(Number(v)) && Number(v) >= 0 ? Number(v) : null);
+    const fields = {
+        peer_id: hexOf(d.peer_id, 32),
+        identity_key: hexOf(d.identity_key, 32),
+        x25519_key: hexOf(d.x25519_key, 32),
+        addr: typeof d.addr === 'string' ? d.addr : null,
+        bandwidth_class: num(d.bandwidth_class),
+        uptime_secs: num(d.uptime_secs),
+        timestamp: num(d.timestamp),
+        signature: hexOf(d.signature, 64),
+        bandwidth_estimate: num(d.bandwidth_estimate),
+    };
+    for (const k of Object.keys(fields)) {
+        if (fields[k] === null) return null;
+    }
+    fields.next_pubkey = null;
+    if (d.next_pubkey !== null && d.next_pubkey !== undefined) {
+        fields.next_pubkey = hexOf(d.next_pubkey, 32);
+        if (fields.next_pubkey === null) return null;
+    }
+    return fields;
 }
 
 /**
@@ -118,111 +159,6 @@ function _bytesToHexPublic(v) {
     const b = _normalizeBytes(v);
     return b ? _bytesToHex(b) : '';
 }
-
-// Precomputed SHA-256 helper using Web Crypto in the browser, node:crypto
-// under node --test. Synchronous SubtleCrypto isn't available so we do a
-// blocking-looking API via a pure-JS SHA-256 fallback — necessary because
-// the verify loop is not async.
-function _sha256AuthoritySignable(peerIdBytes, endorsedAt, expiresAt) {
-    const buf = new Uint8Array(32 + 8 + 8);
-    buf.set(peerIdBytes, 0);
-    _writeU64BE(buf, 32, endorsedAt);
-    _writeU64BE(buf, 40, expiresAt);
-    return _sha256Sync(buf);
-}
-
-function _writeU64BE(buf, off, n) {
-    // JS numbers are safe to 2^53. Timestamps fit.
-    const hi = Math.floor(n / 0x100000000);
-    const lo = n >>> 0;
-    buf[off] = (hi >>> 24) & 0xff;
-    buf[off + 1] = (hi >>> 16) & 0xff;
-    buf[off + 2] = (hi >>> 8) & 0xff;
-    buf[off + 3] = hi & 0xff;
-    buf[off + 4] = (lo >>> 24) & 0xff;
-    buf[off + 5] = (lo >>> 16) & 0xff;
-    buf[off + 6] = (lo >>> 8) & 0xff;
-    buf[off + 7] = lo & 0xff;
-}
-
-// Pure-JS SHA-256 for the sync path (authoritative for bits the WASM
-// doesn't expose). Small, self-contained, no deps. Returns Uint8Array.
-function _sha256Sync(data) {
-    const K = new Uint32Array([
-        0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1,
-        0x923f82a4, 0xab1c5ed5, 0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3,
-        0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174, 0xe49b69c1, 0xefbe4786,
-        0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
-        0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147,
-        0x06ca6351, 0x14292967, 0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13,
-        0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85, 0xa2bfe8a1, 0xa81a664b,
-        0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
-        0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a,
-        0x5b9cca4f, 0x682e6ff3, 0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208,
-        0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
-    ]);
-    const H = new Uint32Array([
-        0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a,
-        0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19,
-    ]);
-    const bitLen = data.length * 8;
-    const padLen = ((data.length + 9 + 63) & ~63) - data.length;
-    const buf = new Uint8Array(data.length + padLen);
-    buf.set(data, 0);
-    buf[data.length] = 0x80;
-    // Write bit length as u64 big-endian into last 8 bytes.
-    const end = buf.length;
-    buf[end - 4] = (bitLen >>> 24) & 0xff;
-    buf[end - 3] = (bitLen >>> 16) & 0xff;
-    buf[end - 2] = (bitLen >>> 8) & 0xff;
-    buf[end - 1] = bitLen & 0xff;
-
-    const W = new Uint32Array(64);
-    for (let off = 0; off < buf.length; off += 64) {
-        for (let i = 0; i < 16; i++) {
-            const o = off + i * 4;
-            W[i] = (buf[o] << 24) | (buf[o + 1] << 16) | (buf[o + 2] << 8) | buf[o + 3];
-            W[i] >>>= 0;
-        }
-        for (let i = 16; i < 64; i++) {
-            const s0 = _rotr(W[i - 15], 7) ^ _rotr(W[i - 15], 18) ^ (W[i - 15] >>> 3);
-            const s1 = _rotr(W[i - 2], 17) ^ _rotr(W[i - 2], 19) ^ (W[i - 2] >>> 10);
-            W[i] = (W[i - 16] + s0 + W[i - 7] + s1) >>> 0;
-        }
-        let a = H[0], b = H[1], c = H[2], d = H[3];
-        let e = H[4], f = H[5], g = H[6], h = H[7];
-        for (let i = 0; i < 64; i++) {
-            const S1 = _rotr(e, 6) ^ _rotr(e, 11) ^ _rotr(e, 25);
-            const ch = (e & f) ^ (~e & g);
-            const t1 = (h + S1 + ch + K[i] + W[i]) >>> 0;
-            const S0 = _rotr(a, 2) ^ _rotr(a, 13) ^ _rotr(a, 22);
-            const mj = (a & b) ^ (a & c) ^ (b & c);
-            const t2 = (S0 + mj) >>> 0;
-            h = g; g = f; f = e;
-            e = (d + t1) >>> 0;
-            d = c; c = b; b = a;
-            a = (t1 + t2) >>> 0;
-        }
-        H[0] = (H[0] + a) >>> 0;
-        H[1] = (H[1] + b) >>> 0;
-        H[2] = (H[2] + c) >>> 0;
-        H[3] = (H[3] + d) >>> 0;
-        H[4] = (H[4] + e) >>> 0;
-        H[5] = (H[5] + f) >>> 0;
-        H[6] = (H[6] + g) >>> 0;
-        H[7] = (H[7] + h) >>> 0;
-    }
-    const out = new Uint8Array(32);
-    for (let i = 0; i < 8; i++) {
-        out[i * 4] = (H[i] >>> 24) & 0xff;
-        out[i * 4 + 1] = (H[i] >>> 16) & 0xff;
-        out[i * 4 + 2] = (H[i] >>> 8) & 0xff;
-        out[i * 4 + 3] = H[i] & 0xff;
-    }
-    return out;
-}
-
-function _rotr(x, n) { return ((x >>> n) | (x << (32 - n))) >>> 0; }
 
 /**
  * Relay discovery and connection with fallback chain.

@@ -104,7 +104,7 @@ fn session_nonce_is_ratchet_key_prefix_and_message_number() {
             "message {i} opens under N-SESSION"
         );
 
-        // No other construction opens it: the one PNP-001 described before v0.15
+        // No other construction opens it: the one PNP-001 described before v0.16
         // (`chain_index (4) || seq_number (8)`), the fields the other way round, another
         // part of the ratchet key, a little-endian counter, or an all-zero nonce.
         let mut old = [0u8; 12];

@@ -1,12 +1,18 @@
 # PNP-002: ParolNet Handshake Protocol
 
 ### Status: CANDIDATE
-### Version: 0.6
+### Version: 0.7
 ### Date: 2026-11-21
 
 ---
 
 ## Changelog
+
+**v0.7 (2026-11-21) — Counter limits**
+
+- Added §5.9 "Counter Limits". A chain carries at most `MAX_CHAIN_LENGTH` = 2^24 messages: a sender at that length does not encrypt and reports an error (**PNP-002-MUST-045**), a receiver rejects a `message_number` or `previous_chain_length` past it before doing anything else with the message (**PNP-002-MUST-046**), no counter wraps, all counter arithmetic is checked and saved state with a counter past its limit is refused (**PNP-002-MUST-047**), and a send that fails changes no session state (**PNP-002-MUST-048**). MUST count: 48.
+- Before, the specification said nothing about a counter at the end of its range. An implementation that let `message_number` wrap would have gone back to number 0 on the same ratchet key.
+- Wire format unchanged. A header whose `message_number` is 2^24 or more, or whose `previous_chain_length` is above 2^24, was valid under v0.6 and is rejected now; no honest sender comes near either value.
 
 **v0.6 (2026-11-21) — Authenticated ratchet header, bounded skipped message keys (wire-incompatible)**
 
@@ -344,6 +350,30 @@ When a message arrives ahead of the receiving chain, or closes the previous chai
 Rule 2 bounds the memory and the stored size of a session (2000 keys of 68 bytes) and keeps the bound from becoming a dead end: a store that refused new keys once full would make the session reject every later out-of-order message for good, since stored keys otherwise leave only when their messages arrive. Evicting the oldest key gives up the message that has been missing the longest instead. Eviction happens when the new state is committed, after the message that causes it has authenticated, so a forged message can evict nothing. The order of the stored keys is part of the session state and is preserved when a session is saved and restored.
 
 `MAX_STORED_SKIPPED` is twice `MAX_SKIP` so that the keys of a full gap closed on the previous chain and a full gap on the current one can be held together. Rule 1 has a consequence that no storage policy removes: if more than `MAX_SKIP` consecutive messages of one sending chain are lost, the receiver rejects every later message of that chain, and of the chain after it, whose `previous_chain_length` exceeds the receiver's position by more than `MAX_SKIP`. Such a session recovers only if enough of the lost messages are delivered after all, or through a new handshake.
+
+### 5.9 Counter Limits
+
+A Double Ratchet session has five counters. Three are in the session state: the number of messages sent in the current sending chain (`Ns`, the `message_number` of the next message), the number received in the current receiving chain (`Nr`), and the length of the previous sending chain (`PN`, sent as `previous_chain_length`). Two are on the wire, as unsigned 32-bit integers in the ratchet header (§5.7): `message_number` and `previous_chain_length`. `message_number` is the index of the message key in its chain and the last four bytes of the AEAD nonce.
+
+| Counter | Width | Use | Limit |
+|---------|-------|-----|-------|
+| `message_number` (wire), `Ns`, `Nr` | uint32 | key index in the chain; nonce bytes 8-11 | a message number is at most `MAX_CHAIN_LENGTH` - 1; `Ns` and `Nr` are at most `MAX_CHAIN_LENGTH` |
+| `previous_chain_length` (wire), `PN` | uint32 | how many keys of the previous chain to keep | at most `MAX_CHAIN_LENGTH` |
+| stored skipped message keys | count | memory | `MAX_STORED_SKIPPED` (§5.8) |
+| DH ratchet steps | not counted | none | none: no field or state counts them |
+
+`MAX_CHAIN_LENGTH` = 2^24 = 16,777,216.
+
+1. A chain MUST NOT carry more than `MAX_CHAIN_LENGTH` messages: its message numbers are 0 to `MAX_CHAIN_LENGTH` - 1. A sender whose sending chain has reached that length MUST NOT encrypt another message under it and MUST NOT derive another message key from it; it MUST report the condition to the layer above as an error of its own, distinct from any other failure. **PNP-002-MUST-045** The sending chain is replaced, and its numbering restarts at 0, by the DH ratchet step the sender performs when a message with a new ratchet key arrives from the peer; from then on the session sends again. A sender that cannot wait for that closes the session (§5.6) and performs a new handshake. It MUST NOT continue the chain, restart its numbering, or generate a new ratchet key pair on its own.
+2. A receiver MUST reject a message whose `message_number` is `MAX_CHAIN_LENGTH` or more, or whose `previous_chain_length` is more than `MAX_CHAIN_LENGTH`, before any other processing of the message, a look-up among the stored skipped message keys included, and without any change to the session (§5.7). **PNP-002-MUST-046**
+3. No counter of a session may wrap. Every addition to a counter MUST be checked, and a result outside the counter's limit is an error that leaves the session unchanged; an implementation MUST NOT use arithmetic that wraps or saturates silently, and MUST NOT narrow a counter to a smaller type. A saved session whose `Ns`, `Nr` or `PN` is above `MAX_CHAIN_LENGTH`, or which holds a skipped message key with a message number of `MAX_CHAIN_LENGTH` or more, MUST be rejected when it is restored. **PNP-002-MUST-047**
+4. A send that fails MUST NOT change session state. **PNP-002-MUST-048** The sending chain key and `Ns` advance together, and only once the message has been produced: after a failed send (rule 1, or any other failure) the chain key, `Ns` and every other part of the session are what they were before. This is the sending side of §5.7 rule 1. A chain key that advanced without `Ns`, or the reverse, would put every later message of the chain under a key the receiver derives for another number.
+
+**Why 2^24.** A sender cannot replace its sending chain by itself: the DH ratchet step needs a new ratchet key from the peer, which arrives with the peer's next message of any kind. The limit therefore has to sit where no conversation reaches it. 2^24 messages are 64 GiB of 4096-byte envelopes sent in one direction without a single message coming back, and 1677 times the 10,000 messages after which §5.5 recommends rekeying. It is also 256 times below the range of the wire fields, so no sum formed from these counters (a message number plus `MAX_SKIP`, a chain length plus one) can come near 2^32. `previous_chain_length` may equal `MAX_CHAIN_LENGTH`: that is the length of a chain that was used to its end.
+
+**What the limit is not for.** Nonce uniqueness does not rest on it. Each message key is the output of one chain step and encrypts exactly one message, so a (key, nonce) pair repeats only if the same chain step is used twice. The nonce (§5.7) adds the first 8 bytes of the chain's ratchet key and the message number. What the limit rules out is the repetition a wrapped counter would produce: message number 0 again under the same ratchet key, with a receiver that has long consumed that number. For the same reason the DH ratchet steps need no counter: each step derives its chains from a fresh DH output, the chains are told apart by their ratchet keys, and a session may take any number of steps.
+
+One way to use a chain step twice remains, and no counter rule removes it: sending from a copy of the session state that is older than a message already sent (a backup restored, a write that was lost). The restored state derives the same message key and nonce for a different plaintext. This revision adds no rule for it. The defence is in how state is stored, not in a counter: the advanced state is made durable before the message leaves the device, and a session known to come from an older copy is closed and replaced by a new handshake.
 
 ## 6. Security Considerations
 

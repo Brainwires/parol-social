@@ -3,6 +3,7 @@
 //! ```text
 //! cargo run -p parolnet-app --example bot -- --relay ws://127.0.0.1:8080/ws \
 //!     --data-dir /tmp/bot [--show-code | --pair CODE] [--echo] [--host-only] [--bind IP]
+//!     [--downloads DIR] [--accept-files]
 //! ```
 //!
 //! Prints one JSON object per line on stdout: `ready` (peer id), `code` (with
@@ -14,6 +15,11 @@
 //! [call-id]`, `reject [call-id]`, `hangup [call-id]`, `video on|off [call-id]` (renegotiate
 //! our video), `network-changed` (restart ICE as after an interface change), `quit`. With
 //! `--echo` every received message is answered with `echo: <text>`.
+//!
+//! Files (PNP-010): `sendfile <peer-id> <path>`, `acceptfile [id]`, `declinefile [id]`,
+//! `cancelfile [id]`. A `transfer` line is printed whenever a transfer changes state; a
+//! received file's line carries its path and SHA-256 once it is complete. With
+//! `--accept-files` every offer is accepted; received files go to `--downloads`.
 //!
 //! In a call the bot sends a 440 Hz tone (Opus, encoded with opus-rs) and, for a video call,
 //! loops `testpattern.ivf` (VP8, 160x120, 30 fps: colour bars, a moving box and a frame
@@ -27,6 +33,7 @@ use std::time::Duration;
 use parolnet_app::KeyStorage;
 use parolnet_app::{
     AppConfig, AppEvent, AppHandle, CallMedia, CallState, Direction, MediaEvent, MediaKind,
+    TransferInfo, TransferState,
 };
 use serde_json::json;
 use tokio::io::{AsyncBufReadExt as _, BufReader};
@@ -35,6 +42,43 @@ const TEST_PATTERN: &[u8] = include_bytes!("testpattern.ivf");
 
 fn out(v: serde_json::Value) {
     println!("{v}");
+}
+
+/// SHA-256 (hex) of a file, read 1 MiB at a time.
+fn sha256_of(path: &std::path::Path) -> Option<String> {
+    use sha2::Digest as _;
+    use std::io::Read as _;
+    let mut file = std::fs::File::open(path).ok()?;
+    let mut hasher = sha2::Sha256::new();
+    let mut block = vec![0u8; 1 << 20];
+    loop {
+        let n = file.read(&mut block).ok()?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&block[..n]);
+    }
+    Some(hex::encode(hasher.finalize()))
+}
+
+fn transfer_line(t: &TransferInfo) -> serde_json::Value {
+    let state = match t.state {
+        TransferState::Cancelled { by_peer, reason } => {
+            format!(
+                "Cancelled({reason:?}{})",
+                if by_peer { ", by peer" } else { "" }
+            )
+        }
+        s => format!("{s:?}"),
+    };
+    let received = t.direction == Direction::Received && t.state == TransferState::Complete;
+    json!({
+        "event": "transfer", "id": t.id, "peer_id": t.peer_id,
+        "direction": format!("{:?}", t.direction), "name": t.name, "size": t.size,
+        "state": state, "bytes_done": t.bytes_done, "pending": t.pending,
+        "path": t.path.as_ref().map(|p| p.display().to_string()),
+        "sha256": if received { t.path.as_deref().and_then(sha256_of) } else { None },
+    })
 }
 
 /// The frames of an IVF file.
@@ -160,6 +204,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut data_dir = PathBuf::from("parolnet-bot");
     let (mut show_code, mut pair, mut echo, mut host_only) = (false, None, false, false);
     let mut bind = None;
+    let mut downloads = None;
+    let mut accept_files = false;
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
         match a.as_str() {
@@ -172,6 +218,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "--echo" => echo = true,
             "--host-only" => host_only = true,
             "--bind" => bind = Some(args.next().ok_or("--bind needs a value")?.parse()?),
+            "--downloads" => {
+                downloads = Some(PathBuf::from(
+                    args.next().ok_or("--downloads needs a value")?,
+                ))
+            }
+            "--accept-files" => accept_files = true,
             other => return Err(format!("unknown argument {other}").into()),
         }
     }
@@ -184,6 +236,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         cfg.stun_servers = Some(Vec::new());
     }
     cfg.bind_ip = bind;
+    cfg.downloads_dir = downloads;
     let (app, mut events) = parolnet_app::start(cfg).await?;
     out(json!({"event": "ready", "peer_id": app.peer_id(), "public_key": app.public_key()}));
     if show_code {
@@ -196,6 +249,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // The latest call (for `accept` / `reject` / `hangup` without an id).
     let mut last_call: Option<(String, bool)> = None;
+    // The latest offer (for `acceptfile` / `declinefile` / `cancelfile` without an id), and
+    // what was last printed about each transfer (progress alone prints nothing).
+    let mut last_transfer: Option<String> = None;
+    let mut shown: std::collections::HashMap<String, (TransferState, bool)> =
+        std::collections::HashMap::new();
     // Whether the test pattern is produced for the call under way.
     let mut sending_video = Arc::new(AtomicBool::new(false));
     let mut stdin = BufReader::new(tokio::io::stdin()).lines();
@@ -232,6 +290,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         }));
                         if c.state == CallState::Incoming {
                             last_call = Some((c.call_id.clone(), c.video));
+                        }
+                    }
+                    AppEvent::Transfer(t) => {
+                        let now = (t.state, t.pending);
+                        if shown.insert(t.id.clone(), now) != Some(now) {
+                            out(transfer_line(&t));
+                        }
+                        if t.direction == Direction::Received && t.state == TransferState::Offered {
+                            last_transfer = Some(t.id.clone());
+                            if accept_files && let Err(e) = app.accept_transfer(&t.id).await {
+                                out(json!({"event": "error", "text": e.to_string()}));
+                            }
                         }
                     }
                     AppEvent::CallQuality { call_id, quality } => out(json!({
@@ -329,6 +399,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             Some(id) if cmd == "reject" => app.reject_call(&id),
                             Some(id) => app.hangup(&id),
                             None => out(json!({"event": "error", "text": "no call"})),
+                        }
+                    }
+                    Some("sendfile") => {
+                        let rest = line.strip_prefix("sendfile").unwrap_or("").trim_start();
+                        let (peer, path) = rest.split_once(' ').unwrap_or((rest, ""));
+                        match app.offer_file(peer, path.trim()).await {
+                            Ok(t) => last_transfer = Some(t.id),
+                            Err(e) => out(json!({"event": "error", "text": e.to_string()})),
+                        }
+                    }
+                    Some(cmd @ ("acceptfile" | "declinefile" | "cancelfile")) => {
+                        let id = words.next().map(str::to_owned).or_else(|| last_transfer.clone());
+                        let Some(id) = id else {
+                            out(json!({"event": "error", "text": "no transfer"}));
+                            continue;
+                        };
+                        let result = match cmd {
+                            "acceptfile" => app.accept_transfer(&id).await,
+                            "declinefile" => app.decline_transfer(&id).await,
+                            _ => app.cancel_transfer(&id).await,
+                        };
+                        if let Err(e) = result {
+                            out(json!({"event": "error", "text": e.to_string()}));
                         }
                     }
                     Some(other) => {

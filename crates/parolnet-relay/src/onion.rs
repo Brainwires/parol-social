@@ -118,6 +118,33 @@ pub fn onion_peel(
         .map_err(|_| RelayError::AeadFailed)
 }
 
+/// Take the counter value for the next cell under one key and direction, and advance it
+/// (PNP-004-MUST-018, MUST-019, MUST-059).
+///
+/// The value returned is used for exactly one cell. A counter is never reset while its key
+/// lives and never wraps: at `u32::MAX` this returns [`RelayError::NonceOverflow`], the
+/// counter stays where it is, and the circuit has to be destroyed.
+pub fn next_counter(counter: &mut u32) -> Result<u32, RelayError> {
+    let current = *counter;
+    *counter = current.checked_add(1).ok_or(RelayError::NonceOverflow)?;
+    Ok(current)
+}
+
+/// Advance every counter of a direction by one cell, all or none (PNP-004-MUST-059).
+///
+/// Returns the values to use for this cell. If any counter is at its limit none is moved
+/// and the circuit has to be destroyed.
+pub fn next_counters(counters: &mut [u32]) -> Result<Vec<u32>, RelayError> {
+    if counters.contains(&u32::MAX) {
+        return Err(RelayError::NonceOverflow);
+    }
+    let current = counters.to_vec();
+    for c in counters.iter_mut() {
+        *c = c.checked_add(1).ok_or(RelayError::NonceOverflow)?;
+    }
+    Ok(current)
+}
+
 /// Encrypt a payload with multiple onion layers (OP side).
 ///
 /// Layers are applied innermost-first: encrypt with hop N's key first,

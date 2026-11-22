@@ -21,6 +21,42 @@ const MAX_SKIP: u32 = 1000;
 /// more deletes the oldest, so the stored keys never make the session refuse a message.
 const MAX_STORED_SKIPPED: usize = 2000;
 
+/// Maximum number of messages in one chain (PNP-002-MUST-045): a sending chain carries the
+/// message numbers `0 ..= MAX_CHAIN_LENGTH - 1` and then stops. A chain is replaced by a DH
+/// ratchet step, which needs a new ratchet key from the peer, so the limit is set where no
+/// honest conversation reaches it (2^24 messages in one direction without a single reply)
+/// and still 256 times below the range of the `u32` wire fields: no counter of a session can
+/// come near wrapping, whatever is added to it.
+pub const MAX_CHAIN_LENGTH: u32 = 1 << 24;
+
+/// Refuse a counter that is past its limit (`value > limit`).
+fn check_counter(counter: &'static str, value: u32, limit: u32) -> Result<(), CryptoError> {
+    if value > limit {
+        return Err(CryptoError::CounterOutOfRange {
+            counter,
+            value: u64::from(value),
+            limit: u64::from(limit),
+        });
+    }
+    Ok(())
+}
+
+/// The counters of a ratchet header are within their limits (PNP-002-MUST-046): a message
+/// number names one of the `MAX_CHAIN_LENGTH` messages of a chain, and a previous chain is
+/// at most `MAX_CHAIN_LENGTH` long. Public header values only.
+fn check_header_counters(header: &RatchetHeader) -> Result<(), CryptoError> {
+    check_counter(
+        "message_number",
+        header.message_number,
+        MAX_CHAIN_LENGTH - 1,
+    )?;
+    check_counter(
+        "previous_chain_length",
+        header.previous_chain_length,
+        MAX_CHAIN_LENGTH,
+    )
+}
+
 /// The key of a message that was skipped over, kept until that message arrives or the key is
 /// evicted.
 #[derive(Zeroize, ZeroizeOnDrop)]
@@ -174,9 +210,11 @@ impl DoubleRatchetSession {
         out.extend_from_slice(&self.recv_n.to_be_bytes());
         out.extend_from_slice(&self.previous_send_n.to_be_bytes());
 
-        let count = self.skipped_keys.len() as u32;
+        // At most `MAX_STORED_SKIPPED` (2000) keys are ever held, so the count fits; the
+        // conversion is checked all the same, and exactly `count` keys follow it.
+        let count = u32::try_from(self.skipped_keys.len()).unwrap_or(u32::MAX);
         out.extend_from_slice(&count.to_be_bytes());
-        for key in &self.skipped_keys {
+        for key in self.skipped_keys.iter().take(MAX_STORED_SKIPPED) {
             out.extend_from_slice(&key.ratchet_key);
             out.extend_from_slice(&key.message_number.to_be_bytes());
             out.extend_from_slice(&key.message_key);
@@ -252,20 +290,32 @@ impl DoubleRatchetSession {
             None
         };
 
+        // No stored counter may be past its limit (PNP-002-MUST-047): a state that says
+        // otherwise was not written by this code, and is refused whole.
         let send_n = read_4(&mut pos)?;
+        check_counter("send_n", send_n, MAX_CHAIN_LENGTH)?;
         let recv_n = read_4(&mut pos)?;
+        check_counter("recv_n", recv_n, MAX_CHAIN_LENGTH)?;
         let previous_send_n = read_4(&mut pos)?;
+        check_counter("previous_send_n", previous_send_n, MAX_CHAIN_LENGTH)?;
 
-        let skip_count = read_4(&mut pos)? as usize;
+        let skip_count = usize::try_from(read_4(&mut pos)?).map_err(|_| err())?;
         if skip_count > MAX_STORED_SKIPPED {
             return Err(err());
         }
 
         let mut skipped_keys = VecDeque::with_capacity(skip_count);
         for _ in 0..skip_count {
+            let ratchet_key = read_32(&mut pos)?;
+            let message_number = read_4(&mut pos)?;
+            check_counter(
+                "skipped message_number",
+                message_number,
+                MAX_CHAIN_LENGTH - 1,
+            )?;
             skipped_keys.push_back(SkippedKey {
-                ratchet_key: read_32(&mut pos)?,
-                message_number: read_4(&mut pos)?,
+                ratchet_key,
+                message_number,
                 message_key: read_32(&mut pos)?,
             });
         }
@@ -446,7 +496,14 @@ impl ReceiveAttempt {
                     message_key: mk,
                 });
                 mk.zeroize();
-                self.recv_n += 1;
+                self.recv_n = self
+                    .recv_n
+                    .checked_add(1)
+                    .ok_or(CryptoError::CounterOutOfRange {
+                        counter: "recv_n",
+                        value: u64::from(self.recv_n),
+                        limit: u64::from(MAX_CHAIN_LENGTH),
+                    })?;
             }
         }
         Ok(())
@@ -528,31 +585,35 @@ impl RatchetSession for DoubleRatchetSession {
         plaintext: &[u8],
         extra_aad: &[u8],
     ) -> Result<(RatchetHeader, Vec<u8>), CryptoError> {
-        // The message number after this one must exist: `send_n` is the low four bytes of
-        // the nonce and must not wrap within a sending chain. A chain at u32::MAX is used up
-        // until the peer's next ratchet key starts a new one. Checked before the chain moves,
-        // so a refused encrypt changes nothing.
+        // A chain carries `MAX_CHAIN_LENGTH` messages and no more (PNP-002-MUST-045). The
+        // chain is used up until the peer's next ratchet key starts a new one; nothing wraps
+        // and nothing is reused. Checked before anything is derived.
+        if self.send_n >= MAX_CHAIN_LENGTH {
+            return Err(CryptoError::SendChainExhausted {
+                limit: MAX_CHAIN_LENGTH,
+            });
+        }
         let next_send_n = self
             .send_n
             .checked_add(1)
-            .ok_or(CryptoError::RatchetError {
-                reason: "sending chain exhausted".into(),
+            .ok_or(CryptoError::SendChainExhausted {
+                limit: MAX_CHAIN_LENGTH,
             })?;
-
-        let send_ck = self
-            .send_chain_key
-            .as_mut()
-            .ok_or(CryptoError::RatchetError {
-                reason: "no sending chain key established".into(),
-            })?;
-
-        let message_key = Zeroizing::new(Self::chain_ratchet(send_ck)?);
 
         let ratchet_pub = self
             .our_ratchet_public_key()
             .ok_or(CryptoError::RatchetError {
                 reason: "no DH ratchet key".into(),
             })?;
+
+        // The chain steps on a copy: the session takes the new chain key and the new message
+        // number together, and only once the message exists (PNP-002-MUST-048). A message
+        // key is never left behind a counter that did not move, or the other way round.
+        let mut next_chain_key =
+            Zeroizing::new(self.send_chain_key.ok_or(CryptoError::RatchetError {
+                reason: "no sending chain key established".into(),
+            })?);
+        let message_key = Zeroizing::new(Self::chain_ratchet(&mut next_chain_key)?);
 
         let header = RatchetHeader {
             ratchet_key: ratchet_pub,
@@ -566,6 +627,10 @@ impl RatchetSession for DoubleRatchetSession {
         let aad = build_aad(&header, extra_aad);
         let ciphertext = cipher.encrypt(&nonce, plaintext, &aad)?;
 
+        // Commit.
+        if let Some(chain_key) = self.send_chain_key.as_mut() {
+            chain_key.copy_from_slice(&next_chain_key[..]);
+        }
         self.send_n = next_send_n;
 
         Ok((header, ciphertext))
@@ -579,6 +644,11 @@ impl RatchetSession for DoubleRatchetSession {
         ciphertext: &[u8],
         extra_aad: &[u8],
     ) -> Result<Vec<u8>, CryptoError> {
+        // Counters past their limits are refused before anything else is done with the
+        // message (PNP-002-MUST-046). The header is not authenticated yet, and no honest
+        // sender produces such a header (`encrypt` stops at the limit).
+        check_header_counters(header)?;
+
         let nonce = Self::build_nonce(&header.ratchet_key, header.message_number);
         let aad = build_aad(header, extra_aad);
 
@@ -593,14 +663,15 @@ impl RatchetSession for DoubleRatchetSession {
             return Ok(plaintext);
         }
 
-        // No sender emits message number u32::MAX (`encrypt` refuses at that point), and
-        // accepting it would wrap `recv_n`. The header is not authenticated yet.
+        // At most `MAX_CHAIN_LENGTH` after the check above; the addition is checked anyway.
         let next_recv_n =
             header
                 .message_number
                 .checked_add(1)
-                .ok_or(CryptoError::RatchetError {
-                    reason: "message number out of range".into(),
+                .ok_or(CryptoError::CounterOutOfRange {
+                    counter: "message_number",
+                    value: u64::from(header.message_number),
+                    limit: u64::from(MAX_CHAIN_LENGTH - 1),
                 })?;
 
         // Everything below runs on a copy; `self` changes only in `commit`.
@@ -1451,17 +1522,17 @@ mod tests {
 
     // ── Counter limits ──────────────────────────────────────────────────
     //
-    // `send_n` is a `u32` and the low four bytes of the nonce. At its limit the session
-    // refuses, in place of wrapping (a panic in debug builds, message number 0 again in
-    // release).
+    // A chain carries `MAX_CHAIN_LENGTH` messages (PNP-002-MUST-045 to MUST-048). At the
+    // limit the session refuses to send and to receive; no counter comes near the end of
+    // its `u32`.
 
     /// A pair whose Alice-to-Bob chain is established and has one message number left.
     fn pair_near_the_counter_limit() -> (DoubleRatchetSession, DoubleRatchetSession) {
         let (mut alice, mut bob) = setup_session_pair();
         let (h, c) = alice.encrypt(b"first", &[]).unwrap();
         assert_eq!(bob.decrypt(&h, &c, &[]).unwrap(), b"first");
-        alice.send_n = u32::MAX - 1;
-        bob.recv_n = u32::MAX - 1;
+        alice.send_n = MAX_CHAIN_LENGTH - 1;
+        bob.recv_n = MAX_CHAIN_LENGTH - 1;
         (alice, bob)
     }
 
@@ -1471,8 +1542,8 @@ mod tests {
 
         // The last message number a chain may use.
         let (header, ct) = alice.encrypt(b"last", &[]).unwrap();
-        assert_eq!(header.message_number, u32::MAX - 1);
-        assert_eq!(alice.send_n, u32::MAX);
+        assert_eq!(header.message_number, MAX_CHAIN_LENGTH - 1);
+        assert_eq!(alice.send_n, MAX_CHAIN_LENGTH);
 
         // At the limit: an error, and the session is exactly what it was.
         let before = snapshot(&alice);
@@ -1483,10 +1554,10 @@ mod tests {
         // The last message decrypts, and a reply (a DH ratchet step, which starts a new
         // sending chain at 0) puts the sender back in business.
         assert_eq!(bob.decrypt(&header, &ct, &[]).unwrap(), b"last");
-        assert_eq!(bob.recv_n, u32::MAX);
+        assert_eq!(bob.recv_n, MAX_CHAIN_LENGTH);
         let (h, c) = bob.encrypt(b"reply", &[]).unwrap();
         assert_eq!(alice.decrypt(&h, &c, &[]).unwrap(), b"reply");
-        assert_eq!(alice.previous_send_n, u32::MAX);
+        assert_eq!(alice.previous_send_n, MAX_CHAIN_LENGTH);
         let (h, c) = alice.encrypt(b"again", &[]).unwrap();
         assert_eq!(h.message_number, 0);
         assert_eq!(bob.decrypt(&h, &c, &[]).unwrap(), b"again");
@@ -1497,20 +1568,20 @@ mod tests {
         let (mut alice, mut bob) = pair_near_the_counter_limit();
         let (last, last_ct) = alice.encrypt(b"last", &[]).unwrap();
 
-        // What a sender that ignores the limit would emit next: message number u32::MAX
-        // under the next key of the same chain.
+        // What a sender that ignores the limit would emit next: message number
+        // `MAX_CHAIN_LENGTH` under the next key of the same chain.
         let ratchet_pub = alice.our_ratchet_public_key().unwrap();
         let message_key =
             DoubleRatchetSession::chain_ratchet(alice.send_chain_key.as_mut().unwrap()).unwrap();
         let header = RatchetHeader {
             ratchet_key: ratchet_pub,
             previous_chain_length: 0,
-            message_number: u32::MAX,
+            message_number: MAX_CHAIN_LENGTH,
         };
         let ct = ChaCha20Poly1305Cipher::new(&message_key)
             .unwrap()
             .encrypt(
-                &DoubleRatchetSession::build_nonce(&ratchet_pub, u32::MAX),
+                &DoubleRatchetSession::build_nonce(&ratchet_pub, MAX_CHAIN_LENGTH),
                 b"wrapped",
                 &build_aad(&header, &[]),
             )
@@ -1520,5 +1591,43 @@ mod tests {
         assert!(bob.decrypt(&header, &ct, &[]).is_err());
         assert_eq!(snapshot(&bob), before);
         assert_eq!(bob.decrypt(&last, &last_ct, &[]).unwrap(), b"last");
+    }
+
+    #[test]
+    fn decrypt_refuses_a_previous_chain_length_past_the_limit() {
+        let (mut alice, mut bob) = established_pair();
+        let (h, ct) = alice.encrypt(b"genuine", b"aad").unwrap();
+        for pn in [MAX_CHAIN_LENGTH + 1, u32::MAX] {
+            let mut forged = h.clone();
+            forged.previous_chain_length = pn;
+            let before = snapshot(&bob);
+            assert!(matches!(
+                bob.decrypt(&forged, &ct, b"aad"),
+                Err(CryptoError::CounterOutOfRange { .. })
+            ));
+            assert_eq!(snapshot(&bob), before);
+        }
+        assert_eq!(bob.decrypt(&h, &ct, b"aad").unwrap(), b"genuine");
+    }
+
+    #[test]
+    fn import_refuses_counters_past_the_limit() {
+        let (alice, _bob) = established_pair();
+        let good = alice.export_bytes();
+        assert!(DoubleRatchetSession::import_bytes(&good).is_ok());
+        // All four optional fields are present: the three counters start at a fixed offset.
+        let counters = 1 + 32 + 4 * 33;
+        for field in 0..3 {
+            let at = counters + field * 4;
+            let mut bad = good.clone();
+            bad[at..at + 4].copy_from_slice(&(MAX_CHAIN_LENGTH + 1).to_be_bytes());
+            assert!(matches!(
+                DoubleRatchetSession::import_bytes(&bad),
+                Err(CryptoError::CounterOutOfRange { .. })
+            ));
+            let mut edge = good.clone();
+            edge[at..at + 4].copy_from_slice(&MAX_CHAIN_LENGTH.to_be_bytes());
+            assert!(DoubleRatchetSession::import_bytes(&edge).is_ok());
+        }
     }
 }

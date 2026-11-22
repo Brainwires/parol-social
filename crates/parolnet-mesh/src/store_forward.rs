@@ -182,13 +182,19 @@ impl InMemoryStore {
     }
 
     /// Generate a unique nonce for at-rest encryption.
-    async fn next_nonce(&self) -> [u8; 12] {
+    ///
+    /// The counter never wraps: the store's key is fixed for its lifetime, so a repeated
+    /// counter would be a repeated (key, nonce) pair. At the end of its range the store
+    /// refuses to buffer.
+    async fn next_nonce(&self) -> Result<[u8; 12], MeshError> {
         let mut counter = self.nonce_counter.lock().await;
         let val = *counter;
-        *counter = counter.wrapping_add(1);
+        *counter = val
+            .checked_add(1)
+            .ok_or_else(|| MeshError::StorageError("at-rest nonce counter exhausted".into()))?;
         let mut nonce = [0u8; 12];
         nonce[4..12].copy_from_slice(&val.to_be_bytes());
-        nonce
+        Ok(nonce)
     }
 
     fn cipher(&self) -> Result<ChaCha20Poly1305Cipher, MeshError> {
@@ -212,7 +218,7 @@ impl InMemoryStore {
                 "message larger than a whole buffer".into(),
             ));
         }
-        let nonce = self.next_nonce().await;
+        let nonce = self.next_nonce().await?;
         let sealed = self
             .cipher()?
             .encrypt(&nonce, &wire, &[])

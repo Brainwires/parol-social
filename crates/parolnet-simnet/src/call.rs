@@ -798,6 +798,8 @@ impl PeerTask {
                             return;
                         }
                         RtcEvent::DataChannelOpen { .. }
+                        | RtcEvent::DataChannelClose { .. }
+                        | RtcEvent::DataChannelBufferedLow { .. }
                         | RtcEvent::DataChannelMessage { .. }
                         | RtcEvent::IceConnectionState(_)
                         | RtcEvent::RemoteOfferIgnored => {}

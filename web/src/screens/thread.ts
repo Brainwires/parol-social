@@ -2,7 +2,8 @@
 // when the line opens, the messages that waited fill in one after another.
 import { useEffect, useLayoutEffect, useRef, useState } from "denext";
 import type { BubbleKind } from "../components/Bubble.tsx";
-import type { ChatMessage, DeliveryState } from "../state/model.ts";
+import { transferKind } from "../components/FileBubble.tsx";
+import type { ChatMessage, DeliveryState, TransferInfo } from "../state/model.ts";
 
 /** Time between one waiting bubble starting to fill and the next (tokens: motion.fill-stagger). */
 export const FILL_STAGGER_MS = 350;
@@ -47,9 +48,96 @@ export function captionOf(
   for (let i = items.length - 1; i >= 0; i--) {
     const kind = items[i].kind;
     if (kind === "received") continue;
+    if (kind === "stopped") continue;
     return { after: i, caption: kind === "held" ? "waiting" : kind };
   }
   return null;
+}
+
+/** One entry of a conversation's timeline: a message, or a file transfer. */
+export type Entry =
+  | { type: "message"; message: ChatMessage }
+  | { type: "transfer"; transfer: TransferInfo };
+
+function entryDirection(entry: Entry): ChatMessage["direction"] {
+  return entry.type === "message" ? entry.message.direction : entry.transfer.direction;
+}
+
+/**
+ * Messages and transfers in one timeline, by time (a message's `timestampMs`, a transfer's
+ * `createdMs`). Both lists are oldest first; at the same moment the message comes first, and
+ * each list keeps its own order.
+ */
+export function timeline(
+  messages: readonly ChatMessage[],
+  transfers: readonly TransferInfo[],
+): Entry[] {
+  const out: Entry[] = [];
+  let m = 0;
+  let f = 0;
+  while (m < messages.length || f < transfers.length) {
+    const message = messages[m];
+    const transfer = transfers[f];
+    if (
+      transfer === undefined || (message !== undefined && message.timestampMs <= transfer.createdMs)
+    ) {
+      out.push({ type: "message", message });
+      m++;
+    } else {
+      out.push({ type: "transfer", transfer });
+      f++;
+    }
+  }
+  return out;
+}
+
+export interface TimelineItem {
+  entry: Entry;
+  kind: BubbleKind;
+  groupStart: boolean;
+  groupEnd: boolean;
+}
+
+/** The timeline as bubbles: each with its form, and grouped by side across both kinds. */
+export function timelineItems(
+  messages: readonly ChatMessage[],
+  transfers: readonly TransferInfo[],
+  stillOutlined: ReadonlySet<number> = new Set(),
+): TimelineItem[] {
+  const entries = timeline(messages, transfers);
+  return entries.map((entry, i) => ({
+    entry,
+    kind: entry.type === "message"
+      ? bubbleKind(entry.message, stillOutlined)
+      : transferKind(entry.transfer),
+    groupStart: entries[i - 1] === undefined ||
+      entryDirection(entries[i - 1]) !== entryDirection(entry),
+    groupEnd: entries[i + 1] === undefined ||
+      entryDirection(entries[i + 1]) !== entryDirection(entry),
+  }));
+}
+
+/**
+ * The thread's caption follows the last of our messages. A file has its own status line, so
+ * transfers neither carry the caption nor move it.
+ */
+export function timelineCaption(
+  items: readonly TimelineItem[],
+): { after: number; caption: Caption } | null {
+  for (let i = items.length - 1; i >= 0; i--) {
+    const { entry, kind } = items[i];
+    if (entry.type !== "message" || kind === "received" || kind === "stopped") continue;
+    return { after: i, caption: kind === "held" ? "waiting" : kind };
+  }
+  return null;
+}
+
+/** The newest entry of a conversation: what its row in the list shows. */
+export function lastEntry(
+  messages: readonly ChatMessage[],
+  transfers: readonly TransferInfo[],
+): Entry | undefined {
+  return timeline(messages, transfers).at(-1);
 }
 
 function reducedMotion(): boolean {

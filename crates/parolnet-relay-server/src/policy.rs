@@ -82,6 +82,26 @@ pub const SIGNALING_FRAME_TYPES: &[&str] = &[
     "watch",
 ];
 
+/// `GET /peers/presence`: every PeerId connected to the relay (PNP-008 §10.5).
+pub const PEERS_PRESENCE_PATH: &str = "/peers/presence";
+/// `GET /peers/lookup`: whether one PeerId is online, and where (PNP-008 §10.6).
+pub const PEERS_LOOKUP_PATH: &str = "/peers/lookup";
+
+/// HTTP endpoints only a relay-profile relay serves. A signaling-only relay
+/// does not register them: a request gets 404, whatever it carries
+/// (PNP-001-MUST-071). The two `/peers/*` endpoints are among them because
+/// they say who is online; on a signaling-only relay that is learned only
+/// over a registered WebSocket.
+pub const RELAY_PROFILE_ENDPOINTS: &[&str] = &[
+    "/tokens/issue",
+    "/telemetry",
+    "/endorse",
+    "/directory/push",
+    "/federation/v1",
+    PEERS_PRESENCE_PATH,
+    PEERS_LOOKUP_PATH,
+];
+
 /// Effective relay configuration, read once at startup.
 #[derive(Clone, Debug)]
 pub struct RelayPolicy {
@@ -175,6 +195,12 @@ impl RelayPolicy {
         } else {
             PROFILE_RELAY
         }
+    }
+
+    /// Whether this relay serves the HTTP endpoint at `path`. A signaling-only
+    /// relay serves none of [`RELAY_PROFILE_ENDPOINTS`].
+    pub fn serves_endpoint(&self, path: &str) -> bool {
+        !self.signaling_only || !RELAY_PROFILE_ENDPOINTS.contains(&path)
     }
 
     /// Whether a client frame type is accepted under this profile.

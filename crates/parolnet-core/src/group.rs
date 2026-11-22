@@ -6,7 +6,7 @@ use parolnet_crypto::sender_key::{SenderKeyDistribution, SenderKeyMessage, Sende
 use parolnet_protocol::address::PeerId;
 use parolnet_protocol::group::{
     GroupId, GroupMember, GroupMetadataPayload, GroupOpType, GroupOperation, GroupRole,
-    MAX_GROUP_MEMBERS, SENDER_KEY_ROTATION_MESSAGES, SENDER_KEY_ROTATION_SECS,
+    MAX_GROUP_MEMBERS, MAX_GROUP_VERSION, SENDER_KEY_ROTATION_MESSAGES, SENDER_KEY_ROTATION_SECS,
 };
 use rand::RngCore;
 use sha2::{Digest, Sha256};
@@ -50,7 +50,17 @@ impl Group {
     /// Check if sender key needs rotation based on message count or time elapsed.
     pub fn needs_rotation(&self, now_secs: u64) -> bool {
         self.messages_since_rotation >= SENDER_KEY_ROTATION_MESSAGES
-            || now_secs - self.last_rotation_ts >= SENDER_KEY_ROTATION_SECS
+            || now_secs.saturating_sub(self.last_rotation_ts) >= SENDER_KEY_ROTATION_SECS
+    }
+
+    /// The version our next operation on this group carries (PNP-009-MUST-082): one above
+    /// the current one, by checked addition, and never past `MAX_GROUP_VERSION`. Changes
+    /// nothing; callers ask before they touch the group.
+    fn next_version(&self) -> Result<u64, CoreError> {
+        match self.metadata.version.checked_add(1) {
+            Some(next) if next <= MAX_GROUP_VERSION => Ok(next),
+            _ => Err(CoreError::GroupVersionExhausted),
+        }
     }
 
     /// Rotate our sender key and reset counters.
@@ -99,6 +109,17 @@ impl Group {
         member.role = role;
         Ok(())
     }
+}
+
+/// Refuse a group version past `MAX_GROUP_VERSION` (PNP-009-MUST-083).
+fn check_group_version(version: u64) -> Result<(), CoreError> {
+    if version > MAX_GROUP_VERSION {
+        return Err(CoreError::GroupVersionOutOfRange {
+            version,
+            limit: MAX_GROUP_VERSION,
+        });
+    }
+    Ok(())
 }
 
 /// Manages all groups the local user is a member of.
@@ -184,6 +205,7 @@ impl GroupManager {
                 "we are not in the group member list".into(),
             ));
         }
+        check_group_version(metadata.version)?;
 
         let group = Group::new(group_id, metadata, our_peer_id);
         let dist = group.our_sender_key.create_distribution(our_peer_id.0);
@@ -245,9 +267,29 @@ impl GroupManager {
             .our_sender_key
             .encrypt(plaintext)
             .map_err(CoreError::Crypto)?;
-        group.messages_since_rotation += 1;
+        // Advisory only (it feeds `needs_rotation`); the chain's own limit is enforced by
+        // the sender key state.
+        group.messages_since_rotation = group.messages_since_rotation.saturating_add(1);
 
         Ok((group.our_peer_id, msg))
+    }
+
+    /// Rotate our sender key for a group (PNP-009 §7.3) and return the distribution to send
+    /// to every other member. This is what a sender does when
+    /// [`Self::encrypt_group_text`] fails with
+    /// `CryptoError::SenderKeyChainExhausted` (PNP-009-MUST-078), and on the recommended
+    /// schedule of §7.2.
+    pub fn rotate_our_sender_key(
+        &self,
+        group_id: &GroupId,
+        now_secs: u64,
+    ) -> Result<SenderKeyDistribution, CoreError> {
+        let mut groups = self.groups.lock().unwrap_or_else(|e| e.into_inner());
+        let group = groups.get_mut(group_id).ok_or(CoreError::GroupNotFound)?;
+        group.rotate_sender_key(now_secs);
+        Ok(group
+            .our_sender_key
+            .create_distribution(group.our_peer_id.0))
     }
 
     /// Decrypt a text message from another group member.
@@ -297,13 +339,14 @@ impl GroupManager {
         if group.is_member(&new_member) {
             return Err(CoreError::GroupError("peer is already a member".into()));
         }
+        let version = group.next_version()?;
 
         group.metadata.members.push(GroupMember {
             peer_id: new_member,
             role: GroupRole::Member,
             joined_at: now_secs,
         });
-        group.metadata.version += 1;
+        group.metadata.version = version;
 
         Ok(GroupOperation {
             group_id: *group_id,
@@ -341,6 +384,7 @@ impl GroupManager {
             return Err(CoreError::GroupError("target is not a member".into()));
         }
         group.ensure_not_last_admin(target)?;
+        let version = group.next_version()?;
 
         // Remove from member list
         group.metadata.members.retain(|m| m.peer_id != *target);
@@ -351,7 +395,7 @@ impl GroupManager {
         // Rotate our sender key so removed member can't decrypt new messages
         group.rotate_sender_key(now_secs);
 
-        group.metadata.version += 1;
+        group.metadata.version = version;
 
         let dist = group
             .our_sender_key
@@ -397,6 +441,9 @@ impl GroupManager {
             .get_mut(&op.group_id)
             .ok_or(CoreError::GroupNotFound)?;
 
+        // Past the limit: refused whatever else it says (PNP-009-MUST-083), so that no
+        // operation can leave the group without a next version.
+        check_group_version(op.version)?;
         if op.version <= group.metadata.version {
             return Err(CoreError::GroupError(
                 "stale group operation version".into(),

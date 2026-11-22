@@ -512,7 +512,7 @@ impl StandardRelayNode {
         ) else {
             return;
         };
-        entry.forward_counter += 1;
+        entry.forward_counter = entry.forward_counter.saturating_add(1);
         if !entry.active {
             entry.active = true;
             actions.push(RelayAction::Reschedule);
@@ -588,7 +588,7 @@ impl StandardRelayNode {
         ) else {
             return;
         };
-        entry.forward_counter += 1;
+        entry.forward_counter = entry.forward_counter.saturating_add(1);
 
         if hops_left == Some(0) {
             // The counter ran out: neither forwarded nor carried out.
@@ -691,7 +691,7 @@ impl StandardRelayNode {
         ) else {
             return;
         };
-        entry.backward_counter += 1;
+        entry.backward_counter = entry.backward_counter.saturating_add(1);
         entry.out_side = entry.pending_out.take();
         let (in_link, in_cid) = entry.in_side;
         if let Ok(extended) = RelayCell::new(in_cid, CellType::Extended, &sealed) {
@@ -731,7 +731,7 @@ impl StandardRelayNode {
         ) else {
             return;
         };
-        entry.backward_counter += 1;
+        entry.backward_counter = entry.backward_counter.saturating_add(1);
         entry.last_sent_backward = now;
         entry.filler_backward = false;
         let (in_link, in_cid) = entry.in_side;
@@ -780,7 +780,7 @@ impl StandardRelayNode {
             &entry.keys.backward_nonce_seed,
             entry.backward_counter,
         )?;
-        entry.backward_counter += 1;
+        entry.backward_counter = entry.backward_counter.saturating_add(1);
         entry.last_sent_backward = now;
         let cell = RelayCell::new(circuit_id, CellType::Data, &sealed)?;
         inner.enqueue(&mut touched, link, id, cell);
@@ -874,7 +874,7 @@ impl StandardRelayNode {
                 ) && let Ok(cell) = RelayCell::new(in_cid, CellType::Padding, &sealed)
                 {
                     // The exit's padding is encrypted exactly as its DATA is (MUST-052).
-                    entry.backward_counter += 1;
+                    entry.backward_counter = entry.backward_counter.saturating_add(1);
                     queue.push((in_link, cell));
                 }
             }

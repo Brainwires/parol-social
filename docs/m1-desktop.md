@@ -214,6 +214,47 @@ secret, contacts, ratchet sessions, history, the sender queue, settings. Beside 
   drops the client's `watch` frames: nothing queued, no push, the contact comes back, and the
   connection is rebuilt by a probe.
 
+## Files (PNP-010)
+
+A file goes from one `parolnet-app` to another (or to the web app) as `specs/PNP-010-file-transfer.md`
+says: the offer travels in the session as a `FILE_TRANSFER` (0x15) envelope with the name, size,
+MIME type, the SHA-256 of the plaintext and a fresh 256-bit file key; the receiver's accept goes
+back the same way; the receiver then opens a second data channel `pn-file/<id>` on the contact's
+connection and the file flows on it as 64 KiB sealed records.
+
+- **Commands and events**: `AppHandle::offer_file`, `accept_transfer`, `decline_transfer`,
+  `cancel_transfer`, `transfers`; `AppEvent::Transfer(TransferInfo)` on every change and a few
+  times a second while records flow. `TransferInfo::pending` says that our latest message about
+  the transfer is still on this device (the contact is unreachable).
+- **Disk**: the sender reads the file once for its hash (1 MiB at a time), then one record at
+  a time as the channel takes them (it pauses above 4 MiB buffered and continues at 1 MiB). The
+  receiver appends to `<downloads>/<id>.part` (owner-only), makes that durable every second or
+  16 MiB and only then records the count in the store, and at the end renames the part to the
+  offered name made safe (`sanitize_file_name`; a taken name becomes `name (1).ext`). Neither
+  side holds more than a few records in memory: the connection's event pump hands a transfer
+  channel's messages to its worker through a queue of 16.
+- **Resume**: on every new channel the receiver states the next record it needs; the sender
+  starts there. After a restart the receiver cuts the part file back to the recorded count,
+  reads it back into the hash and continues; the sender checks that the file still has the
+  offered size and modification time, and cancels (`Unavailable`) if not. The transfer's state
+  is in the encrypted store with everything else, so it does not depend on the session, the
+  connection or the process that made the offer.
+- **Refusals**: a record that does not authenticate at its position ends the attempt and is
+  never written; three attempts in a row that end that way cancel the transfer (`Integrity`),
+  as does a final hash that differs. Offers above `AppConfig::max_accept_size` (4 GiB), a 17th
+  waiting offer from one contact and offers above ten in a burst are declined without asking.
+- **Measured** (loopback, macOS arm64, release build, `PAROLNET_TRANSFER_TEST_MIB=2048 cargo
+  test --release -p parolnet-app --test file_transfer a_transfer_survives`): 2 GiB with the
+  connection killed at a quarter, the receiving app restarted at half and the sending app at
+  three quarters, verified by SHA-256: 48.7 s, 42 MiB/s overall including the three reconnects;
+  hashing the 2 GiB source for the offer took 1.3 s. The same test runs in CI with 48 MiB.
+- **Tests**: `crates/parolnet-app/tests/file_transfer.rs` (both directions, empty and one-byte
+  files, a second file of the same name, decline, cancel, the size limit, an offer made while
+  the contact is away and across a restart of the sender, the resumed transfer above, a file
+  that changed after the offer) and `file_tamper.rs` (a record corrupted in flight is refused
+  and the genuine one arrives on a new channel; persistent corruption cancels).
+- **Bot**: `sendfile <peer> <path>`, `acceptfile`, `declinefile`, `cancelfile`, `--downloads`,
+  `--accept-files`; a `transfer` line per state change, with the received file's SHA-256.
 ## Connections that follow the network (PNP-011 sections 5.5 and 8)
 
 - **Candidates.** A connection binds one UDP socket per usable local address, IPv4 and IPv6,
@@ -350,7 +391,9 @@ video runs at its minimum there: adapted, not frozen).
   keychain (the start error says so); no key rotation; the keychain path has run on no real
   keychain yet (opt-in test `crates/parolnet-store/tests/keychain.rs`), and the vendored OpenSSL
   build has not run on the Windows runners.
-- Files (PNP-010), multi-device.
+- Files: no group files; nothing limits how much disk a contact's accepted offers may take
+  beyond the per-offer size limit; a received part is plaintext in the downloads folder while it
+  arrives (as the finished file is). Multi-device.
 
 ## Next slice
 

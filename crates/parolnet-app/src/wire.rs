@@ -127,6 +127,10 @@ pub enum ClientFrame {
         signature: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         nonce: Option<String>,
+        /// The canonical name of the relay this client dialed (PNP-001
+        /// §10.7); the signature covers it.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        relay: Option<String>,
     },
     Watch {
         peer_ids: Vec<String>,
@@ -386,8 +390,20 @@ mod tests {
             pubkey: None,
             signature: None,
             nonce: None,
+            relay: None,
         };
         assert_eq!(f.to_json(), r#"{"type":"register","peer_id":"ab"}"#);
+        let f = ClientFrame::Register {
+            peer_id: "ab".into(),
+            pubkey: Some("cd".into()),
+            signature: Some("ef".into()),
+            nonce: Some("01".into()),
+            relay: Some("relay.example:443".into()),
+        };
+        assert_eq!(
+            f.to_json(),
+            r#"{"type":"register","peer_id":"ab","pubkey":"cd","signature":"ef","nonce":"01","relay":"relay.example:443"}"#
+        );
         let f = ClientFrame::Watch {
             peer_ids: vec!["a".into()],
         };

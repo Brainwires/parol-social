@@ -9,6 +9,7 @@ import {
   wasmApi,
 } from "../engine/browser.ts";
 import { Engine } from "../engine/engine.ts";
+import { clearStoredFiles } from "../engine/files.ts";
 import type { WasmApi } from "../engine/platform.ts";
 import { SealedStorage } from "../engine/sealed-storage.ts";
 import type { Vault } from "../engine/vault.ts";
@@ -66,7 +67,7 @@ export function browserEnv(options: EnvOptions): StoreEnv {
           });
           return {
             hasIdentity: (await storage.get("identity", "self")) !== undefined,
-            device: deviceVault(vault, storage, browserVaultCrypto(wasm)),
+            device: deviceVault(vault, storage, browserVaultCrypto(wasm), clearStoredFiles),
             start: (): Promise<EnginePort> =>
               Engine.start(platform, {
                 relayUrl: relayUrl(),
@@ -87,7 +88,11 @@ export function browserEnv(options: EnvOptions): StoreEnv {
             await vault.unlock(passphrase);
             return await unlocked();
           },
-          destroy: () => vault.destroy(),
+          // The database and its keys, then the received files those keys could open.
+          async destroy() {
+            await vault.destroy();
+            await clearStoredFiles();
+          },
         },
       };
     },

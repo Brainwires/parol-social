@@ -62,15 +62,12 @@ impl Shared {
     fn wrap(&self, data: &[u8]) -> Result<Vec<u8>, RelayError> {
         let hop_keys = guard_of(&self.hop_keys);
         let mut counters = guard_of(&self.forward_counters);
-        // The counter never reaches 2^32 (PNP-004-MUST-019 / MUST-056).
-        if counters.contains(&u32::MAX) {
-            return Err(RelayError::NonceOverflow);
-        }
-        let result = onion::onion_encrypt(data, &hop_keys, &counters)?;
-        for c in counters.iter_mut() {
-            *c += 1;
-        }
-        Ok(result)
+        // The counter never reaches 2^32 (PNP-004-MUST-019 / MUST-056): at the limit this
+        // refuses and moves nothing. Otherwise the values are read and advanced under the
+        // one lock, before the cell is built, so no two cells share a value and a value is
+        // spent even if the cell is then never sent (PNP-004-MUST-059).
+        let cell_counters = onion::next_counters(&mut counters)?;
+        onion::onion_encrypt(data, &hop_keys, &cell_counters)
     }
 
     /// Take backward layers off, hop 1 first, as many as authenticate. A layer that
@@ -92,7 +89,7 @@ impl Shared {
                 *counter,
             ) {
                 Ok(plain) => {
-                    *counter += 1;
+                    onion::next_counter(counter)?;
                     current = plain;
                     peeled += 1;
                 }
@@ -216,6 +213,10 @@ impl EstablishedCircuit {
     }
 
     /// Encrypt data with all onion layers for sending through the circuit.
+    ///
+    /// The forward counters are read and advanced under one lock (PNP-004-MUST-059): two
+    /// callers can never encrypt under the same counter values, and a counter value is
+    /// spent even if the caller then fails to send the cell.
     pub fn wrap_data(&self, data: &[u8]) -> Result<Vec<u8>, RelayError> {
         self.shared.wrap(data)
     }
@@ -228,6 +229,12 @@ impl EstablishedCircuit {
             return Err(RelayError::AeadFailed);
         }
         Ok(plain)
+    }
+
+    /// The forward counter of each hop: how many cells have been encrypted under that
+    /// hop's forward key since it was derived (PNP-004-MUST-059).
+    pub fn forward_counters(&self) -> Vec<u32> {
+        guard_of(&self.shared.forward_counters).clone()
     }
 
     /// Get the circuit ID.

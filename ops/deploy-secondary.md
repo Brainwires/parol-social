@@ -67,6 +67,21 @@ Do **not** copy `relay.key` from the primary — each relay must have its
 own Ed25519 identity. The relay generates `relay-data-secondary/relay.key`
 (mode 0600) automatically on first boot.
 
+Set the name clients will dial this relay under (required; PNP-001 §10.7).
+A client signs its registration for the host it dialed and the relay
+refuses any other name, so a relay without this registers nobody but
+clients on the same machine:
+
+```
+# Secondary's .env
+RELAY_PUBLIC_NAMES=biscuits-two.parol.social
+```
+
+Comma-separated `host` or `host:port`; no port means 443. List every name
+clients use (and, for a relay-profile federation, the `host:port` form its
+peers have in their `PEER_RELAY_URLS`). The relay logs its names at startup,
+or a warning when none is set.
+
 ## 5. Configure peer discovery
 
 Both relays need to know about each other so `/directory` sync picks up
@@ -116,8 +131,14 @@ For clients to accept the secondary's descriptors, the authority set
 `AUTHORITY_THRESHOLD` build arguments, see section 8) must have endorsed
 it. Use `parolnet-authority-cli` (see `crates/parolnet-authority-cli/`)
 on the offline authority machine to produce an `AuthorityEndorsement`
-CBOR blob for the secondary's descriptor, then upload it to the
+CBOR blob for the secondary's descriptor (`endorse-relay --descriptor
+<file>`), then upload the descriptor with its endorsements to the
 secondary.
+
+An endorsement signs the descriptor itself (PNP-008-MUST-002): it is valid
+for that descriptor only and for the descriptor's seven days. Each new
+descriptor of the relay needs new endorsements, so the ceremony recurs at
+least weekly per relay.
 
 This runbook does not cover the authority signing ceremony itself —
 that is operator-specific and should run on an airgapped machine.
@@ -184,6 +205,26 @@ RELAY_PUBLIC_URL=https://biscuits.parol.social
 # Secondary's .env
 RELAY_PUBLIC_URL=https://biscuits-two.parol.social
 ```
+
+**1a. List each federation peer's relay key in `FEDERATION_PEER_KEYS`, and
+this relay's own names in `RELAY_PUBLIC_NAMES`.** `/peers/presence` and
+`/peers/lookup` are no longer public (PNP-008 §10.8). They exist only in the
+relay profile (`SIGNALING_ONLY=0`) and answer only requests signed for this
+relay: presence to the relays whose Ed25519 identity keys are listed, lookup
+to those and to peers registered here. A relay signs its presence polls with
+its own identity key for the name it dials, so on every relay:
+
+```
+# Relay A's .env
+SIGNALING_ONLY=0
+RELAY_PUBLIC_NAMES=a.example,203.0.113.1:9000   # every host[:port] A is dialed under,
+                                                # the form in B's PEER_RELAY_URLS included
+FEDERATION_PEER_KEYS=<B's "Relay Ed25519 public key", 64 hex>
+```
+
+and the mirror image on B. A relay that is not listed gets HTTP 403 and
+its presence cache for that peer stays empty; one that dials a name the
+peer does not serve gets 401.
 
 **2. Exact-string match between `PEER_RELAY_URLS` and each relay's
 `/directory` `addr` field.** Federation presence-fetch does a naive
