@@ -23,7 +23,8 @@ use super::{Conn, Engine, PendingBootstrap, now_secs, peer_id_of};
 use crate::store::QueuedEnvelope;
 use crate::wire::msg_type;
 use crate::{
-    AppError, AppEvent, ChatMessage, Contact, DeliveryState, Direction, PathState, now_ms,
+    AppError, AppEvent, ChatMessage, Contact, DeliveryState, Direction, PairingMark, PathState,
+    now_ms,
 };
 
 /// One bootstrap under way with a peer.
@@ -157,7 +158,8 @@ impl Engine {
             old.pairing.abort();
             self.drop_deferred(&peer, &mut old);
         }
-        let (contact, new) = self.upsert_contact(&peer, Some(hex::encode(their_ik)));
+        let (_, new) = self.upsert_contact(&peer, Some(hex::encode(their_ik)));
+        let contact = self.mark_pairing(&peer, new);
         self.pairings.insert(
             peer.clone(),
             PairingSlot {
@@ -165,7 +167,7 @@ impl Engine {
                 outbox: VecDeque::from([init]),
                 hint: true,
                 started: false,
-                created_contact: new,
+                created_contact: contact.pairing == Some(PairingMark::New),
                 deferred: Vec::new(),
             },
         );
@@ -187,6 +189,39 @@ impl Engine {
         self.drop_conn(&peer);
         self.connect(&peer, true);
         Ok(contact)
+    }
+
+    /// Mark the contact as being paired (saved with it): if a restart interrupts the
+    /// pairing, the next start removes what it left (`State::forget_unfinished_pairings`).
+    fn mark_pairing(&mut self, peer: &str, new: bool) -> Contact {
+        let mark = if new {
+            PairingMark::New
+        } else {
+            PairingMark::Again
+        };
+        let contact = self
+            .state
+            .contacts
+            .iter_mut()
+            .find(|c| c.peer_id == peer)
+            .expect("the contact was just added or found");
+        // A pairing that replaces one still under way keeps what that one knew.
+        if contact.pairing != Some(PairingMark::New) {
+            contact.pairing = Some(mark);
+        }
+        contact.clone()
+    }
+
+    /// The pairing is over: take the mark off, and record a confirmed SAS. Returns the
+    /// contact when it changed.
+    fn unmark_pairing(&mut self, peer: &str, sas_verified: bool) -> Option<Contact> {
+        let contact = self.state.contacts.iter_mut().find(|c| c.peer_id == peer)?;
+        if contact.pairing.is_none() && (contact.sas_verified || !sas_verified) {
+            return None;
+        }
+        contact.pairing = None;
+        contact.sas_verified |= sas_verified;
+        Some(contact.clone())
     }
 
     /// A text sent while the pairing is under way: shown as queued, encrypted later.
@@ -309,7 +344,8 @@ impl Engine {
                     old.pairing.abort();
                     self.drop_deferred(peer, &mut old);
                 }
-                let (contact, new) = self.upsert_contact(peer, Some(hex::encode(ik)));
+                let (_, new) = self.upsert_contact(peer, Some(hex::encode(ik)));
+                let contact = self.mark_pairing(peer, new);
                 tracing::info!(peer = %crate::short_id(peer), "bootstrap authenticated (presenter side)");
                 self.pairings.insert(
                     peer.to_owned(),
@@ -318,7 +354,7 @@ impl Engine {
                         outbox: VecDeque::new(),
                         hint: false,
                         started: true,
-                        created_contact: new,
+                        created_contact: contact.pairing == Some(PairingMark::New),
                         deferred: Vec::new(),
                     },
                 );
@@ -329,6 +365,11 @@ impl Engine {
                 });
                 self.send_watch();
                 self.apply_pairing_outputs(peer, outputs);
+                // A binding sent before (to a contact that is being added again) was made
+                // under the session this one replaced, and the peer could not read it.
+                if let Some(c) = self.peers.get_mut(peer).and_then(|p| p.conn.as_mut()) {
+                    c.binding_sent = false;
+                }
                 self.send_binding(peer);
             }
             Err(reason) => {
@@ -468,6 +509,9 @@ impl Engine {
                 Err(_) => self.mark_message(peer, id, DeliveryState::Dropped),
             }
         }
+        if let Some(contact) = self.unmark_pairing(peer, sas_verified) {
+            self.emit(AppEvent::ContactUpdated(contact));
+        }
         self.persist_sessions();
         self.emit(AppEvent::PairingComplete {
             peer_id: peer.to_owned(),
@@ -506,6 +550,8 @@ impl Engine {
                 peer_id: peer.to_owned(),
             });
             self.send_watch();
+        } else if let Some(contact) = self.unmark_pairing(peer, false) {
+            self.emit(AppEvent::ContactUpdated(contact));
         }
         self.persist_sessions();
         self.emit(AppEvent::PairingFailed {

@@ -28,7 +28,7 @@ use zeroize::Zeroizing;
 pub use parolnet_store::KeychainKeyProvider;
 pub use parolnet_store::{KeyProvider, MemoryKeyProvider};
 
-use crate::{AppError, ChatMessage, Contact, DeliveryState, Direction};
+use crate::{AppError, ChatMessage, Contact, DeliveryState, Direction, PairingMark};
 
 /// Sender queue limits (as the PWA: `QUEUE_LIMITS` in `pwa/src/relay-profile.js`).
 pub const QUEUE_MAX_AGE_MS: u64 = 30 * 24 * 60 * 60 * 1000;
@@ -233,6 +233,50 @@ impl State {
         self.contacts.iter().find(|c| c.peer_id == peer_id)
     }
 
+    /// Clean up after pairings (PNP-003) that a restart interrupted. A pairing lives in
+    /// memory only, so a contact still marked as pairing was never finished: the session
+    /// stored for it is the bootstrap session (or a PNP-002 session the contact never saw
+    /// confirmed) and must not be used. A contact the pairing added goes, with everything
+    /// kept about it; a contact that was there before stays without a session, and what it
+    /// had waiting is marked dropped. True when something changed.
+    pub fn forget_unfinished_pairings(&mut self) -> bool {
+        let marked: Vec<(String, PairingMark)> = self
+            .contacts
+            .iter()
+            .filter_map(|c| c.pairing.map(|mark| (c.peer_id.clone(), mark)))
+            .collect();
+        for (peer, mark) in &marked {
+            self.sessions.remove(peer);
+            let _ = self.take_queue_for(peer);
+            match mark {
+                PairingMark::New => {
+                    self.contacts.retain(|c| &c.peer_id != peer);
+                    self.messages.remove(peer);
+                    self.transfers.retain(|t| &t.peer_id != peer);
+                }
+                PairingMark::Again => {
+                    if let Some(c) = self.contacts.iter_mut().find(|c| &c.peer_id == peer) {
+                        c.pairing = None;
+                    }
+                    let waiting: Vec<u64> = self
+                        .messages
+                        .get(peer)
+                        .into_iter()
+                        .flatten()
+                        .filter(|m| m.state == DeliveryState::Queued)
+                        .map(|m| m.id)
+                        .collect();
+                    for id in waiting {
+                        if let Some(m) = self.message_mut(peer, id) {
+                            m.state = DeliveryState::Dropped;
+                        }
+                    }
+                }
+            }
+        }
+        !marked.is_empty()
+    }
+
     pub fn alloc_message_id(&mut self) -> u64 {
         self.next_message_id += 1;
         self.next_message_id
@@ -247,6 +291,12 @@ fn contact_record(c: &Contact) -> ContactRecord {
         name: c.name.clone(),
         identity_key: c.identity_key.clone(),
         added_ms: c.added_ms,
+        sas_verified: c.sas_verified,
+        pairing: match c.pairing {
+            None => 0,
+            Some(PairingMark::New) => 1,
+            Some(PairingMark::Again) => 2,
+        },
     }
 }
 
@@ -256,6 +306,12 @@ fn contact_from(r: ContactRecord) -> Contact {
         name: r.name,
         identity_key: r.identity_key,
         added_ms: r.added_ms,
+        sas_verified: r.sas_verified,
+        pairing: match r.pairing {
+            0 => None,
+            1 => Some(PairingMark::New),
+            _ => Some(PairingMark::Again),
+        },
     }
 }
 
@@ -748,7 +804,75 @@ mod tests {
             name: "Pat".into(),
             identity_key: None,
             added_ms: 1,
+            sas_verified: false,
+            pairing: None,
         }
+    }
+
+    #[test]
+    fn a_restart_forgets_unfinished_pairings() {
+        let mut st = State::default();
+        assert!(!st.forget_unfinished_pairings());
+
+        // "new": the pairing added the contact. "old": it was a contact before.
+        let contact = |peer: &str, pairing| Contact {
+            peer_id: peer.into(),
+            pairing,
+            sas_verified: peer == "old",
+            ..pat()
+        };
+        st.contacts = vec![
+            contact("new", Some(PairingMark::New)),
+            contact("old", Some(PairingMark::Again)),
+            contact("p", None),
+        ];
+        for peer in ["new", "old", "p"] {
+            st.sessions.insert(peer.into(), "0a".into());
+            let id = st.alloc_message_id();
+            let m = msg(peer, id, "waiting");
+            st.push_message(m.clone());
+            st.enqueue(
+                QueuedEnvelope {
+                    peer_id: peer.into(),
+                    envelope: "00".into(),
+                    created_ms: 1,
+                    message_id: Some(m.id),
+                },
+                1,
+            );
+        }
+
+        assert!(st.forget_unfinished_pairings());
+        let ids: Vec<&str> = st.contacts.iter().map(|c| c.peer_id.as_str()).collect();
+        assert_eq!(ids, ["old", "p"]);
+        assert!(st.contacts.iter().all(|c| c.pairing.is_none()));
+        // A confirmed SAS is about the identity, not about one pairing: it stays.
+        assert!(st.contact("old").unwrap().sas_verified);
+        // Only the untouched contact keeps its session and its queue.
+        assert_eq!(st.sessions.keys().collect::<Vec<_>>(), ["p"]);
+        assert_eq!(st.queued_for("new") + st.queued_for("old"), 0);
+        assert_eq!(st.queued_for("p"), 1);
+        assert!(!st.messages.contains_key("new"));
+        assert_eq!(st.messages["old"][0].state, DeliveryState::Dropped);
+        assert_eq!(st.messages["p"][0].state, DeliveryState::Queued);
+        assert!(!st.forget_unfinished_pairings());
+
+        // The marks and the SAS flag survive the store.
+        let dir = tmp_dir("pairing-marks");
+        let keys = memory();
+        let store = Store::open(&dir, &keys).unwrap();
+        st.contacts.push(contact("new", Some(PairingMark::New)));
+        st.contacts.push(contact("again", Some(PairingMark::Again)));
+        store.save_state(&st).unwrap();
+        drop(store);
+        let back = Store::open(&dir, &keys).unwrap().load_state().unwrap();
+        let mark = |peer: &str| back.contact(peer).unwrap().pairing;
+        assert_eq!(mark("new"), Some(PairingMark::New));
+        assert_eq!(mark("again"), Some(PairingMark::Again));
+        assert_eq!(mark("p"), None);
+        assert!(back.contact("old").unwrap().sas_verified);
+        assert!(!back.contact("p").unwrap().sas_verified);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     fn tmp_dir(tag: &str) -> PathBuf {

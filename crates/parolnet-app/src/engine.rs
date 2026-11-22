@@ -405,7 +405,13 @@ pub(crate) async fn start(
     });
 
     let client = ParolNet::from_identity(ParolNetConfig::default(), identity);
-    let state = store.load_state()?;
+    let mut state = store.load_state()?;
+    // A pairing that a restart interrupted is over: its half-made contact and its session
+    // are removed before anything can use them.
+    if state.forget_unfinished_pairings() {
+        tracing::info!("removed what an unfinished pairing left behind");
+        store.save_state(&state)?;
+    }
     let mut sessions = Vec::with_capacity(state.sessions.len());
     for (pid, data) in &state.sessions {
         match (decode_32(pid), hex::decode(data)) {
@@ -704,6 +710,8 @@ impl Engine {
             name: self.default_name(peer),
             identity_key,
             added_ms: now_ms(),
+            sas_verified: false,
+            pairing: None,
         };
         self.state.contacts.push(contact.clone());
         (contact, true)

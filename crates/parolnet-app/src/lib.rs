@@ -190,6 +190,23 @@ pub struct Contact {
     /// identity rotation and safety numbers.
     pub identity_key: Option<String>,
     pub added_ms: u64,
+    /// Both users confirmed the verification code (the SAS of PNP-003 §5.5) when they
+    /// paired. Kept across later pairings with the same identity.
+    #[serde(default)]
+    pub sas_verified: bool,
+    /// A pairing with the contact is under way. It does not survive a restart: a contact
+    /// found with this mark at start is cleaned up (see `State::forget_unfinished_pairings`).
+    #[serde(default)]
+    pub pairing: Option<PairingMark>,
+}
+
+/// What a pairing under way means for its contact if it does not complete.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PairingMark {
+    /// The pairing added the contact: it goes again.
+    New,
+    /// The contact was there before: it stays, without a session.
+    Again,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
