@@ -157,7 +157,7 @@ impl RelayNode for StandardRelayNode {
                     &entry.keys.forward_nonce_seed,
                     entry.forward_counter,
                 )?;
-                entry.forward_counter += 1;
+                onion::next_counter(&mut entry.forward_counter)?;
 
                 match entry.next_hop {
                     Some((addr, next_cid)) => {

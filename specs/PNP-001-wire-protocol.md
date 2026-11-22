@@ -1,12 +1,17 @@
 # PNP-001: ParolNet Wire Protocol
 
 ### Status: CANDIDATE
-### Version: 0.15
+### Version: 0.16
 ### Date: 2026-11-21
 
 ---
 
 ## Changelog
+
+**v0.16 (2026-11-21) — Nonce catalog matches the session and sender-key layers**
+
+- §3.3 (**PNP-001-MUST-006**, same clause ID) and the `N-SESSION` row of §9 now state the nonce the session layer has used throughout and PNP-002 §5.7 already describes: the first 8 bytes of the message's ratchet public key followed by `msg_number` (4 bytes, big-endian). The former text (`chain_index (4B) || seq_number (8B)`) described no implementation and named counters that do not exist in the Double Ratchet state. The `N-SENDERKEY` row of §9 now agrees with PNP-009 §5.4: the first 8 bytes of `SHA-256(signing_public_key)` followed by `chain_index` (4 bytes, big-endian). No wire change.
+- §9 points to the limits of the counters that feed these nonces: PNP-002 §5.9, PNP-009 §5.9 and PNP-004 §5.1. No counter wraps.
 
 **v0.15 (2026-11-21) — Message type 0x15 FILE_TRANSFER**
 
@@ -216,10 +221,12 @@ Flags bitfield:
 The AEAD nonce for the session layer MUST be constructed per scheme `N-SESSION` defined in §9:
 
 ```
-nonce (12 bytes) = chain_index (4 bytes, big-endian) || seq_number (8 bytes, big-endian)
+nonce (12 bytes) = ratchet_public_key[0..8] (8 bytes) || msg_number (4 bytes, big-endian)
 ```
 
 **PNP-001-MUST-006**
+
+`ratchet_public_key` and `msg_number` are the fields of the message's ratchet header (§3.1). `msg_number` never reaches 2^24 and never wraps (PNP-002 §5.9), and every message is encrypted under a message key of its own, so no (key, nonce) pair repeats.
 
 The AEAD additional authenticated data (AAD) MUST be the concatenation of the encoded Double Ratchet header of the message (all three fields of the wire ratchet header, in the fixed 40-byte encoding of PNP-002 §5.7) followed by the serialized CBOR bytes of the cleartext header:
 
@@ -498,10 +505,12 @@ Multiple independently scoped AEAD contexts exist in the ParolNet stack. Each us
 
 | Scheme | Context | Construction | Size | Defined |
 |--------|---------|--------------|------|---------|
-| `N-SESSION` | Session-layer envelope AEAD (§3.3) | `chain_index (4B BE) \|\| seq_number (8B BE)` | 12 bytes | PNP-001 §3.3 |
+| `N-SESSION` | Session-layer envelope AEAD (§3.3) | `ratchet_public_key[0..8] \|\| msg_number (4B BE)` | 12 bytes | PNP-001 §3.3, PNP-002 §5.7 |
 | `N-HANDSHAKE` | PNP-002 X3DH-derived handshake AEAD | HKDF-SHA-256 of shared secret with context label | 12 bytes | PNP-002 §5.2 |
 | `N-ONION` | PNP-004 onion-layer AEAD (per hop) | `nonce_seed (12B) XOR counter (12B BE)` | 12 bytes | PNP-004 §5.1.5 |
-| `N-SENDERKEY` | PNP-009 group sender-key AEAD | `SHA-256(signing_public_key)[0..4] \|\| chain_index (8B BE)` | 12 bytes | PNP-009 §5.4 |
+| `N-SENDERKEY` | PNP-009 group sender-key AEAD | `SHA-256(signing_public_key)[0..8] \|\| chain_index (4B BE)` | 12 bytes | PNP-009 §5.4 |
+
+The counters in these constructions have limits, and none may wrap: `msg_number` in PNP-002 §5.9 (**PNP-002-MUST-045** to **MUST-048**), `chain_index` in PNP-009 §5.9 (**PNP-009-MUST-078** to **MUST-081**), the onion `counter` in PNP-004 §5.1 (**PNP-004-MUST-019**, **MUST-056**, **MUST-059**).
 
 Implementations MUST NOT construct an AEAD nonce by any scheme other than those listed here in the context specified. **PNP-001-MUST-047** Future nonce schemes MUST be added to this catalog in a future revision of PNP-001.
 

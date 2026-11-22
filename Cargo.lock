@@ -3114,6 +3114,7 @@ dependencies = [
 name = "parolnet-conformance"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "ciborium",
  "curve25519-dalek",
  "ed25519-dalek",

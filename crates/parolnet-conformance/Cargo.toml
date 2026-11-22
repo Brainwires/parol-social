@@ -26,7 +26,8 @@ hkdf = "0.13"
 
 [dev-dependencies]
 parolnet-clause = { path = "../parolnet-clause" }
-parolnet-crypto = { workspace = true }
+# `test-hooks`: state near a counter limit without 2^16 sends (PNP-009-MUST-078 to MUST-081).
+parolnet-crypto = { workspace = true, features = ["test-hooks"] }
 parolnet-protocol = { workspace = true }
 parolnet-transport = { workspace = true }
 parolnet-mesh = { workspace = true }
@@ -46,6 +47,8 @@ serde_json = { workspace = true }
 ciborium = { workspace = true }
 hex = { workspace = true }
 tokio = { workspace = true }
+# The mock guard connection of the PNP-004 counter tests implements `Connection`.
+async-trait = { workspace = true }
 rand = { workspace = true }
 rand_core = { workspace = true }
 x25519-dalek = { workspace = true }

@@ -6,6 +6,11 @@ license.workspace = true
 rust-version.workspace = true
 description = "Cryptographic primitives for ParolNet: X3DH, Double Ratchet, AEAD, deniable encryption"
 
+[features]
+# Test-only constructors for state near a counter limit (used by parolnet-conformance).
+# Never enable in a production build.
+test-hooks = []
+
 [dependencies]
 x25519-dalek.workspace = true
 ed25519-dalek.workspace = true

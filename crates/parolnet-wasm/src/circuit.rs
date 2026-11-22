@@ -339,6 +339,22 @@ pub fn process_extended(
 // WasmCircuit
 // ---------------------------------------------------------------------------
 
+/// Advance every counter of a direction by one cell, all or none, and return the values to
+/// use for this cell (PNP-004-MUST-059). A counter is never reset while its key lives and
+/// never wraps: if any is at `u32::MAX` none is moved and the circuit has to be destroyed.
+fn next_counters(counters: &mut [u32]) -> Result<Vec<u32>, String> {
+    if counters.contains(&u32::MAX) {
+        return Err("nonce counter overflow".into());
+    }
+    let current = counters.to_vec();
+    for c in counters.iter_mut() {
+        *c = c
+            .checked_add(1)
+            .ok_or_else(|| String::from("nonce counter overflow"))?;
+    }
+    Ok(current)
+}
+
 /// An established onion circuit with hop keys and counters.
 pub struct WasmCircuit {
     pub hop_keys: Vec<WasmHopKeys>,
@@ -352,16 +368,11 @@ pub struct WasmCircuit {
 impl WasmCircuit {
     /// Encrypt data with all onion layers for sending through the circuit.
     pub fn wrap_data(&mut self, data: &[u8]) -> Result<Vec<u8>, String> {
-        for c in &self.forward_counters {
-            if *c == u32::MAX {
-                return Err("nonce counter overflow".into());
-            }
-        }
-        let result = onion_encrypt(data, &self.hop_keys, &self.forward_counters)?;
-        for c in &mut self.forward_counters {
-            *c += 1;
-        }
-        Ok(result)
+        // One counter value per cell and per key, spent before the cell is built; at the
+        // limit nothing moves and the circuit has to be destroyed (PNP-004-MUST-019,
+        // MUST-056, MUST-059).
+        let cell_counters = next_counters(&mut self.forward_counters)?;
+        onion_encrypt(data, &self.hop_keys, &cell_counters)
     }
 
     /// Decrypt data received through the circuit (reverse direction).
@@ -372,9 +383,7 @@ impl WasmCircuit {
             }
         }
         let result = onion_decrypt(data, &self.hop_keys, &self.backward_counters)?;
-        for c in &mut self.backward_counters {
-            *c += 1;
-        }
+        next_counters(&mut self.backward_counters)?;
         Ok(result)
     }
 }
@@ -449,6 +458,8 @@ pub async fn build_circuit_impl(ws: &WasmWebSocket, ws_id: u32) -> Result<u32, S
     let created = WasmRelayCell::from_bytes(&buf)?;
     let guard_keys = process_created(&created, &secrets[0])?;
     hop_keys.push(guard_keys);
+    // Cells encrypted so far under each hop's forward key (PNP-004-MUST-059).
+    let mut forward_counters: Vec<u32> = vec![0];
 
     // --- Steps 2-3: EXTEND for middle and exit hops ---
     // In single-relay MVP mode we use a dummy PeerId for each hop.
@@ -462,9 +473,9 @@ pub async fn build_circuit_impl(ws: &WasmWebSocket, ws_id: u32) -> Result<u32, S
         // Onion-wrap the EXTEND payload through existing hops
         let payload_data = &ext_cell.payload[..ext_cell.payload_len as usize];
         // Wrap from innermost (last existing hop) to outermost (first hop)
-        let wrap_counters: Vec<u32> = (0..hop_keys.len())
-            .map(|i| i as u32 + (hop_idx as u32 - 1))
-            .collect();
+        // The EXTEND cell spends one counter value of every hop key it is wrapped under
+        // (PNP-004-MUST-059); the data phase carries on from there.
+        let wrap_counters = next_counters(&mut forward_counters)?;
         let encrypted = onion_encrypt(payload_data, &hop_keys, &wrap_counters)?;
 
         let mut wire_payload = [0u8; CELL_PAYLOAD_SIZE];
@@ -494,12 +505,14 @@ pub async fn build_circuit_impl(ws: &WasmWebSocket, ws_id: u32) -> Result<u32, S
         let extended = WasmRelayCell::from_bytes(&buf)?;
         let new_keys = process_extended(&extended, &ext_secret)?;
         hop_keys.push(new_keys);
+        forward_counters.push(0);
     }
 
     let n = hop_keys.len();
     let circuit = WasmCircuit {
         hop_keys,
-        forward_counters: vec![0; n],
+        // Not back to 0: the counters go on from the EXTEND cells (PNP-004-MUST-059).
+        forward_counters,
         backward_counters: vec![0; n],
         circuit_id,
         ws_id,
@@ -631,6 +644,8 @@ async fn build_circuit_proxy(proxy: &WasmWebSocketProxy, ws_id: u32) -> Result<u
     let created = WasmRelayCell::from_bytes(&buf)?;
     let guard_keys = process_created(&created, &secret)?;
     hop_keys.push(guard_keys);
+    // Cells encrypted so far under each hop's forward key (PNP-004-MUST-059).
+    let mut forward_counters: Vec<u32> = vec![0];
 
     // --- Steps 2-3: EXTEND for middle and exit hops ---
     for hop_idx in 1..REQUIRED_HOPS {
@@ -640,9 +655,9 @@ async fn build_circuit_proxy(proxy: &WasmWebSocketProxy, ws_id: u32) -> Result<u
         let (ext_cell, ext_secret) = extend_cell(circuit_id, &target_peer_id);
 
         let payload_data = &ext_cell.payload[..ext_cell.payload_len as usize];
-        let wrap_counters: Vec<u32> = (0..hop_keys.len())
-            .map(|i| i as u32 + (hop_idx as u32 - 1))
-            .collect();
+        // The EXTEND cell spends one counter value of every hop key it is wrapped under
+        // (PNP-004-MUST-059); the data phase carries on from there.
+        let wrap_counters = next_counters(&mut forward_counters)?;
         let encrypted = onion_encrypt(payload_data, &hop_keys, &wrap_counters)?;
 
         let mut wire_payload = [0u8; CELL_PAYLOAD_SIZE];
@@ -673,12 +688,14 @@ async fn build_circuit_proxy(proxy: &WasmWebSocketProxy, ws_id: u32) -> Result<u
         let extended = WasmRelayCell::from_bytes(&buf)?;
         let new_keys = process_extended(&extended, &ext_secret)?;
         hop_keys.push(new_keys);
+        forward_counters.push(0);
     }
 
     let n = hop_keys.len();
     let circuit = WasmCircuit {
         hop_keys,
-        forward_counters: vec![0; n],
+        // Not back to 0: the counters go on from the EXTEND cells (PNP-004-MUST-059).
+        forward_counters,
         backward_counters: vec![0; n],
         circuit_id,
         ws_id,
