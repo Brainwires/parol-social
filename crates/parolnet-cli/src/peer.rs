@@ -123,6 +123,32 @@ fn sign(identity: &IdentityKeyPair, message: &[u8]) -> ed25519_dalek::Signature 
     sk.sign(message)
 }
 
+/// The credentialed `register` frame that answers the relay's challenge
+/// `nonce_hex` (PNP-001 §10.7). The signature covers the register message,
+/// which names the relay at `relay_url`: it is valid at that relay only.
+pub fn register_answer(
+    identity: &IdentityKeyPair,
+    relay_url: &str,
+    nonce_hex: &str,
+) -> Result<serde_json::Value> {
+    use parolnet_protocol::relay_auth::{REGISTER_NONCE_LEN, RelayName, register_signable};
+    let nonce: [u8; REGISTER_NONCE_LEN] = hex::decode(nonce_hex)
+        .context("challenge nonce hex")?
+        .try_into()
+        .map_err(|_| anyhow!("challenge nonce is not 32 bytes"))?;
+    let relay = RelayName::from_url(relay_url).map_err(|e| anyhow!("relay URL: {e}"))?;
+    let sig = sign(identity, &register_signable(&nonce, &relay, None));
+    let public_key = identity.public_key_bytes();
+    Ok(serde_json::json!({
+        "type": "register",
+        "peer_id": hex::encode(PeerId::from_public_key(&public_key).0),
+        "pubkey": hex::encode(public_key),
+        "signature": hex::encode(sig.to_bytes()),
+        "nonce": nonce_hex,
+        "relay": relay.as_str(),
+    }))
+}
+
 fn now_ms() -> u64 {
     use std::time::{SystemTime, UNIX_EPOCH};
     SystemTime::now()
@@ -210,15 +236,7 @@ async fn run_peer_task(
                             "challenge" => {
                                 let nonce_hex = v.get("nonce").and_then(|s| s.as_str())
                                     .ok_or_else(|| anyhow!("challenge missing nonce"))?;
-                                let nonce = hex::decode(nonce_hex)?;
-                                let sig = sign(&identity, &nonce);
-                                let reg = serde_json::json!({
-                                    "type":"register",
-                                    "peer_id": peer_hex,
-                                    "pubkey": hex::encode(identity.public_key_bytes()),
-                                    "signature": hex::encode(sig.to_bytes()),
-                                    "nonce": nonce_hex,
-                                });
+                                let reg = register_answer(&identity, relay_url, nonce_hex)?;
                                 write.send(Message::Text(reg.to_string().into())).await?;
                             }
                             "registered" => {

@@ -511,6 +511,11 @@ function swConnectRelay() {
             }
             // Pongs are purely for liveness; no app handling needed.
             if (msg.type === 'pong') return;
+            // PNP-001 §10.7: the page signs its answer to a challenge for the
+            // relay this socket was opened to. Only this worker knows which
+            // one that is, so it says so here; whatever the relay put in the
+            // field is replaced.
+            if (msg.type === 'challenge') msg.relay_endpoint = swRelayEndpoint(relayWs && relayWs.url);
             swBroadcastOrBuffer(msg);
         } catch(e) {}
     };
@@ -525,6 +530,21 @@ function swConnectRelay() {
     };
 
     relayWs.onerror = () => {};
+}
+
+// The host and port a relay WebSocket URL points at, as the URL parser the
+// socket itself used reads it; a URL without a port has its scheme's default.
+// null when the URL is not a plain ws: / wss: URL.
+function swRelayEndpoint(url) {
+    try {
+        const u = new URL(url);
+        if (u.protocol !== 'wss:' && u.protocol !== 'ws:') return null;
+        if (u.username !== '' || u.password !== '' || u.hostname === '') return null;
+        const port = u.port !== '' ? Number(u.port) : (u.protocol === 'wss:' ? 443 : 80);
+        return { host: u.hostname, port };
+    } catch {
+        return null;
+    }
 }
 
 function swScheduleReconnect() {
@@ -675,7 +695,8 @@ self.addEventListener('message', event => {
                     peer_id: d.peerId,
                     pubkey: d.pubkey,
                     signature: d.signature,
-                    nonce: d.nonce
+                    nonce: d.nonce,
+                    relay: d.relay
                 }));
             }
             break;

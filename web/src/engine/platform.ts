@@ -37,8 +37,17 @@ export interface WasmApi {
   get_peer_id(): string;
   /** Ed25519 public key, hex. */
   get_public_key(): string;
-  /** Ed25519 signature (hex) over the hex-decoded bytes. */
-  sign_bytes(dataHex: string): string;
+  /**
+   * The canonical name (`host:port`) of the relay at a host and port (PNP-001 §10.7).
+   * Throws when the host is not one a relay can have.
+   */
+  relay_name(host: string, port: number): string;
+  /**
+   * The answer to a relay's register challenge: the Ed25519 signature (hex) over the
+   * register message for the 32-byte nonce and the relay's canonical name. Valid at that
+   * relay only.
+   */
+  sign_relay_register(nonceHex: string, relayName: string): string;
   /** Encrypt for a peer and pad to a bucket; returns the envelope hex. Advances the ratchet. */
   envelope_encode(
     destPeerIdHex: string,

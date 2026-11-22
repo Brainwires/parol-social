@@ -300,10 +300,19 @@ export function handleRelayMessage(msg) {
     console.log('[Relay] ←', msg && msg.type);
     switch (msg.type) {
         case 'challenge':
-            // Relay requires challenge-response auth: sign the nonce with our Ed25519 key
-            if (msg.nonce && wasm && wasm.sign_bytes && wasm.get_public_key) {
+            // Relay requires challenge-response auth. The answer is signed with
+            // our Ed25519 key for the relay the service worker's socket was
+            // opened to (`relay_endpoint`, set by the worker, PNP-001 §10.7):
+            // it is of no use to a relay that passes on another relay's nonce.
+            if (msg.nonce && wasm && wasm.sign_relay_register && wasm.relay_name && wasm.get_public_key) {
                 try {
-                    const signature = wasm.sign_bytes(msg.nonce);
+                    const ep = msg.relay_endpoint;
+                    if (!ep || typeof ep.host !== 'string' || !Number.isInteger(ep.port)) {
+                        console.warn('[Auth] Challenge without the relay it came from; not signing');
+                        return { delivered: true };
+                    }
+                    const relay = wasm.relay_name(ep.host, ep.port);
+                    const signature = wasm.sign_relay_register(msg.nonce, relay);
                     const pubkey = wasm.get_public_key();
                     const peerId = window._peerId;
                     connMgr._swPost({
@@ -311,7 +320,8 @@ export function handleRelayMessage(msg) {
                         peerId,
                         pubkey,
                         signature,
-                        nonce: msg.nonce
+                        nonce: msg.nonce,
+                        relay
                     });
                     console.log('[Auth] Challenge signed, sending authenticated register');
                     return { delivered: true };
@@ -320,7 +330,7 @@ export function handleRelayMessage(msg) {
                     return { delivered: false, reason: 'sign-failed' };
                 }
             } else {
-                console.warn('[Auth] Cannot sign challenge — WASM not ready or missing sign_bytes');
+                console.warn('[Auth] Cannot sign challenge — WASM not ready or missing sign_relay_register');
                 return { delivered: false, reason: 'wasm-not-ready' };
             }
 

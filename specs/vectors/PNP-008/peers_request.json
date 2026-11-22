@@ -1,0 +1,24 @@
+{
+  "clauses": ["PNP-008-MUST-100"],
+  "description": "Authenticated /peers/* request (PNP-008 §10.8.1). The requester holds the Ed25519 secret key `secret_key` and asks the relay it dials at `relay_url`, at Unix time `timestamp`. `message` is the signed bytes (label || kind || timestamp || target || name_len || name), `signature` the Ed25519 signature over them and `authorization` the header value.",
+  "input": {
+    "secret_key": "0707070707070707070707070707070707070707070707070707070707070707",
+    "relay_url": "https://relay.example/",
+    "timestamp": 1800000000,
+    "lookup_target": "4242424242424242424242424242424242424242424242424242424242424242"
+  },
+  "expected": {
+    "public_key": "ea4a6c63e29c520abef5507b132ec5f9954776aebebe7b92421eea691446d22c",
+    "relay_name": "relay.example:443",
+    "presence": {
+      "message": "504e502d3030382d70656572732d726571756573742d763101000000006b49d2000000000000000000000000000000000000000000000000000000000000000000001172656c61792e6578616d706c653a343433",
+      "signature": "08ac364fdb85d487c7ff9d75f341e1b045626e0e3a2af9b71faace3bd44b32a8fec3f57e224c833f5d6bfd2eda39f4ff704706f8e20365cca57b24d8bce13e04",
+      "authorization": "PNP-Ed25519 key=ea4a6c63e29c520abef5507b132ec5f9954776aebebe7b92421eea691446d22c,ts=1800000000,relay=relay.example:443,sig=08ac364fdb85d487c7ff9d75f341e1b045626e0e3a2af9b71faace3bd44b32a8fec3f57e224c833f5d6bfd2eda39f4ff704706f8e20365cca57b24d8bce13e04"
+    },
+    "lookup": {
+      "message": "504e502d3030382d70656572732d726571756573742d763102000000006b49d2004242424242424242424242424242424242424242424242424242424242424242001172656c61792e6578616d706c653a343433",
+      "signature": "0c77494d859eddc2ec03a33a18ff6cdee1adc567803cbdcb75b2c8141d3b57749f2dbed14200de018aaacc62736d2640e4f63266c50a782d1852d9ce24e93801",
+      "authorization": "PNP-Ed25519 key=ea4a6c63e29c520abef5507b132ec5f9954776aebebe7b92421eea691446d22c,ts=1800000000,relay=relay.example:443,sig=0c77494d859eddc2ec03a33a18ff6cdee1adc567803cbdcb75b2c8141d3b57749f2dbed14200de018aaacc62736d2640e4f63266c50a782d1852d9ce24e93801"
+    }
+  }
+}

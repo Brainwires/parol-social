@@ -349,21 +349,8 @@ async fn demo_presenter(
         match v.get("type").and_then(|s| s.as_str()).unwrap_or("") {
             "challenge" => {
                 let nonce_hex = v.get("nonce").and_then(|s| s.as_str()).unwrap();
-                let nonce = hex::decode(nonce_hex)?;
-                let sig = sign_with_identity(&identity, &nonce);
-                write
-                    .send(Message::Text(
-                        serde_json::json!({
-                            "type":"register",
-                            "peer_id":our_peer_hex,
-                            "pubkey":hex::encode(identity.public_key_bytes()),
-                            "signature":hex::encode(sig.to_bytes()),
-                            "nonce":nonce_hex,
-                        })
-                        .to_string()
-                        .into(),
-                    ))
-                    .await?;
+                let reg = peer::register_answer(&identity, relay_url, nonce_hex)?;
+                write.send(Message::Text(reg.to_string().into())).await?;
                 tracing::info!("[P] sent auth register");
             }
             "registered" => tracing::info!("[P] registered"),
@@ -486,15 +473,7 @@ async fn run_present(relay_url: &str, http_base: &str) -> Result<()> {
                             .and_then(|s| s.as_str())
                             .ok_or_else(|| anyhow!("challenge missing nonce"))?
                             .to_string();
-                        let nonce = hex::decode(&nonce_hex).context("challenge nonce hex")?;
-                        let sig = sign_with_identity(&identity, &nonce);
-                        let reg = serde_json::json!({
-                            "type": "register",
-                            "peer_id": our_peer_hex,
-                            "pubkey": hex::encode(identity.public_key_bytes()),
-                            "signature": hex::encode(sig.to_bytes()),
-                            "nonce": nonce_hex,
-                        });
+                        let reg = peer::register_answer(&identity, relay_url, &nonce_hex)?;
                         write.send(Message::Text(reg.to_string().into())).await?;
                         tracing::info!("signed + sent authenticated register");
                     }

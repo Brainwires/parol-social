@@ -333,6 +333,79 @@ pub fn sign_bytes(data_hex: &str) -> Result<String, JsError> {
     Ok(hex::encode(sig.to_bytes()))
 }
 
+/// Sign `message` with the identity key; the copy of the secret is wiped.
+fn sign_with_identity(message: &[u8]) -> Result<[u8; 64], JsError> {
+    use ed25519_dalek::Signer;
+    let state = STATE.lock().unwrap_or_else(|e| e.into_inner());
+    let client = state
+        .client
+        .as_ref()
+        .ok_or_else(|| JsError::new("not initialized"))?;
+    let secret = zeroize::Zeroizing::new(client.export_identity_secret());
+    let signing_key = ed25519_dalek::SigningKey::from_bytes(&secret);
+    Ok(signing_key.sign(message).to_bytes())
+}
+
+/// The canonical name of the relay at `host` and `port` (PNP-001 §10.7):
+/// `host:port`, lowercase, the port always present. Pass the `hostname` of
+/// the relay URL as the browser's `URL` parser reports it, and the URL's
+/// port or its scheme's default (443 for `wss:`, 80 for `ws:`). Throws when
+/// the host is not a name a relay can have.
+#[wasm_bindgen]
+pub fn relay_name(host: &str, port: u16) -> Result<String, JsError> {
+    parolnet_protocol::relay_auth::RelayName::from_host_port(host, port)
+        .map(|n| n.as_str().to_owned())
+        .map_err(|e| JsError::new(&e.to_string()))
+}
+
+/// Answer a relay's register challenge (PNP-001 §10.7): the Ed25519
+/// signature, as hex, over the register message for `nonce_hex` (the 32-byte
+/// challenge) and `relay_name` (the canonical name of the relay this client
+/// dialed, from [`relay_name`]). The signature is valid at that relay only.
+#[wasm_bindgen]
+pub fn sign_relay_register(nonce_hex: &str, relay_name: &str) -> Result<String, JsError> {
+    use parolnet_protocol::relay_auth::{REGISTER_NONCE_LEN, RelayName, register_signable};
+    let nonce: [u8; REGISTER_NONCE_LEN] = hex::decode(nonce_hex)
+        .map_err(|e| JsError::new(&format!("invalid nonce hex: {e}")))?
+        .try_into()
+        .map_err(|_| JsError::new("the challenge nonce must be 32 bytes"))?;
+    let relay = RelayName::parse(relay_name).map_err(|e| JsError::new(&e.to_string()))?;
+    let signature = sign_with_identity(&register_signable(&nonce, &relay, None))?;
+    Ok(hex::encode(signature))
+}
+
+/// The `Authorization` header value for `GET /peers/lookup?id=<target>` at
+/// the relay named `relay_name` (PNP-008 §10.8), signed with the identity
+/// key. `now_secs` is the current Unix time.
+#[wasm_bindgen]
+pub fn peers_lookup_authorization(
+    relay_name: &str,
+    target_peer_id_hex: &str,
+    now_secs: u64,
+) -> Result<String, JsError> {
+    use parolnet_protocol::relay_auth::{
+        PeersAuthorization, PeersRequest, RelayName, peers_request_signable,
+    };
+    let relay = RelayName::parse(relay_name).map_err(|e| JsError::new(&e.to_string()))?;
+    let target: [u8; 32] = hex::decode(target_peer_id_hex)
+        .map_err(|e| JsError::new(&format!("invalid peer id hex: {e}")))?
+        .try_into()
+        .map_err(|_| JsError::new("a peer id must be 32 bytes"))?;
+    let request = PeersRequest::Lookup(parolnet_protocol::address::PeerId(target));
+    let key: [u8; 32] = hex::decode(get_public_key())
+        .ok()
+        .and_then(|k| k.try_into().ok())
+        .ok_or_else(|| JsError::new("not initialized"))?;
+    let signature = sign_with_identity(&peers_request_signable(request, now_secs, &relay))?;
+    Ok(PeersAuthorization {
+        key,
+        timestamp: now_secs,
+        relay,
+        signature,
+    }
+    .to_header())
+}
+
 // ── Session Management ──────────────────────────────────────
 
 /// Establish a Double Ratchet session with a peer.
@@ -1974,6 +2047,59 @@ pub fn get_authority_pubkeys() -> JsValue {
 #[wasm_bindgen]
 pub fn get_authority_threshold() -> usize {
     federation::AUTHORITY_THRESHOLD
+}
+
+/// The bytes an authority signs to endorse a relay descriptor
+/// (PNP-008-MUST-002), as hex: the deterministic CBOR encoding of the
+/// descriptor, the relay's own signature included.
+///
+/// `descriptor` is an object with the descriptor's fields: `peer_id`,
+/// `identity_key`, `x25519_key` and `signature` as hex strings, `addr` as
+/// `"ip:port"`, `next_pubkey` as a hex string or null, and the numeric
+/// fields as numbers. Pair the result with [`verify_authority_signature`].
+#[wasm_bindgen]
+pub fn descriptor_endorsement_message(descriptor: JsValue) -> Result<String, JsError> {
+    #[derive(serde::Deserialize)]
+    struct Fields {
+        peer_id: String,
+        identity_key: String,
+        x25519_key: String,
+        addr: String,
+        bandwidth_class: u8,
+        uptime_secs: u64,
+        timestamp: u64,
+        signature: String,
+        bandwidth_estimate: u64,
+        next_pubkey: Option<String>,
+    }
+    fn bytes<const N: usize>(name: &str, hex_str: &str) -> Result<[u8; N], JsError> {
+        hex::decode(hex_str)
+            .ok()
+            .and_then(|b| b.try_into().ok())
+            .ok_or_else(|| JsError::new(&format!("{name} must be {N} bytes of hex")))
+    }
+    let f: Fields = serde_wasm_bindgen::from_value(descriptor)
+        .map_err(|e| JsError::new(&format!("invalid descriptor: {e}")))?;
+    let descriptor = federation::RelayDescriptor {
+        peer_id: parolnet_protocol::address::PeerId(bytes("peer_id", &f.peer_id)?),
+        identity_key: bytes("identity_key", &f.identity_key)?,
+        x25519_key: bytes("x25519_key", &f.x25519_key)?,
+        addr: f
+            .addr
+            .parse()
+            .map_err(|_| JsError::new("addr must be ip:port"))?,
+        bandwidth_class: f.bandwidth_class,
+        uptime_secs: f.uptime_secs,
+        timestamp: f.timestamp,
+        signature: bytes("signature", &f.signature)?,
+        bandwidth_estimate: f.bandwidth_estimate,
+        next_pubkey: f
+            .next_pubkey
+            .as_deref()
+            .map(|k| bytes("next_pubkey", k))
+            .transpose()?,
+    };
+    Ok(hex::encode(descriptor.endorsement_signable_bytes()))
 }
 
 /// Verify a raw Ed25519 signature against an authority public key.

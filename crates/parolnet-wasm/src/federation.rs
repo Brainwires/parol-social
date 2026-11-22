@@ -40,13 +40,13 @@ mod sig_bytes {
     }
 }
 
-/// A single authority's endorsement of a relay (mirror of `parolnet_relay::authority::AuthorityEndorsement`).
+/// A single authority's endorsement of one relay descriptor (mirror of
+/// `parolnet_relay::authority::AuthorityEndorsement`). The signature covers
+/// the whole descriptor, the relay's own signature included
+/// (PNP-008-MUST-002).
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AuthorityEndorsement {
     pub authority_pubkey: [u8; 32],
-    pub relay_peer_id: PeerId,
-    pub endorsed_at: u64,
-    pub expires_at: u64,
     #[serde(with = "sig_bytes")]
     pub signature: [u8; 64],
 }
@@ -92,27 +92,15 @@ struct DirectorySignableContent<'a> {
 }
 
 impl AuthorityEndorsement {
-    /// SHA-256 hash of (relay_peer_id || endorsed_at || expires_at).
-    pub fn signable_bytes(&self) -> Vec<u8> {
-        let mut hasher = Sha256::new();
-        hasher.update(self.relay_peer_id.0);
-        hasher.update(self.endorsed_at.to_be_bytes());
-        hasher.update(self.expires_at.to_be_bytes());
-        hasher.finalize().to_vec()
-    }
-
-    /// Verify the endorsement signature.
-    pub fn verify(&self) -> Result<bool, String> {
+    /// Whether this is `authority_pubkey`'s signature over `descriptor`
+    /// (PNP-008-MUST-002).
+    pub fn verify(&self, descriptor: &RelayDescriptor) -> Result<bool, String> {
         let verifying_key = VerifyingKey::from_bytes(&self.authority_pubkey)
             .map_err(|e| format!("invalid authority pubkey: {e}"))?;
         let signature = Signature::from_bytes(&self.signature);
-        let signable = self.signable_bytes();
-        Ok(verifying_key.verify(&signable, &signature).is_ok())
-    }
-
-    /// Check whether this endorsement has expired.
-    pub fn is_expired(&self, now_secs: u64) -> bool {
-        now_secs >= self.expires_at
+        Ok(verifying_key
+            .verify(&descriptor.endorsement_signable_bytes(), &signature)
+            .is_ok())
     }
 }
 
@@ -151,6 +139,15 @@ impl RelayDescriptor {
         buf
     }
 
+    /// The bytes an authority signs to endorse this descriptor
+    /// (PNP-008-MUST-002): its deterministic CBOR encoding, the relay's own
+    /// signature included (mirror of
+    /// `parolnet_relay::directory::RelayDescriptor::endorsement_signable_bytes`).
+    pub fn endorsement_signable_bytes(&self) -> Vec<u8> {
+        parolnet_protocol::det_cbor::to_deterministic_cbor(self)
+            .expect("a relay descriptor always encodes as CBOR")
+    }
+
     /// Whether this descriptor is its relay's own statement (PNP-008-MUST-027
     /// item 1): `peer_id` is the hash of `identity_key`, and `signature` is that
     /// key's over [`Self::signable_bytes`].
@@ -173,9 +170,8 @@ impl RelayDescriptor {
 impl EndorsedDescriptor {
     /// Validate the descriptor (PNP-008-MUST-027: its relay's signature by the
     /// key its PeerId is the hash of, and its age) and check that at least
-    /// `threshold` valid, non-expired endorsements of it exist from distinct
-    /// authorities in the trusted set. An endorsement names a PeerId only, so
-    /// the descriptor checks are what tie it to these keys and this address.
+    /// `threshold` distinct authorities of the trusted set signed this very
+    /// descriptor (PNP-008-MUST-002).
     pub fn verify_threshold(
         &self,
         authority_pubkeys: &[[u8; 32]],
@@ -195,13 +191,7 @@ impl EndorsedDescriptor {
             if !authority_pubkeys.contains(&endorsement.authority_pubkey) {
                 continue;
             }
-            if endorsement.is_expired(now_secs) {
-                continue;
-            }
-            if !endorsement.verify()? {
-                continue;
-            }
-            if endorsement.relay_peer_id != self.descriptor.peer_id {
+            if !endorsement.verify(&self.descriptor)? {
                 continue;
             }
             if !valid_authorities.contains(&endorsement.authority_pubkey) {
@@ -265,10 +255,10 @@ mod tests {
         d
     }
 
-    /// An endorsement names a PeerId; it must not carry over to a descriptor that
-    /// claims that PeerId with other keys or another address (PNP-008-MUST-027).
+    /// An endorsement is for one descriptor (PNP-008-MUST-002); it must not carry
+    /// over to a descriptor with other keys or another address (PNP-008-MUST-027).
     #[test]
-    fn endorsement_does_not_carry_to_a_forged_descriptor() {
+    fn endorsement_does_not_carry_to_another_descriptor() {
         let authority = SigningKey::from_bytes(&[1; 32]);
         let trusted = [authority.verifying_key().to_bytes()];
         let relay = SigningKey::from_bytes(&[7; 32]);
@@ -276,14 +266,11 @@ mod tests {
         let now = 1_800_000_000;
 
         let genuine = descriptor(&relay, "198.51.100.7:443", now);
-        let mut endorsement = AuthorityEndorsement {
+        let endorse = |d: &RelayDescriptor| AuthorityEndorsement {
             authority_pubkey: trusted[0],
-            relay_peer_id: genuine.peer_id,
-            endorsed_at: now,
-            expires_at: now + 86400,
-            signature: [0u8; 64],
+            signature: authority.sign(&d.endorsement_signable_bytes()).to_bytes(),
         };
-        endorsement.signature = authority.sign(&endorsement.signable_bytes()).to_bytes();
+        let endorsement = endorse(&genuine);
         let accepted = |descriptor: RelayDescriptor, at: u64| {
             EndorsedDescriptor {
                 descriptor,
@@ -303,8 +290,32 @@ mod tests {
         moved.addr = "203.0.113.66:443".parse().unwrap();
         assert!(!accepted(moved, now));
 
-        // MUST-027 item 3: older than seven days.
+        // The relay's own, validly signed descriptor at another address: the
+        // endorsement was not made for it.
+        let relocated = descriptor(&relay, "203.0.113.66:443", now);
+        assert!(relocated.verify_self_signature());
+        assert!(!accepted(relocated, now));
+
+        // MUST-027 item 3: older than seven days, even when endorsed as such.
         let old = descriptor(&relay, "198.51.100.7:443", now - 7 * 86400);
-        assert!(!accepted(old, now));
+        let old = EndorsedDescriptor {
+            endorsements: vec![endorse(&old)],
+            descriptor: old,
+        };
+        assert!(!old.verify_threshold(&trusted, 1, now).unwrap());
+    }
+
+    /// The native relay crate and this mirror sign and verify the same bytes:
+    /// the encoding does not depend on either crate's field order.
+    #[test]
+    fn endorsement_bytes_are_the_deterministic_cbor_of_the_descriptor() {
+        let relay = SigningKey::from_bytes(&[7; 32]);
+        let d = descriptor(&relay, "198.51.100.7:443", 1_800_000_000);
+        let bytes = d.endorsement_signable_bytes();
+        let back: RelayDescriptor = ciborium::from_reader(bytes.as_slice()).unwrap();
+        assert_eq!(back.endorsement_signable_bytes(), bytes);
+        // A map of the ten descriptor fields, shortest key first.
+        assert_eq!(bytes[0], 0xaa);
+        assert_eq!(&bytes[1..6], b"\x64addr");
     }
 }
