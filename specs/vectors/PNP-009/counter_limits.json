@@ -1,0 +1,10 @@
+{
+  "clauses": ["PNP-009-MUST-078", "PNP-009-MUST-079", "PNP-009-MUST-080", "PNP-009-MUST-082", "PNP-009-MUST-083"],
+  "description": "PNP-009 counter limits. A sender key chain carries MAX_SENDER_CHAIN_LENGTH = 2^16 messages (§5.9): chain indexes run from 0 to 2^16 - 1, in a SenderKeyMessage and in a SenderKeyDistribution. A group version is at most MAX_GROUP_VERSION = 2^53 - 1 (§6.4). Versions are decimal strings: some are not exact as JSON numbers.",
+  "max_sender_chain_length": 65536,
+  "accepted_chain_indexes": [0, 1, 65535],
+  "rejected_chain_indexes": [65536, 65537, 4294967295],
+  "max_group_version": "9007199254740991",
+  "accepted_group_versions": ["1", "9007199254740991"],
+  "rejected_group_versions": ["9007199254740992", "18446744073709551615"]
+}

@@ -30,6 +30,7 @@ import {
   parseIcePayload,
   parseSdpPayload,
   parseServerFrame,
+  relayEndpoint,
   shouldInitiate,
 } from "../../src/engine/wire.ts";
 import { FakeClock } from "./harness/fakes.ts";
@@ -113,6 +114,50 @@ Deno.test("safety number: the PNP-002 §10 vector", async () => {
   assertEquals(expected, "0203903273 2487506436 7022175877 9751782849 2461095953 2148788959");
   assertEquals(wasm.safety_number(a, b), expected);
   assertEquals(wasm.safety_number(b, a), expected);
+});
+
+Deno.test("register answer: the PNP-001 §10.7 vector", async () => {
+  const wasm = await newWasm();
+  const v = JSON.parse(
+    await Deno.readTextFile(
+      new URL("../../../specs/vectors/PNP-001/relay_register.json", import.meta.url),
+    ),
+  );
+  wasm.initialize_from_key(v.input.secret_key);
+  assertEquals(wasm.get_public_key(), v.expected.public_key);
+  // The name comes from the URL the socket is opened with.
+  const { host, port } = relayEndpoint(v.input.relay_url);
+  const name = wasm.relay_name(host, port);
+  assertEquals(name, v.expected.relay_name);
+  // Ed25519 is deterministic: the signature over the register message is the vector's.
+  assertEquals(wasm.sign_relay_register(v.input.nonce, name), v.expected.signature);
+  // Another relay, another signature; a name that is not canonical, or a nonce that is
+  // not 32 bytes, is not signed at all.
+  assert(wasm.sign_relay_register(v.input.nonce, "relay.example:443") !== v.expected.signature);
+  assertThrows(() => wasm.sign_relay_register(v.input.nonce, "Parol.Social:443"));
+  assertThrows(() => wasm.sign_relay_register(v.input.nonce, "parol.social"));
+  assertThrows(() => wasm.sign_relay_register("00ff", name));
+});
+
+Deno.test("wire: the endpoint of a relay URL", () => {
+  assertEquals(relayEndpoint("wss://Parol.Social/ws"), { host: "parol.social", port: 443 });
+  assertEquals(relayEndpoint("wss://parol.social:443/ws"), { host: "parol.social", port: 443 });
+  assertEquals(relayEndpoint("ws://relay.test/ws"), { host: "relay.test", port: 80 });
+  assertEquals(relayEndpoint("ws://127.0.0.1:9000/ws"), { host: "127.0.0.1", port: 9000 });
+  assertEquals(relayEndpoint("wss://[::1]:8443/ws"), { host: "[::1]", port: 8443 });
+  // What the URL parser reads as the host is what the socket connects to.
+  assertEquals(relayEndpoint("wss://relay.test\\@evil.test/ws").host, "relay.test");
+  for (
+    const url of [
+      "https://relay.test/ws",
+      "wss://user@relay.test/ws",
+      "wss://user:pw@relay.test/ws",
+      "relay.test:443",
+      "",
+    ]
+  ) {
+    assertThrows(() => relayEndpoint(url), Error, undefined, url);
+  }
 });
 
 Deno.test("wire: relay frames", () => {

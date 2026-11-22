@@ -480,6 +480,8 @@ impl Engine {
             .is_some_and(Conn::is_verified)
         {
             self.set_path(peer, PathState::Direct);
+            // What a transfer owed the contact while the pairing was under way.
+            self.transfers_on_verified(peer);
         }
         self.flush_queue(peer);
         self.flush_call_signals(peer);

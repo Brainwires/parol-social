@@ -2,8 +2,12 @@
 //
 // When the PWA wants to send to a peer that doesn't live on its own home
 // relay, it first has to find out which relay the peer *is* connected to.
-// The PWA's home relay exposes `GET /peers/lookup?id=<hex>` for exactly
-// this purpose (PNP-008-MUST-064). The response is Ed25519-signed by the
+// The PWA's home relay (relay profile only) exposes
+// `GET /peers/lookup?id=<hex>` for exactly this purpose (PNP-008-MUST-064),
+// to peers registered on it: the request carries an `Authorization` header
+// signed with our identity key for that relay and that PeerId (PNP-008
+// §10.8). A signaling-only relay does not serve the endpoint at all. The
+// response is Ed25519-signed by the
 // relay that actually hosts the peer — the signature binds
 // `(relay_peer_id, peer_id, last_seen)` together, so a compromised
 // intermediate relay can't steer traffic to a different URL without
@@ -295,12 +299,31 @@ function _sha256Sync(data) {
     return out;
 }
 
+// The `Authorization` header for a lookup of `peerIdHex` at the relay whose
+// HTTP base is `httpBase`: our identity key's signature over the request,
+// the relay's canonical name and the current time (PNP-008 §10.8). null when
+// the wasm core cannot make one.
+async function _lookupAuthorization(httpBase, peerIdHex) {
+    try {
+        if (_inj.authorizeFn) return await _inj.authorizeFn(httpBase, peerIdHex);
+        const state = await _getState();
+        const wasm = state && state.wasm;
+        if (!wasm || !wasm.peers_lookup_authorization || !wasm.relay_name) return null;
+        const u = new URL(httpBase);
+        const port = u.port !== '' ? Number(u.port) : (u.protocol === 'https:' ? 443 : 80);
+        const relay = wasm.relay_name(u.hostname, port);
+        return wasm.peers_lookup_authorization(relay, peerIdHex, BigInt(Math.floor(Date.now() / 1000)));
+    } catch (_) {
+        return null;
+    }
+}
+
 /**
  * Resolve the home-relay URL for `peerIdHex`. See module-level comment
  * for semantics.
  *
  * Overridable injection seams (exposed for tests):
- *   - `_inject({ fetchFn, verifyFn, homeRelayUrl, verifiedDirectory })`
+ *   - `_inject({ fetchFn, verifyFn, homeRelayUrl, verifiedDirectory, authorizeFn })`
  *
  * @param {string} peerIdHex - 64-char lowercase hex (32-byte PeerId).
  * @returns {Promise<string|null>}
@@ -323,10 +346,16 @@ export async function lookupHomeRelay(peerIdHex) {
     if (!httpBase) return null;
     const url = httpBase + '/peers/lookup?id=' + encodeURIComponent(key);
 
+    // The relay answers only a peer registered on it (PNP-008 §10.8). Without
+    // credentials the request is still sent and refused with 401.
+    const headers = { 'Accept': 'application/cbor' };
+    const authorization = await _lookupAuthorization(httpBase, key);
+    if (authorization) headers['Authorization'] = authorization;
+
     let resp;
     try {
         const fetchFn = _inj.fetchFn || fetch;
-        resp = await fetchFn(url, { headers: { 'Accept': 'application/cbor' } });
+        resp = await fetchFn(url, { headers });
     } catch (_) {
         return null;
     }
@@ -476,6 +505,7 @@ const _inj = {
     verifyFn: null,
     homeRelayUrl: null,
     verifiedDirectory: null,
+    authorizeFn: null,
     storageLoad: null,
     storageSave: null,
 };
@@ -487,6 +517,7 @@ export function _resetInject() {
     _inj.verifyFn = null;
     _inj.homeRelayUrl = null;
     _inj.verifiedDirectory = null;
+    _inj.authorizeFn = null;
     _inj.storageLoad = null;
     _inj.storageSave = null;
 }

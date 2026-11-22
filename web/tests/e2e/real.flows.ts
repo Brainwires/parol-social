@@ -83,7 +83,10 @@ async function recordPeerConnections(context: BrowserContext): Promise<void> {
             watched.add(dtls);
             const n = watched.size;
             note(`dtls transport ${n} (mid ${t.mid}) ${dtls.state}`);
-            dtls.addEventListener("statechange", () => note(`dtls transport ${n} ${dtls.state}`));
+            dtls.addEventListener(
+              "statechange",
+              () => note(`dtls transport ${n} ${dtls.state}`),
+            );
           }
         });
         pc.addEventListener(
@@ -127,7 +130,10 @@ function answers(page: Page): Promise<string> {
   return Promise.race([
     page.evaluate(() => "the page answers"),
     new Promise<string>((done) =>
-      setTimeout(() => done("the page does not answer: its main thread is blocked"), 5_000)
+      setTimeout(
+        () => done("the page does not answer: its main thread is blocked"),
+        5_000,
+      )
     ),
   ]).catch((e) => `the page does not answer: ${e}`);
 }
@@ -139,9 +145,9 @@ function connectionReport(page: Page): Promise<string> {
     const kept = (window as unknown as { __pcs?: Kept[] }).__pcs ?? [];
     const out: string[] = [];
     for (const video of document.querySelectorAll("video")) {
-      const tracks = (video.srcObject as MediaStream | null)?.getTracks().map((t) =>
-        `${t.kind} ${t.readyState}${t.enabled ? "" : " disabled"}${t.muted ? " muted" : ""}`
-      );
+      const tracks = (video.srcObject as MediaStream | null)?.getTracks().map((
+        t,
+      ) => `${t.kind} ${t.readyState}${t.enabled ? "" : " disabled"}${t.muted ? " muted" : ""}`);
       out.push(
         `video ${video.dataset.testid}: ${video.paused ? "paused" : "playing"}, ` +
           `readyState ${video.readyState}, ${video.videoWidth}x${video.videoHeight}, ` +
@@ -220,7 +226,9 @@ async function withConnectionReport(
             new Promise<string>((done) => setTimeout(() => done("no report in 10 s"), 10_000)),
           ]).catch((e) => `no report: ${e}`)
           : "no report";
-        const calls = (callLogs.get(page) ?? []).map((l) => `  ${l}`).join("\n");
+        const calls = (callLogs.get(page) ?? []).map((l) => `  ${l}`).join(
+          "\n",
+        );
         return `${state}\ncall log:\n${calls || "  (nothing)"}\n${connections}`;
       }),
     );
@@ -829,9 +837,9 @@ test("a video call: ring, accept, controls, end; and a declined call", async ({ 
   // teardown is reported as such, with the engine's last line.
   const captures = (page: Page) =>
     page.evaluate(() =>
-      (window as unknown as { __captures: MediaStream[] }).__captures.flatMap((stream) =>
-        stream.getTracks().map((track) => track.readyState)
-      )
+      (window as unknown as { __captures: MediaStream[] }).__captures.flatMap((
+        stream,
+      ) => stream.getTracks().map((track) => track.readyState))
     );
   type Kept = { pc: RTCPeerConnection };
   // The call's connection is the one that carries media.
@@ -858,7 +866,9 @@ test("a video call: ring, accept, controls, end; and a declined call", async ({ 
     // same time. Ben closes his; Ana's goes away by itself.
     await Promise.all([
       (async () => {
-        await expect(ana.page.getByTestId("call-status")).toHaveText("Call ended");
+        await expect(ana.page.getByTestId("call-status")).toHaveText(
+          "Call ended",
+        );
         await expect(ana.page.getByTestId("call-remote")).toHaveCount(0);
       })(),
       (async () => {
@@ -876,7 +886,9 @@ test("a video call: ring, accept, controls, end; and a declined call", async ({ 
     for (const page of [ana.page, ben.page]) {
       // The capture is stopped and the call's connection closed.
       await expect.poll(() => captures(page)).toEqual(["ended", "ended"]);
-      await expect.poll(() => signaling(page, connections.get(page)!)).toEqual(["closed"]);
+      await expect.poll(() => signaling(page, connections.get(page)!)).toEqual([
+        "closed",
+      ]);
     }
   }, 60_000);
 
@@ -901,6 +913,165 @@ test("a video call: ring, accept, controls, end; and a declined call", async ({ 
   await send(ana.page, "Talk later then.");
   await expect(bubble(ben.page, "Talk later then.")).toBeVisible();
   await allClean(ana, ben);
+});
+
+/** A file bubble in the open conversation, by the file's name. */
+const fileBubble = (page: Page, name: string) =>
+  page.getByTestId("transfer-bubble").filter({ hasText: name });
+
+/**
+ * Chromium has `showSaveFilePicker`, a system dialog no test can answer; without it the app
+ * saves through a download link, which is what every other browser does and what this checks.
+ */
+async function saveByDownload(context: BrowserContext): Promise<void> {
+  await context.addInitScript(() => {
+    delete (window as unknown as { showSaveFilePicker?: unknown })
+      .showSaveFilePicker;
+  });
+}
+
+test("a file: offered, accepted, progress in words, verified and saved; one declined; one withdrawn", async ({ browser, live }) => {
+  const { createHash, randomBytes } = await import("node:crypto");
+  const { readFile } = await import("node:fs/promises");
+  // FLOW_FILE_MIB: the size of the file that goes across (the M1 bar for desktop <-> web
+  // is 100 MiB, see the interop suite; Playwright hands a page at most 50 MiB this way).
+  const mib = Math.min(48, Number(process.env.FLOW_FILE_MIB ?? 6));
+  const data = randomBytes(mib * 1024 * 1024 + 4321);
+  const sha256 = createHash("sha256").update(data).digest("hex");
+  const patience = { timeout: 60_000 + mib * 3_000 };
+
+  const ana = await person(browser, live, PHONE, saveByDownload);
+  const ben = await person(browser, live, WIDE);
+  await start(ana.page);
+  await start(ben.page);
+  await pairByPaste(ana.page, ben.page, { presenter: "Ana", scanner: "Ben" });
+  await openLine(ana.page, ben.page);
+
+  // Ben picks a file in the composer. It is offered at once: the line is open.
+  await ben.page.getByTestId("composer-file").setInputFiles({
+    name: "field notes.pdf",
+    mimeType: "application/pdf",
+    buffer: data,
+  });
+  const sent = fileBubble(ben.page, "field notes.pdf");
+  await expect(sent).toHaveAttribute("data-direction", "sent", patience);
+  await expect(sent).toHaveAttribute("data-state", "offered");
+  await expect(sent).toHaveAttribute("data-pending", "false");
+
+  // Ana sees the offer with its name and size, and nothing arrives before she says so.
+  const got = fileBubble(ana.page, "field notes.pdf");
+  await expect(got).toHaveAttribute("data-direction", "received");
+  await expect(got).toHaveAttribute("data-state", "offered");
+  await expect(got.getByTestId("transfer-name")).toHaveText("field notes.pdf");
+  await expect(got.getByTestId("transfer-save")).toHaveCount(0);
+  await got.getByTestId("transfer-accept").click();
+
+  // It arrives, verifies, and both devices say so.
+  await expect(got).toHaveAttribute("data-state", "complete", patience);
+  await expect(sent).toHaveAttribute("data-state", "complete", patience);
+  await expect(got.getByTestId("transfer-status")).not.toHaveText("");
+  await expect(sent.getByTestId("transfer-status")).not.toHaveText("");
+
+  // Saving gives exactly the file that was sent, under its name.
+  const [download] = await Promise.all([
+    ana.page.waitForEvent("download"),
+    got.getByTestId("transfer-save").click(),
+  ]);
+  // (WebKit on Linux writes the space in a download's name as an underscore.)
+  expect(download.suggestedFilename().replace("_", " ")).toBe(
+    "field notes.pdf",
+  );
+  const saved = await readFile(await download.path());
+  expect(saved.length).toBe(data.length);
+  expect(createHash("sha256").update(saved).digest("hex")).toBe(sha256);
+
+  // A name that tries to be a path arrives as a plain name; Ben declines it.
+  await ana.page.getByTestId("composer-file").setInputFiles({
+    name: "../../etc/passwd",
+    mimeType: "text/plain",
+    buffer: Buffer.from("not what it says"),
+  });
+  const refused = fileBubble(ben.page, "passwd");
+  await expect(refused).toHaveAttribute("data-state", "offered");
+  await expect(refused.getByTestId("transfer-name")).toHaveText("passwd");
+  await refused.getByTestId("transfer-decline").click();
+  await expect(refused).toHaveAttribute("data-state", "declined");
+  await expect(
+    ana.page.getByTestId("transfer-bubble").filter({ hasText: "passwd" }),
+  ).toHaveAttribute("data-state", "declined");
+
+  // An offer taken back before it was answered.
+  await ben.page.getByTestId("composer-file").setInputFiles({
+    name: "second thoughts.txt",
+    mimeType: "text/plain",
+    buffer: Buffer.from("never mind"),
+  });
+  const withdrawn = fileBubble(ben.page, "second thoughts.txt");
+  await expect(withdrawn).toHaveAttribute("data-state", "offered");
+  await expect(fileBubble(ana.page, "second thoughts.txt")).toHaveAttribute(
+    "data-state",
+    "offered",
+  );
+  await withdrawn.getByTestId("transfer-cancel").click();
+  await expect(withdrawn).toHaveAttribute("data-state", "cancelled");
+  await expect(fileBubble(ana.page, "second thoughts.txt")).toHaveAttribute(
+    "data-state",
+    "cancelled",
+  );
+  await expect(
+    fileBubble(ana.page, "second thoughts.txt").getByTestId("transfer-accept"),
+  ).toHaveCount(0);
+
+  await allClean(ana, ben);
+});
+
+test("a file offered while they are away waits on this device and goes when they return", async ({ browser, live }) => {
+  const { randomBytes } = await import("node:crypto");
+  const ana = await person(browser, live, PHONE);
+  const ben = await person(browser, live, WIDE);
+  await start(ana.page);
+  await start(ben.page);
+  await pairByPaste(ana.page, ben.page, { presenter: "Ana", scanner: "Ben" });
+  await openLine(ana.page, ben.page);
+
+  // Ana closes her tab.
+  await ana.page.close();
+  await expect(ben.page.getByTestId("conversation")).not.toHaveAttribute(
+    "data-line",
+    "open",
+    CONNECT,
+  );
+  await ben.page.getByTestId("composer-file").setInputFiles({
+    name: "for later.bin",
+    mimeType: "application/octet-stream",
+    buffer: randomBytes(300_000),
+  });
+  const waiting = fileBubble(ben.page, "for later.bin");
+  await expect(waiting).toHaveAttribute("data-state", "offered");
+  await expect(waiting).toHaveAttribute("data-pending", "true");
+
+  // She comes back: the offer reaches her, she accepts, it arrives.
+  const again = await ana.context.newPage();
+  const problems = await watch(again, live);
+  await again.goto(live.url);
+  await expect(waiting).toHaveAttribute("data-pending", "false", {
+    timeout: 90_000,
+  });
+  await again.getByTestId("conversation-list").getByRole("link", {
+    name: /Ben/,
+  }).click();
+  const got = fileBubble(again, "for later.bin");
+  await expect(got).toHaveAttribute("data-state", "offered", CONNECT);
+  await got.getByTestId("transfer-accept").click();
+  await expect(got).toHaveAttribute("data-state", "complete", {
+    timeout: 60_000,
+  });
+  await expect(waiting).toHaveAttribute("data-state", "complete", {
+    timeout: 60_000,
+  });
+
+  await expectClean(problems);
+  await expectClean(ben.problems);
 });
 
 test("the list: unread counts, newest first, read when opened", async ({ browser, live }) => {

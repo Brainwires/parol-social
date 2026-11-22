@@ -41,7 +41,10 @@ relying on it.
   connect to sees your IP address unless you relay through your own TURN server (Settings; the
   relay never offers one and the apps have none built in); messages to an offline
   contact wait on your device. Operators who want store-and-forward, tokens, TURN credentials or
-  federation run the relay profile (`SIGNALING_ONLY=0`).
+  federation run the relay profile (`SIGNALING_ONLY=0`). A registration is signed for the relay
+  it is made at (its `host:port`, which an operator sets in `RELAY_PUBLIC_NAMES`), so one relay
+  cannot register you at another, and a signaling-only relay answers no HTTP request about who
+  is online ([PNP-001 §10.7](specs/PNP-001-wire-protocol.md)).
 - **Metadata, honestly stated.** Your home relay learns your `PeerId`, your IP address, when you are
   online and the `PeerId`s you exchange signaling with (and, on a relay-profile relay, envelopes). A media server (M2) learns who is in a room
   and packet sizes and timing. The default mode does **not** hide that you use ParolNet, resist
@@ -73,11 +76,12 @@ apps/desktop (GPUI)      web/ (TS + wasm)        later: iOS / Android shells (Un
 | `parolnet-relay-server` | Axum relay: signaling-only by default (register, SDP / ICE, presence, STUN URIs); opt-in relay profile with store-and-forward, federation, TURN credentials | exists |
 | `parolnet-rtc` | Async driver for the sans-I/O [`webrtc-rs-rtc`](https://github.com/Brainwires/webrtc-rs-rtc) engine (native): sockets on every interface (IPv4 and IPv6), STUN and the user's TURN server, data channels, RTP with RTX, ICE restart, track renegotiation, the congestion controller's estimate, a statistics digest; runs on real sockets or, in virtual time, on `parolnet-simnet` | M1 |
 | `parolnet-store` | Encrypted native persistence: SQLite with SQLCipher (bundled), database key in the OS keychain (`keyring`) or an owner-only key file on machines without one; identity, contacts, sessions, messages, sender queue, settings; schema migrations, incremental transactional writes, import of the earlier plaintext data directory, wipe | M1 |
-| `parolnet-app` | Headless client core: identity, PWA-compatible pairing, signaling-only relay client, a direct data channel per contact bound to the E2EE session (DTLS fingerprints, PNP-001 §10.5.1), 1:1 encrypted chat, sender-side queue, 1:1 voice / video calls | M1 |
+| `parolnet-app` | Headless client core: identity, PWA-compatible pairing, signaling-only relay client, a direct data channel per contact bound to the E2EE session (DTLS fingerprints, PNP-001 §10.5.1), 1:1 encrypted chat, sender-side queue, 1:1 voice / video calls, file transfer that survives a lost connection and a restart (PNP-010) | M1 |
 | `apps/desktop` | GPUI desktop client: contacts, pairing, chat (UI v0), 1:1 calls with camera, echo cancellation and device menus; the M0 video spike behind `--spike` | M1 |
 | `parolnet-media` | Call media for native clients (no dependency on the rest of the workspace): frames, the capture traits and synthetic sources, resampling, Opus, echo cancellation / noise suppression / gain (AEC3, pure Rust), the audio duplex path; behind opt-in features, VP8 through libvpx, microphone and speakers (cpal), camera capture (nokhwa) | M1 |
+| `parolnet-transfer` | File transfer (PNP-010) without I/O, for native and wasm: the offer and its answers, sealed 64 KiB records (ChaCha20-Poly1305, STREAM nonces, a key per attempt), resume at the record the receiver names, the final SHA-256 check, limits. `parolnet-app` streams files from and to disk with it; the web app drives it through `parolnet-wasm` | M1 |
 | `parolnet-simnet` | Test-only: a deterministic in-memory network (loss, jitter, reordering, a rate cap) that runs `parolnet-rtc` in virtual time, and the M1 call checks on it (setup, renegotiation, ICE restart, the estimate; 2% loss, 300 kbit/s cap, 100 ms jitter) | M1 |
-| `parolnet-call`, `-transfer`, `-simnet` | Calls, PNP-010 transfer, network simulator | M1 |
+| `parolnet-call` | Calls | M1 |
 | `parolnet-mls`, `-sframe`, `-sfu` | MLS groups and devices, SFrame, the SFU | M2 |
 
 Media: Opus audio with echo cancellation (AEC3), VP8 video (VP9 / AV1 later), DTLS-SRTP end to end

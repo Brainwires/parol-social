@@ -101,6 +101,12 @@ expect_status /turn-credentials 200 && {
 expect_status /health 200
 # A plain GET (no upgrade) reaches the relay, which refuses it.
 expect_status /ws 400 426
+# A signaling-only relay tells no HTTP caller who is online (PNP-001-MUST-071).
+expect_status /peers/presence 404
+expect_status "/peers/lookup?id=$(printf '%064d' 0)" 404
+expect_status /bootstrap 200 && {
+  [ "$(cat "$TMP/b")" = "[]" ] || fail "/bootstrap lists peers on a signaling-only relay"
+}
 
 if [ "$FAILED" -ne 0 ]; then
   echo "smoke checks FAILED"

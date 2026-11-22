@@ -1,5 +1,6 @@
 //! The relay WebSocket client: connects, registers by Ed25519 challenge, keeps the socket
-//! alive and reconnects with backoff. It forwards every relay frame to the app core and
+//! alive and reconnects with backoff. The answer to the challenge is signed for the relay
+//! this client dialed (PNP-001 §10.7), so it is of no use at any other relay. It forwards every relay frame to the app core and
 //! sends the frames the core gives it. Signaling frames are never queued here: a frame given
 //! while the socket is down is dropped (the core retries at its own level).
 
@@ -10,9 +11,12 @@ use futures_util::{SinkExt, StreamExt};
 use tokio::sync::{Notify, mpsc};
 use tokio_tungstenite::tungstenite::Message;
 
+use parolnet_protocol::relay_auth::{REGISTER_NONCE_LEN, RelayName, register_signable};
+
 use crate::wire::{ClientFrame, ServerFrame};
 
-/// Signs a relay challenge nonce with the identity key.
+/// Signs a message with the identity key. The signaling task gives it the register message
+/// of PNP-001 §10.7 (label, the relay's nonce, the relay's name), never a bare nonce.
 pub type Signer = Arc<dyn Fn(&[u8]) -> [u8; 64] + Send + Sync>;
 
 /// What the signaling task reports to the core.
@@ -188,6 +192,9 @@ async fn session(
     registered: &mut bool,
 ) -> Result<(), String> {
     crate::install_crypto_provider();
+    // The name of the relay this socket goes to, from the URL it is opened with. The
+    // challenge answer is signed for it and for no other relay.
+    let relay_name = RelayName::from_url(url).map_err(|e| format!("relay URL: {e}"))?;
     let (ws, _) = tokio::time::timeout(
         Duration::from_secs(15),
         tokio_tungstenite::connect_async(url),
@@ -203,6 +210,7 @@ async fn session(
         pubkey: None,
         signature: None,
         nonce: None,
+        relay: None,
     }))
     .await
     .map_err(|e| format!("send: {e}"))?;
@@ -234,13 +242,21 @@ async fn session(
                 let Some(frame) = ServerFrame::parse(&text) else { continue };
                 match frame {
                     ServerFrame::Challenge { nonce } => {
-                        let Ok(nonce_bytes) = hex::decode(&nonce) else { continue };
-                        let sig = signer(&nonce_bytes);
+                        // A challenge that is not a 32-byte nonce is not answered: the
+                        // identity key signs the register message and nothing else here.
+                        let Some(nonce_bytes) = hex::decode(&nonce)
+                            .ok()
+                            .and_then(|b| <[u8; REGISTER_NONCE_LEN]>::try_from(b).ok())
+                        else {
+                            continue;
+                        };
+                        let sig = signer(&register_signable(&nonce_bytes, &relay_name, None));
                         sink.send(send(&ClientFrame::Register {
                             peer_id: peer_id.to_owned(),
                             pubkey: Some(public_key_hex.to_owned()),
                             signature: Some(hex::encode(sig)),
                             nonce: Some(nonce),
+                            relay: Some(relay_name.as_str().to_owned()),
                         }))
                         .await
                         .map_err(|e| format!("send: {e}"))?;
@@ -539,6 +555,100 @@ mod tests {
                 !matches!(event, Some(SigEvent::Disconnected { .. }) | None),
                 "dropped a relay that was sending frames"
             );
+        }
+        task.abort();
+    }
+
+    /// PNP-001 §10.7: the answer to a challenge is the identity key's signature over the
+    /// register message, which names the relay the client dialed. A relay that passes on
+    /// another relay's nonce gets a signature the other relay refuses.
+    #[tokio::test]
+    async fn the_challenge_answer_is_signed_for_the_relay_that_was_dialed() {
+        use ed25519_dalek::{Signer as _, SigningKey, Verifier as _};
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let nonce = [0x5a_u8; REGISTER_NONCE_LEN];
+        let (answer_tx, mut answer_rx) = mpsc::unbounded_channel::<serde_json::Value>();
+        tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
+            // The plain register, then the challenges; every later frame is reported.
+            let _ = ws.next().await;
+            // Not a 32-byte nonce: must not be signed.
+            let _ = ws
+                .send(Message::Text(
+                    r#"{"type":"challenge","nonce":"abcd"}"#.into(),
+                ))
+                .await;
+            let challenge = format!(r#"{{"type":"challenge","nonce":"{}"}}"#, hex::encode(nonce));
+            let _ = ws.send(Message::Text(challenge.into())).await;
+            while let Some(Ok(Message::Text(text))) = ws.next().await {
+                let _ = answer_tx.send(serde_json::from_str(&text).unwrap());
+            }
+        });
+
+        let key = SigningKey::from_bytes(&[7u8; 32]);
+        let public = key.verifying_key();
+        let signer: Signer = Arc::new(move |m| key.sign(m).to_bytes());
+        let (events_tx, _events) = mpsc::unbounded_channel();
+        let (_tx, rx) = mpsc::unbounded_channel();
+        // Dialed with a path and a query: the name is the host and port alone.
+        let task = tokio::spawn(run(
+            format!("ws://{addr}/ws?probe=1"),
+            "00".repeat(32),
+            hex::encode(public.to_bytes()),
+            signer,
+            events_tx,
+            rx,
+            FAST,
+            Arc::new(Notify::new()),
+        ));
+
+        let answer = tokio::time::timeout(Duration::from_secs(10), answer_rx.recv())
+            .await
+            .expect("an answer in time")
+            .expect("the relay task is running");
+        assert_eq!(answer["type"], "register");
+        // The first frame after the challenges answers the 32-byte nonce: the short one
+        // was skipped.
+        assert_eq!(answer["nonce"], hex::encode(nonce));
+        let name = addr.to_string();
+        assert_eq!(answer["relay"], name);
+        let signature: [u8; 64] = hex::decode(answer["signature"].as_str().unwrap())
+            .unwrap()
+            .try_into()
+            .unwrap();
+        let signature = ed25519_dalek::Signature::from_bytes(&signature);
+        let relay = RelayName::parse(&name).unwrap();
+        public
+            .verify(&register_signable(&nonce, &relay, None), &signature)
+            .expect("signed over the register message for the dialed relay");
+        // Not valid for another relay, and not a signature over the bare nonce.
+        let other = RelayName::parse("relay-r.example:443").unwrap();
+        assert!(
+            public
+                .verify(&register_signable(&nonce, &other, None), &signature)
+                .is_err()
+        );
+        assert!(public.verify(&nonce, &signature).is_err());
+        task.abort();
+    }
+
+    /// A relay URL without a usable relay name is never dialed: there would be nothing to
+    /// sign the answer for.
+    #[tokio::test]
+    async fn a_url_without_a_relay_name_is_refused_before_connecting() {
+        let (mut events, _tx, task) = client("ws://user@127.0.0.1:1/ws".to_owned(), FAST);
+        assert!(matches!(
+            next_event(&mut events).await,
+            SigEvent::Connecting
+        ));
+        match next_event(&mut events).await {
+            SigEvent::Disconnected { reason } => {
+                assert!(reason.starts_with("relay URL:"), "{reason}")
+            }
+            other => panic!("expected a disconnect, got {other:?}"),
         }
         task.abort();
     }

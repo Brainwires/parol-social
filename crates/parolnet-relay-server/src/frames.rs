@@ -15,10 +15,17 @@ pub struct IncomingMessage {
     pub exclude: Vec<String>,
     /// Ed25519 public key (hex) for registration challenge-response.
     pub pubkey: Option<String>,
-    /// Hex-encoded Ed25519 signature over the challenge nonce.
+    /// Hex-encoded Ed25519 signature over the register message (PNP-001
+    /// §10.7): label, challenge nonce, relay key pin and relay name.
     pub signature: Option<String>,
     /// Hex-encoded challenge nonce being responded to.
     pub nonce: Option<String>,
+    /// Canonical name (`host:port`) of the relay the client dialed; part of
+    /// the signed register message.
+    pub relay: Option<String>,
+    /// Relay identity key (hex) the client pins, if it pins one; part of the
+    /// signed register message.
+    pub relay_key: Option<String>,
     /// H9 Privacy Pass token (hex CBOR). REQUIRED on "message" frames —
     /// replaces the outer `from` field (see PNP-001 §"Outer Relay Frame",
     /// clause PNP-001-MUST-048).

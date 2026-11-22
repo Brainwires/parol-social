@@ -19,6 +19,12 @@ pub const SENDER_KEY_ROTATION_MESSAGES: u32 = 1000;
 /// Duration in seconds before sender key rotation is required (24 hours).
 pub const SENDER_KEY_ROTATION_SECS: u64 = 86400;
 
+/// Highest `version` a group's metadata or a `GroupOperation` may carry
+/// (PNP-009-MUST-082 / MUST-083): 2^53 - 1, the largest integer every implementation,
+/// a JavaScript one included, holds exactly. One operation a millisecond takes 285,000
+/// years to get there, and the `u64` field is 2048 times wider still.
+pub const MAX_GROUP_VERSION: u64 = (1 << 53) - 1;
+
 /// Unique identifier for a group, derived from cryptographic material.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct GroupId(pub [u8; 32]);

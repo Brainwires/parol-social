@@ -13,6 +13,14 @@ services:
       # cells, gossip, TURN credentials or federation. Set to 0 only on a
       # deployment that deliberately offers the relay profile.
       - SIGNALING_ONLY=1
+      # The host[:port] clients dial this relay under (comma-separated; no
+      # port means 443). A client signs its registration for the name it
+      # dialed and the relay refuses any other name, so that a signature made
+      # for another relay cannot be replayed here (PNP-001 §10.7). REQUIRED on
+      # a public deployment: unset, only loopback clients can register. Set
+      # RELAY_PUBLIC_NAMES in the shell or in .env to override, e.g.
+      # RELAY_PUBLIC_NAMES=localhost:1411 for a local run of this file.
+      - RELAY_PUBLIC_NAMES=${RELAY_PUBLIC_NAMES:-parol.social}
       # STUN only (answered by the host's STUN server on UDP 3478; Cloudflare's
       # tunnel does not carry UDP, so clients reach it directly).
       - STUN_URIS=stun:biscuits.parol.social:3478
@@ -51,6 +59,9 @@ services:
     environment:
       - DEV_MODE=false
       - SIGNALING_ONLY=1
+      # The secondary's own public host[:port] (see RELAY_PUBLIC_NAMES above).
+      # Empty means loopback clients only: set it before going live.
+      - RELAY_PUBLIC_NAMES=${RELAY_SECONDARY_PUBLIC_NAMES:-}
       - TRUSTED_PROXY_IPS=127.0.0.1
       # PEER_RELAY_URLS is populated via the runbook so the two relays
       # mutually discover each other over /directory polling.

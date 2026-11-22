@@ -42,8 +42,32 @@ export interface ParolnetTestHooks {
   iceServers(): IceServer[];
   /** Not in §11.4: the engine's own path vocabulary, for tests that need `NoDirectPath`. */
   rawPathState(peerId: string): PathState;
+  /** Not in §11.4: the file transfers (PNP-010) with one contact or all, oldest first. */
+  transfers(peerId?: string): Promise<TestTransfer[]>;
+  /**
+   * Not in §11.4: SHA-256 (hex) and length of a received, complete file as it is stored on
+   * this device; null when there is none.
+   */
+  transferDigest(id: string): Promise<{ sha256: string; size: number } | null>;
+  /** Not in §11.4: received parts survive a reload (OPFS) or not (memory). */
+  filesPersist(): boolean;
   /** Not in §11.4: take the hooks away again. */
   uninstall(): void;
+}
+
+export interface TestTransfer {
+  id: string;
+  peerId: string;
+  direction: "sent" | "received";
+  name: string;
+  size: number;
+  /** `offered`, `waiting`, `active`, `complete`, `declined` or `cancelled`. */
+  state: string;
+  /** `Cancelled` only: who and why, e.g. `peer:Integrity`. */
+  cancelled: string | null;
+  bytesDone: number;
+  pending: boolean;
+  available: boolean;
 }
 
 function testPath(path: PathState): TestPathState {
@@ -112,6 +136,14 @@ export function installTestHooks(
           state: ev.call.state.kind === "Ended" ? "idle" : callState(),
         });
         break;
+      case "Transfer":
+        announce({
+          kind: "transfer",
+          id: ev.transfer.id,
+          peerId: ev.transfer.peerId,
+          state: ev.transfer.state.kind.toLowerCase(),
+        });
+        break;
     }
   });
   const pathOf = (peerId: string): PathState =>
@@ -163,6 +195,33 @@ export function installTestHooks(
     },
     callState,
     iceServers: () => engine.iceServers(),
+    transfers: async (peerId) =>
+      (await engine.transfers(peerId)).map((t) => ({
+        id: t.id,
+        peerId: t.peerId,
+        direction: lower(t.direction),
+        name: t.name,
+        size: t.size,
+        state: t.state.kind.toLowerCase(),
+        cancelled: t.state.kind === "Cancelled"
+          ? `${t.state.byPeer ? "peer" : "self"}:${t.state.reason}`
+          : null,
+        bytesDone: t.bytesDone,
+        pending: t.pending,
+        available: t.available,
+      })),
+    transferDigest: async (id) => {
+      const blob = await engine.transferFile(id);
+      if (!blob) return null;
+      const digest = new Uint8Array(
+        await crypto.subtle.digest("SHA-256", await blob.arrayBuffer()),
+      );
+      return {
+        sha256: [...digest].map((b) => b.toString(16).padStart(2, "0")).join(""),
+        size: blob.size,
+      };
+    },
+    filesPersist: () => engine.receivedFilesPersist(),
     uninstall: () => {
       unsubscribe();
       if (target.__parolnetTest === hooks) delete target.__parolnetTest;

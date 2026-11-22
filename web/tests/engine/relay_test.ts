@@ -15,7 +15,7 @@ import { FakeClock, FakeRelay, tick } from "./harness/fakes.ts";
 const ME = "0a".repeat(32);
 const PK = "0b".repeat(32);
 
-function setup(jitter = 0) {
+function setup(jitter = 0, url = "ws://relay.test/ws") {
   const clock = new FakeClock();
   const relay = new FakeRelay();
   const states: RelayState[] = [];
@@ -26,13 +26,17 @@ function setup(jitter = 0) {
     info: (...a) => logs.push(a.join(" ")),
     warn: (...a) => logs.push(a.join(" ")),
   };
-  const signed: string[] = [];
+  const signed: [nonce: string, relayName: string][] = [];
   const client = new RelayClient({
-    url: "ws://relay.test/ws",
+    url,
     peerId: ME,
     publicKey: PK,
-    sign: (nonce) => {
-      signed.push(nonce);
+    relayName: (host, port) => {
+      if (host === "bad.test") throw new Error("not a relay name");
+      return `${host}:${port}`;
+    },
+    sign: (nonce, relayName) => {
+      signed.push([nonce, relayName]);
       return "5a".repeat(64);
     },
     sockets: relay.factory,
@@ -58,11 +62,76 @@ Deno.test("relay: connect, challenge, signed register, registered", async () => 
   assertEquals(s.url, "ws://relay.test/ws");
   assertEquals(s.sent, [
     { type: "register", peer_id: ME },
-    { type: "register", peer_id: ME, pubkey: PK, signature: "5a".repeat(64), nonce: s.nonce },
+    {
+      type: "register",
+      peer_id: ME,
+      pubkey: PK,
+      signature: "5a".repeat(64),
+      nonce: s.nonce,
+      relay: "relay.test:80",
+    },
   ]);
-  assertEquals(t.signed, [s.nonce]);
+  // Signed for the relay that was dialed (PNP-001 §10.7), never the bare nonce.
+  assertEquals(t.signed, [[s.nonce, "relay.test:80"]]);
   assert(t.client.registered);
   assert(t.logs.includes("Registered with relay. Profile: signaling-only"));
+  t.client.stop();
+});
+
+Deno.test("relay: the answer names the relay the socket was opened to", async () => {
+  for (
+    const [url, name] of [
+      ["wss://Relay.Test/ws", "relay.test:443"],
+      ["wss://relay.test:8443/ws?x=1", "relay.test:8443"],
+      ["ws://127.0.0.1:9000/ws", "127.0.0.1:9000"],
+      ["ws://[::1]:9000/ws", "[::1]:9000"],
+    ]
+  ) {
+    const t = setup(0, url);
+    t.client.start();
+    await t.settle();
+    const s = t.relay.sockets[0];
+    assertEquals(s.sent[1].relay, name, url);
+    assertEquals(t.signed, [[s.nonce, name]], url);
+    t.client.stop();
+  }
+});
+
+Deno.test("relay: a URL that names no relay is never dialed", async () => {
+  for (
+    const url of [
+      "wss://user:pw@relay.test/ws",
+      "wss://user@relay.test/ws",
+      "https://relay.test/ws",
+      "not a url",
+      "ws://bad.test/ws",
+    ]
+  ) {
+    const t = setup(0, url);
+    t.client.start();
+    await t.settle();
+    assertEquals(t.kinds(), ["Connecting", "Disconnected"], url);
+    assertEquals(t.relay.sockets.length, 0, url);
+    assertEquals(t.signed, [], url);
+    t.client.stop();
+  }
+});
+
+Deno.test("relay: a challenge that is not a 32-byte nonce is not signed", async () => {
+  const t = setup();
+  t.relay.silent = true;
+  t.client.start();
+  await t.settle();
+  const s = t.relay.sockets[0];
+  for (const nonce of ["", "00ff", "zz".repeat(32), "ab".repeat(31), "ab".repeat(33)]) {
+    s.deliver({ type: "challenge", nonce });
+  }
+  await t.settle();
+  assertEquals(t.signed, []);
+  assertEquals(s.sent, [{ type: "register", peer_id: ME }]);
+  s.deliver({ type: "challenge", nonce: "ab".repeat(32) });
+  await t.settle();
+  assertEquals(t.signed, [["ab".repeat(32), "relay.test:80"]]);
   t.client.stop();
 });
 

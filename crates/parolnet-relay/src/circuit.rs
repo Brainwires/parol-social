@@ -52,64 +52,50 @@ impl EstablishedCircuit {
     }
 
     /// Encrypt data with all onion layers for sending through the circuit.
+    ///
+    /// The forward counters are read and advanced under one lock (PNP-004-MUST-059): two
+    /// callers can never encrypt under the same counter values, and a counter value is
+    /// spent even if the caller then fails to send the cell.
     pub fn wrap_data(&self, data: &[u8]) -> Result<Vec<u8>, RelayError> {
         let hop_keys = self.hop_keys.lock().unwrap_or_else(|e| e.into_inner());
-        let counters = self
-            .forward_counters
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-
-        // Check for counter overflow before encrypting
-        for c in counters.iter() {
-            if *c == u32::MAX {
-                return Err(RelayError::NonceOverflow);
-            }
-        }
-
-        let result = onion::onion_encrypt(data, &hop_keys, &counters)?;
-        drop(counters);
-        drop(hop_keys);
-
-        // Increment all forward counters
         let mut counters = self
             .forward_counters
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        for c in counters.iter_mut() {
-            *c += 1;
-        }
 
-        Ok(result)
+        // Refuses, moving nothing, when a counter is at its limit (MUST-019 / MUST-056).
+        let cell_counters = onion::next_counters(&mut counters)?;
+        onion::onion_encrypt(data, &hop_keys, &cell_counters)
     }
 
     /// Decrypt data received through the circuit (reverse direction).
+    ///
+    /// The backward counters advance only for a cell that authenticates, under the same
+    /// lock that read them.
     pub fn unwrap_data(&self, data: &[u8]) -> Result<Vec<u8>, RelayError> {
         let hop_keys = self.hop_keys.lock().unwrap_or_else(|e| e.into_inner());
-        let counters = self
+        let mut counters = self
             .backward_counters
             .lock()
             .unwrap_or_else(|e| e.into_inner());
 
         // Check for counter overflow before decrypting
-        for c in counters.iter() {
-            if *c == u32::MAX {
-                return Err(RelayError::NonceOverflow);
-            }
+        if counters.contains(&u32::MAX) {
+            return Err(RelayError::NonceOverflow);
         }
 
         let result = onion::onion_decrypt(data, &hop_keys, &counters)?;
-        drop(counters);
-        drop(hop_keys);
-
-        let mut counters = self
-            .backward_counters
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        for c in counters.iter_mut() {
-            *c += 1;
-        }
-
+        onion::next_counters(&mut counters)?;
         Ok(result)
+    }
+
+    /// The forward counter of each hop: how many cells have been encrypted under that
+    /// hop's forward key since it was derived (PNP-004-MUST-059).
+    pub fn forward_counters(&self) -> Vec<u32> {
+        self.forward_counters
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     /// Get the circuit ID.
@@ -318,8 +304,6 @@ impl StandardCircuitBuilder {
         }
 
         let circuit_id: u32 = rand::random::<u32>() | 1;
-        let mut hop_keys = Vec::with_capacity(REQUIRED_HOPS);
-
         // Step 1: CREATE with the guard (first hop)
         let (create_cell, our_secret) = CircuitHandshake::create_cell(circuit_id);
         conn.send(&create_cell.to_bytes())
@@ -338,54 +322,18 @@ impl StandardCircuitBuilder {
         buf.copy_from_slice(&raw);
         let created = RelayCell::from_bytes(&buf)?;
         let guard_keys = CircuitHandshake::process_created(&created, &our_secret)?;
-        hop_keys.push(guard_keys);
 
-        // Steps 2-3: EXTEND to each subsequent hop
+        // Steps 2-3: EXTEND to each subsequent hop, on the one circuit. Its forward counters
+        // count the EXTEND cells too (PNP-004-MUST-059): a hop key derived here goes on into
+        // the data phase with the counter it reached, never back to 0, so no counter value
+        // is used twice under one key.
+        let circuit =
+            EstablishedCircuit::from_hop_keys(vec![guard_keys], circuit_id).with_connection(conn);
         for hop in &hops[1..] {
-            let (extend_cell, ext_secret) = CircuitHandshake::extend_cell(circuit_id, hop.peer_id);
-
-            // Wrap EXTEND payload through existing hops
-            let partial = EstablishedCircuit::from_hop_keys(hop_keys.clone(), circuit_id);
-            let encrypted =
-                partial.wrap_data(&extend_cell.payload[..extend_cell.payload_len as usize])?;
-
-            let mut payload = [0u8; CELL_PAYLOAD_SIZE];
-            let copy_len = encrypted.len().min(CELL_PAYLOAD_SIZE);
-            payload[..copy_len].copy_from_slice(&encrypted[..copy_len]);
-
-            let wire_cell = RelayCell {
-                circuit_id,
-                cell_type: CellType::Extend,
-                payload,
-                payload_len: copy_len as u16,
-            };
-            conn.send(&wire_cell.to_bytes())
-                .await
-                .map_err(RelayError::Transport)?;
-
-            let raw = conn.recv().await.map_err(RelayError::Transport)?;
-            if raw.len() != CELL_SIZE {
-                return Err(RelayError::CellError(format!(
-                    "expected {} bytes in EXTENDED, got {}",
-                    CELL_SIZE,
-                    raw.len()
-                )));
-            }
-            let mut buf = [0u8; CELL_SIZE];
-            buf.copy_from_slice(&raw);
-            let extended = RelayCell::from_bytes(&buf)?;
-
-            let new_keys = CircuitHandshake::process_extended(&extended, &ext_secret)?;
-            hop_keys.push(new_keys);
+            Circuit::extend(&circuit, hop).await?;
         }
 
-        Ok(EstablishedCircuit {
-            forward_counters: Mutex::new(vec![0; hop_keys.len()]),
-            backward_counters: Mutex::new(vec![0; hop_keys.len()]),
-            hop_keys: Mutex::new(hop_keys),
-            circuit_id,
-            guard_connection: Some(conn),
-        })
+        Ok(circuit)
     }
 }
 

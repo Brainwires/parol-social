@@ -105,6 +105,15 @@ impl RelayDescriptor {
         buf
     }
 
+    /// The bytes an authority signs to endorse this descriptor
+    /// (PNP-008-MUST-002): its deterministic CBOR encoding, the relay's own
+    /// signature included. The `endorsements` array is not part of a
+    /// descriptor, so it is not covered.
+    pub fn endorsement_signable_bytes(&self) -> Vec<u8> {
+        parolnet_protocol::det_cbor::to_deterministic_cbor(self)
+            .expect("a relay descriptor always encodes as CBOR")
+    }
+
     /// Whether this descriptor is its relay's own statement (PNP-008-MUST-027 item 1):
     /// `peer_id` is the hash of `identity_key`, and `signature` is that key's over
     /// [`Self::signable_bytes`]. Without the first half a descriptor signed with any key
@@ -547,8 +556,8 @@ impl RelayDirectory {
     /// Verifies the descriptor (its relay's signature and its age) and that it
     /// has sufficient authority endorsements (meeting the configured threshold),
     /// then inserts it into the directory unless a descriptor at least as recent
-    /// is already there (PNP-008-MUST-030): an endorsement outlives the
-    /// descriptors it was issued under, and an old one must not come back.
+    /// is already there (PNP-008-MUST-030): an endorsed descriptor stays
+    /// valid for seven days, and an older one must not replace a newer one.
     pub fn handle_endorsed_descriptor(
         &mut self,
         desc: EndorsedDescriptor,

@@ -5589,6 +5589,7 @@ dependencies = [
 name = "parolnet-app"
 version = "0.1.0"
 dependencies = [
+ "bytes",
  "ciborium",
  "ed25519-dalek",
  "futures-util",
@@ -5598,6 +5599,7 @@ dependencies = [
  "parolnet-protocol",
  "parolnet-rtc",
  "parolnet-store",
+ "parolnet-transfer",
  "qrcode",
  "rand 0.8.8",
  "reqwest",
@@ -5739,6 +5741,21 @@ dependencies = [
  "subtle",
  "thiserror 2.0.21",
  "tracing",
+ "zeroize",
+]
+
+[[package]]
+name = "parolnet-transfer"
+version = "0.1.0"
+dependencies = [
+ "chacha20poly1305",
+ "ciborium",
+ "hex",
+ "hkdf 0.13.0",
+ "rand_core 0.6.4",
+ "sha2 0.11.1",
+ "subtle",
+ "thiserror 2.0.21",
  "zeroize",
 ]
 

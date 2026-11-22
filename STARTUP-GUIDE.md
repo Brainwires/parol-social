@@ -128,8 +128,12 @@ cargo build --release -p parolnet-relay-server
 Run it:
 
 ```bash
-RELAY_PORT=9000 ./target/release/parolnet-relay
+RELAY_PORT=9000 RELAY_PUBLIC_NAMES=relay.example.com ./target/release/parolnet-relay
 ```
+
+`RELAY_PUBLIC_NAMES` is the host (and port, when it is not 443) that clients will dial this relay
+under. A client signs its registration for the name it dialed and the relay refuses any other, so
+a relay without it accepts only clients on the same machine (`localhost`, `127.0.0.1`).
 
 ### Option B: Run with Docker
 
@@ -139,6 +143,7 @@ A Dockerfile is included at the repository root. It builds the relay server and 
 docker build -t parolnet-relay .
 docker run -d -p 9000:80 \
   -e RELAY_PORT=9000 \
+  -e RELAY_PUBLIC_NAMES=relay.example.com \
   parolnet-relay
 ```
 
@@ -147,6 +152,9 @@ docker run -d -p 9000:80 \
 | Variable | Required | Default | Description |
 |----------|----------|---------|-------------|
 | `RELAY_PORT` | No | `9000` | Port the relay listens on |
+| `RELAY_PUBLIC_NAMES` | **Yes, on a public relay** | Loopback names only | Comma-separated `host` or `host:port` that clients dial this relay under; no port means 443. Example: `relay.example.com` for `wss://relay.example.com/ws`, `203.0.113.5:9000` for `ws://203.0.113.5:9000/ws`. A registration is signed for the dialed name and refused under any other (PNP-001 §10.7). Unset, only clients that dialed `localhost` / `127.0.0.1` / `[::1]` can register. A malformed entry stops the relay at startup. |
+| `SIGNALING_ONLY` | No | `1` | `0` selects the relay profile (store-and-forward, tokens, federation, TURN credentials). The default serves signaling only. |
+| `FEDERATION_PEER_KEYS` | No | Empty | Relay profile only. Comma-separated Ed25519 public keys (64 hex characters, the "Relay Ed25519 public key" a relay logs at startup) of the relays allowed to read this relay's `/peers/presence`. Empty means nobody is. |
 | `RELAY_SECRET_KEY` | No | Random on each start | 64-char hex Ed25519 secret key for the relay's identity. Set this so the relay keeps the same PeerId across restarts. |
 | `PEER_RELAY_URLS` | No | Empty | Comma-separated URLs of other relays for directory sync. Example: `https://relay2.example.com,https://relay3.example.com` |
 | `ADMIN_TOKEN` | No | Empty | Secret token for admin endpoints |
@@ -191,10 +199,11 @@ Relays sync their directory of endorsed relays every 60 seconds.
 |------|--------|---------|
 | `/ws` | GET | WebSocket connection for messaging |
 | `/health` | GET | Health check (returns "OK") |
-| `/peers` | GET | List connected peers |
+| `/peers` | GET | List connected peers (operator only: needs `ADMIN_TOKEN`) |
 | `/directory` | GET | Get the relay directory |
-| `/endorse` | POST | Submit an endorsement (CBOR body) |
-| `/bootstrap` | GET | Bootstrap peer discovery |
+| `/endorse` | POST | Relay profile: submit an endorsed descriptor (CBOR body) |
+| `/peers/presence`, `/peers/lookup` | GET | Relay profile: who is online, to signed requests only (PNP-008 §10.8). Not served by a signaling-only relay |
+| `/bootstrap` | GET | Always `[]` (kept for older clients) |
 
 ---
 
@@ -202,57 +211,66 @@ Relays sync their directory of endorsed relays every 60 seconds.
 
 A relay is not trusted until enough authorities endorse it. With a threshold of 2, at least 2 of your 3 authority holders must each create an endorsement for each relay.
 
+An endorsement signs one **relay descriptor**: the relay's keys, address and timestamp, with the relay's own signature (PNP-008-MUST-002). It is valid for that descriptor only, and for as long as the descriptor is: seven days from its timestamp. A relay that publishes a new descriptor (a new address, new keys, or simply a newer timestamp) needs new endorsements, so plan for authorities to sign at least once a week per relay.
+
 ### Create an endorsement
+
+Get the descriptor to endorse, for example from the relay's directory:
+
+```bash
+curl -s http://relay-address:9000/directory -o directory.cbor
+```
 
 Each authority holder runs this on their own machine (where their `.key` file is stored):
 
 ```bash
 ./target/release/parolnet-authority endorse-relay \
+  --descriptor directory.cbor \
   --relay-peer-id RELAY_PEER_ID_HEX \
   --authority-key ./authority-1.key \
-  --expires-days 365 \
   --output endorsement-auth1.cbor
 ```
 
 Replace:
-- `RELAY_PEER_ID_HEX` with the 64-character hex PeerId from the relay's startup log
+- `directory.cbor` with the file holding the descriptor (one CBOR `RelayDescriptor`, or a list of them as `/directory` returns)
+- `RELAY_PEER_ID_HEX` with the 64-character hex PeerId from the relay's startup log (it selects the descriptor in a list, and is checked against a single one)
 - `./authority-1.key` with the path to that authority's private key file
 
-This creates a CBOR-encoded endorsement file.
-
-The command prints details to stderr:
+The command refuses a descriptor that the relay's own key did not sign or that is older than seven days. It creates a CBOR-encoded endorsement file and prints what it endorsed to stderr; read it back before publishing:
 
 ```
 Endorsement written to: endorsement-auth1.cbor
-Endorsement (hex): d8a4...
+Endorsement (hex): a2...
 Authority pubkey:  a1b2c3d4...
 Relay PeerId:      7a3f9b2c...
-Endorsed at:       1713168000 (unix)
-Expires at:        1744704000 (unix, 365 days)
+Relay key:         5e6f...
+Relay address:     203.0.113.5:9000
+Descriptor time:   1713168000 (unix)
+Valid until:       1713772800 (unix; the descriptor's seven days)
 ```
 
-### Submit endorsements to the relay
+### Submit the endorsed descriptor to the relay
 
-Send each endorsement file to the relay's `/endorse` endpoint:
+The relay's `/endorse` endpoint (relay profile) takes an `EndorsedDescriptor`: a CBOR map `{descriptor, endorsements}` holding the descriptor and at least the threshold number of endorsements of it.
 
 ```bash
 curl -X POST http://relay-address:9000/endorse \
-  --data-binary @endorsement-auth1.cbor \
+  --data-binary @endorsed-descriptor.cbor \
   -H "Content-Type: application/cbor"
 ```
 
-Repeat for each authority's endorsement. With a threshold of 2, you need at least 2 endorsements before the relay is considered trusted.
-
 ### Verify an endorsement
 
-You can check an endorsement file at any time:
+You can check an endorsement against its descriptor at any time:
 
 ```bash
 ./target/release/parolnet-authority verify-endorsement \
-  --endorsement endorsement-auth1.cbor
+  --endorsement endorsement-auth1.cbor \
+  --descriptor directory.cbor \
+  --relay-peer-id RELAY_PEER_ID_HEX
 ```
 
-This shows the authority, relay, dates, and whether the signature is valid.
+This shows the authority, the descriptor and whether the signature is valid for it.
 
 ---
 
