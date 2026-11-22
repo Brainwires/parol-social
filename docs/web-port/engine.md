@@ -63,9 +63,12 @@ class Engine {
   snapshot(): Snapshot; // synchronous, immutable
 
   // Pairing (PNP-003)
-  createPairingCode(): Promise<PairingCode>; // { code, expiresAtMs }
+  createPairingCode(): Promise<PairingCode>; // { code (base45, for the QR), text, expiresAtMs }
   cancelPairing(): Promise<void>;
-  pairWithCode(code: string, how: { via: "scan" | "paste" }): Promise<Contact>;
+  pairWithCode(code: string, how: { via: "scan" | "paste" }): Promise<Contact>; // contact.pairing
+  confirmSas(peerId: string): Promise<void>; // "the verification code matches"
+  rejectSas(peerId: string): Promise<void>; // "it does not": the pairing is aborted
+  stopPairing(peerId: string): Promise<void>;
 
   // Chat
   sendText(peerId: string, text: string): Promise<ChatMessage>; // state "Sent" or "Queued"
@@ -149,6 +152,16 @@ instead of "could not connect".
   asynchronous, and reject with `NotQueued` once the message has left the device.
 - Adding a contact is `pairWithCode(code, { via })` and returns the contact; the name comes later
   through `renameContact`. The presenter side gets its contact through `ContactAdded`.
+- A contact that is being added carries `pairing` (`"new"`, or `"again"` for one that existed
+  before) until `PairingComplete`. The pairing is the PNP-003 exchange of the native core
+  (`parolnet_core::bootstrap::pairing`, reached through `crates/parolnet-wasm/src/pairing.rs`):
+  BootstrapHandshake both ways, the verification code (`snapshot().sas`, the `Sas` event,
+  `confirmSas` / `rejectSas`), then the PNP-002 handshake whose session replaces the bootstrap
+  session. Until it completes nothing but the pairing's own messages and the channel binding
+  crosses the channel; texts wait in the queue. `PairingFailed` (a rejected or mismatched code,
+  a timeout, a lost connection) removes a contact the pairing had added. A pairing lives in
+  memory only: a contact still marked `pairing` at start is removed (`"new"`) or keeps its
+  place without a session (`"again"`). `Contact.sasVerified` records a code both confirmed.
 - "You are offline" is `snapshot().relay.kind !== "Registered"`.
 - A pairing code has an expiry (`PairingCode.expiresAtMs`). Where the core exports the
   pending bootstrap (`export_pending_bootstrap`), the code and that blob are stored, so after a
@@ -328,10 +341,10 @@ The engine works with today's `crates/parolnet-wasm`, but these would make it si
    `import_pending_bootstrap`; the engine stores the blob with the code (feature-detected).
 2. ~~`clear_pending_bootstrap()`.~~ Now in the core; the engine calls it on expiry, cancel and
    use.
-3. **`bootstrap_decrypt(envelope, expected_peer_id)`**: the §5.3.1 fallback alone, bound to one
-   peer, returning the scanner's identity key. Today the only entry is `trial_decrypt`, which
-   first tries every existing session (and damages them, see below) and returns the PeerId where
-   `source_hint` should be the key. The engine works around all three.
+3. ~~`bootstrap_decrypt(envelope, expected_peer_id)`: the §5.3.1 fallback alone, bound to one
+   peer.~~ Now `pairing_respond(expected_peer_id, envelope, ...)`, which also checks that the
+   envelope carries the scanner's BootstrapHandshake (PNP-003 §5.4); `trial_decrypt` no longer
+   touches a pending pairing and the engine no longer calls it.
 4. **A transactional decrypt** in the core (see "Defects found"). The engine's rollback through
    `import_sessions` would then be unnecessary.
 5. ~~`remove_session(peer_id)`.~~ Now in the core; the engine uses it (feature-detected).

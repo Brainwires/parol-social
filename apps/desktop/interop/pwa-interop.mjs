@@ -5,7 +5,9 @@
 //   INTEROP_APP=web node apps/desktop/interop/pwa-interop.mjs
 //
 // The browser side (INTEROP_APP)
-//   pwa  (default) the PWA in pwa/, as below.
+//   pwa  (default) the PWA in pwa/, as below. It speaks the pairing that came before the
+//        PNP-003 BootstrapHandshake and can no longer pair with the desktop: CI runs the web
+//        target only.
 //   web  the Denext web app in web/ that replaces it: its test build (web/out-test, from
 //        `denext task build-wasm && denext task build:test` in web/), served under /pwa/ with
 //        the production Content-Security-Policy by web/tests/e2e/static-server.mjs, the relay
@@ -68,6 +70,14 @@
 //   4. Channel binding (PNP-001 §10.5.1): every case above requires both sides to verify the
 //      other's binding before the path is direct; here the PWA binds a fingerprint it did not
 //      see (as if a relay had swapped the desktop's), and the desktop must refuse the channel.
+//      The pairing that was under way on it ends there (PNP-003 §4): the desktop reports it as
+//      failed, removes the contact it had added, and sends it nothing.
+//
+// Pairing with the web app (PNP-003): every pairing goes through the verification code of
+// §5.5. The web app asks for it, both ends show it, the test checks that the two are the
+// same and confirms on both (`compareSas`), and the desktop must report the pairing as
+// complete with the code confirmed.
+//
 //   5. The desktop video-calls the PWA (the browser's fake camera and microphone); the PWA
 //      accepts; the desktop sends its test pattern (VP8) and a tone (Opus): RTP flows both
 //      ways and the browser decodes the desktop's video and audio. The browser side does not
@@ -760,6 +770,19 @@ class Web extends Client {
     await this.page.click('[data-testid="pairing-code-submit"]');
   }
 
+  /// The six digits of the verification code on screen (PNP-003 §5.5), once it is shown.
+  async sasDigits() {
+    return until(`web ${this.name}: its verification code`, 45_000, async () => {
+      const shown = this.page.locator('[data-testid="sas-digits"]');
+      return (await shown.count()) > 0 ? await shown.first().getAttribute("data-digits") : null;
+    });
+  }
+
+  /// "They match".
+  async confirmSas() {
+    await this.page.click('[data-testid="sas-match"]');
+  }
+
   // The web app's database is sealed at rest (docs/web-port/at-rest.md), so nothing can be
   // read from it here: what the app holds is asked of its test hooks.
   async hasContact(peerId) {
@@ -853,6 +876,30 @@ async function closing(pwa, tag) {
   if (problems.length) throw new Error(`${tag}: the web app reported ${problems.join("; ")}`);
 }
 
+/// PNP-003 §5.5. The web app asks for the verification code in every pairing, so both ends
+/// show it (the bot asks for none and shows it because its contact does). The test stands in
+/// for the two people: the two codes must be the same, then each side says so, and the
+/// desktop reports the pairing as complete with the code confirmed. The old PWA knows no such
+/// step. `from`: where in the bot's event log this pairing began.
+async function compareSas(bot, pwa, tag, from = 0) {
+  if (!(pwa instanceof Web)) return;
+  const shown = await bot.wait("the verification code", (e) => e.event === "sas" && e.peer_id === pwa.peerId, 45_000, from);
+  const digits = await pwa.sasDigits();
+  if (!/^\d{6}$/.test(shown.digits) || digits !== shown.digits) {
+    throw new Error(`${tag}: the verification codes differ: the desktop shows ${shown.digits}, the web app ${digits}`);
+  }
+  if ([...shown.emoji].length !== 5) throw new Error(`${tag}: the desktop's emoji code is not five emoji: ${shown.emoji}`);
+  bot.send(`sas-confirm ${pwa.peerId}`);
+  await pwa.confirmSas();
+  const done = await bot.wait("the pairing to complete", (e) => e.event === "paired" && e.peer_id === pwa.peerId, 45_000, from);
+  if (done.sas_verified !== true) throw new Error(`${tag}: the desktop did not record the confirmed verification code`);
+  log(`${tag}: both showed ${shown.digits} and confirmed it`);
+}
+
+/// What a pairing code looks like as text: the web app's and the desktop's are base45
+/// (PNP-003) with an underscore for every blank; the old PWA's was hex.
+const CODE_AS_TEXT = target === "web" ? /^[0-9A-Z_$%*+\-./:]{100,}$/ : /^[0-9a-f]{100,}$/i;
+
 async function bothVerified(bot, pwa, tag) {
   await until(`${tag}: the PWA verifies the desktop's channel binding`, 20_000, () => pwa.verified(bot.peerId));
   await until(`${tag}: the desktop verifies the PWA's channel binding`, 20_000, () =>
@@ -885,9 +932,10 @@ async function caseDesktopEntersPwaCode(ctx) {
   const pwa = await App.open(browser, ctx.site, "one");
 
   const code = await pwa.showCode();
-  if (!/^[0-9a-f]{100,}$/i.test(code)) throw new Error(`${tag}: unexpected PWA code ${code.slice(0, 40)}`);
+  if (!CODE_AS_TEXT.test(code)) throw new Error(`${tag}: unexpected PWA code ${code.slice(0, 40)}`);
   bot.send(`pair ${code}`);
-  await bot.wait("paired", (e) => e.event === "paired" && e.peer_id === pwa.peerId);
+  await compareSas(bot, pwa, tag);
+  await bot.wait("paired", (e) => e.event === "paired" && e.peer_id === pwa.peerId, 45_000);
   await bot.wait("direct path", (e) => e.event === "path" && e.peer_id === pwa.peerId && e.state === "Direct", 45_000);
   await until(`${tag}: the PWA adds the desktop as a secure contact`, 30_000, () => pwa.hasContact(bot.peerId));
   await bothVerified(bot, pwa, tag);
@@ -923,9 +971,11 @@ async function casePwaPastesDesktopCode(ctx) {
   const mark = bot.events.length;
   bot.send("code");
   const { code } = await bot.wait("code", (e) => e.event === "code", 10_000, mark);
+  if (!CODE_AS_TEXT.test(code)) throw new Error(`${tag}: unexpected desktop code ${code.slice(0, 40)}`);
   await pwa.pasteCode(code);
   await until(`${tag}: the PWA stores the desktop as a contact`, 10_000, () => pwa.hasContact(bot.peerId));
   await bot.wait("contact (presenter side)", (e) => e.event === "contact" && e.peer_id === pwa.peerId, 45_000);
+  await compareSas(bot, pwa, tag, mark);
   await bot.wait("direct path", (e) => e.event === "path" && e.peer_id === pwa.peerId && e.state === "Direct", 45_000);
   await bothVerified(bot, pwa, tag);
   log(`${tag}: paired, direct data channel, bindings verified`);
@@ -965,21 +1015,30 @@ async function caseTamperedBindingIsRefused(ctx) {
 
   const code = await pwa.showCode();
   bot.send(`pair ${code}`);
-  await bot.wait("paired", (e) => e.event === "paired" && e.peer_id === pwa.peerId);
   const notice = await bot.wait(
     "the end-to-end check to fail",
     (e) => e.event === "notice" && e.text.includes("failed its end-to-end check"),
     45_000,
   );
   await bot.wait("BindingFailed path", (e) => e.event === "path" && e.peer_id === pwa.peerId && e.state === "BindingFailed", 10_000);
+  // The pairing was under way on the refused connection: it is over (PNP-003 §4), and the
+  // contact it had added is gone again. Nobody was asked to confirm anything.
+  await bot.wait("the pairing to fail", (e) => e.event === "pairing_failed" && e.peer_id === pwa.peerId, 10_000);
+  await bot.wait("the contact to be removed", (e) => e.event === "contact_removed" && e.peer_id === pwa.peerId, 10_000);
   if (bot.events.some((e) => e.event === "path" && e.peer_id === pwa.peerId && e.state === "Direct")) {
     throw new Error(`${tag}: the desktop reported a direct path despite the bad binding`);
   }
-  // Nothing the desktop queued went out on the refused channel.
+  if (bot.events.some((e) => e.event === "paired" && e.peer_id === pwa.peerId)) {
+    throw new Error(`${tag}: the desktop completed a pairing despite the bad binding`);
+  }
+  // Nothing can be sent to what is not a contact.
   const mark = bot.events.length;
   bot.send(`send ${pwa.peerId} must not be delivered on a refused channel`);
-  const sent = await bot.wait("queued", (e) => e.event === "sent", 10_000, mark);
-  if (sent.state !== "Queued") throw new Error(`${tag}: expected the message to queue, got ${sent.state}`);
+  const answer = await bot.wait("the send to be refused", (e) => e.event === "sent" || e.event === "error", 10_000, mark);
+  if (answer.event !== "error") throw new Error(`${tag}: expected the send to be refused, got ${JSON.stringify(answer)}`);
+  if (pwa instanceof Web) {
+    await until(`${tag}: the web app keeps no contact either`, 30_000, async () => !(await pwa.hasContact(bot.peerId)));
+  }
   log(`${tag}: refused (${notice.text.slice(0, 60)}...)`);
   await bot.quit();
   await closing(pwa, tag);
@@ -1010,6 +1069,7 @@ async function caseCalls(ctx) {
   const pwa = await App.open(browser, ctx.site, "calls");
   const code = await pwa.showCode();
   bot.send(`pair ${code}`);
+  await compareSas(bot, pwa, "calls");
   await bot.wait("direct path", (e) => e.event === "path" && e.peer_id === pwa.peerId && e.state === "Direct", 45_000);
   await bothVerified(bot, pwa, "calls");
 
@@ -1093,6 +1153,7 @@ async function casePwaOffersWithMedia(ctx) {
   const { code } = await bot.wait("code", (e) => e.event === "code", 10_000, mark);
   await pwa.pasteCode(code);
   await bot.wait("contact (presenter side)", (e) => e.event === "contact" && e.peer_id === pwa.peerId, 45_000);
+  await compareSas(bot, pwa, tag, mark);
   await bot.wait("direct path", (e) => e.event === "path" && e.peer_id === pwa.peerId && e.state === "Direct", 45_000);
   await bothVerified(bot, pwa, tag);
   const roles = await pwa.page.evaluate(() =>
@@ -1150,6 +1211,7 @@ async function caseFiles(ctx) {
   bot.send("code");
   const { code } = await bot.wait("code", (e) => e.event === "code", 10_000, mark);
   await pwa.pasteCode(code);
+  await compareSas(bot, pwa, tag, mark);
   await bot.wait("direct path", (e) => e.event === "path" && e.peer_id === pwa.peerId && e.state === "Direct", 45_000);
   await bothVerified(bot, pwa, tag);
 
