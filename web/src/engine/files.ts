@@ -8,8 +8,10 @@
 // - `MemoryFileStore`: `Blob`s (the browser may spill large ones to disk). Lost on reload:
 //   the transfer then starts again from the first record.
 //
-// What is stored is the file's plaintext: a received file is for the user to open. It is
-// removed when the transfer is removed, when its contact is removed, and by "delete all data".
+// Neither sees a file's plaintext: the engine seals every segment before it is written
+// (./sealed-files.ts; docs/web-port/at-rest.md, "Received files"), and what `readSegment`
+// and `blob` return is that ciphertext. What is stored is removed when the transfer is
+// removed, when its contact is removed, by "delete all data" and by a restore from a backup.
 import type { FileStore, SegmentWriter } from "./platform.ts";
 
 /** In-memory store (tests, and browsers without a writable OPFS). */
@@ -94,6 +96,24 @@ interface OpfsDir {
 /** The directory inside the origin private file system that holds every transfer's parts. */
 const ROOT = "parolnet-transfers";
 
+type OpfsRoot = { getDirectory?(): Promise<unknown> } | undefined;
+
+const pageStorage = (): OpfsRoot =>
+  (globalThis as { navigator?: { storage?: OpfsRoot } }).navigator?.storage;
+
+/**
+ * Remove everything the transfers keep in the origin private file system, without a store
+ * and without the engine: for "delete all data" on a locked device, and after a restore
+ * from a backup (the rows that held the files' keys are gone then). Never rejects.
+ */
+export async function clearStoredFiles(storage: OpfsRoot = pageStorage()): Promise<void> {
+  try {
+    if (typeof storage?.getDirectory !== "function") return;
+    const top = await storage.getDirectory() as OpfsDir;
+    await top.removeEntry(ROOT, { recursive: true });
+  } catch { /* nothing stored, or no OPFS here */ }
+}
+
 /** Segments in OPFS: `parolnet-transfers/<transfer id>/<index>`. */
 export class OpfsFileStore implements FileStore {
   readonly persistent = true;
@@ -104,11 +124,7 @@ export class OpfsFileStore implements FileStore {
    * The store, or null where the browser cannot write OPFS files from a page (no
    * `navigator.storage.getDirectory`, no `createWritable`, or a context that refuses it).
    */
-  static async open(
-    storage: { getDirectory?(): Promise<unknown> } | undefined = (globalThis as {
-      navigator?: { storage?: { getDirectory?(): Promise<unknown> } };
-    }).navigator?.storage,
-  ): Promise<OpfsFileStore | null> {
+  static async open(storage: OpfsRoot = pageStorage()): Promise<OpfsFileStore | null> {
     try {
       if (typeof storage?.getDirectory !== "function") return null;
       const top = await storage.getDirectory() as OpfsDir;
@@ -199,12 +215,7 @@ export class OpfsFileStore implements FileStore {
     } catch { /* nothing stored */ }
   }
 
-  async clear(): Promise<void> {
-    const top = await (globalThis as unknown as {
-      navigator: { storage: { getDirectory(): Promise<OpfsDir> } };
-    }).navigator.storage.getDirectory();
-    try {
-      await top.removeEntry(ROOT, { recursive: true });
-    } catch { /* nothing stored */ }
+  clear(): Promise<void> {
+    return clearStoredFiles();
   }
 }

@@ -225,12 +225,13 @@ export async function browserPlatform(
     random: browserRandom,
     fetch: browserFetch,
     sha256: browserSha256,
+    subtle: g.crypto.subtle,
     log: options.log ?? consoleLogger,
     media: options.media ??
       (g.navigator?.mediaDevices ? browserMedia : undefined),
     lock: browserLock(`${dbName}-engine`),
-    // Received files: OPFS where this browser can write it from a page (a part then
-    // survives a reload); otherwise the engine keeps them in memory.
+    // Received files, sealed by the engine before they get here: OPFS where this browser
+    // can write it from a page (a part then survives a reload); otherwise memory.
     files: (await OpfsFileStore.open()) ?? undefined,
   };
 }

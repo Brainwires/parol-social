@@ -194,6 +194,7 @@ export class World {
         new Uint8Array(
           await crypto.subtle.digest("SHA-256", data as BufferSource),
         ),
+      subtle: crypto.subtle,
       log,
       media,
       files: options.files,

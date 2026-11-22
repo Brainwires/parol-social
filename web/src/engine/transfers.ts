@@ -10,7 +10,8 @@
 // - The file flows as sealed 64 KiB records on its own data channel `pn-file/<id>`, opened
 //   by the receiver. The sender reads the picked `File` slice by slice and pauses on the
 //   channel's `bufferedAmount`; the receiver writes segments to a `FileStore` (OPFS where the
-//   browser allows it) and never holds the file in memory.
+//   browser allows it) and never holds the file in memory. What it stores is sealed under a
+//   key of the transfer's own, kept in its row (./sealed-files.ts; docs/web-port/at-rest.md).
 // - After a lost connection the receiver opens a new channel and names the next record it
 //   needs. After a reload a received part in OPFS is read back into the hash and continued;
 //   a file being sent is gone with the page (a web page keeps no file handle), so that
@@ -18,11 +19,12 @@
 //
 // Everything runs in the engine's mailbox except the sender's read-and-send loop, which
 // re-enters it through `host.internal` for anything that changes a transfer.
+import { fromHex, toHex } from "./bytes.ts";
 import { MemoryFileStore } from "./files.ts";
+import { SealedFiles } from "./sealed-files.ts";
 import type {
   DataChannel,
   FileSource,
-  FileStore,
   Platform,
   SegmentWriter,
   TransferControl,
@@ -82,6 +84,11 @@ export interface TransferRow {
   sha256: string;
   /** The file key (hex). Secret; null once the transfer is over. Never logged. */
   key: string | null;
+  /**
+   * Receiver: the key what is stored of the file is sealed with (hex; ./sealed-files.ts).
+   * Not the file key of the transfer. Secret; kept for as long as the file is, never logged.
+   */
+  storeKey?: string | null;
   /** Receiver: how many records each stored segment holds, in order. */
   segs: number[];
   pending: Pending | null;
@@ -158,12 +165,18 @@ export class TransferManager {
   /** The files being sent (lost on reload). */
   private readonly sources = new Map<string, FileSource>();
   private readonly limiters = new Map<string, WasmOfferLimiter>();
-  private readonly files: FileStore;
+  private readonly files: SealedFiles;
   private limitsCache: TransferLimits | null = null;
   private stopped = false;
 
   constructor(private readonly host: TransferHost) {
-    this.files = host.platform.files ?? new MemoryFileStore();
+    const { platform } = host;
+    // Whatever keeps the segments (OPFS, memory) is given ciphertext only.
+    this.files = new SealedFiles(
+      platform.files ?? new MemoryFileStore(),
+      { subtle: platform.subtle, random: (n) => platform.random.bytes(n) },
+      () => this.limits.chunkSize,
+    );
   }
 
   private get wasm() {
@@ -212,9 +225,27 @@ export class TransferManager {
     await this.host.save([this.rowOp(row)]);
   }
 
+  /** The key the transfer's stored segments are sealed with; made when first needed. */
+  private storeKey(row: TransferRow): Uint8Array {
+    if (typeof row.storeKey !== "string") row.storeKey = toHex(this.files.newKey());
+    const key = fromHex(row.storeKey);
+    if (!key) throw new Error("the transfer's storage key is unreadable");
+    return key;
+  }
+
   private stored(row: TransferRow): number {
     const records = row.segs.reduce((a, b) => a + b, 0);
     return Math.min(row.size, records * this.limits.chunkSize);
+  }
+
+  /** How many bytes of the file stored segment `index` holds, by the row's count of records. */
+  private segmentBytes(row: TransferRow, index: number): number {
+    const { chunkSize } = this.limits;
+    let before = 0;
+    for (let i = 0; i < index; i++) before += row.segs[i];
+    const start = Math.min(row.size, before * chunkSize);
+    const end = Math.min(row.size, (before + row.segs[index]) * chunkSize);
+    return end - start;
   }
 
   info(row: TransferRow): TransferInfo {
@@ -422,6 +453,8 @@ export class TransferManager {
     const row = this.mine(id, true);
     row.phase = "accepted";
     row.pending = { t: "accept" };
+    // The key for what will be stored is in the row before the first segment is.
+    this.storeKey(row).fill(0);
     await this.saveRow(row);
     this.emit(row);
     // The accept goes first, then the channel (PNP-010-MUST-010).
@@ -452,10 +485,18 @@ export class TransferManager {
   async file(id: string): Promise<Blob | null> {
     const row = this.rows.get(id);
     if (!row || row.outgoing || row.phase !== "complete" || row.segs.length === 0) return null;
+    if (typeof row.storeKey !== "string") return null;
+    let key: Uint8Array | null = null;
     try {
-      return await this.files.blob(id, row.segs.length, row.mime);
+      key = this.storeKey(row);
+      const blob = await this.files.blob(id, row.segs.length, row.mime, key);
+      // Every segment opened; together they are the file that was verified, or nothing.
+      return blob.size === row.size ? blob : null;
     } catch {
+      // Missing, or not what was stored (changed or cut short at rest).
       return null;
+    } finally {
+      key?.fill(0);
     }
   }
 
@@ -522,6 +563,7 @@ export class TransferManager {
     row.pending = byPeer ? null : { t: "cancel", reason };
     if (!row.outgoing) {
       row.segs = [];
+      row.storeKey = null;
       await this.files.remove(row.id).catch(() => {});
     }
     return [this.rowOp(row)];
@@ -752,9 +794,24 @@ export class TransferManager {
         row.key,
         records,
       );
-      // PNP-010-MUST-025: the stored plaintext goes into the final hash.
-      for (let i = 0; i < row.segs.length; i++) {
-        receiver.absorb_stored(await this.files.readSegment(row.id, i));
+      // PNP-010-MUST-025: the stored plaintext goes into the final hash. A segment that
+      // was changed, cut short or moved at rest does not open, and throws here.
+      if (row.segs.length > 0) {
+        if (typeof row.storeKey !== "string") throw new Error("stored without a key");
+        const key = this.storeKey(row);
+        try {
+          for (let i = 0; i < row.segs.length; i++) {
+            const plain = await this.files.readSegment(row.id, i, key);
+            try {
+              if (plain.length !== this.segmentBytes(row, i)) throw new Error("a short segment");
+              receiver.absorb_stored(plain);
+            } finally {
+              plain.fill(0);
+            }
+          }
+        } finally {
+          key.fill(0);
+        }
       }
       run.receiver = receiver;
       run.bytes = receiver.stored_bytes();
@@ -846,7 +903,14 @@ export class TransferManager {
     }
     if (chunk === undefined) return; // START
     try {
-      attempt.writer ??= await this.files.writer(row.id, row.segs.length);
+      if (!attempt.writer) {
+        const key = this.storeKey(row);
+        try {
+          attempt.writer = await this.files.writer(row.id, row.segs.length, key);
+        } finally {
+          key.fill(0);
+        }
+      }
       await attempt.writer.write(chunk);
       attempt.segRecords++;
       attempt.progressed = true;

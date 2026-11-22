@@ -438,22 +438,28 @@ wasm core (`crates/parolnet-wasm/src/transfer.rs` over `crates/parolnet-transfer
 - **Sending**: the picked `File` is read 1 MiB at a time, each record is sealed in wasm and
   sent; the loop pauses above 4 MiB of `bufferedAmount` and continues at 1 MiB
   (`bufferedamountlow`, with a look at the amount every 50 ms in case the event is missed).
-- **Receiving**: plaintext is written to a `FileStore` as segments of 256 records (16 MiB), each
+- **Receiving**: each record's plaintext is sealed (`SealedFiles`, [at-rest.md](at-rest.md),
+  "Received files") and written to a `FileStore` as segments of 256 records (16 MiB), each
   written once; a segment's records count as stored when it is closed, and the count is saved
-  then. The finished file is a `Blob` over the segments. `OpfsFileStore` (the origin private
-  file system, when the browser lets a page use `createWritable`) keeps segments across a
-  reload: the engine reads them back into the hash and asks for the next record.
-  `MemoryFileStore` (Blobs) is the fallback: a reload starts that file over.
+  then. `transferFile` decrypts the segments into a `Blob`. `OpfsFileStore` (the origin
+  private file system, when the browser lets a page use `createWritable`) keeps segments
+  across a reload: the engine opens them, reads them back into the hash and asks for the next
+  record; a segment that does not open (changed or cut short at rest) is dropped and the
+  file starts over. `MemoryFileStore` (Blobs, of ciphertext) is the fallback: a reload starts
+  that file over. `Platform.subtle` is the WebCrypto the sealing uses.
 - **A reload of the sending page** loses the `File`, so its unfinished outgoing transfers are
   cancelled with reason `Unavailable` at the next start (PNP-010-MAY-001) and the contact is
   told when it is next reachable.
 - **Storage**: one row per transfer in the `settings` store under `transfer:<id>` (no schema
   change): the offer with the file key until the transfer is over, the phase, the segment
-  list, the pending control message. Received files are plaintext in OPFS until the transfer
-  is removed, its contact is removed, or "delete all data".
+  list, the pending control message, and for a file being received the key its stored
+  segments are sealed with (`storeKey`). The row is sealed like every other. Received files
+  stay in OPFS, sealed, until the transfer is removed or cancelled, its contact is removed,
+  "delete all data", or a restore from a backup.
 - **Not solved**: a page cannot slow a sender down. `RTCDataChannel` has no receive-side
-  backpressure, so when the sender is faster than this device's storage the unprocessed
-  records wait in the page's memory. The protocol has no credit scheme for that yet.
+  backpressure, so when the sender is faster than this device's storage (which now includes
+  sealing each record) the unprocessed records wait in the page's memory. The protocol has
+  no credit scheme for that yet.
 
 ## Not done in this phase
 

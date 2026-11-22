@@ -5,7 +5,10 @@
 import { assert, assertEquals, assertRejects } from "@std/assert";
 import { MemoryFileStore } from "../../src/engine/files.ts";
 import type { FileSource } from "../../src/engine/platform.ts";
-import type { SettingRow } from "../../src/engine/storage.ts";
+import { SealedStorage } from "../../src/engine/sealed-storage.ts";
+import { MemoryStorage, type SettingRow } from "../../src/engine/storage.ts";
+import { Vault, VaultError } from "../../src/engine/vault.ts";
+import { FAST_KDF, testCrypto } from "./harness/vault.ts";
 import { SEGMENT_RECORDS, type TransferRow } from "../../src/engine/transfers.ts";
 import { EngineError, type TransferInfo } from "../../src/engine/types.ts";
 import type { FakeDc } from "./harness/fakes.ts";
@@ -398,7 +401,7 @@ Deno.test(
 );
 
 Deno.test(
-  "transfer: a stored part that changed at rest fails the final check and nothing is kept",
+  "transfer: a stored part that changed at rest is not used, and the file starts over",
   withWorld(async (w) => {
     const [a, b, store] = await pairWithFiles(w);
     const data = bytes(40 * CHUNK);
@@ -412,6 +415,7 @@ Deno.test(
     w.rtc.holdBinary = false;
     const b2shutdown = b.engine.shutdown();
     await b2shutdown;
+    assertEquals((await rowOf(b, o.id))?.segs, [20]);
     // Someone edits the stored segment while the app is closed.
     const stored = await store.readSegment(o.id, 0);
     stored[1000] ^= 0x01;
@@ -422,11 +426,105 @@ Deno.test(
     const b2 = await w.device("b", { storage: b.storage, files: store });
     await w.advance(120_000);
     await flow(w);
-    assertEquals(last(b2, o.id).state, { kind: "Cancelled", byPeer: false, reason: "Integrity" });
-    assertEquals(last(a, o.id).state, { kind: "Cancelled", byPeer: true, reason: "Integrity" });
-    assertEquals(await store.segments(o.id), 0);
+    // The segment does not open, so nothing of it reaches the hash or the person: the
+    // receiver asks for the file from its first record and ends with the genuine one.
+    assertEquals(last(b2, o.id).state.kind, "Complete");
+    assertEquals(last(a, o.id).state.kind, "Complete");
+    assertEquals(await received(b2, o.id), data);
+    assertEquals(new DataView(fileChannels(b2).at(-1)!.sentBinary[0].buffer).getUint32(1), 0);
+    assertEquals((await rowOf(b2, o.id))?.segs, [40]);
+    assert(!b2.eventsOf("Notice").some((n) => n.code === "Transfer"));
+
+    // The same once the file is complete: a changed segment is no file to save.
+    const whole = await store.readSegment(o.id, 0);
+    whole[whole.length - 1] ^= 0x01;
+    const again = await store.writer(o.id, 0);
+    await again.write(whole);
+    await again.close();
     assertEquals(await b2.engine.transferFile(o.id), null);
-    assert(b2.eventsOf("Notice").some((n) => n.code === "Transfer"));
+  }),
+);
+
+Deno.test(
+  "transfer: what is stored of a file is sealed, and follows the lock and a change of keys",
+  withWorld(async (w) => {
+    const c = await testCrypto(w.clock);
+    const raw = new MemoryStorage();
+    const vault = await Vault.open(raw, c);
+    // One view of the database per vault: the engine's, which this test reads through too.
+    const sealed = new SealedStorage(vault);
+    const store = new MemoryFileStore();
+    const a = await w.device("a");
+    const b = await w.device("b", { storage: raw, engineStorage: sealed, files: store });
+    await w.pair(a, b);
+    const records = SEGMENT_RECORDS + 30;
+    const data = bytes(records * CHUNK);
+    const o = await a.engine.offerFile(b.id, fileOf("sealed.bin", data));
+    await flow(w);
+    w.rtc.holdBinary = true;
+    await b.engine.acceptTransfer(o.id);
+    await flow(w);
+    await deliver(w, 2 + SEGMENT_RECORDS + 10);
+    w.rtc.heldBinary = [];
+
+    // The first segment is stored: a header, and every record with a tag of its own.
+    // Nothing of the file is in it.
+    assertEquals(await store.segments(o.id), 1);
+    const kept = await store.readSegment(o.id, 0);
+    assertEquals(kept.length, 17 + SEGMENT_RECORDS * (CHUNK + 16));
+    const latin1 = new TextDecoder("latin1");
+    const text = latin1.decode(kept);
+    for (const at of [0, CHUNK, 77 * CHUNK + 5, SEGMENT_RECORDS * CHUNK - 32]) {
+      assert(!text.includes(latin1.decode(data.subarray(at, at + 32))), `plaintext at ${at}`);
+    }
+    // Its key is in the transfer's row and nowhere readable.
+    const row = (await sealed.get<SettingRow>("settings", `transfer:${o.id}`))?.value as
+      | TransferRow
+      | undefined;
+    assertEquals(row?.storeKey?.length, 64);
+    assert(row?.storeKey !== row?.key, "not the transfer's own file key");
+    const database = JSON.stringify(
+      [...(await raw.dump(["settings"])).entries()],
+      (_key, value) => value instanceof Uint8Array ? latin1.decode(value) : value,
+    );
+    assert(!database.includes(row!.storeKey!));
+    assert(!database.includes("sealed.bin"));
+
+    // A passphrase is set while the transfer waits: every row is sealed again under new
+    // keys, the file's key with them. Then the page reloads.
+    await vault.setPassphrase("four unrelated plain words", FAST_KDF);
+    await b.engine.shutdown();
+    w.devices = w.devices.filter((d) => d !== b);
+    await w.settle();
+    const locked = await Vault.open(raw, c);
+    assert(locked.locked);
+    const reopened = new SealedStorage(locked);
+    // Locked, nothing says what the key is: the stored part cannot be opened.
+    const error = await assertRejects(
+      () => reopened.get("settings", `transfer:${o.id}`),
+      VaultError,
+    );
+    assertEquals(error.code, "Locked");
+
+    await locked.unlock("four unrelated plain words");
+    const b2 = await w.device("b", { storage: raw, engineStorage: reopened, files: store });
+    const waiting = (await b2.engine.transfers())[0];
+    assertEquals(waiting.bytesDone, (SEGMENT_RECORDS + 10) * CHUNK);
+    w.rtc.holdBinary = false;
+    w.rtc.releaseBinary();
+    await w.advance(120_000);
+    await flow(w);
+    assertEquals(last(b2, o.id).state.kind, "Complete");
+    assertEquals(last(a, o.id).state.kind, "Complete");
+    assertEquals(await received(b2, o.id), data);
+    // It went on where it was: the part stored before the change of keys was read back.
+    const resume = fileChannels(b2).at(-1)!.sentBinary[0];
+    assertEquals(new DataView(resume.buffer).getUint32(1), SEGMENT_RECORDS + 10);
+
+    // Cancelled or removed, a transfer leaves neither a file nor its key.
+    await b2.engine.removeTransfer(o.id);
+    assertEquals(await store.segments(o.id), 0);
+    assertEquals(await reopened.get("settings", `transfer:${o.id}`), undefined);
   }),
 );
 

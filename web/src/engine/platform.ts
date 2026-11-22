@@ -239,7 +239,8 @@ export interface SegmentWriter {
 /**
  * Where a received file is kept while it arrives and until the user saves it: a sequence of
  * segments per transfer, each written once, front to back. A file is never held in one
- * piece in memory: the finished file is a `Blob` over the segments.
+ * piece in memory. The engine hands a store only ciphertext (./sealed-files.ts): a segment
+ * is opaque bytes to it, and `blob` is not what the person saves.
  */
 export interface FileStore {
   /** Stored parts survive a reload (OPFS), or not (memory). */
@@ -473,11 +474,15 @@ export interface Platform {
   random: Random;
   fetch: Fetch;
   sha256: Sha256;
+  /** WebCrypto: received files are sealed with it before they are stored (./sealed-files.ts). */
+  subtle: SubtleCrypto;
   log: Logger;
   /** Optional: calls need it. */
   media?: MediaDevices;
   /** Optional: single-instance guard. */
   lock?: InstanceLock;
-  /** Optional: where received files are kept (default: memory, lost on reload). */
+  /**
+   * Optional: where received files are kept, sealed (default: memory, lost on reload).
+   */
   files?: FileStore;
 }
