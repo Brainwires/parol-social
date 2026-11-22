@@ -26,6 +26,8 @@ pub enum MessageType {
     IdentityRotate = 0x13,
     /// Direct data-channel binding (PNP-001 §10.5.1).
     ChannelBinding = 0x14,
+    /// File transfer offer and control (PNP-010 §4).
+    FileTransfer = 0x15,
 }
 
 impl MessageType {
@@ -44,7 +46,8 @@ impl MessageType {
     /// assert_eq!(MessageType::from_u8(0x00), None);
     /// assert_eq!(MessageType::from_u8(0x12), None);
     /// assert_eq!(MessageType::from_u8(0x14), Some(MessageType::ChannelBinding));
-    /// assert_eq!(MessageType::from_u8(0x15), None);
+    /// assert_eq!(MessageType::from_u8(0x15), Some(MessageType::FileTransfer));
+    /// assert_eq!(MessageType::from_u8(0x16), None);
     /// ```
     pub fn from_u8(v: u8) -> Option<Self> {
         match v {
@@ -67,6 +70,7 @@ impl MessageType {
             0x11 => Some(Self::SenderKeyDistribution),
             0x13 => Some(Self::IdentityRotate),
             0x14 => Some(Self::ChannelBinding),
+            0x15 => Some(Self::FileTransfer),
             _ => None,
         }
     }

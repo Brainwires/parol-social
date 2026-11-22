@@ -7,6 +7,7 @@
 import { Engine, type EngineConfig } from "../../../src/engine/engine.ts";
 import type {
   FetchResponse,
+  FileStore,
   Logger,
   MediaDevices,
   Platform,
@@ -61,6 +62,8 @@ export interface DeviceOptions {
   media?: boolean;
   /** Exports this device's core lacks: the engine runs as on an older parolnet-wasm. */
   without?: readonly (keyof WasmApi)[];
+  /** Where received files are kept (default: the engine's own memory store). */
+  files?: FileStore;
 }
 
 /** `wasm` without some of its exports (they read as missing, as on an older core). */
@@ -191,8 +194,10 @@ export class World {
         new Uint8Array(
           await crypto.subtle.digest("SHA-256", data as BufferSource),
         ),
+      subtle: crypto.subtle,
       log,
       media,
+      files: options.files,
     };
     const engine = await Engine.start(platform, {
       relayUrl: RELAY_URL,

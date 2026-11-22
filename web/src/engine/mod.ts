@@ -8,6 +8,8 @@ export * from "./types.ts";
 export type * from "./platform.ts";
 export { DEFAULT_RECONNECT, type ReconnectConfig } from "./reconnect.ts";
 export { DB_NAME, DB_VERSION, IdbStorage, MemoryStorage } from "./storage.ts";
+export { clearStoredFiles, MemoryFileStore, OpfsFileStore } from "./files.ts";
+export { type FileCrypto, FileSealError, SealedFiles } from "./sealed-files.ts";
 export { SealedStorage } from "./sealed-storage.ts";
 export {
   KDF_DEFAULT,

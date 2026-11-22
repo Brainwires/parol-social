@@ -12,20 +12,23 @@ use std::path::PathBuf;
 
 use anyhow::{Context as _, bail};
 use gpui::{
-    App, Bounds, ClipboardItem, Context, Entity, FontWeight, IntoElement, Render, SharedString,
-    Window, WindowBounds, WindowOptions, div, prelude::*, px, rgb, size,
+    App, Bounds, ClipboardItem, Context, Entity, ExternalPaths, FontWeight, IntoElement,
+    PathPromptOptions, Render, SharedString, Window, WindowBounds, WindowOptions, div, prelude::*,
+    px, rgb, size,
 };
 use gpui_component::Root;
 use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::input::{Input, InputEvent, InputState};
+use gpui_component::progress::Progress;
 use parolnet_app::KeyStorage;
 use parolnet_app::{
     AppConfig, AppEvent, AppHandle, CallEnd, CallInfo, CallMedia, CallState, ChatMessage, Contact,
-    DeliveryState, Direction, PathState, RelayState,
+    DeliveryState, Direction, PathState, RelayState, TransferInfo,
 };
 
 use crate::call::{CallSession, DeviceLists, MediaOptions};
 use crate::settings::SettingsView;
+use crate::transfer::{self, Action, TimelineItem};
 use crate::ui::VideoView;
 use tokio::sync::mpsc::UnboundedReceiver;
 
@@ -287,12 +290,24 @@ struct ContactRow {
     path: PathState,
 }
 
+/// A file being read for its hash before `offer_file` returns.
+struct Preparing {
+    token: u64,
+    peer: String,
+    path: PathBuf,
+}
+
 pub struct ChatView {
     app: AppHandle,
     relay: RelayState,
     contacts: Vec<ContactRow>,
     selected: Option<String>,
     messages: HashMap<String, Vec<ChatMessage>>,
+    /// Each conversation's file transfers, oldest first (`transfer.rs`).
+    transfers: HashMap<String, Vec<TransferInfo>>,
+    /// Files being prepared for an offer, in the order they were picked.
+    preparing: Vec<Preparing>,
+    next_token: u64,
     pane: Pane,
     pairing_code: Option<String>,
     qr: Option<QrRows>,
@@ -376,6 +391,10 @@ impl ChatView {
                     loaded.insert(c.contact.peer_id.clone(), list);
                 }
             }
+            let mut files: HashMap<String, Vec<TransferInfo>> = HashMap::new();
+            for t in app2.transfers(None).await.unwrap_or_default() {
+                files.entry(t.peer_id.clone()).or_default().push(t);
+            }
             let _ = this.update(cx, |view, cx| {
                 view.relay = snapshot.relay;
                 view.contacts = snapshot
@@ -387,6 +406,9 @@ impl ChatView {
                     })
                     .collect();
                 view.messages = loaded;
+                for (peer, list) in files {
+                    transfer::merge_loaded(view.transfers.entry(peer).or_default(), list);
+                }
                 cx.notify();
             });
         })
@@ -398,6 +420,9 @@ impl ChatView {
             contacts: Vec::new(),
             selected: None,
             messages: HashMap::new(),
+            transfers: HashMap::new(),
+            preparing: Vec::new(),
+            next_token: 0,
             pane: Pane::Welcome,
             pairing_code: None,
             qr: None,
@@ -475,6 +500,7 @@ impl ChatView {
                 }
             }
             AppEvent::Notice(n) => self.notice = Some(n),
+            AppEvent::Transfer(t) => self.on_transfer(t),
         }
         cx.notify();
     }
@@ -500,10 +526,142 @@ impl ChatView {
             .unwrap_or_default();
         self.name_input
             .update(cx, |s, cx| s.set_value(name, window, cx));
-        self.selected = Some(peer);
+        self.selected = Some(peer.clone());
         self.pane = Pane::Chat;
         self.notice = None;
+        self.load_transfers(peer, cx);
         cx.notify();
+    }
+
+    fn on_transfer(&mut self, t: TransferInfo) {
+        transfer::upsert(self.transfers.entry(t.peer_id.clone()).or_default(), t);
+    }
+
+    /// Reload a conversation's transfers from the core (when it opens).
+    fn load_transfers(&mut self, peer: String, cx: &mut Context<Self>) {
+        let app = self.app.clone();
+        cx.spawn(async move |this, cx| {
+            let Ok(list) = app.transfers(Some(&peer)).await else {
+                return;
+            };
+            let _ = this.update(cx, |view, cx| {
+                transfer::merge_loaded(view.transfers.entry(peer).or_default(), list);
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Offer files (picked or dropped) to a contact; folders are refused with a line.
+    fn offer_paths(&mut self, peer: String, paths: Vec<PathBuf>, cx: &mut Context<Self>) {
+        let (files, folders) = transfer::split_folders(&paths, |p| p.is_dir());
+        if let Some(line) = transfer::folders_refused_text(&folders) {
+            self.notice = Some(line);
+        }
+        for path in files {
+            self.offer(peer.clone(), path, cx);
+        }
+        cx.notify();
+    }
+
+    /// `offer_file` reads the whole file for its hash before it returns: the bubble says
+    /// "Preparing …" meanwhile, and the UI thread only awaits.
+    fn offer(&mut self, peer: String, path: PathBuf, cx: &mut Context<Self>) {
+        let token = self.next_token;
+        self.next_token += 1;
+        self.preparing.push(Preparing {
+            token,
+            peer: peer.clone(),
+            path: path.clone(),
+        });
+        let app = self.app.clone();
+        cx.spawn(async move |this, cx| {
+            let result = app.offer_file(&peer, path.clone()).await;
+            let _ = this.update(cx, |view, cx| {
+                view.preparing.retain(|p| p.token != token);
+                match result {
+                    Ok(info) => view.on_transfer(info),
+                    Err(e) => {
+                        view.notice =
+                            Some(format!("Not sent: {}: {e}", transfer::display_name(&path)))
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// The attach button: the system's file picker, then an offer per file.
+    fn attach(&mut self, cx: &mut Context<Self>) {
+        let Some(peer) = self.selected.clone() else {
+            return;
+        };
+        let picked = cx.prompt_for_paths(PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: true,
+            prompt: Some("Send".into()),
+        });
+        cx.spawn(async move |this, cx| {
+            let paths = match picked.await {
+                Ok(Ok(Some(paths))) => paths,
+                Ok(Ok(None)) | Err(_) => return, // dismissed
+                Ok(Err(e)) => {
+                    let _ = this.update(cx, |view, cx| {
+                        view.notice = Some(format!("Could not open the file picker: {e}"));
+                        cx.notify();
+                    });
+                    return;
+                }
+            };
+            let _ = this.update(cx, |view, cx| view.offer_paths(peer, paths, cx));
+        })
+        .detach();
+    }
+
+    /// A transfer bubble's button.
+    fn transfer_action(&mut self, t: &TransferInfo, action: Action, cx: &mut Context<Self>) {
+        match action {
+            Action::Open | Action::Reveal => {
+                let Some(path) = t.path.as_deref() else {
+                    return;
+                };
+                if !path.exists() {
+                    self.notice = Some(format!("{} is no longer at {}", t.name, path.display()));
+                    cx.notify();
+                    return;
+                }
+                // The system's default handler (or the file manager): the app never runs a
+                // received file itself.
+                if action == Action::Open {
+                    cx.open_with_system(path);
+                } else {
+                    cx.reveal_path(path);
+                }
+            }
+            Action::Accept | Action::Decline | Action::Cancel => {
+                let (app, id, name) = (self.app.clone(), t.id.clone(), t.name.clone());
+                cx.spawn(async move |this, cx| {
+                    let result = match action {
+                        Action::Accept => app.accept_transfer(&id).await,
+                        Action::Decline => app.decline_transfer(&id).await,
+                        _ => app.cancel_transfer(&id).await,
+                    };
+                    let _ = this.update(cx, |view, cx| {
+                        match result {
+                            Ok(info) => view.on_transfer(info),
+                            Err(e) => {
+                                view.notice =
+                                    Some(transfer::action_error(action, &name, &e.to_string()))
+                            }
+                        }
+                        cx.notify();
+                    });
+                })
+                .detach();
+            }
+        }
     }
 
     fn name_of(&self, peer: &str) -> String {
@@ -1323,10 +1481,18 @@ impl ChatView {
                     )
             });
 
-        let empty = Vec::new();
-        let msgs = self.messages.get(peer).unwrap_or(&empty);
+        let (no_msgs, no_files) = (Vec::new(), Vec::new());
+        let msgs = self.messages.get(peer).unwrap_or(&no_msgs);
+        let files = self.transfers.get(peer).unwrap_or(&no_files);
         let mut list = div().flex().flex_col().gap_2().p_3();
-        for m in msgs.iter().rev().take(300).rev() {
+        for item in transfer::timeline(msgs, files, 300) {
+            let m = match item {
+                TimelineItem::Message(m) => m,
+                TimelineItem::Transfer(t) => {
+                    list = list.child(self.render_transfer(t, cx));
+                    continue;
+                }
+            };
             let sent = m.direction == Direction::Sent;
             let state = match (m.direction, m.state) {
                 (Direction::Sent, DeliveryState::Queued) => " · waiting",
@@ -1349,11 +1515,36 @@ impl ChatView {
                 ),
             );
         }
+        for p in self.preparing.iter().filter(|p| p.peer == peer) {
+            list = list.child(
+                div().flex().justify_end().child(
+                    div()
+                        .max_w(px(520.))
+                        .px_3()
+                        .py_2()
+                        .rounded_lg()
+                        .border_1()
+                        .border_color(rgb(0x1f6feb))
+                        .text_sm()
+                        .text_color(rgb(0xc9d1d9))
+                        .overflow_hidden()
+                        .whitespace_nowrap()
+                        .text_ellipsis_middle()
+                        .child(transfer::preparing_text(&p.path)),
+                ),
+            );
+        }
 
+        let drop_peer = peer.to_owned();
         div()
+            .id("conversation")
             .size_full()
             .flex()
             .flex_col()
+            .drag_over::<ExternalPaths>(|style, _, _, _| style.bg(rgb(0x161b22)))
+            .on_drop(cx.listener(move |this, paths: &ExternalPaths, _, cx| {
+                this.offer_paths(drop_peer.clone(), paths.paths().to_vec(), cx)
+            }))
             .child(header)
             .children(safety)
             .child(
@@ -1371,6 +1562,11 @@ impl ChatView {
                     .p_3()
                     .border_t_1()
                     .border_color(rgb(0x30363d))
+                    .child(
+                        Button::new("attach")
+                            .label("Attach")
+                            .on_click(cx.listener(|this, _, _, cx| this.attach(cx))),
+                    )
                     .child(div().flex_1().child(Input::new(&self.composer)))
                     .child(
                         Button::new("send")
@@ -1379,6 +1575,80 @@ impl ChatView {
                             .on_click(cx.listener(|this, _, window, cx| this.send(window, cx))),
                     ),
             )
+    }
+}
+
+impl ChatView {
+    /// A file's bubble: aligned like a text bubble, outlined until the file is on the other
+    /// device (filled once complete), with the name, size, status in words and buttons.
+    fn render_transfer(&self, t: &TransferInfo, cx: &mut Context<Self>) -> impl IntoElement {
+        let sent = t.direction == Direction::Sent;
+        let color = if sent { 0x1f6feb } else { 0x30363d };
+        let filled = transfer::filled(t);
+        let mut buttons = div().flex().flex_wrap().gap_2();
+        for action in transfer::actions(t) {
+            let info = t.clone();
+            let mut button =
+                Button::new(SharedString::from(format!("transfer-{}-{action:?}", t.id)))
+                    .label(action.label())
+                    .on_click(
+                        cx.listener(move |this, _, _, cx| this.transfer_action(&info, action, cx)),
+                    );
+            if action == Action::Accept {
+                button = button.primary();
+            }
+            buttons = buttons.child(button);
+        }
+        let mut bubble = div()
+            .max_w(px(520.))
+            .min_w(px(220.))
+            .px_3()
+            .py_2()
+            .rounded_lg()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .border_1()
+            .border_color(rgb(color))
+            .when(filled, |d| d.bg(rgb(color)))
+            .child(
+                div()
+                    .flex()
+                    .gap_2()
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .overflow_hidden()
+                            .whitespace_nowrap()
+                            .text_ellipsis_middle()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(rgb(0xffffff))
+                            .child(t.name.clone()),
+                    )
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(rgb(0xc9d1d9))
+                            .child(transfer::human_size(t.size)),
+                    ),
+            )
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(rgb(0xc9d1d9))
+                    .child(transfer::status_text(t)),
+            );
+        if let Some(percent) = transfer::progress_percent(t) {
+            bubble = bubble.child(
+                Progress::new(SharedString::from(format!("transfer-progress-{}", t.id)))
+                    .value(percent),
+            );
+        }
+        div()
+            .flex()
+            .when(sent, |d| d.justify_end())
+            .child(bubble.child(buttons))
     }
 }
 
@@ -1471,6 +1741,8 @@ pub fn main(raw: &[String]) -> anyhow::Result<()> {
         .build()?;
     let mut config = AppConfig::new(opts.data_dir.clone(), opts.relay_url.clone());
     config.key_storage = opts.key_storage.clone();
+    // Received files go to Downloads/ParolNet (the core's default is inside the data dir).
+    config.downloads_dir = transfer::default_downloads_dir();
     let (app, events) = runtime
         .block_on(parolnet_app::start(config))
         .with_context(|| {

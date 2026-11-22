@@ -346,24 +346,48 @@ export class FakeDc implements DataChannel {
   onmessage: ((ev: { data: unknown }) => void) | null = null;
   onclose: (() => void) | null = null;
   other: FakeDc | null = null;
-  /** Everything sent on this end. */
+  binaryType = "blob";
+  bufferedAmountLowThreshold = 0;
+  onbufferedamountlow: (() => void) | null = null;
+  /** Every text frame sent on this end. */
   sent: string[] = [];
+  /** Every binary message sent on this end (a copy of each). */
+  sentBinary: Uint8Array[] = [];
 
   constructor(readonly pc: FakePc, readonly label: string) {}
 
-  send(data: string): void {
+  send(data: string | Uint8Array): void {
     if (this.readyState !== "open") throw new Error("channel not open");
-    this.sent.push(data);
     const rtc = this.pc.rtc;
-    if (rtc.dropFrame?.(this.pc, data)) return;
     const other = this.other;
+    if (typeof data !== "string") {
+      // As a browser: the bytes are taken at once, held in the buffer until they are on
+      // their way, and arrive as an ArrayBuffer of their own.
+      let bytes: Uint8Array<ArrayBuffer> | null = new Uint8Array(data);
+      this.sentBinary.push(bytes);
+      const held = bytes.length;
+      this.bufferedAmount += held;
+      bytes = rtc.tamper ? rtc.tamper(this.pc, this.label, bytes) : bytes;
+      const deliver = () => {
+        this.bufferedAmount -= held;
+        if (bytes && other && other.readyState === "open") {
+          other.onmessage?.({ data: bytes.buffer });
+        }
+        if (this.bufferedAmount <= this.bufferedAmountLowThreshold) this.onbufferedamountlow?.();
+      };
+      if (rtc.holdBinary) rtc.heldBinary.push(deliver);
+      else queueMicrotask(deliver);
+      return;
+    }
+    this.sent.push(data);
+    if (rtc.dropFrame?.(this.pc, data)) return;
     queueMicrotask(() => {
       if (other && other.readyState === "open") other.onmessage?.({ data });
     });
   }
 
   /** Put a raw frame in front of the other end, as if this end had sent it. */
-  inject(data: string): void {
+  inject(data: string | ArrayBuffer): void {
     const other = this.other;
     queueMicrotask(() => other?.onmessage?.({ data }));
   }
@@ -440,6 +464,25 @@ export class FakePc implements PeerConnection {
   createDataChannel(label: string): DataChannel {
     const dc = new FakeDc(this, label);
     this.channels.push(dc);
+    // On a connection that is up, a further channel opens in-band on both ends.
+    const peer = this.peer;
+    if (peer && this.connectionState === "connected") {
+      queueMicrotask(() => {
+        if (
+          dc.readyState !== "connecting" || this.connectionState !== "connected" ||
+          peer.connectionState !== "connected" || this.rtc.blockChannels
+        ) return;
+        const mirror = new FakeDc(peer, label);
+        peer.channels.push(mirror);
+        dc.other = mirror;
+        mirror.other = dc;
+        dc.readyState = "open";
+        mirror.readyState = "open";
+        peer.ondatachannel?.({ channel: mirror });
+        dc.onopen?.();
+        mirror.onopen?.();
+      });
+    }
     return dc;
   }
 
@@ -538,6 +581,24 @@ export class FakeRtc {
   offererStateStuck = false;
   /** Return true to lose a data-channel frame in flight. */
   dropFrame: ((from: FakePc, data: string) => boolean) | null = null;
+  /** Change (or with null, lose) a binary data-channel message in flight. */
+  tamper:
+    | ((
+      from: FakePc,
+      label: string,
+      data: Uint8Array<ArrayBuffer>,
+    ) => Uint8Array<ArrayBuffer> | null)
+    | null = null;
+  /** Binary messages stay in the senders' buffers until `releaseBinary`. */
+  holdBinary = false;
+  heldBinary: (() => void)[] = [];
+  /** Channels opened on a live connection never open. */
+  blockChannels = false;
+
+  /** Deliver the binary messages held back by `holdBinary` (all, or the first `count`). */
+  releaseBinary(count = Infinity): void {
+    for (const deliver of this.heldBinary.splice(0, count)) deliver();
+  }
 
   factory = (config: PeerConfig): PeerConnection => {
     const pc = new FakePc(this, config);

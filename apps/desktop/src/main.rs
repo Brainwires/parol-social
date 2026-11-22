@@ -34,6 +34,7 @@ mod macos;
 mod media_check;
 mod receiver;
 mod settings;
+mod transfer;
 mod ui;
 
 use std::net::SocketAddr;

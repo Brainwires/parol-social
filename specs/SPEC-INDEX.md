@@ -17,6 +17,7 @@ This index is the authoritative registry of ParolNet Protocol (PNP) specificatio
 | PNP-007 | Media & File Transfer | 0.2 | CANDIDATE | 89 | 12 | 3 | 104 | 100% M / 92% S |
 | PNP-008 | Relay Federation & Network Resilience | 0.2 | CANDIDATE | 62 | 11 | 3 | 76 | 100% M / 100% S |
 | PNP-009 | Group Communication | 0.2 | CANDIDATE | 77 | 7 | 3 | 87 | 100% M / 100% S |
+| PNP-010 | File Transfer | 0.1 | CANDIDATE | 36 | 7 | 2 | 45 | 100% M / 43% S |
 | PNP-011 | 1:1 Calls | 0.1 | CANDIDATE | 34 | 8 | 1 | 43 | 100% M / 100% S |
 | **Totals** | — | — | — | **512** | **97** | **31** | **640** | **—** |
 
@@ -51,4 +52,5 @@ Clause IDs are stable. Once a clause ID is published in a CANDIDATE or ADOPTED s
 
 ## Changelog
 
+- **2026-11-21** — PNP-010 (File Transfer) v0.1 CANDIDATE added: 36 MUST, 7 SHOULD, 2 MAY, vectors under `specs/vectors/PNP-010/`. It supersedes PNP-007 §7, whose clauses are marked `[DEPRECATED]` in place (PNP-007 v0.4). PNP-001 v0.15 allocates message type 0x15. (The Totals row is not recomputed here.)
 - **2026-04-17** — Initial SPEC-INDEX. All 9 specs harmonized to v0.2 CANDIDATE with numbered clause IDs. Cross-spec inconsistencies resolved (nonce construction catalog in PNP-001 §9, AEAD layering in PNP-001 §6.6, replay-window consolidation, TTL scope table in PNP-005 §3.6, BLE UUID assignment in PNP-003, onion ChaCha-only clarification in PNP-004, IBLT parameter pinning in PNP-005, MediaSource naming note in PNP-007, PNP-008 rewritten from roadmap to normative spec).
