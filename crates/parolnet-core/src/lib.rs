@@ -28,6 +28,8 @@ pub mod group;
 pub mod group_call;
 pub mod group_file;
 pub mod identity_rotation;
+#[cfg(feature = "mesh")]
+pub mod mesh_relay;
 pub mod panic;
 pub mod session;
 #[cfg(feature = "native")]
