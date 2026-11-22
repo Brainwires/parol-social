@@ -274,13 +274,25 @@ impl Identity {
 }
 
 /// Challenge-response registration; returns the `registered` (or `error`) frame.
+///
+/// The answer is signed for the relay the socket was opened to, by the name it was dialed
+/// under (PNP-001 §10.7): `127.0.0.1:<port>`, a loopback name every relay here serves.
 pub async fn register(ws: &mut Ws, id: &Identity) -> Value {
+    use parolnet_protocol::relay_auth::{RelayName, register_signable};
+    let relay_name = match ws.get_ref() {
+        tokio_tungstenite::MaybeTlsStream::Plain(tcp) => tcp.peer_addr().unwrap().to_string(),
+        _ => panic!("a plain TCP socket"),
+    };
     ws_send(ws, json!({"type": "register", "peer_id": id.peer_id})).await;
     let ch = ws_recv_type(ws, "challenge", Duration::from_secs(5))
         .await
         .expect("challenge");
-    let nonce = hex::decode(ch["nonce"].as_str().unwrap()).unwrap();
-    let sig = id.key.sign(&nonce);
+    let nonce: [u8; 32] = hex::decode(ch["nonce"].as_str().unwrap())
+        .unwrap()
+        .try_into()
+        .expect("a 32-byte nonce");
+    let relay = RelayName::parse(&relay_name).unwrap();
+    let sig = id.key.sign(&register_signable(&nonce, &relay, None));
     ws_send(
         ws,
         json!({
@@ -288,7 +300,8 @@ pub async fn register(ws: &mut Ws, id: &Identity) -> Value {
             "peer_id": id.peer_id,
             "pubkey": hex::encode(id.public),
             "signature": hex::encode(sig.to_bytes()),
-            "nonce": hex::encode(&nonce),
+            "nonce": hex::encode(nonce),
+            "relay": relay_name,
         }),
     )
     .await;
