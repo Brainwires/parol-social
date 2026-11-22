@@ -166,10 +166,12 @@ export const connMgr = {
             try { msg = JSON.parse(ev.data); } catch (_) { return; }
             const s = await _state();
             const wasm = s.wasm;
-            // Challenge → sign nonce → send authenticated register.
-            if (msg.type === 'challenge' && msg.nonce && wasm && wasm.sign_bytes && wasm.get_public_key) {
+            // Challenge → sign the register message for the relay this socket
+            // was opened to (PNP-001 §10.7) → send authenticated register.
+            if (msg.type === 'challenge' && msg.nonce && wasm && wasm.sign_relay_register && wasm.relay_name && wasm.get_public_key) {
                 try {
-                    const signature = wasm.sign_bytes(msg.nonce);
+                    const relay = relayNameOfUrl(entry.ws.url, wasm);
+                    const signature = wasm.sign_relay_register(msg.nonce, relay);
                     const pubkey = wasm.get_public_key();
                     const peerId = window._peerId;
                     entry.ws.send(JSON.stringify({
@@ -177,7 +179,8 @@ export const connMgr = {
                         peer_id: peerId,
                         pubkey,
                         signature,
-                        nonce: msg.nonce
+                        nonce: msg.nonce,
+                        relay
                     }));
                     entry.authState = 'challenged';
                 } catch (_) {
@@ -286,6 +289,20 @@ export const connMgr = {
         });
     }
 };
+
+// The canonical name (`host:port`, PNP-001 §10.7) of the relay a ws: / wss: /
+// http: / https: URL points at, as the browser's URL parser reads the URL. A
+// URL without a port has its scheme's default. Throws when there is none.
+export function relayNameOfUrl(url, wasm) {
+    const u = new URL(url);
+    let port;
+    if (u.protocol === 'wss:' || u.protocol === 'https:') port = 443;
+    else if (u.protocol === 'ws:' || u.protocol === 'http:') port = 80;
+    else throw new Error('not a relay URL');
+    if (u.username !== '' || u.password !== '' || u.hostname === '') throw new Error('not a relay URL');
+    if (u.port !== '') port = Number(u.port);
+    return wasm.relay_name(u.hostname, port);
+}
 
 function _toWsUrl(relayUrl) {
     let u = (relayUrl || '').replace(/\/$/, '');

@@ -1,4 +1,6 @@
-use parolnet_relay_server::challenge::RegisterChallenge;
+use parolnet_relay_server::challenge::{
+    RegisterAnswer, RegisterChallenge, RelayNames, verify_register,
+};
 use parolnet_relay_server::frames::{IncomingMessage, OutgoingMessage};
 use parolnet_relay_server::policy::{
     BinaryAdmission, Budget, FrameBudget, IpSlots, MAX_CIRCUITS_PER_CONN, MAX_REGISTER_ATTEMPTS,
@@ -1237,6 +1239,33 @@ async fn main() {
         info!("Relay profile: relay (SIGNALING_ONLY=0)");
     }
 
+    // The names clients dial this relay under. A register answer is accepted
+    // only when it was signed for one of them (PNP-001 §10.7), so a public
+    // relay without RELAY_PUBLIC_NAMES registers nobody but local clients.
+    let relay_names = match RelayNames::from_config(
+        std::env::var("RELAY_PUBLIC_NAMES").ok().as_deref(),
+    ) {
+        Ok(names) => Arc::new(names),
+        Err((entry, e)) => {
+            eprintln!(
+                "RELAY_PUBLIC_NAMES: {entry:?} is not a relay name ({e}); expected host or host:port, comma-separated"
+            );
+            std::process::exit(2);
+        }
+    };
+    if relay_names.configured().is_empty() {
+        tracing::warn!(
+            "RELAY_PUBLIC_NAMES is not set: only clients that dialed this relay by a loopback address (localhost, 127.0.0.1, [::1]) can register. Set it to the host[:port] clients connect to, e.g. RELAY_PUBLIC_NAMES=relay.example.org"
+        );
+    } else {
+        let names: Vec<&str> = relay_names
+            .configured()
+            .iter()
+            .map(|n| n.as_str())
+            .collect();
+        info!("Relay public names: {}", names.join(", "));
+    }
+
     // Bridge mode configuration
     let bridge_mode = std::env::var("BRIDGE_MODE").unwrap_or_default() == "true";
     let bridge_front_domain: Option<String> = std::env::var("BRIDGE_FRONT_DOMAIN")
@@ -1524,6 +1553,8 @@ async fn main() {
         signal_limiter: signal_limiter.clone(),
         peer_slots: peer_slots.clone(),
         watches: watches.clone(),
+        relay_names: relay_names.clone(),
+        relay_pubkey: pubkey_bytes,
     };
 
     #[allow(unused_mut)]
@@ -2050,6 +2081,10 @@ struct WsCtx {
     /// Registered PeerIds per client IP.
     peer_slots: IpSlots,
     watches: Arc<Mutex<WatchRegistry>>,
+    /// Names a register answer may be signed for (PNP-001 §10.7).
+    relay_names: Arc<RelayNames>,
+    /// This relay's Ed25519 identity key, for clients that pin it.
+    relay_pubkey: [u8; 32],
 }
 
 fn send_json(tx: &mpsc::UnboundedSender<Message>, msg: &OutgoingMessage) {
@@ -2067,43 +2102,6 @@ fn presence_frame(peer_id: &str, online: bool) -> OutgoingMessage {
         online: Some(online),
         ..Default::default()
     }
-}
-
-/// Verify a register challenge answer: PeerId = SHA-256(pubkey) and an
-/// Ed25519 signature over `nonce`.
-///
-/// `nonce` is the challenge this relay issued on this socket, as returned by
-/// [`RegisterChallenge::redeem`]; it is never the client's copy. A signature
-/// over a nonce the client chose proves nothing: it can be a replay.
-fn verify_register(
-    peer_id: &str,
-    pubkey_hex: &str,
-    sig_hex: &str,
-    nonce: &[u8; parolnet_relay_server::challenge::CHALLENGE_NONCE_LEN],
-) -> Result<(), String> {
-    let pubkey_bytes = hex::decode(pubkey_hex).map_err(|e| format!("invalid pubkey hex: {e}"))?;
-    let sig_bytes = hex::decode(sig_hex).map_err(|e| format!("invalid signature hex: {e}"))?;
-
-    use sha2::{Digest, Sha256};
-    let expected_pid = hex::encode(Sha256::digest(&pubkey_bytes));
-    if expected_pid != peer_id {
-        return Err("peer_id does not match pubkey".into());
-    }
-
-    let vk_bytes: [u8; 32] = pubkey_bytes
-        .try_into()
-        .map_err(|_| "pubkey must be 32 bytes".to_string())?;
-    let verifying_key = ed25519_dalek::VerifyingKey::from_bytes(&vk_bytes)
-        .map_err(|e| format!("invalid Ed25519 key: {e}"))?;
-    let sig_arr: [u8; 64] = sig_bytes
-        .try_into()
-        .map_err(|_| "signature must be 64 bytes".to_string())?;
-    let signature = ed25519_dalek::Signature::from_bytes(&sig_arr);
-
-    use ed25519_dalek::Verifier;
-    verifying_key
-        .verify(nonce, &signature)
-        .map_err(|_| "signature verification failed".to_string())
 }
 
 fn unix_now() -> u64 {
@@ -2126,6 +2124,8 @@ async fn handle_socket(socket: WebSocket, ctx: WsCtx, client_ip: IpAddr, _conn_s
         signal_limiter,
         peer_slots,
         watches,
+        relay_names,
+        relay_pubkey,
     } = ctx;
 
     let (mut sender, mut receiver) = socket.split();
@@ -2327,7 +2327,10 @@ async fn handle_socket(socket: WebSocket, ctx: WsCtx, client_ip: IpAddr, _conn_s
 
                 // The nonce must be the one issued on this socket, alive and
                 // not yet answered; the signature is then checked over the
-                // relay's copy of it. Every credentialed `register` spends
+                // register message built from the relay's copy of it and a
+                // name this relay serves, so an answer the client made for
+                // another relay does not register it here (PNP-001 §10.7).
+                // Every credentialed `register` spends
                 // the challenge, pass or fail, and a refusal carries no new
                 // one: the client asks again with a plain `register`, which
                 // counts against MAX_REGISTER_ATTEMPTS like any other.
@@ -2338,7 +2341,21 @@ async fn handle_socket(socket: WebSocket, ctx: WsCtx, client_ip: IpAddr, _conn_s
                             .redeem(&echoed, std::time::Instant::now())
                             .map_err(|e| e.message().to_string())
                     })
-                    .and_then(|nonce| verify_register(&peer_id, pubkey_hex, sig_hex, &nonce));
+                    .and_then(|nonce| {
+                        verify_register(
+                            RegisterAnswer {
+                                peer_id: &peer_id,
+                                pubkey_hex,
+                                signature_hex: sig_hex,
+                                relay: incoming.relay.as_deref(),
+                                relay_key_hex: incoming.relay_key.as_deref(),
+                            },
+                            &nonce,
+                            &relay_names,
+                            &relay_pubkey,
+                        )
+                        .map_err(|e| e.message())
+                    });
                 if let Err(err_msg) = redeemed {
                     send_error(
                         &tx,

@@ -29,6 +29,7 @@ pub mod identity_rotation;
 pub mod media;
 pub mod message;
 pub mod padding;
+pub mod relay_auth;
 
 pub use address::{BridgeAddress, PeerId};
 pub use error::ProtocolError;
