@@ -5,9 +5,19 @@ import { cp, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { controlled, expect, expectClean, OUT_DIR, test, watch, workerVersion } from "./harness.ts";
+import {
+  controlled,
+  expect,
+  expectClean,
+  OUT_DIR,
+  test,
+  watch,
+  workerVersion,
+} from "./harness.ts";
 
-const LEGACY_DIR = fileURLToPath(new URL("./fixtures/legacy-pwa", import.meta.url));
+const LEGACY_DIR = fileURLToPath(
+  new URL("./fixtures/legacy-pwa", import.meta.url),
+);
 
 test("renders under /pwa/ with the CSP header, no errors, nothing leaves localhost", async ({ page, server }) => {
   const problems = await watch(page, server);
@@ -33,7 +43,9 @@ test("renders under /pwa/ with the CSP header, no errors, nothing leaves localho
       new Promise((resolve) => {
         const open = indexedDB.open("parolnet-web");
         open.onsuccess = () => {
-          const rows = open.result.transaction("identity").objectStore("identity").count();
+          const rows = open.result.transaction("identity").objectStore(
+            "identity",
+          ).count();
           rows.onsuccess = () => resolve(rows.result);
         };
       })
@@ -42,7 +54,11 @@ test("renders under /pwa/ with the CSP header, no errors, nothing leaves localho
 
   // Fonts are the self-hosted ones.
   await page.evaluate(() => document.fonts.ready);
-  expect(await page.evaluate(() => document.fonts.check('16px "Atkinson Hyperlegible Next"'))).toBe(
+  expect(
+    await page.evaluate(() =>
+      document.fonts.check('16px "Atkinson Hyperlegible Next"')
+    ),
+  ).toBe(
     true,
   );
 
@@ -57,13 +73,19 @@ test("the production export has no state lab and no test hooks", async ({ page, 
 });
 
 test("no layout shift while wasm loads", async ({ page, server, browserName }) => {
-  test.skip(browserName !== "chromium", "the layout-shift entry type is Chromium-only");
+  test.skip(
+    browserName !== "chromium",
+    "the layout-shift entry type is Chromium-only",
+  );
   await page.addInitScript(() => {
     const state = { shift: 0 };
     (window as unknown as { __cls: typeof state }).__cls = state;
     new PerformanceObserver((list) => {
       for (const entry of list.getEntries()) {
-        const shift = entry as unknown as { value: number; hadRecentInput: boolean };
+        const shift = entry as unknown as {
+          value: number;
+          hadRecentInput: boolean;
+        };
         if (!shift.hadRecentInput) state.shift += shift.value;
       }
     }).observe({ type: "layout-shift", buffered: true });
@@ -84,9 +106,15 @@ test("the service worker controls the page and the app starts offline", async ({
   // Polled: right after `controlled` the document can be one that has no controller for a
   // moment (see `workerVersion` in the harness).
   await expect.poll(() =>
-    page.evaluate(() => navigator.serviceWorker.controller?.scriptURL).catch(() => undefined)
+    page.evaluate(() => navigator.serviceWorker.controller?.scriptURL).catch(
+      () => undefined,
+    )
   ).toBe(server.url + "sw.js");
-  expect(await page.evaluate(() => navigator.serviceWorker.ready.then((r) => r.scope))).toBe(
+  expect(
+    await page.evaluate(() =>
+      navigator.serviceWorker.ready.then((r) => r.scope)
+    ),
+  ).toBe(
     server.url,
   );
   await expect(page.getByTestId("first-run")).toBeVisible();
@@ -98,13 +126,19 @@ test("the service worker controls the page and the app starts offline", async ({
   await page.reload();
   await expect(page.getByTestId("first-run")).toBeVisible();
   await page.evaluate(() => document.fonts.ready);
-  expect(await page.evaluate(() => document.fonts.check('16px "Atkinson Hyperlegible Next"'))).toBe(
+  expect(
+    await page.evaluate(() =>
+      document.fonts.check('16px "Atkinson Hyperlegible Next"')
+    ),
+  ).toBe(
     true,
   );
   // The scanner's decoder is cached too: scanning works offline.
   expect(
     await page.evaluate(() =>
-      caches.match(new URL("vendor/jsqr.js", document.baseURI).href).then((hit) => hit?.ok)
+      caches.match(new URL("vendor/jsqr.js", document.baseURI).href).then((
+        hit,
+      ) => hit?.ok)
     ),
   ).toBe(true);
   expect(await problems.csp(), "CSP violations offline").toEqual([]);
@@ -119,12 +153,18 @@ test("a new build is offered and applied on reload", async ({ page, server }) =>
     const manifestPath = join(next, "manifest.webmanifest");
     await writeFile(
       manifestPath,
-      (await readFile(manifestPath, "utf8")).replace('"ParolNet"', '"ParolNet "'),
+      (await readFile(manifestPath, "utf8")).replace(
+        '"ParolNet"',
+        '"ParolNet "',
+      ),
     );
     const swPath = join(next, "sw.js");
     const sw = await readFile(swPath, "utf8");
     const version = /"version":"([0-9a-f]+)"/.exec(sw)![1];
-    await writeFile(swPath, sw.replace(`"version":"${version}"`, '"version":"next-build"'));
+    await writeFile(
+      swPath,
+      sw.replace(`"version":"${version}"`, '"version":"next-build"'),
+    );
 
     await page.goto(server.url);
     await controlled(page);
@@ -147,18 +187,26 @@ test("a new build is offered and applied on reload", async ({ page, server }) =>
       const worker = await found;
       await new Promise<void>((resolve, reject) => {
         const settle = () => {
-          if (worker.state === "installed" || worker.state === "activated") resolve();
-          else if (worker.state === "redundant") reject(new Error("the new build did not install"));
+          if (worker.state === "installed" || worker.state === "activated") {
+            resolve();
+          } else if (worker.state === "redundant") {
+            reject(new Error("the new build did not install"));
+          }
         };
         worker.addEventListener("statechange", settle);
         settle();
       });
     });
-    await expect(page.getByTestId("update-ready")).toContainText("A new version is ready");
+    await expect(page.getByTestId("update-ready")).toContainText(
+      "A new version is ready",
+    );
     // Until the person reloads, the old build keeps serving this tab.
     expect(await workerVersion(page)).toBe(version);
 
-    await Promise.all([page.waitForEvent("load"), page.getByTestId("update-reload").click()]);
+    await Promise.all([
+      page.waitForEvent("load"),
+      page.getByTestId("update-reload").click(),
+    ]);
     await controlled(page);
     await expect(page.getByTestId("first-run")).toBeVisible();
     expect(await workerVersion(page)).toBe("next-build");
@@ -181,7 +229,9 @@ test("replaces the previous PWA's worker and caches without the person doing any
   // The new app is deployed. The old page is still open; the browser checks sw.js for an
   // update (on its own on a navigation; here the test asks for it).
   server.setRoot(OUT_DIR);
-  await page.evaluate(() => navigator.serviceWorker.ready.then((r) => r.update()));
+  await page.evaluate(() =>
+    navigator.serviceWorker.ready.then((r) => r.update())
+  );
 
   // The new worker takes over, clears the old caches and reloads the window into the app.
   await expect(page.getByTestId("first-run")).toBeVisible({ timeout: 30_000 });
@@ -190,6 +240,8 @@ test("replaces the previous PWA's worker and caches without the person doing any
   expect(caches).toHaveLength(1);
   expect(caches[0]).toMatch(/^parolnet-web-[0-9a-f]{16}$/);
   expect(
-    await page.evaluate(() => navigator.serviceWorker.getRegistrations().then((r) => r.length)),
+    await page.evaluate(() =>
+      navigator.serviceWorker.getRegistrations().then((r) => r.length)
+    ),
   ).toBe(1);
 });
