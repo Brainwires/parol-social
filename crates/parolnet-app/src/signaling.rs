@@ -49,6 +49,22 @@ const KEEPALIVE: Keepalive = Keepalive {
 const NUDGE_DEAD_AFTER: Duration = Duration::from_secs(6);
 const BACKOFF_MIN: Duration = Duration::from_secs(1);
 const BACKOFF_MAX: Duration = Duration::from_secs(30);
+/// After a connection to the relay ended, the next one is not opened before this long has
+/// passed (PNP-006-MUST-024): no rapid connect / disconnect pattern on the wire.
+const RECONNECT_WAIT: Duration = Duration::from_secs(30);
+
+/// The timing of the relay socket.
+#[derive(Clone, Copy, Debug)]
+struct Timing {
+    keepalive: Keepalive,
+    /// See [`RECONNECT_WAIT`].
+    reconnect_wait: Duration,
+}
+
+const TIMING: Timing = Timing {
+    keepalive: KEEPALIVE,
+    reconnect_wait: RECONNECT_WAIT,
+};
 
 /// The reconnect delay: doubles from `BACKOFF_MIN` to `BACKOFF_MAX` while attempts fail and
 /// starts over once a socket got registered.
@@ -77,6 +93,7 @@ impl Backoff {
 pub struct SigHandle {
     tx: mpsc::UnboundedSender<ClientFrame>,
     nudge: Arc<Notify>,
+    stop: Arc<Notify>,
     task: tokio::task::JoinHandle<()>,
 }
 
@@ -85,20 +102,33 @@ impl SigHandle {
         let _ = self.tx.send(frame);
     }
 
-    /// The network changed: reconnect now when the socket is down (instead of waiting out
-    /// the backoff), and when it looks up, find out quickly whether it still is (a ping at
-    /// once, and a short wait for anything from the relay).
+    /// The network changed: when the socket is down, reconnect without waiting out the
+    /// backoff (the wait after a disconnect, PNP-006-MUST-024, still applies), and when it
+    /// looks up, find out quickly whether it still is (a ping at once, and a short wait for
+    /// anything from the relay).
     pub fn nudge(&self) {
         self.nudge.notify_one();
     }
 
-    pub fn stop(&self) {
-        self.task.abort();
+    /// Close the relay socket properly (the WebSocket close, then TLS `close_notify`,
+    /// PNP-006-MUST-026) and end the task. Bounded: an unresponsive relay is not waited for.
+    pub async fn stop(&mut self) {
+        self.stop.notify_one();
+        if tokio::time::timeout(STOP_TIMEOUT, &mut self.task)
+            .await
+            .is_err()
+        {
+            self.task.abort();
+        }
     }
 }
 
+/// How long [`SigHandle::stop`] waits for the task to close its socket.
+const STOP_TIMEOUT: Duration = Duration::from_secs(4);
+
 pub fn spawn(
     url: String,
+    trust_anchors: Vec<Vec<u8>>,
     peer_id: String,
     public_key_hex: String,
     signer: Signer,
@@ -106,49 +136,83 @@ pub fn spawn(
 ) -> SigHandle {
     let (tx, rx) = mpsc::unbounded_channel();
     let nudge = Arc::new(Notify::new());
+    let stop = Arc::new(Notify::new());
     let task = tokio::spawn(run(
-        url,
-        peer_id,
-        public_key_hex,
-        signer,
+        Target {
+            url,
+            trust_anchors,
+            peer_id,
+            public_key_hex,
+            signer,
+        },
         events,
         rx,
-        KEEPALIVE,
+        TIMING,
         nudge.clone(),
+        stop.clone(),
     ));
-    SigHandle { tx, nudge, task }
+    SigHandle {
+        tx,
+        nudge,
+        stop,
+        task,
+    }
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn run(
+/// The relay and who we are to it.
+struct Target {
     url: String,
+    /// Extra TLS trust anchors for the relay's certificate (DER).
+    trust_anchors: Vec<Vec<u8>>,
     peer_id: String,
     public_key_hex: String,
     signer: Signer,
+}
+
+/// How one socket ended.
+enum End {
+    /// The socket is gone (closed by the relay, an error, the silence limit).
+    Down(String),
+    /// We were asked to stop; the socket was closed properly.
+    Stopped,
+}
+
+async fn run(
+    target: Target,
     events: mpsc::UnboundedSender<SigEvent>,
     mut outgoing: mpsc::UnboundedReceiver<ClientFrame>,
-    keepalive: Keepalive,
+    timing: Timing,
     nudge: Arc<Notify>,
+    stop: Arc<Notify>,
 ) {
     let mut backoff = Backoff::new();
     loop {
         let _ = events.send(SigEvent::Connecting);
         let mut registered = false;
-        let reason = match session(
-            &url,
-            &peer_id,
-            &public_key_hex,
-            &signer,
+        let mut connected = false;
+        let end = session(
+            &target,
             &events,
             &mut outgoing,
-            keepalive,
+            timing.keepalive,
             &nudge,
+            &stop,
             &mut registered,
+            &mut connected,
         )
-        .await
-        {
-            Ok(()) => "closed".to_owned(),
-            Err(e) => e,
+        .await;
+        let reason = match end {
+            End::Stopped => return,
+            End::Down(reason) => reason,
+        };
+        let ended = tokio::time::Instant::now();
+        // A connection that existed is not replaced before `reconnect_wait` has passed,
+        // whatever asks for it (PNP-006-MUST-024). An attempt that never connected left
+        // nothing on the wire to wait for.
+        let earliest = if connected {
+            ended + timing.reconnect_wait
+        } else {
+            ended
         };
         let delay = backoff.delay_after(registered);
         if events
@@ -161,51 +225,102 @@ async fn run(
         }
         tracing::debug!(%reason, ?delay, "relay socket down; reconnecting");
         // Drop frames given while down: signaling is never queued.
-        let sleep = tokio::time::sleep(delay);
+        let sleep = tokio::time::sleep_until((ended + delay).max(earliest));
         tokio::pin!(sleep);
         loop {
             tokio::select! {
                 _ = &mut sleep => break,
-                // The network is back: try now, and start the backoff over.
+                // The network is back: start the backoff over and try as soon as the wait
+                // after a disconnect allows.
                 _ = nudge.notified() => {
                     backoff = Backoff::new();
-                    break;
+                    sleep.as_mut().reset(earliest);
                 }
+                _ = stop.notified() => return,
                 f = outgoing.recv() => if f.is_none() { return },
             }
         }
     }
 }
 
-/// One socket's life. `registered` is set as soon as the relay registers the socket, so the
-/// caller knows it however the socket ends.
+/// One socket's life. `connected` is set once the connection to the relay exists and
+/// `registered` as soon as the relay registers the socket, so the caller knows both however
+/// the socket ends.
+///
+/// The socket is never closed here for its age: it lives until the relay or the network
+/// ends it or the app stops (PNP-006-MUST-022 / MUST-023).
 #[allow(clippy::too_many_arguments)]
 async fn session(
-    url: &str,
-    peer_id: &str,
-    public_key_hex: &str,
-    signer: &Signer,
+    target: &Target,
     events: &mpsc::UnboundedSender<SigEvent>,
     outgoing: &mut mpsc::UnboundedReceiver<ClientFrame>,
     keepalive: Keepalive,
     nudge: &Notify,
+    stop: &Notify,
     registered: &mut bool,
-) -> Result<(), String> {
+    connected: &mut bool,
+) -> End {
     crate::install_crypto_provider();
     // The name of the relay this socket goes to, from the URL it is opened with. The
     // challenge answer is signed for it and for no other relay.
-    let relay_name = RelayName::from_url(url).map_err(|e| format!("relay URL: {e}"))?;
-    let (ws, _) = tokio::time::timeout(
+    let relay_name = match RelayName::from_url(&target.url) {
+        Ok(name) => name,
+        Err(e) => return End::Down(format!("relay URL: {e}")),
+    };
+    let connect = tokio::time::timeout(
         Duration::from_secs(15),
-        tokio_tungstenite::connect_async(url),
+        crate::relay_socket::connect(&target.url, &target.trust_anchors),
+    );
+    let mut ws = tokio::select! {
+        r = connect => match r {
+            Err(_) => return End::Down("connect timed out".to_owned()),
+            Ok(Err(e)) => return End::Down(e),
+            Ok(Ok(ws)) => ws,
+        },
+        _ = stop.notified() => return End::Stopped,
+    };
+    *connected = true;
+    match serve(
+        &mut ws,
+        target,
+        &relay_name,
+        events,
+        outgoing,
+        keepalive,
+        nudge,
+        stop,
+        registered,
     )
     .await
-    .map_err(|_| "connect timed out".to_owned())?
-    .map_err(|e| format!("connect: {e}"))?;
-    let (mut sink, mut stream) = ws.split();
+    {
+        Ok(true) => {
+            crate::relay_socket::close(ws).await;
+            End::Stopped
+        }
+        Ok(false) => End::Down("closed".to_owned()),
+        // Dropping the socket tears it down; `run` reconnects after its wait.
+        Err(reason) => End::Down(reason),
+    }
+}
 
+/// Register and carry frames until the socket ends. `Ok(true)`: we were asked to stop and
+/// the socket is still open; `Ok(false)`: the relay closed it.
+#[allow(clippy::too_many_arguments)]
+async fn serve(
+    ws: &mut crate::relay_socket::RelaySocket,
+    target: &Target,
+    relay_name: &RelayName,
+    events: &mpsc::UnboundedSender<SigEvent>,
+    outgoing: &mut mpsc::UnboundedReceiver<ClientFrame>,
+    keepalive: Keepalive,
+    nudge: &Notify,
+    stop: &Notify,
+    registered: &mut bool,
+) -> Result<bool, String> {
+    let (peer_id, public_key_hex, signer) =
+        (&target.peer_id, &target.public_key_hex, &target.signer);
     let send = |frame: &ClientFrame| Message::Text(frame.to_json().into());
-    sink.send(send(&ClientFrame::Register {
+    ws.send(send(&ClientFrame::Register {
         peer_id: peer_id.to_owned(),
         pubkey: None,
         signature: None,
@@ -224,15 +339,15 @@ async fn session(
     tokio::pin!(silence);
     loop {
         tokio::select! {
-            msg = stream.next() => {
+            msg = ws.next() => {
                 let msg = match msg {
                     Some(Ok(m)) => m,
                     Some(Err(e)) => return Err(format!("read: {e}")),
-                    None => return Ok(()),
+                    None => return Ok(false),
                 };
                 let text = match msg {
                     Message::Text(t) => t.to_string(),
-                    Message::Close(_) => return Ok(()),
+                    Message::Close(_) => return Ok(false),
                     _ => continue,
                 };
                 // Any frame of the relay shows it is alive, not only a pong.
@@ -250,8 +365,8 @@ async fn session(
                         else {
                             continue;
                         };
-                        let sig = signer(&register_signable(&nonce_bytes, &relay_name, None));
-                        sink.send(send(&ClientFrame::Register {
+                        let sig = signer(&register_signable(&nonce_bytes, relay_name, None));
+                        ws.send(send(&ClientFrame::Register {
                             peer_id: peer_id.to_owned(),
                             pubkey: Some(public_key_hex.to_owned()),
                             signature: Some(hex::encode(sig)),
@@ -274,23 +389,24 @@ async fn session(
                 }
             }
             frame = outgoing.recv() => {
-                let Some(frame) = frame else { return Ok(()) };
+                // The core is gone: close as on a stop.
+                let Some(frame) = frame else { return Ok(true) };
                 // Only register / ping may precede registration (PNP-001 §10.6).
                 if !*registered && !matches!(frame, ClientFrame::Ping { .. }) {
                     tracing::debug!("dropping a frame given before registration");
                     continue;
                 }
-                sink.send(send(&frame)).await.map_err(|e| format!("send: {e}"))?;
+                ws.send(send(&frame)).await.map_err(|e| format!("send: {e}"))?;
             }
             _ = ping.tick() => {
-                sink.send(send(&ClientFrame::Ping { ts: crate::now_ms() }))
+                ws.send(send(&ClientFrame::Ping { ts: crate::now_ms() }))
                     .await
                     .map_err(|e| format!("send: {e}"))?;
             }
             _ = nudge.notified() => {
                 // The network changed under a socket that looks alive: ask, and do not wait
                 // the full keepalive for the answer.
-                sink.send(send(&ClientFrame::Ping { ts: crate::now_ms() }))
+                ws.send(send(&ClientFrame::Ping { ts: crate::now_ms() }))
                     .await
                     .map_err(|e| format!("send: {e}"))?;
                 let soon = tokio::time::Instant::now()
@@ -299,8 +415,9 @@ async fn session(
                     silence.as_mut().reset(soon);
                 }
             }
+            _ = stop.notified() => return Ok(true),
             _ = &mut silence => {
-                // Dropping the socket tears it down; `run` reconnects after its backoff.
+                // An unresponsive relay is not owed a proper close.
                 return Err(format!(
                     "no frame from the relay for {} s",
                     keepalive.dead_after.as_secs_f32()
@@ -372,7 +489,7 @@ mod tests {
 
     fn client(
         url: String,
-        keepalive: Keepalive,
+        keepalive: Timing,
     ) -> (
         mpsc::UnboundedReceiver<SigEvent>,
         mpsc::UnboundedSender<ClientFrame>,
@@ -384,7 +501,7 @@ mod tests {
 
     fn nudgeable_client(
         url: String,
-        keepalive: Keepalive,
+        timing: Timing,
     ) -> (
         mpsc::UnboundedReceiver<SigEvent>,
         mpsc::UnboundedSender<ClientFrame>,
@@ -396,20 +513,25 @@ mod tests {
         let signer: Signer = Arc::new(|_| [0u8; 64]);
         let nudge = Arc::new(Notify::new());
         let task = tokio::spawn(run(
-            url,
-            "00".repeat(32),
-            "00".repeat(32),
-            signer,
+            Target {
+                url,
+                trust_anchors: Vec::new(),
+                peer_id: "00".repeat(32),
+                public_key_hex: "00".repeat(32),
+                signer,
+            },
             events_tx,
             rx,
-            keepalive,
+            timing,
             nudge.clone(),
+            Arc::new(Notify::new()),
         ));
         (events, tx, task, nudge)
     }
 
-    /// A network change does not wait out the reconnect backoff, and a socket that looks
-    /// alive is checked at once.
+    /// A network change does not wait out the reconnect backoff (nothing was connected, so
+    /// there is no disconnect to wait after), and a socket that looks alive is checked at
+    /// once.
     #[tokio::test]
     async fn a_nudge_reconnects_now_and_checks_a_live_socket() {
         // Nobody listens: attempts fail and the backoff grows (1 s, 2 s, 4 s).
@@ -454,10 +576,21 @@ mod tests {
             .expect("the signaling task is running")
     }
 
-    const FAST: Keepalive = Keepalive {
+    const FAST_KEEPALIVE: Keepalive = Keepalive {
         ping_every: Duration::from_millis(100),
         dead_after: Duration::from_millis(400),
     };
+    /// Short enough for a test, long enough to tell from "at once".
+    const FAST: Timing = Timing {
+        keepalive: FAST_KEEPALIVE,
+        reconnect_wait: Duration::from_millis(1500),
+    };
+
+    #[test]
+    fn a_connection_is_not_replaced_within_30_seconds() {
+        // PNP-006-MUST-024.
+        assert_eq!(TIMING.reconnect_wait, Duration::from_secs(30));
+    }
 
     #[tokio::test]
     async fn pings_on_schedule_and_stays_up_while_the_relay_answers() {
@@ -473,7 +606,7 @@ mod tests {
         ));
 
         // Several times the silence limit: the pongs keep the socket alive.
-        tokio::time::sleep(FAST.dead_after * 4).await;
+        tokio::time::sleep(FAST_KEEPALIVE.dead_after * 4).await;
         assert!(
             events.try_recv().is_err(),
             "no disconnect while pongs arrive"
@@ -500,7 +633,7 @@ mod tests {
         ));
 
         // The relay stops sending but keeps the socket open: no error, no close.
-        tokio::time::sleep(FAST.ping_every * 3 / 2).await;
+        tokio::time::sleep(FAST_KEEPALIVE.ping_every * 3 / 2).await;
         answering.store(false, Ordering::SeqCst);
         let silent_from = Instant::now();
         match next_event(&mut events).await {
@@ -514,7 +647,7 @@ mod tests {
         // runs out between `dead_after - ping_every` and `dead_after` from here (bounds
         // widened for a loaded machine).
         assert!(
-            waited >= FAST.dead_after / 2 && waited < FAST.dead_after * 3,
+            waited >= FAST_KEEPALIVE.dead_after / 2 && waited < FAST_KEEPALIVE.dead_after * 3,
             "declared dead after {waited:?}"
         );
 
@@ -545,11 +678,11 @@ mod tests {
                 if ws.send(Message::Text(registered.into())).await.is_err() {
                     return;
                 }
-                tokio::time::sleep(FAST.dead_after / 2).await;
+                tokio::time::sleep(FAST_KEEPALIVE.dead_after / 2).await;
             }
         });
         let (mut events, _tx, task) = client(url, FAST);
-        let until = Instant::now() + FAST.dead_after * 3;
+        let until = Instant::now() + FAST_KEEPALIVE.dead_after * 3;
         while let Ok(event) = tokio::time::timeout_at(until, events.recv()).await {
             assert!(
                 !matches!(event, Some(SigEvent::Disconnected { .. }) | None),
@@ -595,13 +728,17 @@ mod tests {
         let (_tx, rx) = mpsc::unbounded_channel();
         // Dialed with a path and a query: the name is the host and port alone.
         let task = tokio::spawn(run(
-            format!("ws://{addr}/ws?probe=1"),
-            "00".repeat(32),
-            hex::encode(public.to_bytes()),
-            signer,
+            Target {
+                url: format!("ws://{addr}/ws?probe=1"),
+                trust_anchors: Vec::new(),
+                peer_id: "00".repeat(32),
+                public_key_hex: hex::encode(public.to_bytes()),
+                signer,
+            },
             events_tx,
             rx,
             FAST,
+            Arc::new(Notify::new()),
             Arc::new(Notify::new()),
         ));
 
@@ -669,8 +806,10 @@ mod tests {
         }
     }
 
+    /// PNP-006-MUST-024: a socket that existed is replaced no sooner than the reconnect wait
+    /// after it ended, however it ended, and a network change does not shorten that.
     #[tokio::test]
-    async fn registered_socket_that_ends_in_an_error_reconnects_at_the_minimum_backoff() {
+    async fn a_socket_that_ended_is_replaced_after_the_reconnect_wait_even_when_nudged() {
         // The relay registers every client and then drops the TCP connection without a
         // WebSocket close: the client's read fails.
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -686,7 +825,7 @@ mod tests {
                 tokio::time::sleep(Duration::from_millis(50)).await;
             }
         });
-        let (mut events, _tx, task) = client(url, FAST);
+        let (mut events, _tx, task, nudge) = nudgeable_client(url, FAST);
 
         async fn registered_then_failed(events: &mut mpsc::UnboundedReceiver<SigEvent>) {
             assert!(matches!(
@@ -701,8 +840,6 @@ mod tests {
             }
         }
 
-        // Three sockets in a row get registered and end in an error. Doubling would wait
-        // 1 s and then 2 s; a registration resets it, so both waits are the minimum.
         assert!(matches!(
             next_event(&mut events).await,
             SigEvent::Connecting
@@ -710,17 +847,61 @@ mod tests {
         registered_then_failed(&mut events).await;
         for round in 0..2 {
             let down_from = Instant::now();
+            // The second round is nudged at once: the wait still holds.
+            if round == 1 {
+                nudge.notify_one();
+            }
             assert!(matches!(
                 next_event(&mut events).await,
                 SigEvent::Connecting
             ));
             let waited = down_from.elapsed();
             assert!(
-                waited >= BACKOFF_MIN * 9 / 10 && waited < BACKOFF_MIN * 17 / 10,
+                waited >= FAST.reconnect_wait * 9 / 10 && waited < FAST.reconnect_wait * 2,
                 "round {round}: reconnected after {waited:?}"
             );
             registered_then_failed(&mut events).await;
         }
         task.abort();
+    }
+
+    /// PNP-006-MUST-026: asked to stop, the client closes the WebSocket properly instead of
+    /// dropping the connection.
+    #[tokio::test]
+    async fn a_stop_closes_the_socket_with_a_close_frame() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("ws://{}", listener.local_addr().unwrap());
+        let (closed_tx, closed_rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
+            let registered = r#"{"type":"registered","peer_id":"00"}"#;
+            let _ = ws.send(Message::Text(registered.into())).await;
+            let mut close_frame = false;
+            while let Some(Ok(msg)) = ws.next().await {
+                close_frame |= matches!(msg, Message::Close(_));
+            }
+            let _ = closed_tx.send(close_frame);
+        });
+        let (events_tx, mut events) = mpsc::unbounded_channel();
+        let signer: Signer = Arc::new(|_| [0u8; 64]);
+        let mut handle = spawn(
+            url,
+            Vec::new(),
+            "00".repeat(32),
+            "00".repeat(32),
+            signer,
+            events_tx,
+        );
+        loop {
+            if matches!(next_event(&mut events).await, SigEvent::Registered { .. }) {
+                break;
+            }
+        }
+        handle.stop().await;
+        assert!(
+            closed_rx.await.unwrap(),
+            "the socket ended without a close frame"
+        );
     }
 }

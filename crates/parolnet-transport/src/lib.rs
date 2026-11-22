@@ -12,6 +12,7 @@
 //! Native only — WASM clients use `parolnet-wasm` for browser WebSocket.
 
 pub mod ble;
+pub mod conn_manager;
 pub mod domain_front;
 pub mod error;
 pub mod noise;

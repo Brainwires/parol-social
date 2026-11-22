@@ -29,6 +29,9 @@ tokio-tungstenite = { workspace = true, features = ["rustls-tls-webpki-roots"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 reqwest = { workspace = true, features = ["rustls-tls-webpki-roots-no-provider"] }
 futures-util.workspace = true
+# TCP keepalive on the relay socket (PNP-006-MUST-027) and its trust roots.
+socket2 = { version = "0.6", features = ["all"] }
+webpki-roots.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 ciborium.workspace = true

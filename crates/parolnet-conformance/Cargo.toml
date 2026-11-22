@@ -51,6 +51,15 @@ hex = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
 # The mock connections of the PNP-004 tests implement `Connection`.
 async-trait = { workspace = true }
+# PNP-006: a TLS server the transports and the client connect to, HTTP/2 from the other side,
+# and reading socket options back.
+rustls = { workspace = true }
+tokio-rustls = { workspace = true }
+rcgen = { workspace = true }
+h2 = "0.4"
+http = "1"
+bytes = "1"
+socket2 = { version = "0.6", features = ["all"] }
 # The black-box harness (tests/common): a scripted peer on the relay and on a data channel.
 tokio-tungstenite = { workspace = true }
 futures-util = { workspace = true }

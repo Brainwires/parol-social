@@ -241,7 +241,8 @@ async fn handle_bridge_info(
     )
 }
 
-/// Fallback route for bridge-mode relays (PNP-008-MUST-085..088).
+/// The front page of every relay (PNP-006-MUST-033 / MUST-040) and the fallback route of a
+/// bridge-mode relay (PNP-008-MUST-085..088).
 ///
 /// Any request that does not hit a known ParolNet endpoint is served the
 /// generic cover page — plain HTTP 200, `text/html`, body ≥ 256 B, no
@@ -1917,6 +1918,11 @@ async fn main() {
         // MUST-085..088: serve the generic cover page for every other path.
         app = app.fallback(get(handle_cover_page));
     }
+    // In every profile the site's front page is the generic cover page: a client that is
+    // not ParolNet and asks what is here sees a plain web server (PNP-006-MUST-033 /
+    // MUST-040). Paths that are not endpoints stay 404, as on any web server (a bridge
+    // answers those with the page too, above).
+    app = app.route("/", get(handle_cover_page));
 
     // Add /stats endpoint only when feature is enabled AND env var is set
     // (relay profile only).

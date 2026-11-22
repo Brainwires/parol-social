@@ -212,3 +212,74 @@ async fn a_second_channel_streams_with_backpressure_and_closes_alone() {
     offerer.close().await;
     answerer.close().await;
 }
+
+/// The next text or binary message on channel `id`.
+async fn next_message(events: &mut Receiver<RtcEvent>, id: usize) -> Vec<u8> {
+    loop {
+        match events.recv().await.expect("events") {
+            RtcEvent::DataChannelMessage { id: on, payload } if on == id => {
+                return payload.to_vec();
+            }
+            RtcEvent::Closed { error } => panic!("closed before a message: {error:?}"),
+            _ => {}
+        }
+    }
+}
+
+// `send_text_acked` answers when the peer has acknowledged the message, each message for
+// itself whatever else is sent on the channel around it, and never for a message sent to a
+// peer that is gone.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_acknowledged_send_answers_when_the_peer_has_the_message_and_never_for_a_lost_one() {
+    let ((offerer, _offerer_events, a), (answerer, mut answerer_events, b)) =
+        timeout(Duration::from_secs(20), connected())
+            .await
+            .expect("connect");
+
+    let acked = offerer.send_text_acked(a, "one").unwrap();
+    timeout(Duration::from_secs(10), acked)
+        .await
+        .expect("acknowledged in time")
+        .expect("acknowledged");
+    let got = timeout(
+        Duration::from_secs(10),
+        next_message(&mut answerer_events, b),
+    )
+    .await
+    .expect("delivered");
+    assert_eq!(got, b"one");
+
+    // Acknowledged and plain sends mixed: every acknowledged one is answered.
+    let two = offerer.send_text_acked(a, "two").unwrap();
+    offerer.send_text(a, "plain").unwrap();
+    offerer.send_data(a, &[7u8; 2000][..]).unwrap();
+    let three = offerer.send_text_acked(a, "three").unwrap();
+    for (name, acked) in [("two", two), ("three", three)] {
+        timeout(Duration::from_secs(10), acked)
+            .await
+            .unwrap_or_else(|_| panic!("{name} was not acknowledged in time"))
+            .unwrap_or_else(|_| panic!("{name} was dropped unacknowledged"));
+    }
+    for want in [&b"two"[..], b"plain", &[7u8; 2000], b"three"] {
+        let got = timeout(
+            Duration::from_secs(10),
+            next_message(&mut answerer_events, b),
+        )
+        .await
+        .expect("delivered");
+        assert_eq!(got, want);
+    }
+
+    // The peer goes away. Whatever this side learns of it, and whenever, a message sent
+    // now is not reported as acknowledged.
+    answerer.close().await;
+    drop(answerer_events);
+    if let Ok(lost) = offerer.send_text_acked(a, "lost") {
+        let outcome = timeout(Duration::from_secs(6), lost).await;
+        assert!(
+            !matches!(outcome, Ok(Ok(()))),
+            "a message nobody received was reported as acknowledged"
+        );
+    }
+    offerer.close().await;
+}

@@ -132,6 +132,149 @@ async fn messages_for_an_absent_contact_wait_and_arrive_over_the_next_channel() 
         .await;
     let texts: Vec<&[u8]> = got.iter().map(|d| d.plaintext.as_slice()).collect();
     assert_eq!(texts, [&b"first"[..], b"second", b"third"]);
+    // A message leaves the queue when the contact's end has acknowledged it.
+    for _ in 0..3 {
+        app.wait("a delivered message marked sent", 10, |e| {
+            matches!(
+                e,
+                AppEvent::MessageState {
+                    state: DeliveryState::Sent,
+                    ..
+                }
+            )
+        })
+        .await;
+    }
     let snapshot = app.handle.snapshot().await.unwrap();
     assert_eq!(snapshot.contacts[0].queued, 0);
+}
+
+// A message leaves the device's queue when the contact's end has acknowledged it, not when
+// it is handed to a data channel. Here the contact's connection is gone but the app still
+// holds its side of it (the grace period, or an ICE restart): messages sent now are handed
+// to a channel nobody reads. They stay queued, are never shown as sent, and reach the
+// contact, in order and once, over the next connection.
+#[clause("PNP-005-SHOULD-017")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn messages_given_to_a_dying_channel_stay_queued_and_arrive_over_the_next() {
+    let relay = Relay::start(&[]).await;
+    let mut app = App::start(&relay).await;
+    let code = app.handle.create_pairing_code().await.unwrap();
+    let mut peer = RawPeer::connect(&relay, &code).await;
+    let peer_id = peer.id.peer_id.clone();
+    peer.send_bootstrap();
+    peer.receive(Duration::from_secs(10), |d| d.msg_type == 0x14)
+        .await;
+    let ours = peer.binding().encode();
+    peer.send(0x14, &ours);
+    app.wait("a direct path", 10, |e| {
+        matches!(
+            e,
+            AppEvent::Path {
+                state: PathState::Direct,
+                ..
+            }
+        )
+    })
+    .await;
+    // A message on the live channel is acknowledged and only then shown as sent.
+    let live = app.handle.send_text(&peer_id, "live").await.unwrap();
+    assert_eq!(live.state, DeliveryState::Queued);
+    let got = peer
+        .receive(Duration::from_secs(10), |d| d.plaintext == b"live")
+        .await;
+    assert_eq!(
+        got.last().map(|d| d.plaintext.as_slice()),
+        Some(&b"live"[..])
+    );
+    app.wait("the live message marked sent", 10, |e| {
+        matches!(e, AppEvent::MessageState { id, state: DeliveryState::Sent, .. } if *id == live.id)
+    })
+    .await;
+    assert_eq!(app.handle.snapshot().await.unwrap().contacts[0].queued, 0);
+
+    // The contact's connection ends. The app has not given its own side up yet: it takes
+    // these messages while it still holds the channel.
+    peer.disconnect().await;
+    let mut ids = Vec::new();
+    for text in ["first", "second", "third"] {
+        let m = app.handle.send_text(&peer_id, text).await.unwrap();
+        assert_eq!(m.state, DeliveryState::Queued, "{text}");
+        ids.push(m.id);
+        // One send slot each, so every one of them has been handed to the channel (or
+        // kept back) before the next.
+        tokio::time::sleep(Duration::from_millis(700)).await;
+    }
+
+    // Until the app gives the connection up, and after, none of them is shown as sent
+    // and all of them are still stored.
+    let mut marked_sent = Vec::new();
+    app.wait_seeing(
+        "the connection given up",
+        40,
+        |e| {
+            matches!(
+                e,
+                AppEvent::Path {
+                    state: PathState::Unknown | PathState::Offline,
+                    ..
+                }
+            )
+        },
+        |e| {
+            if let AppEvent::MessageState {
+                id,
+                state: DeliveryState::Sent,
+                ..
+            } = e
+            {
+                marked_sent.push(*id);
+            }
+        },
+    )
+    .await;
+    assert!(
+        marked_sent.is_empty(),
+        "shown as sent on a channel nobody read: {marked_sent:?}"
+    );
+    let snapshot = app.handle.snapshot().await.unwrap();
+    assert_eq!(snapshot.contacts[0].queued, 3);
+    let history = app.handle.messages(&peer_id).await.unwrap();
+    for id in &ids {
+        let m = history
+            .iter()
+            .find(|m| m.id == *id)
+            .expect("in the history");
+        assert_eq!(m.state, DeliveryState::Queued, "{}", m.text);
+    }
+
+    // The contact comes back with a new connection and binds it: the three arrive, in
+    // order, each once, and only now leave the queue.
+    peer.reconnect().await;
+    let theirs = peer
+        .receive(Duration::from_secs(10), |d| d.msg_type == 0x14)
+        .await;
+    assert_eq!(theirs.len(), 1);
+    let ours = peer.binding().encode();
+    peer.send(0x14, &ours);
+    let got = peer
+        .receive(Duration::from_secs(15), |d| d.plaintext == b"third")
+        .await;
+    let texts: Vec<&[u8]> = got.iter().map(|d| d.plaintext.as_slice()).collect();
+    assert_eq!(texts, [&b"first"[..], b"second", b"third"]);
+    for id in ids {
+        app.wait("a resent message marked sent", 10, |e| {
+            matches!(e, AppEvent::MessageState { id: got, state: DeliveryState::Sent, .. } if *got == id)
+        })
+        .await;
+    }
+    let snapshot = app.handle.snapshot().await.unwrap();
+    assert_eq!(snapshot.contacts[0].queued, 0);
+    // Nothing more follows: no message was sent twice.
+    let more = peer.receive(Duration::from_secs(2), |_| false).await;
+    assert!(
+        more.is_empty(),
+        "sent again: {:?}",
+        more.iter().map(|d| d.msg_type).collect::<Vec<_>>()
+    );
 }

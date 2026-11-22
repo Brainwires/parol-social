@@ -30,6 +30,7 @@ pub mod media;
 pub mod message;
 pub mod padding;
 pub mod relay_auth;
+pub mod shaping;
 
 pub use address::{BridgeAddress, PeerId};
 pub use error::ProtocolError;

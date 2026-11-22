@@ -31,11 +31,14 @@ async fn files_go_both_ways_and_offers_can_be_declined_or_cancelled() {
     let offered = alice.offer_file(bob.peer_id(), &source).await.unwrap();
     assert_eq!(offered.direction, Direction::Sent);
     assert_eq!(offered.state, TransferState::Offered);
-    assert!(
-        !offered.pending,
-        "delivered at once over the verified channel"
-    );
+    // Over the verified channel the offer leaves in the channel's next send slot
+    // (PNP-006 §4.2), a moment later; until then it is owed.
+    assert!(offered.pending, "the offer waits for its send slot");
     assert_eq!(offered.name, "holiday photo.jpg");
+    transfer(&mut alice_rx, "the offer sent", 20, |t| {
+        t.id == offered.id && !t.pending
+    })
+    .await;
 
     let incoming = transfer(&mut bob_rx, "the offer", 20, |t| t.id == offered.id).await;
     assert_eq!(incoming.direction, Direction::Received);

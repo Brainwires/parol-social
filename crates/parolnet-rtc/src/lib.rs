@@ -449,6 +449,12 @@ enum Command {
         id: usize,
         text: String,
     },
+    /// Like `SendText`; `acked` is answered once the peer has acknowledged the message.
+    SendTextAcked {
+        id: usize,
+        text: String,
+        acked: oneshot::Sender<()>,
+    },
     RequestKeyframe {
         track_id: MediaStreamTrackId,
     },
@@ -652,6 +658,26 @@ impl RtcHandle {
             id,
             text: text.into(),
         })
+    }
+
+    /// Send a text message on an open data channel and learn when it has arrived: the
+    /// returned receiver resolves once the peer's SCTP has acknowledged every byte of the
+    /// message (on a reliable channel, which is what [`RtcHandle::open_data_channel`] and
+    /// browsers open by default; a channel with limited retransmissions also releases what
+    /// it gave up on). It resolves with an error, the sender dropped, when the channel or
+    /// the connection ended first: the message may then not have arrived.
+    pub fn send_text_acked(
+        &self,
+        id: usize,
+        text: impl Into<String>,
+    ) -> Result<oneshot::Receiver<()>, RtcError> {
+        let (acked, rx) = oneshot::channel();
+        self.send(Command::SendTextAcked {
+            id,
+            text: text.into(),
+            acked,
+        })?;
+        Ok(rx)
     }
 
     /// Send one encoded frame on the local track of `kind`: a VP8 frame (`samples` in the
@@ -887,6 +913,7 @@ pub async fn spawn(config: RtcConfig) -> Result<(RtcHandle, mpsc::Receiver<RtcEv
         tracks: HashMap::new(),
         audio_jitter: config.jitter_buffer.then(HashMap::new),
         dropped_rtp: 0,
+        ack_waits: Vec::new(),
         senders: built
             .senders
             .into_iter()
@@ -1201,6 +1228,17 @@ struct QualityBase {
     last: ConnectionQuality,
 }
 
+/// A message whose acknowledgement someone waits for.
+struct AckWait {
+    /// The data channel it was sent on.
+    id: usize,
+    /// Bytes given to that channel after this message. The channel's outstanding bytes
+    /// (sent and not yet acknowledged) are released in the order they were sent, so the
+    /// message is acknowledged once no more than these are outstanding.
+    after: usize,
+    acked: oneshot::Sender<()>,
+}
+
 struct Driver {
     pc: RTCPeerConnection,
     /// The bound sockets, most preferred first.
@@ -1222,6 +1260,9 @@ struct Driver {
     /// Audio tracks whose packets are de-jittered before they are delivered.
     audio_jitter: Option<HashMap<MediaStreamTrackId, jitter::AudioJitterBuffer>>,
     dropped_rtp: u64,
+    /// Messages sent with [`RtcHandle::send_text_acked`] that the peer has not acknowledged
+    /// yet, oldest first.
+    ack_waits: Vec<AckWait>,
     /// Local tracks.
     senders: HashMap<MediaKind, LocalSender>,
     codecs: Codecs,
@@ -1293,6 +1334,7 @@ impl Driver {
                 return Ok(());
             }
             self.drain_reads().await;
+            self.release_acks();
 
             let now = now();
             let relay_deadline = self.relay.as_mut().and_then(turn::Relay::poll_timeout);
@@ -1529,6 +1571,32 @@ impl Driver {
         }
     }
 
+    /// `len` more bytes were given to data channel `id`: they are behind every message of
+    /// that channel whose acknowledgement is still awaited.
+    fn note_sent(&mut self, id: usize, len: usize) {
+        for wait in self.ack_waits.iter_mut().filter(|w| w.id == id) {
+            wait.after = wait.after.saturating_add(len);
+        }
+    }
+
+    /// Answer the [`RtcHandle::send_text_acked`] messages the peer has acknowledged since
+    /// the last pass, and forget those whose channel is gone (their senders are dropped:
+    /// not acknowledged).
+    fn release_acks(&mut self) {
+        if self.ack_waits.is_empty() {
+            return;
+        }
+        for wait in std::mem::take(&mut self.ack_waits) {
+            match self.pc.data_channel(wait.id).map(|c| c.outstanding_bytes()) {
+                Some(outstanding) if outstanding <= wait.after => {
+                    let _ = wait.acked.send(());
+                }
+                Some(_) => self.ack_waits.push(wait),
+                None => {}
+            }
+        }
+    }
+
     async fn emit(&mut self, event: RtcEvent) {
         let _ = self.events.send(event).await;
     }
@@ -1724,12 +1792,29 @@ impl Driver {
             }
             Command::SendData { id, data } => {
                 if let Some(mut channel) = self.pc.data_channel(id) {
+                    let len = data.len();
                     channel.send(now, data)?;
+                    self.note_sent(id, len);
                 }
             }
             Command::SendText { id, text } => {
                 if let Some(mut channel) = self.pc.data_channel(id) {
+                    let len = text.len();
                     channel.send_text(now, text)?;
+                    self.note_sent(id, len);
+                }
+            }
+            Command::SendTextAcked { id, text, acked } => {
+                // Without the channel `acked` is dropped here: not sent, not acknowledged.
+                if let Some(mut channel) = self.pc.data_channel(id) {
+                    let len = text.len();
+                    channel.send_text(now, text)?;
+                    self.note_sent(id, len);
+                    self.ack_waits.push(AckWait {
+                        id,
+                        after: 0,
+                        acked,
+                    });
                 }
             }
             Command::RequestKeyframe { track_id } => {
@@ -1794,6 +1879,7 @@ impl Driver {
                 }
             }
             Command::SendDataFlow { id, data, reply } => {
+                let len = data.len();
                 let result = match self.pc.data_channel(id) {
                     Some(mut channel) => channel
                         .send(now, data)
@@ -1801,6 +1887,9 @@ impl Driver {
                         .map_err(|e| RtcError::Channel(e.to_string())),
                     None => Err(RtcError::Channel("closed".into())),
                 };
+                if result.is_ok() {
+                    self.note_sent(id, len);
+                }
                 let _ = reply.send(result);
             }
             Command::SetBufferedLow { id, bytes } => {

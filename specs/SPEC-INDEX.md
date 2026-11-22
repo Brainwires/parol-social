@@ -13,13 +13,13 @@ This index is the authoritative registry of ParolNet Protocol (PNP) specificatio
 | PNP-003 | Bootstrap Protocol | 0.2 | CANDIDATE | 52 | 8 | 3 | 63 | M 41/52 · S 5/8 · MAY 3/3 |
 | PNP-004 | Relay Circuit Construction | 0.3 | CANDIDATE | 59 | 7 | 1 | 67 | M 59/59 · S 7/7 · MAY 0/1 |
 | PNP-005 | Gossip Mesh & Diffusion | 0.3 | CANDIDATE | 49 | 17 | 4 | 70 | M 49/49 · S 17/17 · MAY 0/4 |
-| PNP-006 | Traffic Shaping & Camouflage | 0.3 | CANDIDATE | 45 | 15 | 5 | 65 | M 45/45 · S 15/15 · MAY 0/5 |
+| PNP-006 | Traffic Shaping & Camouflage | 0.3 | CANDIDATE | 45 | 15 | 5 | 65 | M 39/45 · S 12/15 · MAY 0/5 |
 | PNP-007 | Media & File Transfer | 0.4 | CANDIDATE | 90 | 13 | 3 | 106 | M 90/90 · S 12/13 · MAY 0/3 |
 | PNP-008 | Relay Federation & Network Resilience | 0.8 | CANDIDATE | 102 | 11 | 3 | 116 | M 102/102 · S 11/11 · MAY 0/3 |
 | PNP-009 | Group Communication | 0.3 | CANDIDATE | 83 | 7 | 3 | 93 | M 83/83 · S 7/7 · MAY 0/3 |
 | PNP-010 | File Transfer | 0.1 | CANDIDATE | 36 | 7 | 2 | 45 | M 36/36 · S 3/7 · MAY 2/2 |
 | PNP-011 | 1:1 Calls | 0.1 | CANDIDATE | 34 | 8 | 1 | 43 | M 34/34 · S 8/8 · MAY 1/1 |
-| **Totals** | — | — | — | **685** | **124** | **35** | **844** | **M 671/685 · S 115/124 · MAY 9/35** |
+| **Totals** | — | — | — | **685** | **124** | **35** | **844** | **M 665/685 · S 112/124 · MAY 9/35** |
 
 The gate (`cargo xtask clauses --check`) requires a test for every MUST and every SHOULD clause, and that every `#[clause]` id is one a spec publishes. CI runs the report without `--check` for now: many of the tests the column counts do not exercise the implementation (`docs/conformance-audit/`), and the gate goes back on when the coverage is real. MAY clauses are reported and not required: an implementation need not take an option, and an option it does not take has nothing to test.
 

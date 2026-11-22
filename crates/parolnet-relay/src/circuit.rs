@@ -381,6 +381,16 @@ impl EstablishedCircuit {
         }));
     }
 
+    /// Stop the padding task of [`start_padding`](Self::start_padding). For a sender that
+    /// keeps the circuit's whole send schedule itself
+    /// ([`ShapedCircuit`](crate::shaped::ShapedCircuit), PNP-006 §4.1): it sends a cell in
+    /// every slot, and a second source of PADDING cells would break that schedule.
+    pub fn stop_padding(&self) {
+        if let Some(task) = guard_of(&self.padding_task).take() {
+            task.abort();
+        }
+    }
+
     /// Ask the last hop to extend the circuit to `hop`, and take the new hop's keys.
     async fn extend_to(
         &self,

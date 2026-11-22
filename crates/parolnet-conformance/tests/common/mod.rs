@@ -13,8 +13,8 @@
 //! pairing by hand uses [`RawPeer::next_envelope`] and [`RawPeer::apply`] instead.
 //!
 //! The relay binary is `PAROLNET_RELAY_BIN` when set, else `parolnet-relay` in this test's
-//! target directory (built with `cargo build -p parolnet-relay-server` on demand, as
-//! `crates/parolnet-app/tests/two_peers.rs` does).
+//! target directory, brought up to date with `cargo build -p parolnet-relay-server` once per
+//! test binary (a no-op when it is current).
 
 #![allow(dead_code)]
 
@@ -66,10 +66,12 @@ fn relay_binary() -> PathBuf {
     // target/<profile>/deps/<test>-xxxx → target/<profile>/parolnet-relay
     let profile_dir = exe.parent().and_then(Path::parent).unwrap().to_owned();
     let bin = profile_dir.join(format!("parolnet-relay{}", std::env::consts::EXE_SUFFIX));
-    // One build at a time, whichever test of this binary gets here first.
-    static BUILD: Mutex<()> = Mutex::new(());
-    let _guard = BUILD.lock().unwrap_or_else(|e| e.into_inner());
-    if !bin.exists() {
+    // Built once per test binary, by whichever test gets here first, and always through
+    // cargo: a relay binary that is merely there may be older than the sources (a restored
+    // build cache holds one), and cargo does nothing when it is current.
+    static BUILD: Mutex<bool> = Mutex::new(false);
+    let mut built = BUILD.lock().unwrap_or_else(|e| e.into_inner());
+    if !*built {
         let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".into());
         let mut cmd = Command::new(cargo);
         cmd.args([
@@ -84,6 +86,7 @@ fn relay_binary() -> PathBuf {
         }
         let status = cmd.status().expect("run cargo build for the relay");
         assert!(status.success(), "building parolnet-relay failed");
+        *built = true;
     }
     assert!(bin.exists(), "relay binary not found at {}", bin.display());
     bin

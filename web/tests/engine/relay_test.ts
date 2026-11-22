@@ -6,6 +6,7 @@ import {
   BACKOFF_MAX_MS,
   DEAD_AFTER_MS,
   PING_EVERY_MS,
+  RECONNECT_WAIT_MS,
   RelayClient,
 } from "../../src/engine/relay.ts";
 import type { RelayState } from "../../src/engine/types.ts";
@@ -180,6 +181,9 @@ Deno.test("relay: 40 s of silence is a dead socket: closed with 4000 and reconne
   assert(!t.client.registered);
   // Any inbound frame counts, not only pongs: a relay that talks is alive.
   t.relay.silent = false;
+  // The connection existed, so the next one waits 30 s (PNP-006-MUST-024).
+  await t.advance(RECONNECT_WAIT_MS - 1_000);
+  assertEquals(t.kinds().at(-1), "Disconnected");
   await t.advance(1_100);
   assertEquals(t.kinds().slice(-2), ["Connecting", "Registered"]);
   t.client.stop();
@@ -218,7 +222,9 @@ Deno.test("relay: reconnect backs off 1 s doubling to 30 s, with jitter, reset o
   assertEquals(gaps, [1250, 2500, 5000, 10000, 20000, 37500, 37500, 37500]);
   assert(BACKOFF_MAX_MS * 1.25 === 37500);
   assertEquals(t.states.filter((s) => s.kind === "Registered").length, 0);
-  // Back up: it registers, and the next failure starts from 1 s again.
+  // Back up: it registers. That connection existed, so when it drops the next attempt
+  // waits 30 s (PNP-006-MUST-024). The backoff started over at the registration, so the
+  // attempt after that one (which never opens) follows its second step, 2 s with jitter.
   t.relay.down = false;
   await t.advance(40_000);
   assert(t.client.registered);
@@ -226,8 +232,46 @@ Deno.test("relay: reconnect backs off 1 s doubling to 30 s, with jitter, reset o
   t.relay.sockets.at(-1)!.drop();
   await t.settle();
   const n = t.relay.sockets.length;
-  await t.advance(1_300);
+  await t.advance(RECONNECT_WAIT_MS - 500);
+  assertEquals(t.relay.sockets.length, n);
+  await t.advance(600);
   assertEquals(t.relay.sockets.length, n + 1);
+  await t.advance(2_600);
+  assertEquals(t.relay.sockets.length, n + 2);
+  t.client.stop();
+});
+
+Deno.test("relay: PNP-006-MUST-024: a dropped connection is replaced no sooner than 30 s later, nudged or not", async () => {
+  assertEquals(RECONNECT_WAIT_MS, 30_000);
+  const t = setup();
+  t.client.start();
+  await t.settle();
+  assert(t.client.registered);
+  for (const nudged of [false, true, true]) {
+    const n = t.relay.sockets.length;
+    const droppedAt = t.clock.now();
+    t.relay.sockets.at(-1)!.drop();
+    await t.settle();
+    assertEquals(t.kinds().at(-1), "Disconnected");
+    if (nudged) {
+      // The network "came back" at once, and again later: neither shortens the wait.
+      t.client.nudge();
+      await t.settle();
+      assertEquals(t.relay.sockets.length, n);
+      await t.advance(10_000);
+      t.client.nudge();
+      await t.settle();
+    }
+    while (t.relay.sockets.length === n) {
+      await t.advance(250);
+      assert(t.clock.now() - droppedAt < 60_000, "never reconnected");
+    }
+    const waited = t.clock.now() - droppedAt;
+    assert(waited >= RECONNECT_WAIT_MS, `reconnected after ${waited} ms`);
+    assert(waited <= RECONNECT_WAIT_MS + 500, `reconnected only after ${waited} ms`);
+    await t.settle();
+    assert(t.client.registered);
+  }
   t.client.stop();
 });
 

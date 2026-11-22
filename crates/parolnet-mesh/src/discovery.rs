@@ -76,6 +76,9 @@ pub struct UdpDiscovery {
     our_peer_id: PeerId,
     listen_port: u16,
     discovery_key: [u8; 32],
+    /// Off: this node neither asks the local network for peers nor answers it
+    /// (PNP-006-SHOULD-014).
+    enabled: bool,
 }
 
 impl UdpDiscovery {
@@ -84,6 +87,7 @@ impl UdpDiscovery {
             our_peer_id,
             listen_port,
             discovery_key: default_discovery_key(),
+            enabled: true,
         }
     }
 
@@ -93,13 +97,35 @@ impl UdpDiscovery {
             our_peer_id,
             listen_port,
             discovery_key,
+            enabled: true,
         }
+    }
+
+    /// Turn local discovery on or off. Off is for a high-threat environment
+    /// (PNP-006-SHOULD-014): local discovery is network behaviour an observer on the same
+    /// network can see, so the node then sends no discovery request, binds no discovery
+    /// port and answers nobody; peers come from manual configuration or a pre-shared list.
+    pub fn set_enabled(&mut self, enabled: bool) {
+        self.enabled = enabled;
+    }
+
+    /// Builder form of [`set_enabled`](Self::set_enabled).
+    pub fn enabled(mut self, enabled: bool) -> Self {
+        self.enabled = enabled;
+        self
+    }
+
+    pub fn is_enabled(&self) -> bool {
+        self.enabled
     }
 }
 
 #[async_trait]
 impl PeerDiscovery for UdpDiscovery {
     async fn discover(&self) -> Result<Vec<DiscoveredPeer>, MeshError> {
+        if !self.enabled {
+            return Ok(Vec::new());
+        }
         let socket = UdpSocket::bind("0.0.0.0:0")
             .await
             .map_err(|e| MeshError::DiscoveryFailed(format!("bind: {e}")))?;
@@ -170,6 +196,9 @@ impl PeerDiscovery for UdpDiscovery {
     }
 
     async fn announce(&self, _identity: &PeerId) -> Result<(), MeshError> {
+        if !self.enabled {
+            return Ok(());
+        }
         let socket = UdpSocket::bind(format!("0.0.0.0:{DISCOVERY_PORT}"))
             .await
             .map_err(|e| MeshError::DiscoveryFailed(format!("bind announce: {e}")))?;

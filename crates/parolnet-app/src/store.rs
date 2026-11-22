@@ -125,6 +125,10 @@ pub struct State {
     /// The user's own TURN server ("Relay through my own TURN server"), if they set one.
     #[serde(default)]
     pub turn: Option<crate::TurnSettings>,
+    /// The traffic-shaping mode the user chose (PNP-006 §3). NORMAL until they choose
+    /// another (PNP-006-MUST-003).
+    #[serde(default)]
+    pub bandwidth_mode: parolnet_protocol::shaping::BandwidthMode,
     /// File transfers (PNP-010): offers with their keys, phases and progress, so that a
     /// transfer survives a lost connection and a restart.
     #[serde(default)]

@@ -1740,6 +1740,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "h2"
+version = "0.4.20"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7d29020232d6aa3fb1daca64c1127cf662cf97f254ae16c18c05b8ab635fc118"
+dependencies = [
+ "atomic-waker",
+ "bytes",
+ "fnv",
+ "futures-core",
+ "futures-sink",
+ "http",
+ "indexmap",
+ "slab",
+ "tokio",
+ "tokio-util",
+ "tracing",
+]
+
+[[package]]
 name = "half"
 version = "2.7.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3050,11 +3069,13 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.11.0",
+ "socket2",
  "thiserror 2.0.21",
  "tokio",
  "tokio-tungstenite 0.26.2",
  "tracing",
  "tracing-subscriber",
+ "webpki-roots 1.0.7",
  "zeroize",
 ]
 
@@ -3117,13 +3138,16 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
+ "bytes",
  "ciborium",
  "curve25519-dalek",
  "ed25519-dalek",
  "futures-util",
+ "h2",
  "hex",
  "hkdf",
  "hmac 0.13.0",
+ "http",
  "parolnet-app",
  "parolnet-clause",
  "parolnet-core",
@@ -3139,13 +3163,17 @@ dependencies = [
  "qrcode",
  "rand 0.8.5",
  "rand_core 0.6.4",
+ "rcgen",
+ "rustls",
  "serde",
  "serde_bytes",
  "serde_json",
  "sha1 0.11.0",
  "sha2 0.11.0",
+ "socket2",
  "subtle",
  "tokio",
+ "tokio-rustls",
  "tokio-tungstenite 0.26.2",
  "voprf",
  "x25519-dalek",
@@ -3401,12 +3429,18 @@ name = "parolnet-transport"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "bytes",
+ "ciborium",
  "futures-util",
+ "h2",
+ "http",
  "parolnet-crypto",
  "parolnet-protocol",
  "rand 0.8.5",
  "rcgen",
  "rustls",
+ "serde",
+ "socket2",
  "thiserror 2.0.21",
  "tokio",
  "tokio-rustls",
@@ -5098,6 +5132,20 @@ dependencies = [
  "log",
  "tokio",
  "tungstenite 0.29.0",
+]
+
+[[package]]
+name = "tokio-util"
+version = "0.7.20"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e464cf451ba96ebfc6f9b6542f17ee8b8956e33f1e40d9690624e59d7a7f8a4b"
+dependencies = [
+ "bytes",
+ "futures-core",
+ "futures-sink",
+ "libc",
+ "pin-project-lite",
+ "tokio",
 ]
 
 [[package]]

@@ -52,6 +52,9 @@ pub(super) struct Transfers {
     /// Bytes moved, per transfer id, as the workers last reported.
     progress: HashMap<String, u64>,
     limiters: HashMap<String, OfferLimiter>,
+    /// Channels (connection epoch, channel) of received transfers that are closed once the
+    /// transfer's `complete` has left in its send slot.
+    closing: HashMap<String, (u64, usize)>,
     downloads: PathBuf,
     max_accept: u64,
 }
@@ -62,6 +65,7 @@ impl Transfers {
             workers: HashMap::new(),
             progress: HashMap::new(),
             limiters: HashMap::new(),
+            closing: HashMap::new(),
             downloads: cfg
                 .downloads_dir
                 .clone()
@@ -318,17 +322,13 @@ impl Engine {
 
     // ── Control messages ──────────────────────────────────────────
 
-    /// Seal a control message for the contact and send it on the verified channel.
-    fn send_control(&mut self, peer: &str, control: &Control) -> bool {
-        let Some(pid) = peer_id_of(peer) else {
-            return false;
-        };
+    /// Seal a control message for the contact, if there is a verified path to send it on.
+    fn seal_control(&mut self, peer: &str, control: &Control) -> Option<String> {
+        let pid = peer_id_of(peer)?;
         if !self.control_path(peer) {
-            return false;
+            return None;
         }
-        let Ok(mut body) = control.encode() else {
-            return false;
-        };
+        let mut body = control.encode().ok()?;
         let sealed = encrypt_for_peer(
             self.client.sessions(),
             &pid,
@@ -338,66 +338,107 @@ impl Engine {
             None,
         );
         zeroize::Zeroize::zeroize(&mut body);
-        let envelope = match sealed {
-            Ok(e) => hex::encode(e),
+        match sealed {
+            Ok(e) => Some(hex::encode(e)),
             Err(e) => {
                 tracing::warn!(%e, "file-transfer message encrypt failed");
-                return false;
+                None
             }
+        }
+    }
+
+    /// Seal a control message nothing is owed for (the decline of a refused offer) and give
+    /// it to the verified channel: it leaves in the channel's next send slot.
+    fn send_control(&mut self, peer: &str, control: &Control) -> bool {
+        let Some(envelope) = self.seal_control(peer, control) else {
+            return false;
         };
         let ok = self.send_on_channel(peer, &envelope);
         self.persist_sessions();
         ok
     }
 
-    /// Send every control message this device still owes the contact (PNP-010-MUST-006:
-    /// only on a verified connection; until then they wait here).
+    /// Ask for a send slot for every control message this device still owes the contact
+    /// (PNP-010-MUST-006: only on a verified connection; until then they wait here). A
+    /// message stays owed (`pending`) until it has left in its slot
+    /// (`send_owed_transfer_control`), so one that a connection takes with it when it ends
+    /// is sent again on the next.
     pub(super) fn flush_transfer_controls(&mut self, peer: &str) {
         if !self.control_path(peer) {
             return;
         }
-        let owed: Vec<(String, PendingControl)> = self
+        let owed: Vec<String> = self
             .state
             .transfers
             .iter()
-            .filter(|t| t.peer_id == peer)
-            .filter_map(|t| t.pending.map(|p| (t.id.clone(), p)))
+            .filter(|t| t.peer_id == peer && t.pending.is_some())
+            .map(|t| t.id.clone())
             .collect();
-        for (id, pending) in owed {
-            let Some(t) = self.transfer(&id) else {
-                continue;
-            };
-            let Some(tid) = t.transfer_id() else {
-                continue;
-            };
-            let control = match pending {
-                PendingControl::Offer => match t.offer() {
-                    Some(offer) => Control::Offer(offer),
-                    // Over before it was ever delivered: nothing to offer.
-                    None => {
-                        if let Some(t) = self.transfer_mut(&id) {
-                            t.pending = None;
-                        }
-                        continue;
-                    }
-                },
-                PendingControl::Accept => Control::Accept { id: tid },
-                PendingControl::Decline => Control::Decline { id: tid },
-                PendingControl::Cancel(code) => Control::Cancel {
-                    id: tid,
-                    reason: CancelReason::from_code(code),
-                },
-                PendingControl::Complete => Control::Complete { id: tid },
-            };
-            if !self.send_control(peer, &control) {
+        for id in owed {
+            if !self.queue_transfer_control(peer, &id) {
                 break;
             }
-            if let Some(t) = self.transfer_mut(&id) {
-                t.pending = None;
-            }
-            self.emit_transfer(&id);
         }
         self.save();
+    }
+
+    /// The send slot asked for by `flush_transfer_controls` has come up: send what transfer
+    /// `id` owes the contact now, if it still owes something and the path is still there.
+    /// True when a message left in this slot.
+    pub(super) fn send_owed_transfer_control(&mut self, peer: &str, id: &str) -> bool {
+        let sent = self.write_owed_transfer_control(peer, id);
+        // `complete` first, then the channel (the worker left it open for this). Without a
+        // path for the message the channel is closed all the same.
+        if let Some((epoch, dc)) = self.xfer.closing.remove(id)
+            && let Some(h) = self.conn_mut(peer, epoch).and_then(|c| c.handle.as_ref())
+        {
+            let _ = h.close_data_channel(dc);
+        }
+        if sent {
+            self.save();
+            self.emit_transfer(id);
+            // The accept has left: its channel can be opened (PNP-010-MUST-010).
+            self.pump_transfers(peer);
+        }
+        sent
+    }
+
+    fn write_owed_transfer_control(&mut self, peer: &str, id: &str) -> bool {
+        let Some(t) = self.transfer(id).filter(|t| t.peer_id == peer) else {
+            return false;
+        };
+        let (Some(pending), Some(tid)) = (t.pending, t.transfer_id()) else {
+            return false;
+        };
+        let control = match pending {
+            PendingControl::Offer => match t.offer() {
+                Some(offer) => Control::Offer(offer),
+                // Over before it was ever delivered: nothing to offer.
+                None => {
+                    if let Some(t) = self.transfer_mut(id) {
+                        t.pending = None;
+                    }
+                    self.save();
+                    return false;
+                }
+            },
+            PendingControl::Accept => Control::Accept { id: tid },
+            PendingControl::Decline => Control::Decline { id: tid },
+            PendingControl::Cancel(code) => Control::Cancel {
+                id: tid,
+                reason: CancelReason::from_code(code),
+            },
+            PendingControl::Complete => Control::Complete { id: tid },
+        };
+        let Some(envelope) = self.seal_control(peer, &control) else {
+            return false;
+        };
+        let ok = self.write_in_slot(peer, &envelope);
+        self.persist_sessions();
+        if ok && let Some(t) = self.transfer_mut(id) {
+            t.pending = None;
+        }
+        ok
     }
 
     /// A `FILE_TRANSFER` envelope from the contact.
@@ -839,14 +880,21 @@ impl Engine {
                     t.pending = Some(PendingControl::Complete);
                 }
                 self.flush_transfer_controls(&peer);
-                // `complete` first, then the channel (the worker left it open for this).
+                // `complete` first, then the channel (the worker left it open for this):
+                // the channel is closed when the message has left in its send slot, or now
+                // if there is no path to send it on.
                 if let Some(Chan {
                     epoch,
                     dc: Some(dc),
                 }) = chan
-                    && let Some(h) = self.conn_mut(&peer, epoch).and_then(|c| c.handle.as_ref())
                 {
-                    let _ = h.close_data_channel(dc);
+                    if self.transfer_control_queued(&peer, id) {
+                        self.xfer.closing.insert(id.to_owned(), (epoch, dc));
+                    } else if let Some(h) =
+                        self.conn_mut(&peer, epoch).and_then(|c| c.handle.as_ref())
+                    {
+                        let _ = h.close_data_channel(dc);
+                    }
                 }
                 self.save();
                 self.emit_transfer(id);
