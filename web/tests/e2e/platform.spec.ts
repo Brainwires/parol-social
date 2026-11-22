@@ -81,9 +81,11 @@ test("the service worker controls the page and the app starts offline", async ({
   const problems = await watch(page, server);
   await page.goto(server.url);
   await controlled(page);
-  expect(await page.evaluate(() => navigator.serviceWorker.controller?.scriptURL)).toBe(
-    server.url + "sw.js",
-  );
+  // Polled: right after `controlled` the document can be one that has no controller for a
+  // moment (see `workerVersion` in the harness).
+  await expect.poll(() =>
+    page.evaluate(() => navigator.serviceWorker.controller?.scriptURL).catch(() => undefined)
+  ).toBe(server.url + "sw.js");
   expect(await page.evaluate(() => navigator.serviceWorker.ready.then((r) => r.scope))).toBe(
     server.url,
   );
