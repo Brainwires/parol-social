@@ -5,6 +5,7 @@ import { useEffect, useId, useRef, useState } from "denext";
 import { Bubble, HeldBubble } from "../components/Bubble.tsx";
 import { IconButton } from "../components/Button.tsx";
 import { Composer, type ComposerState } from "../components/Composer.tsx";
+import { FileBubble, type TransferAction } from "../components/FileBubble.tsx";
 import { Avatar } from "../components/ConversationRow.tsx";
 import { Icon } from "../components/Icon.tsx";
 import { Line } from "../components/Line.tsx";
@@ -14,13 +15,19 @@ import { showToast } from "../components/Toast.tsx";
 import { type MessageKey, t } from "../i18n/index.ts";
 import { hrefOf, navigate } from "../router.ts";
 import { useStore } from "../state/context.ts";
-import { type ContactView, type LineState, lineState } from "../state/model.ts";
+import {
+  type ContactView,
+  isVerified,
+  type LineState,
+  lineState,
+  type TransferInfo,
+} from "../state/model.ts";
 import { asksForName, shownName } from "../state/names.ts";
-import { contactOf, messagesOf } from "../state/store.ts";
+import { type AppStore, contactOf, messagesOf, transfersOf } from "../state/store.ts";
 import { ContactDetailsSheet, RemoveContactSheet, VerifySheet } from "./ContactSheets.tsx";
 import { errorText } from "./errors.ts";
 import { NamePrompt } from "./NamePrompt.tsx";
-import { type Caption, captionOf, threadItems, useFillSequence } from "./thread.ts";
+import { type Caption, timelineCaption, timelineItems, useFillSequence } from "./thread.ts";
 
 const CAPTION: Record<Caption, MessageKey> = {
   waiting: "caption.waiting",
@@ -51,6 +58,26 @@ function composerState(line: LineState): ComposerState {
   return line === "waiting" ? "away" : "no-path";
 }
 
+/** Run what a file bubble's button asks for. */
+export function runTransferAction(
+  store: AppStore,
+  transfer: TransferInfo,
+  action: TransferAction,
+): Promise<void> {
+  switch (action) {
+    case "accept":
+      return store.acceptTransfer(transfer.id);
+    case "decline":
+      return store.declineTransfer(transfer.id);
+    case "cancel":
+      return store.cancelTransfer(transfer.id);
+    case "save":
+      return store.saveTransfer(transfer.id);
+    case "remove":
+      return store.removeTransfer(transfer.id);
+  }
+}
+
 function Thread({ view, onEdit, onProblem }: {
   view: ContactView;
   onEdit: (id: number, text: string) => void;
@@ -59,16 +86,17 @@ function Thread({ view, onEdit, onProblem }: {
   const store = useStore();
   const { contact } = view;
   const messages = messagesOf(store, contact.peerId);
+  const transfers = transfersOf(store, contact.peerId);
   const { stillOutlined, animated } = useFillSequence(messages);
-  const items = threadItems(messages, stillOutlined);
-  const caption = captionOf(items);
+  const items = timelineItems(messages, transfers, stillOutlined);
+  const caption = timelineCaption(items);
   const scroller = useRef<HTMLDivElement>(null);
 
   // Keep the newest message in view.
   useEffect(() => {
     const el = scroller.current;
     if (el) el.scrollTop = el.scrollHeight;
-  }, [messages.length]);
+  }, [items.length]);
 
   if (items.length === 0) {
     return (
@@ -83,7 +111,32 @@ function Thread({ view, onEdit, onProblem }: {
   return (
     <div className="thread" ref={scroller} data-testid="thread">
       <ol className="thread__list">
-        {items.map(({ message, kind, groupStart, groupEnd }, index) => {
+        {items.map(({ entry, kind, groupStart, groupEnd }, index) => {
+          if (entry.type === "transfer") {
+            const transfer = entry.transfer;
+            const sent = transfer.direction === "Sent";
+            return (
+              <li
+                key={`t:${transfer.id}`}
+                className={`thread__item thread__item--${sent ? "sent" : "received"}${
+                  groupStart ? " thread__item--group-start" : ""
+                }`}
+                data-testid="transfer-item"
+                data-direction={sent ? "sent" : "received"}
+              >
+                <FileBubble
+                  transfer={transfer}
+                  name={shownName(contact)}
+                  filesPersist={store.filesPersist.value}
+                  tail={groupEnd ? (sent ? "end" : "start") : null}
+                  onAction={(action) => {
+                    runTransferAction(store, transfer, action).catch(onProblem);
+                  }}
+                />
+              </li>
+            );
+          }
+          const message = entry.message;
           const sent = message.direction === "Sent";
           const tail = groupEnd ? (sent ? "end" : "start") : null;
           const testId = `bubble-${message.id}`;
@@ -149,6 +202,10 @@ export function Conversation({ peerId, showBack = true }: { peerId: string; show
   const [sheet, setSheet] = useState<OpenSheet>(null);
   const [callHint, setCallHint] = useState(false);
   const [problem, setProblem] = useState<string | null>(null);
+  const [preparing, setPreparing] = useState<string[]>([]);
+  const [dropping, setDropping] = useState(false);
+  const root = useRef<HTMLDivElement>(null);
+  const offerRef = useRef<(files: readonly File[]) => void>(() => {});
   const hintId = useId();
   const heading = useRef<HTMLHeadingElement>(null);
   const known = view !== undefined;
@@ -160,6 +217,38 @@ export function Conversation({ peerId, showBack = true }: { peerId: string; show
     heading.current?.focus();
     if (known) store.connect(peerId);
   }, [peerId, known]);
+
+  // Dropping files on the conversation offers them, as the attach button does (the button is
+  // the way that works for everyone; this is a shortcut for a pointer).
+  useEffect(() => {
+    const el = root.current;
+    if (!el?.addEventListener) return;
+    const carriesFiles = (event: DragEvent) => event.dataTransfer?.types.includes("Files") ?? false;
+    const over = (event: DragEvent) => {
+      if (!carriesFiles(event)) return;
+      event.preventDefault();
+      if (event.dataTransfer) event.dataTransfer.dropEffect = "copy";
+      setDropping(true);
+    };
+    const leave = (event: DragEvent) => {
+      const to = event.relatedTarget as Node | null;
+      if (!to || !el.contains(to)) setDropping(false);
+    };
+    const drop = (event: DragEvent) => {
+      if (!carriesFiles(event)) return;
+      event.preventDefault();
+      setDropping(false);
+      offerRef.current([...(event.dataTransfer?.files ?? [])]);
+    };
+    el.addEventListener("dragover", over);
+    el.addEventListener("dragleave", leave);
+    el.addEventListener("drop", drop);
+    return () => {
+      el.removeEventListener("dragover", over);
+      el.removeEventListener("dragleave", leave);
+      el.removeEventListener("drop", drop);
+    };
+  }, [known]);
 
   // What is on screen has been read, as long as the person can see it.
   useEffect(() => {
@@ -188,6 +277,25 @@ export function Conversation({ peerId, showBack = true }: { peerId: string; show
   const blocker = callBlocker(line);
   const fail = (error: unknown) => setProblem(errorText(error, { name }));
 
+  // Each file is read for its hash before it is offered; meanwhile it is "Preparing …" and
+  // the composer stays usable.
+  const offer = (files: readonly File[]) => {
+    for (const file of files) {
+      setPreparing((now) => [...now, file.name]);
+      store.offerFile(peerId, file).then(
+        () => setProblem(null),
+        fail,
+      ).finally(() =>
+        setPreparing((now) => {
+          const at = now.indexOf(file.name);
+          return at < 0 ? now : [...now.slice(0, at), ...now.slice(at + 1)];
+        })
+      );
+    }
+  };
+
+  offerRef.current = offer;
+
   const callButton = (video: boolean) => (
     <IconButton
       icon={video ? "video" : "phone"}
@@ -209,7 +317,12 @@ export function Conversation({ peerId, showBack = true }: { peerId: string; show
   );
 
   return (
-    <div className="conversation" data-testid="conversation" data-line={line}>
+    <div
+      className={dropping ? "conversation conversation--dropping" : "conversation"}
+      data-testid="conversation"
+      data-line={line}
+      ref={root}
+    >
       <header className="conversation__header">
         {showBack && (
           <a
@@ -252,15 +365,14 @@ export function Conversation({ peerId, showBack = true }: { peerId: string; show
           {t("restored.note", { name })}
         </p>
       )}
-      {contact.verified === "no" && (
+      {!isVerified(contact) && (
         <div className="conversation__verify" data-testid="verify-prompt">
           <span>{t("verify.prompt")}</span>
           <button
             type="button"
             className="link-btn"
             data-testid="verify-open"
-            onClick={() =>
-              setSheet("verify")}
+            onClick={() => setSheet("verify")}
           >
             {t("verify.open")}
           </button>
@@ -344,6 +456,11 @@ export function Conversation({ peerId, showBack = true }: { peerId: string; show
         </div>
       )}
 
+      {dropping && (
+        <p className="conversation__drop" aria-hidden="true">
+          {t("transfer.dropHint", { name })}
+        </p>
+      )}
       <p className="conversation__problem" role="alert" data-testid="conversation-problem">
         {problem ?? ""}
       </p>
@@ -373,6 +490,8 @@ export function Conversation({ peerId, showBack = true }: { peerId: string; show
           setEditing(null);
         }}
         onCancelEdit={() => setEditing(null)}
+        onAttach={offer}
+        preparing={preparing}
       />
 
       {sheet === "details" && (

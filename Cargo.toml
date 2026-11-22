@@ -17,6 +17,7 @@ members = [
     "crates/parolnet-store",
     "crates/parolnet-app",
     "crates/parolnet-media",
+    "crates/parolnet-transfer",
     "crates/parolnet-simnet",
     "xtask",
 ]
@@ -42,6 +43,7 @@ parolnet-rtc = { path = "crates/parolnet-rtc" }
 parolnet-app = { path = "crates/parolnet-app" }
 parolnet-store = { path = "crates/parolnet-store" }
 parolnet-media = { path = "crates/parolnet-media", default-features = false }
+parolnet-transfer = { path = "crates/parolnet-transfer" }
 
 # Realtime engine: Brainwires' fork of webrtc-rs/rtc (sans-I/O), pinned by tag, never a branch.
 # Its DTLS / SRTP provider is ring (C and assembly); the E2EE layer stays pure Rust.
@@ -68,6 +70,8 @@ subtle = "2"
 ciborium = "0.2"
 serde = { version = "1", features = ["derive"] }
 serde_bytes = "0.11"
+# Multicast socket options for mDNS discovery (PNP-005 §5.9).
+socket2 = { version = "0.6", features = ["all"] }
 
 # Async / Networking
 tokio = { version = "1", features = ["full"] }
@@ -129,3 +133,10 @@ keyring = "4"
 proptest = "1"
 tokio-test = "0.4"
 rcgen = "0.14"
+
+# The gossip proof of work (PNP-005 §3.4) is 65 thousand SHA-256 blocks for an ordinary
+# message and a million for a relay descriptor. Unoptimized, the tests that originate
+# such messages take minutes; optimizing this one dependency in dev builds takes that
+# down to seconds.
+[profile.dev.package.sha2]
+opt-level = 3

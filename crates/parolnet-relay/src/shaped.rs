@@ -1,18 +1,22 @@
 //! Traffic shaping on a circuit (PNP-006 §4.1 to §4.3).
 //!
-//! A [`ShapedCircuit`] owns an established circuit and is the only thing that sends on it.
-//! Sends happen in slots one padding interval (plus jitter) apart. A slot carries the oldest
-//! queued real message when there is one, and otherwise a PADDING cell or a dummy message,
-//! in the proportion the bandwidth mode sets.
+//! A [`ShapedCircuit`] owns an established circuit and is the only thing that sends on it:
+//! the circuit's own idle padding (PNP-004 §5.9, `EstablishedCircuit::start_padding`) is
+//! stopped, because the schedule here sends a cell in every slot. Sends happen in slots one
+//! padding interval (plus jitter) apart. A slot carries the oldest queued real message when
+//! there is one, and otherwise a PADDING cell or a dummy message, in the proportion the
+//! bandwidth mode sets.
 //!
-//! Real and dummy messages are both DATA cells. Each carries a PNP-004 §3.7 payload whose
-//! data starts with one flag byte ([`FLAG_REAL`] or [`FLAG_DUMMY`]) and which is padded with
-//! random bytes to [`MAX_DATA_PAYLOAD`], then wrapped in every hop's AEAD layer. A relay on
-//! the way therefore sees a full-size DATA cell either way; only the final recipient, after
-//! the innermost layer is off, reads the flag ([`open_inner`]).
+//! Real and dummy messages are both DATA cells on one stream of the circuit. The data of
+//! each (PNP-004 §3.7) starts with one flag byte ([`FLAG_REAL`] or [`FLAG_DUMMY`]); the
+//! circuit pads the payload with random bytes to [`MAX_DATA_PAYLOAD`](crate::MAX_DATA_PAYLOAD)
+//! and wraps it in every hop's AEAD layer, under the circuit's forward counters like any
+//! other cell. A relay on the way therefore sees a full-size DATA cell either way; only the
+//! final recipient, after the innermost layer is off, reads the flag ([`open_inner`]).
 
 use crate::circuit::EstablishedCircuit;
-use crate::{Circuit, MAX_DATA_PAYLOAD, RelayError};
+use crate::stream::DataCommand;
+use crate::{Circuit, MAX_STREAM_DATA, RelayError};
 use parolnet_transport::noise::{BandwidthMode, SendChoice, SendScheduler, TrafficProfile};
 use rand::rngs::OsRng;
 use rand::{CryptoRng, Rng, RngCore};
@@ -26,15 +30,9 @@ pub const FLAG_DUMMY: u8 = 0x00;
 /// First byte of a real message's data (PNP-006 §4.3.4).
 pub const FLAG_REAL: u8 = 0x01;
 
-/// PNP-004 §3.7: stream id (4), data command (1), data length (2).
-const DATA_HEADER_SIZE: usize = 7;
-/// PNP-004 §3.7 data command DATA.
-const DATA_COMMAND: u8 = 0x01;
-/// The stream shaped messages travel on.
-const STREAM_ID: u32 = 1;
-/// The most application bytes one shaped DATA cell carries: the innermost payload less the
-/// §3.7 header and the flag byte.
-pub const MAX_SHAPED_DATA: usize = MAX_DATA_PAYLOAD - DATA_HEADER_SIZE - 1;
+/// The most application bytes one shaped DATA cell carries: what a DATA cell carries
+/// (PNP-004 §3.7) less the flag byte.
+pub const MAX_SHAPED_DATA: usize = MAX_STREAM_DATA - 1;
 
 /// What the final recipient finds in a DATA cell once the innermost layer is off.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -45,51 +43,32 @@ pub enum Inner {
     Dummy,
 }
 
-/// The innermost DATA payload: the §3.7 header, the flag, `data`, random fill.
-fn inner_payload<R: RngCore + CryptoRng>(
-    flag: u8,
-    data: &[u8],
-    rng: &mut R,
-) -> [u8; MAX_DATA_PAYLOAD] {
+/// The data of a shaped DATA cell: the flag, then `data`.
+fn flagged(flag: u8, data: &[u8]) -> Vec<u8> {
     debug_assert!(data.len() <= MAX_SHAPED_DATA);
-    let mut out = [0u8; MAX_DATA_PAYLOAD];
-    rng.fill_bytes(&mut out);
-    out[0..4].copy_from_slice(&STREAM_ID.to_be_bytes());
-    out[4] = DATA_COMMAND;
-    out[5..7].copy_from_slice(&((data.len() + 1) as u16).to_be_bytes());
-    out[DATA_HEADER_SIZE] = flag;
-    out[DATA_HEADER_SIZE + 1..DATA_HEADER_SIZE + 1 + data.len()].copy_from_slice(data);
+    let mut out = Vec::with_capacity(1 + data.len());
+    out.push(flag);
+    out.extend_from_slice(data);
     out
 }
 
-/// A real message's innermost payload.
-fn real_payload<R: RngCore + CryptoRng>(data: &[u8], rng: &mut R) -> [u8; MAX_DATA_PAYLOAD] {
-    inner_payload(FLAG_REAL, data, rng)
-}
-
-/// A dummy message's innermost payload: a random length of random bytes behind the flag.
-fn dummy_payload<R: RngCore + CryptoRng>(rng: &mut R) -> [u8; MAX_DATA_PAYLOAD] {
+/// A dummy message's data: a random length of random bytes behind the flag.
+fn dummy_data<R: RngCore + CryptoRng>(rng: &mut R) -> Vec<u8> {
     let len = rng.gen_range(0..=MAX_SHAPED_DATA);
     let mut data = vec![0u8; len];
     rng.fill_bytes(&mut data);
-    inner_payload(FLAG_DUMMY, &data, rng)
+    flagged(FLAG_DUMMY, &data)
 }
 
-/// Read the innermost payload of a DATA cell as its final recipient (the exit relay or the
-/// destination): a real message's bytes, or the fact that it was a dummy.
-pub fn open_inner(payload: &[u8]) -> Result<Inner, RelayError> {
-    if payload.len() < DATA_HEADER_SIZE + 1 {
-        return Err(RelayError::CellError("DATA payload too short".into()));
-    }
-    let len = u16::from_be_bytes([payload[5], payload[6]]) as usize;
-    if len == 0 || DATA_HEADER_SIZE + len > payload.len() {
-        return Err(RelayError::CellError("DATA length out of range".into()));
-    }
-    let data = &payload[DATA_HEADER_SIZE..DATA_HEADER_SIZE + len];
-    match data[0] {
-        FLAG_DUMMY => Ok(Inner::Dummy),
-        FLAG_REAL => Ok(Inner::Real(data[1..].to_vec())),
-        other => Err(RelayError::CellError(format!(
+/// Read the data of a DATA cell (the §3.7 Data bytes, as the exit relay delivers them and
+/// `EstablishedCircuit::recv_stream` returns them) as its final recipient: a real message's
+/// bytes, or the fact that it was a dummy.
+pub fn open_inner(data: &[u8]) -> Result<Inner, RelayError> {
+    match data.split_first() {
+        None => Err(RelayError::CellError("DATA without a flag byte".into())),
+        Some((&FLAG_DUMMY, _)) => Ok(Inner::Dummy),
+        Some((&FLAG_REAL, rest)) => Ok(Inner::Real(rest.to_vec())),
+        Some((other, _)) => Err(RelayError::CellError(format!(
             "unknown dummy flag 0x{other:02x}"
         ))),
     }
@@ -160,6 +139,8 @@ impl<R: RngCore + CryptoRng + Send + 'static> ShapedCircuit<R> {
     /// As [`ShapedCircuit::start`], with the random source of the jitter, of the dummy /
     /// padding choice and of the dummy bytes given by the caller.
     pub fn start_with(circuit: EstablishedCircuit, config: SendSchedulerConfig, rng: R) -> Self {
+        // This is the circuit's one sender from here on.
+        circuit.stop_padding();
         let mut scheduler = SendScheduler::with_rng(config.mode, rng);
         scheduler.set_traffic_profile(config.profile);
         let shared = Arc::new(Shared {
@@ -238,6 +219,14 @@ impl<R> Drop for ShapedCircuit<R> {
 
 /// The send loop: wait one interval plus jitter, send exactly one cell, repeat.
 async fn pump<R: RngCore + CryptoRng + Send + 'static>(shared: Arc<Shared<R>>) {
+    // Real and dummy messages share one stream of the circuit.
+    let stream = match shared.circuit.open_stream() {
+        Ok(stream) => stream,
+        Err(e) => {
+            tracing::debug!(%e, "shaped circuit: no stream; not started");
+            return;
+        }
+    };
     loop {
         let delay: Duration = {
             let mut scheduler = shared.scheduler.lock().unwrap_or_else(|e| e.into_inner());
@@ -253,13 +242,13 @@ async fn pump<R: RngCore + CryptoRng + Send + 'static>(shared: Arc<Shared<R>>) {
             let mut scheduler = shared.scheduler.lock().unwrap_or_else(|e| e.into_inner());
             match scheduler.on_slot() {
                 Some(SendChoice::Real(Item::Destroy)) => (Slot::Destroy, None),
-                Some(SendChoice::Real(Item::Data(data))) => {
-                    let payload = scheduler.with_rng_mut(|rng| real_payload(&data, rng));
-                    (Slot::Data(Box::new(payload)), Some(&shared.counters.real))
-                }
+                Some(SendChoice::Real(Item::Data(data))) => (
+                    Slot::Data(flagged(FLAG_REAL, &data)),
+                    Some(&shared.counters.real),
+                ),
                 Some(SendChoice::Dummy) => {
-                    let payload = scheduler.with_rng_mut(dummy_payload);
-                    (Slot::Data(Box::new(payload)), Some(&shared.counters.dummy))
+                    let data = scheduler.with_rng_mut(dummy_data);
+                    (Slot::Data(data), Some(&shared.counters.dummy))
                 }
                 Some(SendChoice::Padding) => (Slot::Padding, Some(&shared.counters.padding)),
                 // Cover traffic is never off on a circuit.
@@ -271,9 +260,14 @@ async fn pump<R: RngCore + CryptoRng + Send + 'static>(shared: Arc<Shared<R>>) {
                 let _ = shared.circuit.destroy().await;
                 return;
             }
-            // Real and dummy take the same path: every hop's AEAD layer, one DATA cell
-            // (PNP-006-MUST-016 / MUST-017).
-            Slot::Data(payload) => shared.circuit.send(&payload[..]).await,
+            // Real and dummy take the same path: one DATA cell, padded to the full payload,
+            // under every hop's AEAD layer (PNP-006-MUST-016 / MUST-017).
+            Slot::Data(data) => {
+                shared
+                    .circuit
+                    .send_stream(stream, DataCommand::Data, &data)
+                    .await
+            }
             Slot::Padding => shared.circuit.send_padding().await,
         };
         if let Err(e) = sent {
@@ -287,7 +281,7 @@ async fn pump<R: RngCore + CryptoRng + Send + 'static>(shared: Arc<Shared<R>>) {
 }
 
 enum Slot {
-    Data(Box<[u8; MAX_DATA_PAYLOAD]>),
+    Data(Vec<u8>),
     Padding,
     Destroy,
 }
@@ -297,28 +291,28 @@ mod tests {
     use super::*;
 
     #[test]
-    fn real_and_dummy_payloads_have_one_size_and_open_as_what_they_are() {
-        let real = real_payload(b"hello", &mut OsRng);
-        let dummy = dummy_payload(&mut OsRng);
-        assert_eq!(real.len(), dummy.len());
+    fn real_and_dummy_data_open_as_what_they_are() {
+        let real = flagged(FLAG_REAL, b"hello");
+        let dummy = dummy_data(&mut OsRng);
         assert_eq!(open_inner(&real).unwrap(), Inner::Real(b"hello".to_vec()));
         assert_eq!(open_inner(&dummy).unwrap(), Inner::Dummy);
-        let empty = real_payload(b"", &mut OsRng);
+        let empty = flagged(FLAG_REAL, b"");
         assert_eq!(open_inner(&empty).unwrap(), Inner::Real(Vec::new()));
-        let full = real_payload(&[7u8; MAX_SHAPED_DATA], &mut OsRng);
+        let full = flagged(FLAG_REAL, &[7u8; MAX_SHAPED_DATA]);
+        assert_eq!(full.len(), MAX_STREAM_DATA);
         assert_eq!(
             open_inner(&full).unwrap(),
             Inner::Real(vec![7u8; MAX_SHAPED_DATA])
         );
+        // Every dummy fits one DATA cell.
+        for _ in 0..200 {
+            assert!(dummy_data(&mut OsRng).len() <= MAX_STREAM_DATA);
+        }
     }
 
     #[test]
-    fn a_malformed_payload_is_refused() {
-        assert!(open_inner(&[0u8; 4]).is_err());
-        let mut bad = real_payload(b"x", &mut OsRng);
-        bad[DATA_HEADER_SIZE] = 0x7f;
-        assert!(open_inner(&bad).is_err());
-        bad[5..7].copy_from_slice(&u16::MAX.to_be_bytes());
-        assert!(open_inner(&bad).is_err());
+    fn malformed_data_is_refused() {
+        assert!(open_inner(&[]).is_err());
+        assert!(open_inner(&[0x7f, 1, 2]).is_err());
     }
 }

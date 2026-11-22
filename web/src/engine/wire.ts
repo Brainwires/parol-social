@@ -13,12 +13,19 @@ export const DATA_CHANNEL_LABEL = "parolnet";
 export const MsgType = {
   /** TEXT: the plaintext is the raw UTF-8 chat text. */
   TEXT: 0x01,
-  /** CONTROL: the scanner's bootstrap envelope carries an empty CONTROL body. */
+  /** CONTROL: an empty body is the first message of a new PNP-002 session. */
   CONTROL: 0x03,
+  /**
+   * HANDSHAKE: PNP-003 BootstrapHandshake / SASVerify and the PNP-002 handshake messages
+   * (CBOR, built and read in wasm). The scanner's bootstrap envelope is one.
+   */
+  HANDSHAKE: 0x05,
   /** DECOY: dropped silently. */
   DECOY: 0x04,
   CALL_SIGNAL: 0x0b,
   CHANNEL_BINDING: 0x14,
+  /** FILE_TRANSFER: PNP-010 offer and control messages (CBOR, built and parsed in wasm). */
+  FILE_TRANSFER: 0x15,
 } as const;
 
 /** Relay caps the client checks before sending (PNP-001-MUST-072). */
@@ -48,6 +55,8 @@ export type ClientFrame =
     pubkey?: string;
     signature?: string;
     nonce?: string;
+    /** The canonical name of the relay this client dialed (PNP-001 §10.7); signed. */
+    relay?: string;
   }
   | { type: "watch"; peer_ids: string[] }
   | { type: SignalKind; to: string; payload: string }
@@ -64,6 +73,28 @@ export type ServerFrame =
 
 function str(v: unknown): string | null {
   return typeof v === "string" ? v : null;
+}
+
+/**
+ * The host and port a relay URL points at, as the browser's URL parser reads it: the same
+ * parser the WebSocket constructor uses, so this is the endpoint the socket goes to. A URL
+ * that names no port has its scheme's default (443 for `wss:`, 80 for `ws:`). Throws for
+ * anything that is not a plain `ws:` / `wss:` URL (user information included): the answer
+ * to a relay's challenge is signed for this endpoint (PNP-001 §10.7), so there must be no
+ * doubt about which one it is.
+ */
+export function relayEndpoint(url: string): { host: string; port: number } {
+  const u = new URL(url);
+  let port: number;
+  if (u.protocol === "wss:") port = 443;
+  else if (u.protocol === "ws:") port = 80;
+  else throw new Error("not a ws: or wss: URL");
+  if (u.username !== "" || u.password !== "") {
+    throw new Error("a relay URL carries no user information");
+  }
+  if (u.hostname === "") throw new Error("a relay URL names a host");
+  if (u.port !== "") port = Number(u.port);
+  return { host: u.hostname, port };
 }
 
 /** Parse a relay text frame. `null` for malformed JSON or a frame missing a required field. */

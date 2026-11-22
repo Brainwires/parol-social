@@ -1,0 +1,20 @@
+{
+  "clauses": ["PNP-001-MUST-084", "PNP-001-MUST-085", "PNP-001-MUST-087"],
+  "description": "Register answer (PNP-001 §10.7). The client holds the Ed25519 secret key `secret_key`, opened its socket to `relay_url` and was sent the challenge `nonce`. `message` is the register message it signs (label || nonce || pin || relay_key || name_len || name) and `signature` its Ed25519 signature over it. `pinned` is the same answer from a client that pins the relay identity key `relay_key`.",
+  "input": {
+    "secret_key": "0707070707070707070707070707070707070707070707070707070707070707",
+    "nonce": "5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a",
+    "relay_url": "wss://Parol.Social/ws",
+    "relay_key": "1111111111111111111111111111111111111111111111111111111111111111"
+  },
+  "expected": {
+    "public_key": "ea4a6c63e29c520abef5507b132ec5f9954776aebebe7b92421eea691446d22c",
+    "relay_name": "parol.social:443",
+    "message": "504e502d3030312d72656c61792d72656769737465722d76315a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a00000000000000000000000000000000000000000000000000000000000000000000107061726f6c2e736f6369616c3a343433",
+    "signature": "0b39c06302dde7ef14a36df48846e654239ebfc1ab0572c054f3337142471bc3dd60f343c29af4f1055b8daf175d678421acdfbc04d15fbbac87988b11f0ee0f",
+    "pinned": {
+      "message": "504e502d3030312d72656c61792d72656769737465722d76315a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a01111111111111111111111111111111111111111111111111111111111111111100107061726f6c2e736f6369616c3a343433",
+      "signature": "df59905954acafeed270eee4e61e2344aec29848253abeb4dd607ac7596e6fc37d5435f16009defc383bd3491913cc80dba1f036c2bd136731183d2945189d08"
+    }
+  }
+}

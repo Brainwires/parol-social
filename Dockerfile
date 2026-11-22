@@ -72,8 +72,8 @@ RUN cd web && denext deno install --frozen
 
 # The wasm core. Its inputs are the Rust workspace and the build script, not the app's sources.
 # AUTHORITY_PUBKEYS (comma-separated 64-char hex Ed25519 keys) and AUTHORITY_THRESHOLD reach
-# crates/parolnet-wasm/build.rs through the environment, as with pwa/build.sh; empty keys mean
-# the dev placeholder keys.
+# crates/parolnet-wasm/build.rs through the environment; empty keys mean the dev placeholder
+# keys.
 COPY Cargo.toml Cargo.lock ./
 COPY .cargo .cargo
 COPY crates crates
@@ -132,6 +132,13 @@ COPY server/entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
 
 EXPOSE 80
+
+# RELAY_PUBLIC_NAMES (comma-separated host or host:port, no port = 443) is the name clients dial
+# this relay under. A client signs its registration for the name it dialed and the relay refuses
+# any other (PNP-001 §10.7). It has no default here on purpose: without it the relay registers
+# only clients that dialed a loopback address (a local `docker run -p 1411:80`), and a public
+# deployment has to say what it is called: `-e RELAY_PUBLIC_NAMES=relay.example.org`, or the
+# `environment:` entry in docker-compose.yml.
 
 # Persistent relay identity — mount this as a volume to keep the Ed25519
 # signing key stable across container restarts. On first boot the relay

@@ -8,10 +8,15 @@
 //! - **Storage** ([`store`]): the identity, contacts, sessions, history and queue live in an
 //!   encrypted database in the data directory (`parolnet-store`: SQLite with SQLCipher); its
 //!   key is kept where [`AppConfig::key_storage`] says. [`delete_all_data`] removes both.
-//! - **Pairing**: the PWA's QR / code bootstrap (PNP-003 + PNP-001 §5.3.1). The presenter
-//!   shows [`AppHandle::create_pairing_code`]; the scanner calls
-//!   [`AppHandle::pair_with_code`], which establishes the Double Ratchet session and sends
-//!   the bootstrap envelope over the first data channel.
+//! - **Pairing**: the QR / code bootstrap (PNP-003 + PNP-001 §5.3.1). The presenter shows
+//!   [`AppHandle::create_pairing_code`] (the base45 text of a QR code); the scanner calls
+//!   [`AppHandle::pair_with_code`], which derives the Bootstrap Secret and sends its
+//!   BootstrapHandshake as the bootstrap envelope over the first data channel. Both prove
+//!   knowledge of the secret, exchange pre-key bundles, compare a Short Authentication String
+//!   when either asked for it ([`AppConfig::request_sas`], [`AppEvent::SasVerification`],
+//!   [`AppHandle::confirm_sas`]) and run the PNP-002 handshake, whose session replaces the
+//!   bootstrap one ([`AppEvent::PairingComplete`]). A pairing that fails removes the contact
+//!   it added ([`AppEvent::PairingFailed`], [`AppEvent::ContactRemoved`]).
 //! - **Signaling**: the relay's signaling-only profile (register by challenge, `watch` /
 //!   `presence`, non-trickle `rtc_offer` / `rtc_answer`, `rtc_ice` for late candidates).
 //! - **Transport**: one direct WebRTC connection per contact through `parolnet-rtc`, with
@@ -32,6 +37,11 @@
 //!   change by ICE restart, gains or loses video by renegotiation
 //!   ([`AppHandle::set_call_video`]), tells the encoder what the path carries
 //!   ([`MediaEvent::TargetBitrate`]) and reports its quality ([`AppEvent::CallQuality`]).
+//! - **Files** ([`transfer`], PNP-010): [`AppHandle::offer_file`], accept / decline /
+//!   cancel, progress as [`AppEvent::Transfer`]. The offer travels in the session; the file
+//!   flows as sealed 64 KiB records on a data channel of its own on the contact's direct
+//!   connection, streamed from and to disk, and resumes after a lost connection or a
+//!   restart of either app. Nothing of a file ever goes through a relay.
 //!
 //! The core runs as one tokio task (an actor): [`start`] returns an [`AppHandle`] for
 //! commands and a channel of [`AppEvent`]s.
@@ -39,10 +49,12 @@
 pub mod call;
 mod engine;
 pub mod ice;
+pub mod qr;
 pub mod reconnect;
 pub mod relay_socket;
 mod signaling;
 pub mod store;
+pub mod transfer;
 pub mod wire;
 
 use std::collections::HashMap;
@@ -57,10 +69,14 @@ pub use call::{
     CallEnd, CallInfo, CallMedia, CallQuality, CallState, FrameSink, MediaEvent, VideoChange,
     Weakness, video_bitrate_for,
 };
+/// A pairing code in the form to show for copying as text (the QR code shows the code
+/// itself): [`AppHandle::pair_with_code`] takes both.
+pub use parolnet_core::bootstrap::qr_text_for_copying as pairing_code_text;
 pub use parolnet_protocol::shaping::BandwidthMode;
 pub use parolnet_rtc::{CandidateKind, ConnectionQuality, MediaKind};
 pub use reconnect::ReconnectConfig;
 pub use store::KeyStorage;
+pub use transfer::{CancelReason, TransferInfo, TransferState};
 
 /// Errors surfaced to the client.
 #[derive(Debug, thiserror::Error)]
@@ -87,8 +103,15 @@ pub enum AppError {
     Busy,
     #[error("unknown call {0}")]
     UnknownCall(String),
+    /// No such transfer, or it is not in a state the command applies to.
+    #[error("unknown transfer {0}")]
+    UnknownTransfer(String),
+    #[error("file transfer: {0}")]
+    Transfer(String),
     #[error("the contact's app cannot change a call that is under way")]
     CannotRenegotiate,
+    #[error("no pairing with {0} is waiting for a SAS confirmation")]
+    NoPairing(String),
     #[error("the app core has stopped")]
     Stopped,
 }
@@ -114,13 +137,28 @@ pub struct AppConfig {
     /// `None`: every usable address of every interface, IPv4 and IPv6, and the core watches
     /// the interfaces and restarts ICE when they change.
     pub bind_ip: Option<IpAddr>,
-    /// How long a contact's code stays acceptable after it is shown (and offers from
-    /// strangers are accepted).
+    /// How long a pairing code is shown and accepted (and offers from strangers are
+    /// accepted): 10 minutes unless changed (PNP-003-SHOULD-001, -SHOULD-003). At most 30
+    /// minutes: a scanner refuses older codes (PNP-003-MUST-011).
     pub pairing_window: Duration,
     /// Optional name to give contacts by default (`None`: the first 8 hex digits).
     pub default_contact_name: Option<String>,
     /// How contacts the relay called offline are re-probed.
     pub reconnect: ReconnectConfig,
+    /// Ask for SAS verification in every pairing (PNP-003 §5.5): both peers then show a
+    /// 6-digit code (and five emoji) that the users compare, and the contact is established
+    /// only once both confirmed it. On unless turned off (PNP-003-SHOULD-004, -SHOULD-006):
+    /// a peer without a user to compare codes (a bot, a test) turns it off, and still
+    /// verifies the SAS when the contact's side asks for it.
+    pub request_sas: bool,
+    /// Relays to name in pairing codes, one per code in turn (PNP-003-SHOULD-008), as
+    /// `hostname:port`. Empty: codes carry no relay hint.
+    pub relay_hints: Vec<String>,
+    /// Where received files go (and their parts while they arrive). `None`: `downloads`
+    /// inside the data directory. A desktop app sets the user's downloads folder.
+    pub downloads_dir: Option<PathBuf>,
+    /// Offers above this size are declined without asking (PNP-010 §8; default 4 GiB).
+    pub max_accept_size: u64,
     /// Take part in ICE restarts and call renegotiation (PNP-011 sections 7 and 8): list the
     /// features, send and answer `reoffer`s and restart offers. Off, this peer behaves as
     /// one that knows neither (the PWA, the web app today): a network change waits for the
@@ -137,9 +175,13 @@ impl AppConfig {
             relay_trust_anchors: Vec::new(),
             stun_servers: None,
             bind_ip: None,
-            pairing_window: Duration::from_secs(30 * 60),
+            pairing_window: Duration::from_secs(10 * 60),
             default_contact_name: None,
             reconnect: ReconnectConfig::default(),
+            request_sas: true,
+            relay_hints: Vec::new(),
+            downloads_dir: None,
+            max_accept_size: transfer::DEFAULT_MAX_ACCEPT_SIZE,
             renegotiation: true,
         }
     }
@@ -154,6 +196,23 @@ pub struct Contact {
     /// identity rotation and safety numbers.
     pub identity_key: Option<String>,
     pub added_ms: u64,
+    /// Both users confirmed the verification code (the SAS of PNP-003 §5.5) when they
+    /// paired. Kept across later pairings with the same identity.
+    #[serde(default)]
+    pub sas_verified: bool,
+    /// A pairing with the contact is under way. It does not survive a restart: a contact
+    /// found with this mark at start is cleaned up (see `State::forget_unfinished_pairings`).
+    #[serde(default)]
+    pub pairing: Option<PairingMark>,
+}
+
+/// What a pairing under way means for its contact if it does not complete.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PairingMark {
+    /// The pairing added the contact: it goes again.
+    New,
+    /// The contact was there before: it stays, without a session.
+    Again,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -224,6 +283,37 @@ pub enum AppEvent {
     Relay(RelayState),
     ContactAdded(Contact),
     ContactUpdated(Contact),
+    /// The pairing code is no longer waiting for a contact (one bootstrapped with it, it
+    /// expired or it was cancelled): take it and its QR code off the display.
+    PairingCodeClosed,
+    /// A contact was removed: the pairing that added it failed (PNP-003 §4, NO_CONTACT).
+    ContactRemoved {
+        peer_id: String,
+    },
+    /// A pairing reached SAS_PENDING (PNP-003 §5.5): show the user this Short Authentication
+    /// String, as digits and as emoji, and ask them to compare it with what the contact's
+    /// device shows, by voice or in person. Then [`AppHandle::confirm_sas`] or
+    /// [`AppHandle::reject_sas`]. The pairing is dropped after 10 minutes without both
+    /// confirmations.
+    SasVerification {
+        peer_id: String,
+        /// The 6-digit SAS.
+        digits: String,
+        /// The same value as five emoji.
+        emoji: String,
+    },
+    /// The pairing is complete: the PNP-002 session is established and the bootstrap secret
+    /// is erased. `sas_verified`: both users confirmed the SAS.
+    PairingComplete {
+        peer_id: String,
+        sas_verified: bool,
+    },
+    /// The pairing was aborted (a proof or SAS that did not verify, a rejection, a timeout,
+    /// a lost connection): nothing of it is kept.
+    PairingFailed {
+        peer_id: String,
+        reason: String,
+    },
     Path {
         peer_id: String,
         state: PathState,
@@ -238,6 +328,9 @@ pub enum AppEvent {
     Notice(String),
     /// A call started, changed state or ended, or its video changed.
     Call(CallInfo),
+    /// A file transfer appeared, changed state or moved on (progress comes a few times a
+    /// second while records flow).
+    Transfer(TransferInfo),
     /// The quality of an active call's connection, about once a second.
     CallQuality {
         call_id: String,
@@ -263,6 +356,13 @@ pub struct Snapshot {
     pub relay: RelayState,
     pub contacts: Vec<ContactView>,
     pub pairing_open: bool,
+    /// The pairing code to display, while one is waiting for a contact: `None` as soon as a
+    /// contact bootstrapped with it, it expired or it was cancelled (PNP-003-MUST-009,
+    /// -MUST-048).
+    pub pairing_code: Option<String>,
+    /// When that code stops being shown (Unix milliseconds), for the expiry indicator
+    /// (PNP-003-SHOULD-001).
+    pub pairing_expires_ms: Option<u64>,
     /// The user configured their own TURN server (its credential is never in a snapshot).
     pub turn_configured: bool,
     /// Connections use that TURN server only.
@@ -325,6 +425,9 @@ impl Drop for TurnSettings {
 pub(crate) enum Command {
     CreatePairingCode(oneshot::Sender<Result<String, AppError>>),
     PairWithCode(String, oneshot::Sender<Result<Contact, AppError>>),
+    CancelPairingCode,
+    ConfirmSas(String, oneshot::Sender<Result<(), AppError>>),
+    RejectSas(String),
     SendText(
         String,
         String,
@@ -334,6 +437,7 @@ pub(crate) enum Command {
     Snapshot(oneshot::Sender<Snapshot>),
     RenameContact(String, String, oneshot::Sender<Result<Contact, AppError>>),
     Connect(String),
+    Disconnect(String),
     StartCall(String, bool, oneshot::Sender<Result<CallInfo, AppError>>),
     AcceptCall(String, oneshot::Sender<Result<CallInfo, AppError>>),
     RejectCall(String),
@@ -344,6 +448,15 @@ pub(crate) enum Command {
     TurnSettings(oneshot::Sender<Option<TurnSettings>>),
     SetTurnSettings(Option<TurnSettings>, oneshot::Sender<Result<(), AppError>>),
     SetBandwidthMode(BandwidthMode, oneshot::Sender<String>),
+    OfferFile(
+        String,
+        PathBuf,
+        oneshot::Sender<Result<TransferInfo, AppError>>,
+    ),
+    AcceptTransfer(String, oneshot::Sender<Result<TransferInfo, AppError>>),
+    DeclineTransfer(String, oneshot::Sender<Result<TransferInfo, AppError>>),
+    CancelTransfer(String, oneshot::Sender<Result<TransferInfo, AppError>>),
+    Transfers(Option<String>, oneshot::Sender<Vec<TransferInfo>>),
     Shutdown(oneshot::Sender<()>),
 }
 
@@ -382,24 +495,53 @@ impl AppHandle {
         rx.await.map_err(|_| AppError::Stopped)
     }
 
-    /// Show this to a contact (as a QR code or text). It stays valid for the pairing window;
-    /// a new call replaces the previous code.
+    /// Show this to a contact (as a QR code, error correction level M or higher, or as
+    /// text). It stays valid for the pairing window and for one pairing; a new call replaces
+    /// the previous code.
     pub async fn create_pairing_code(&self) -> Result<String, AppError> {
         self.ask(Command::CreatePairingCode).await?
     }
 
-    /// Pair with a contact's code (the PWA's QR payload, hex). Establishes the session,
-    /// queues the bootstrap envelope and starts connecting.
+    /// Pair with a contact's code (the text of their QR code: base45 of the PNP-003 QR
+    /// payload). Derives the Bootstrap Secret and starts connecting; the BootstrapHandshake
+    /// goes out when the data channel opens. The contact is listed at once, and removed
+    /// again if the pairing fails ([`AppEvent::PairingFailed`]).
     pub async fn pair_with_code(&self, code: &str) -> Result<Contact, AppError> {
         let code = code.to_owned();
         self.ask(|tx| Command::PairWithCode(code, tx)).await?
+    }
+
+    /// Stop waiting for a contact: the current pairing code is forgotten and must come off
+    /// the display.
+    pub fn cancel_pairing_code(&self) {
+        let _ = self
+            .tx
+            .send(engine::Input::Command(Command::CancelPairingCode));
+    }
+
+    /// The user compared the SAS of [`AppEvent::SasVerification`] and it matches: send our
+    /// confirmation (PNP-003-MUST-028). The pairing completes once the contact's
+    /// confirmation has arrived and verified.
+    pub async fn confirm_sas(&self, peer_id: &str) -> Result<(), AppError> {
+        let p = peer_id.to_owned();
+        self.ask(|tx| Command::ConfirmSas(p, tx)).await?
+    }
+
+    /// The SAS does not match (or the user will not compare it): abort the pairing and
+    /// erase its state.
+    pub fn reject_sas(&self, peer_id: &str) {
+        let _ = self.tx.send(engine::Input::Command(Command::RejectSas(
+            peer_id.to_owned(),
+        )));
     }
 
     /// Send a text message. It is returned as `Queued`: every message waits for a send slot
     /// of the contact's data channel (PNP-006 §4.2; on an idle verified channel that is a
     /// jitter of at most 100 ms in NORMAL mode, after other messages one padding interval
     /// each) or, without a channel, on this device. `Sent` follows as
-    /// [`AppEvent::MessageState`].
+    /// [`AppEvent::MessageState`] once the contact's end has acknowledged the message; until
+    /// then it stays in the encrypted store, and a connection that ends first does not
+    /// lose it: the next one sends it again.
     pub async fn send_text(&self, peer_id: &str, text: &str) -> Result<ChatMessage, AppError> {
         let (p, t) = (peer_id.to_owned(), text.to_owned());
         self.ask(|tx| Command::SendText(p, t, tx)).await?
@@ -424,6 +566,15 @@ impl AppHandle {
         let _ = self
             .tx
             .send(engine::Input::Command(Command::Connect(peer_id.to_owned())));
+    }
+
+    /// Close the direct connection to a contact now. It is built again like after any lost
+    /// connection (at once with [`AppHandle::connect`]); queued messages and file transfers
+    /// continue on the new one.
+    pub fn disconnect(&self, peer_id: &str) {
+        let _ = self.tx.send(engine::Input::Command(Command::Disconnect(
+            peer_id.to_owned(),
+        )));
     }
 
     /// Call a contact over a verified direct connection: audio, plus video when `video`.
@@ -522,6 +673,44 @@ impl AppHandle {
             )));
         }
         self.ask(|tx| Command::SetBandwidthMode(mode, tx)).await
+    }
+
+    /// Offer a file to a contact (PNP-010). The file is read once for its SHA-256 before
+    /// this returns, then on demand while it is sent; it must stay where it is, unchanged,
+    /// until the transfer is over. The offer is delivered at once over a verified direct
+    /// connection, else when one comes up.
+    pub async fn offer_file(
+        &self,
+        peer_id: &str,
+        path: impl Into<PathBuf>,
+    ) -> Result<TransferInfo, AppError> {
+        let (p, path) = (peer_id.to_owned(), path.into());
+        self.ask(|tx| Command::OfferFile(p, path, tx)).await?
+    }
+
+    /// Accept a file a contact offered: it arrives in [`AppConfig::downloads_dir`] whenever
+    /// a direct connection to the contact exists, and resumes where it stopped.
+    pub async fn accept_transfer(&self, id: &str) -> Result<TransferInfo, AppError> {
+        let id = id.to_owned();
+        self.ask(|tx| Command::AcceptTransfer(id, tx)).await?
+    }
+
+    /// Decline a file a contact offered.
+    pub async fn decline_transfer(&self, id: &str) -> Result<TransferInfo, AppError> {
+        let id = id.to_owned();
+        self.ask(|tx| Command::DeclineTransfer(id, tx)).await?
+    }
+
+    /// Stop a transfer for good, as sender or receiver. What was received of it is removed.
+    pub async fn cancel_transfer(&self, id: &str) -> Result<TransferInfo, AppError> {
+        let id = id.to_owned();
+        self.ask(|tx| Command::CancelTransfer(id, tx)).await?
+    }
+
+    /// The transfers with one contact (or all), oldest first, finished ones included.
+    pub async fn transfers(&self, peer_id: Option<&str>) -> Result<Vec<TransferInfo>, AppError> {
+        let p = peer_id.map(str::to_owned);
+        self.ask(|tx| Command::Transfers(p, tx)).await
     }
 
     /// Close every connection, save state and stop the core.

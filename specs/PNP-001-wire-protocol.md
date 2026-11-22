@@ -1,18 +1,28 @@
 # PNP-001: ParolNet Wire Protocol
 
 ### Status: CANDIDATE
-### Version: 0.15
+### Version: 0.17
 ### Date: 2026-11-21
 
 ---
 
 ## Changelog
 
-**v0.15 (2026-11-21) — `N-SESSION` is the nonce the Double Ratchet uses (text correction, no wire change)**
+**v0.17 (2026-11-21) — Registration is bound to the relay; no presence over HTTP on a signaling-only relay (wire-incompatible)**
 
-- §3.3 and the §9 catalog described the session nonce as `chain_index (4 bytes) || seq_number (8 bytes)`, built from the `chain` and `seq` values of the plaintext map. No implementation ever built that nonce: the session AEAD is the Double Ratchet's (PNP-002 §5.7), whose nonce is the first 8 bytes of the message's `ratchet_public_key` followed by its `msg_number` as 4 bytes big-endian, both taken from the ratchet header that travels in the clear. PNP-002 v0.6 §5.7 already states this construction; PNP-001 now states the same one. **PNP-001-MUST-006** is restated (same clause ID), and the `N-SESSION` row of §9 and the first sentence of §6 item 2 follow.
-- Nothing changes on the wire: v0.14 implementations already produce this nonce. The old text could not have been implemented as written, since the receiver needs the nonce before it can decrypt the map that carried `chain` and `seq`.
-- Uniqueness of a (key, nonce) pair (**PNP-001-MUST-041**) does not rest on the nonce alone: every message is encrypted under its own message key, derived from the chain key and used once. MUST count unchanged: 82.
+- Added §10.7 "Registration". It specifies the register challenge, which earlier revisions left to the reference implementation, and changes what the client signs: no longer the relay's bare nonce but a register message made of a domain-separation label, the nonce, an optional pinned relay identity key and the **canonical name of the relay the client dialed** (`host:port`). A relay accepts an answer only for a name it is configured to serve. Before, a relay E that a client connected to could open a socket to another relay R in the client's name, pass R's nonce on as its own challenge and present the client's answer at R: E was then registered at R as that client and received its signaling. New clauses: **PNP-001-MUST-083** … **PNP-001-MUST-087**, **PNP-001-MAY-006**.
+- §10.5: a signaling-only relay no longer serves `GET /peers/presence` and `GET /peers/lookup` (PNP-008 §10.5, §10.6). Both answered anyone, so anyone could ask whether a given PeerId was online. Presence on a signaling-only relay is now learned only over a registered socket. **PNP-001-MUST-071** is restated accordingly (same clause ID); relay-profile relays keep the endpoints behind request signatures (PNP-008 v0.8 §10.8).
+- §10.5 (SHOULD-017): the reference relay's `GET /bootstrap` now returns an empty list in the relay profile too. It listed up to 20 online PeerIds to any caller: the same disclosure, unauthenticated.
+- **Wire-incompatible** with v0.16 and earlier: the `register` answer carries a new `relay` field and a signature over a different message, so a v0.14 client cannot register at a v0.15 relay or the reverse. No deployed implementation of an earlier revision has to be kept working. MUST count: 87.
+
+**v0.16 (2026-11-21) — Nonce catalog matches the session and sender-key layers**
+
+- §3.3 (**PNP-001-MUST-006**, same clause ID) and the `N-SESSION` row of §9 now state the nonce the session layer has used throughout and PNP-002 §5.7 already describes: the first 8 bytes of the message's ratchet public key followed by `msg_number` (4 bytes, big-endian). The former text (`chain_index (4B) || seq_number (8B)`) described no implementation and named counters that do not exist in the Double Ratchet state. §6 item 2 no longer derives uniqueness from `chain_index` and `sequence_number`: every message has its own message key, and `msg_number` varies the nonce within a chain. The `N-SENDERKEY` row of §9 now agrees with PNP-009 §5.4: the first 8 bytes of `SHA-256(signing_public_key)` followed by `chain_index` (4 bytes, big-endian). No wire change.
+- §9 points to the limits of the counters that feed these nonces: PNP-002 §5.9, PNP-009 §5.9 and PNP-004 §5.1. No counter wraps.
+
+**v0.15 (2026-11-21) — Message type 0x15 FILE_TRANSFER**
+
+- §3.4: code `0x15 FILE_TRANSFER` is allocated to PNP-010 (File Transfer): the offer and the accept / decline / cancel / complete messages of a transfer whose records flow on a data channel of their own. The reserved range is now `0x16–0xFF`. Codes 0x02, 0x09 and 0x0A stay allocated; the file transfer they belonged to (PNP-007 §7) is superseded by PNP-010. No clause changes.
 
 **v0.14 (2026-11-21) — The whole ratchet header is associated data (wire-incompatible)**
 
@@ -215,15 +225,15 @@ Flags bitfield:
 | 3 | `is_final_fragment`: 1 if this is the last fragment |
 | 4-7 | Reserved, MUST be 0 **PNP-001-MUST-005** |
 
-The AEAD nonce for the session layer MUST be constructed per scheme `N-SESSION` defined in §9, from two fields of the message's own ratchet header (§3.1, PNP-002 §5.7):
+The AEAD nonce for the session layer MUST be constructed per scheme `N-SESSION` defined in §9:
 
 ```
-nonce (12 bytes) = ratchet_public_key[0..8] (the first 8 bytes) || msg_number (4 bytes, big-endian)
+nonce (12 bytes) = ratchet_public_key[0..8] (8 bytes) || msg_number (4 bytes, big-endian)
 ```
 
 **PNP-001-MUST-006**
 
-The receiver builds the nonce from the ratchet header as it arrived, for a message decrypted with a stored skipped message key as for any other. Both fields are also part of the AAD below, so a header altered in transit fails verification whichever of the two it touches.
+`ratchet_public_key` and `msg_number` are the fields of the message's ratchet header (§3.1). `msg_number` never reaches 2^24 and never wraps (PNP-002 §5.9), and every message is encrypted under a message key of its own, so no (key, nonce) pair repeats.
 
 The AEAD additional authenticated data (AAD) MUST be the concatenation of the encoded Double Ratchet header of the message (all three fields of the wire ratchet header, in the fixed 40-byte encoding of PNP-002 §5.7) followed by the serialized CBOR bytes of the cleartext header:
 
@@ -241,7 +251,7 @@ This construction makes the AEAD tag tamper-evident with respect to (a) every re
 
 ### 3.4 Message Types
 
-Codes 0x01–0x06 and 0x14 are allocated by this specification. Codes 0x07–0x0B are allocated by PNP-007 (Media & File Transfer). Codes 0x0C–0x12 are allocated by PNP-009 (Group Communication). Code 0x13 is allocated by PNP-002 (Handshake Protocol) for identity rotation. PNP-001 is the canonical registry — new message types MUST be assigned here in future revisions.
+Codes 0x01–0x06 and 0x14 are allocated by this specification. Codes 0x07–0x0B are allocated by PNP-007 (Media & File Transfer). Codes 0x0C–0x12 are allocated by PNP-009 (Group Communication). Code 0x13 is allocated by PNP-002 (Handshake Protocol) for identity rotation. Code 0x15 is allocated by PNP-010 (File Transfer). PNP-001 is the canonical registry — new message types MUST be assigned here in future revisions.
 
 | Code | Name | Allocated By | Description |
 |------|------|-------------|-------------|
@@ -265,8 +275,9 @@ Codes 0x01–0x06 and 0x14 are allocated by this specification. Codes 0x07–0x0
 | 0x12 | GROUP_ADMIN | PNP-009 | Group admin operation (invite, member add/remove; see PNP-009 §6.2) |
 | 0x13 | IDENTITY_ROTATE | PNP-002 | Signed identity rotation notification (see PNP-002 §7) |
 | 0x14 | CHANNEL_BINDING | PNP-001 | DTLS fingerprints of a direct data channel (§10.5.1) |
+| 0x15 | FILE_TRANSFER | PNP-010 | File transfer offer and control (accept, decline, cancel, complete); the records flow on the transfer's own data channel |
 
-Codes 0x15–0xFF are reserved for future assignment.
+Codes 0x16–0xFF are reserved for future assignment.
 
 Implementations MUST treat unrecognized message type codes as DECOY and silently discard them after decryption. **PNP-001-MUST-008**
 
@@ -493,6 +504,7 @@ QR-code freshness (30 minutes) is defined in PNP-003 §5.1.6 and is unrelated to
 | PNP-008 (Relay Federation) | Directory-sync messages are PNP-001 envelopes with RELAY_CONTROL (0x06). |
 | PNP-009 (Group Communication) | Allocates message-type codes 0x0C–0x12 (§3.4). |
 | PNP-002 (Handshake Protocol) | Allocates message-type code 0x13 IDENTITY_ROTATE (§3.4) for H5 identity rotation. |
+| PNP-010 (File Transfer) | Allocates message-type code 0x15 FILE_TRANSFER (§3.4); reserves data-channel labels under `pn-` on the direct connection of §10.5. |
 
 ## 9. Nonce Construction Catalog
 
@@ -503,7 +515,9 @@ Multiple independently scoped AEAD contexts exist in the ParolNet stack. Each us
 | `N-SESSION` | Session-layer envelope AEAD (§3.3) | `ratchet_public_key[0..8] \|\| msg_number (4B BE)` | 12 bytes | PNP-001 §3.3, PNP-002 §5.7 |
 | `N-HANDSHAKE` | PNP-002 X3DH-derived handshake AEAD | HKDF-SHA-256 of shared secret with context label | 12 bytes | PNP-002 §5.2 |
 | `N-ONION` | PNP-004 onion-layer AEAD (per hop) | `nonce_seed (12B) XOR counter (12B BE)` | 12 bytes | PNP-004 §5.1.5 |
-| `N-SENDERKEY` | PNP-009 group sender-key AEAD | `SHA-256(signing_public_key)[0..4] \|\| chain_index (8B BE)` | 12 bytes | PNP-009 §5.4 |
+| `N-SENDERKEY` | PNP-009 group sender-key AEAD | `SHA-256(signing_public_key)[0..8] \|\| chain_index (4B BE)` | 12 bytes | PNP-009 §5.4 |
+
+The counters in these constructions have limits, and none may wrap: `msg_number` in PNP-002 §5.9 (**PNP-002-MUST-045** to **MUST-048**), `chain_index` in PNP-009 §5.9 (**PNP-009-MUST-078** to **MUST-081**), the onion `counter` in PNP-004 §5.1 (**PNP-004-MUST-019**, **MUST-056**, **MUST-059**).
 
 Implementations MUST NOT construct an AEAD nonce by any scheme other than those listed here in the context specified. **PNP-001-MUST-047** Future nonce schemes MUST be added to this catalog in a future revision of PNP-001.
 
@@ -662,6 +676,8 @@ The `ts` echo lets the client measure round-trip time and unambiguously match po
 | `POST /tokens/issue` + frame router | `crates/parolnet-relay-server/src/main.rs` |
 | Profile, admission checks, signaling / connection limits, presence watch | `crates/parolnet-relay-server/src/policy.rs` |
 | Store-and-forward bounds (relay profile) | `crates/parolnet-relay-server/src/storage.rs` |
+| Register challenge, relay names, register-answer verification (§10.7) | `crates/parolnet-relay-server/src/challenge.rs` |
+| Register message, canonical relay name (§10.7) | `crates/parolnet-protocol/src/relay_auth.rs` |
 | VOPRF crate | `voprf = "0.5"` (audited, RustCrypto-adjacent) |
 
 ### 10.5 Signaling-Only Relay Profile
@@ -673,7 +689,9 @@ A relay operates in exactly one of two profiles:
 
 **Profile announcement.** The relay MUST include `profile` in every `registered` frame, with the value `"signaling-only"` or `"relay"`, and MUST include the same `profile` field in its `GET /turn-credentials` response. **PNP-001-MUST-070** A client that receives no `profile` field MUST treat the relay as `"relay"` (pre-v0.11 relays). The reference relay MUST default to `"signaling-only"` when no profile is configured.
 
-**What a signaling-only relay accepts.** On the client WebSocket a signaling-only relay MUST accept only the text frame types `register`, `ping`, `rtc_offer`, `rtc_answer`, `rtc_ice` and `watch`, MUST answer any other type with `{type:"error", code:"signaling_only"}` without acting on it, and MUST close the socket (close code 1003) on a binary frame. **PNP-001-MUST-071** It MUST NOT keep a store-and-forward buffer, MUST NOT serve `POST /tokens/issue`, `POST /telemetry`, `POST /endorse`, `POST /directory/push` or the federation link, and MUST NOT issue TURN credentials: `GET /turn-credentials` returns only STUN URIs with empty `username` / `credential`. `GET /directory` stays readable.
+**What a signaling-only relay accepts.** On the client WebSocket a signaling-only relay MUST accept only the text frame types `register`, `ping`, `rtc_offer`, `rtc_answer`, `rtc_ice` and `watch`, MUST answer any other type with `{type:"error", code:"signaling_only"}` without acting on it, and MUST close the socket (close code 1003) on a binary frame. **PNP-001-MUST-071** It MUST NOT keep a store-and-forward buffer, MUST NOT serve `POST /tokens/issue`, `POST /telemetry`, `POST /endorse`, `POST /directory/push`, the federation link, `GET /peers/presence` or `GET /peers/lookup` (each is answered 404, whatever the request carries), and MUST NOT issue TURN credentials: `GET /turn-credentials` returns only STUN URIs with empty `username` / `credential`. `GET /directory` stays readable.
+
+**Who learns that a peer is online.** A signaling-only relay tells nobody over HTTP which PeerIds are connected to it: it does not serve the presence and lookup endpoints of PNP-008 §10.5 – §10.6 (MUST-071 above), `GET /bootstrap` returns an empty list, and `GET /peers` is the operator's (an admin token). Whether a peer is online is learned only over a socket that has registered per §10.7: by the `presence` push between mutual watchers (MUST-076) and by the `peer_offline` answer to a signaling frame (MUST-073), both within the caps of MUST-074. Registration is free, so this does not hide presence from a determined party that knows a PeerId; it makes asking cost a registered, rate-limited socket where it used to cost one anonymous HTTP request.
 
 **Signaling frames.** `rtc_offer` / `rtc_answer` / `rtc_ice` MUST be forwarded only from a registered socket to a peer that is registered and online at that moment, with `from` set to the sender's registered PeerId; they MUST NOT be queued for a peer that is offline. When the recipient is not online the relay MUST answer `{type:"error", code:"peer_offline", peer_id:<to>}`. **PNP-001-MUST-073** The `payload` of an `rtc_offer` or `rtc_answer` MUST NOT exceed 16384 bytes and that of an `rtc_ice` MUST NOT exceed 2048 bytes; a larger payload is refused with `code:"payload_too_large"`. **PNP-001-MUST-072** Per registered sender the relay MUST forward at most 60 signaling frames per minute and 240 per hour, and at most 64 frames per 10 minutes for one (sender, recipient) pair, refusing the excess with `code:"rate_limited"`. **PNP-001-MUST-074** With these caps a modified client can tunnel at most a few kilobytes per second to one cooperating online peer, which is the floor for any signaling service.
 
@@ -685,7 +703,7 @@ A relay operates in exactly one of two profiles:
 
 **Presence without a push (client).** A `peer_offline` answer says only that the recipient was not registered at that moment. Unless the pair are mutual watchers within the 256-id limit, the relay never reports that this changed. A client whose only evidence that a contact is offline is a `peer_offline` answer (no `presence` push for that contact since) SHOULD treat it as provisional and offer again with exponential backoff and jitter, whether or not messages are queued for the contact (the reference client: after 15 seconds, doubling up to 5 minutes for a contact that has queued messages or that the user asked to connect to, and up to 15 minutes for any other), and SHOULD stop when a connection comes up or a `presence` push for the contact arrives; a push is authoritative in both directions, so a contact pushed offline is not probed. A user's explicit request to connect SHOULD offer at once and start the backoff over. All such probes together SHOULD stay well below the per-sender caps of MUST-074 (the reference client: a bucket of 12 probes refilled one per minute, at most 72 an hour, contacts the user waits for first) and SHOULD pause while the client backs off after `rate_limited`. **PNP-001-SHOULD-019**
 
-**Logging.** A relay SHOULD NOT write PeerIds at its default log level, SHOULD NOT write access logs that pair client addresses with PeerIds, and SHOULD NOT accept PeerIds in request URLs; the reference signaling-only relay answers `GET /bootstrap` with an empty list and ignores its `exclude` parameter. **PNP-001-SHOULD-017**
+**Logging.** A relay SHOULD NOT write PeerIds at its default log level, SHOULD NOT write access logs that pair client addresses with PeerIds, and SHOULD NOT accept PeerIds in request URLs; the reference relay, in both profiles, answers `GET /bootstrap` with an empty list and ignores its `exclude` parameter (through v0.14 a relay-profile relay listed up to 20 online PeerIds there to any caller). **PNP-001-SHOULD-017**
 
 #### 10.5.1 Direct Data-Channel Binding
 
@@ -726,6 +744,52 @@ These bounds apply to every relay, whatever its profile. They close paths by whi
 | buffered recipients / total bytes (relay profile) | 4096 / 64 MB |
 | BlindedElements per issuance request / requests per address (relay profile) | 1024 / 10 per min |
 | onion circuits per socket (relay profile) | 64 |
+| register challenge lifetime | 60 s |
+
+### 10.7 Registration
+
+A client registers a PeerId on a relay socket by proving that it holds the Ed25519 key the PeerId is the hash of. Everything a relay does for a PeerId (forwarding signaling to it, reporting its presence, delivering its mailbox in the relay profile) goes to the socket that registered it, so a registration obtained in someone else's name is an impersonation towards everyone who signals to that PeerId.
+
+**The exchange.**
+
+```
+client → relay   {"type":"register","peer_id":<64 hex>}
+relay  → client  {"type":"challenge","nonce":<64 hex>,"peer_id":<64 hex>}
+client → relay   {"type":"register","peer_id":<64 hex>,"pubkey":<64 hex>,
+                  "signature":<128 hex>,"nonce":<64 hex>,"relay":<relay name>
+                  [,"relay_key":<64 hex>]}
+relay  → client  {"type":"registered","peer_id":…,"profile":…}
+            or   {"type":"error","code":"register_failed","message":…}
+```
+
+**The challenge.** The nonce MUST be 32 bytes from a cryptographically secure random source, issued by the relay on that socket in answer to a `register` without credentials. The relay MUST accept a `register` with credentials only if its `nonce` equals (compared in constant time) the nonce outstanding on **that socket**, issued no more than 60 seconds earlier and not yet answered; the relay MUST verify the signature over its own copy of the nonce, never the client's; and every `register` with credentials MUST spend the outstanding nonce, whether it is accepted or refused, so that one nonce is checked against at most one signature. **PNP-001-MUST-083** A relay MAY return the same nonce to a second credential-less `register` that arrives while one is outstanding; its lifetime is not extended. A refusal carries no new nonce: the client asks again, within the register-frame limit of §10.6.
+
+**The register message.** The client MUST compute `signature` as its Ed25519 signature, with the identity key, over exactly these bytes:
+
+```
+register_message =
+    label      (25 bytes)  ASCII "PNP-001-relay-register-v1"
+ || nonce      (32 bytes)  the relay's challenge
+ || pin        ( 1 byte )  0x01 if the client pins the relay's identity key, else 0x00
+ || relay_key  (32 bytes)  that Ed25519 public key; 32 zero bytes when pin = 0x00
+ || name_len   ( 2 bytes)  length of name in bytes, big-endian
+ || name       (name_len)  the canonical relay name (below), ASCII
+```
+
+Every field but the last has a fixed length and the last is length-prefixed, so two different inputs never give the same bytes. A client MUST NOT answer a challenge whose nonce is not 32 bytes, and MUST NOT sign the nonce in any other form (least of all the nonce alone, as revisions before v0.15 did). **PNP-001-MUST-084** The label keeps the signature from being taken for any other statement made with the identity key (and any of those for a register answer).
+
+**The relay name.** The name is `host ":" port`, at most 259 bytes:
+
+- `host` is the host of the URL the client opened the socket to: a DNS name or IPv4 literal in lowercase ASCII (letters, digits, `.`, `-`, `_`; an internationalised name in its A-label form; a single trailing dot removed), or an IPv6 literal in square brackets, in lowercase hexadecimal without leading zeros, the first longest run of two or more zero groups written `::`, and no dotted-decimal part.
+- `port` is always present, in decimal without leading zeros. When the URL names no port it is the default of the URL's scheme: 443 for `wss` (and `https`), 80 for `ws` (and `http`).
+
+`wss://Parol.Social/ws` gives `parol.social:443`; `ws://127.0.0.1:9000/ws` gives `127.0.0.1:9000`; `wss://[2001:DB8::1]:8443/ws` gives `[2001:db8::1]:8443`. The client MUST derive the name from the URL it opens the socket to, so that it names the host and port the socket actually goes to, and from nothing the relay sends; it MUST send the name in the `relay` field, and it MUST NOT open the socket when the URL has no such name (user information in the URL, a host outside the alphabet above, a scheme other than the four named). **PNP-001-MUST-085** The reference web client takes host and port from the browser's URL parser, the one the WebSocket constructor itself uses; the native client refuses any URL that is not a plain `scheme://host[:port]` followed by a path in that alphabet, so that no URL can be read as one host by it and as another by the library that connects.
+
+**What the relay checks.** A relay is configured with the names its clients dial it under (`RELAY_PUBLIC_NAMES` in the reference relay). On a `register` with credentials whose nonce passed MUST-083 the relay MUST verify, and MUST answer `{type:"error", code:"register_failed"}` without registering the socket when any of it fails, that: `peer_id` is the SHA-256 of `pubkey`; `relay` is a relay name in canonical form, byte for byte, and one of the relay's configured names; and `signature` verifies under `pubkey` over the register message built from the relay's own copy of the nonce and that configured name. **PNP-001-MUST-086** An answer the client made for another relay therefore fails at this one, whether it is presented as made (the name is not this relay's) or with the `relay` field rewritten (the signature covers the other name). A relay with no configured name MUST accept only loopback names (`localhost`, an address in `127.0.0.0/8`, `[::1]`; any port) and no other: a client that signed a loopback name was talking to its own machine, so the default serves development on one host and gives nothing to a relay elsewhere.
+
+**Pinning the relay's identity key.** A client that already knows the Ed25519 identity key of the relay it means to reach (from a descriptor that passed PNP-008 §6.3, or out of band) MAY bind it: it sets `pin` to 0x01, puts the key in `relay_key` of the register message and sends the key as the `relay_key` field. **PNP-001-MAY-006** The client MUST NOT take that key from the socket it is registering on. A relay that receives a `relay_key` field MUST refuse the answer unless the field equals its own identity key, and MUST verify the signature over the register message with `pin` = 0x01 and its own key; when the field is absent it MUST verify with `pin` = 0x00 and 32 zero bytes. **PNP-001-MUST-087** Neither side can therefore add or remove the pin after the fact. Neither reference client pins today: on a signaling-only relay a client knows only the relay's URL.
+
+**What this does and does not establish.** The binding is to the name the client dialed. A client that dials relay E gives E an answer that only E can use. It does not protect a client that reaches an impostor under the genuine relay's own name: over `wss` that takes a certificate for that name, and over plain `ws` only control of the network path, which is why a client outside development uses `wss`. Two processes configured with one name are one relay as far as registration goes; an operator who runs several behind one name intends exactly that.
 
 [RFC 9497]: https://www.rfc-editor.org/rfc/rfc9497.html
 [RFC 9578]: https://www.rfc-editor.org/rfc/rfc9578.html

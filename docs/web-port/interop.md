@@ -121,8 +121,8 @@ have seen mDNS answers (`:867-871`).
 
 > **Status.** Implemented: `web/src/engine/test-hooks.ts`, installed only by the test build of
 > the web app (`denext task build:test`; the production export fails its build if the bundle
-> names the hooks). The driver takes `INTEROP_APP=web` to run the same seven cases against the
-> web app; `class Web` in `apps/desktop/interop/pwa-interop.mjs` lists, case by case, what it
+> names the hooks). The driver runs the same seven cases (and files) against the
+> web app, its only target since the old PWA was removed; `class Web` in `apps/desktop/interop/pwa-interop.mjs` lists, case by case, what it
 > checks in place of each old-PWA internal. It acts through the interface (first run, the
 > add-a-contact screen, the composer, the call buttons) and reads the app's database
 > (`parolnet-web`) and the hooks; the `data-testid`s below that the app uses are
@@ -145,8 +145,9 @@ be gated on a build flag; the driver can tell which through `window.__parolnetTe
 | `version: 1` | — | contract version |
 | `ready(): Promise<{peerId}>` | polling `window._peerId` | resolves once the identity is loaded |
 | `relayRegistered(): boolean` and the event `parolnet:test` `{kind:'relay', state:'registered'}` | console `Registered with relay` | true after `registered`, false on disconnect |
-| `showPairingCode(): Promise<string>` | `showView` + `showAddTab` + `#qr-share-code` | navigates to the presenter screen, opens the pairing window, returns the hex code |
-| `pairWithCode(code): Promise<void>` | `showView` / `showAddTab` / input / `connectViaPassphrase` | the same path as the paste UI |
+| `showPairingCode(): Promise<string>` | `showView` + `showAddTab` + `#qr-share-code` | opens the pairing window, returns the code in its text form (base45 with `_` for blanks) |
+| `pairWithCode(code): Promise<void>` | `showView` / `showAddTab` / input / `connectViaPassphrase` | the same path as the paste UI; the contact is added once the verification code was confirmed on both devices |
+| `sas(): {peerId, digits, emoji, confirmed} \| null`, `confirmSas()`, `rejectSas()` and the events `{kind:'sas'}`, `{kind:'paired', sasVerified}`, `{kind:'pairing-failed', reason}` | — (PNP-003 §5.5; the old PWA had no such step) | the verification code a pairing shows, and the person's answer |
 | `contacts(): Promise<string[]>` | IDB `contacts` | peer ids |
 | `messages(peerId): Promise<{direction:'sent'\|'received', text, state}[]>` | IDB `messages` | the history as the UI shows it |
 | `sendText(peerId, text): Promise<{state}>` | `openChat` + `#message-input` + `sendMessage` | sends through the same code path as the composer |

@@ -12,20 +12,23 @@ use std::path::PathBuf;
 
 use anyhow::{Context as _, bail};
 use gpui::{
-    App, Bounds, ClipboardItem, Context, Entity, FontWeight, IntoElement, Render, SharedString,
-    Window, WindowBounds, WindowOptions, div, prelude::*, px, rgb, size,
+    App, Bounds, ClipboardItem, Context, Entity, ExternalPaths, FontWeight, IntoElement,
+    PathPromptOptions, Render, SharedString, Window, WindowBounds, WindowOptions, div, prelude::*,
+    px, rgb, size,
 };
 use gpui_component::Root;
 use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::input::{Input, InputEvent, InputState};
+use gpui_component::progress::Progress;
 use parolnet_app::KeyStorage;
 use parolnet_app::{
     AppConfig, AppEvent, AppHandle, CallEnd, CallInfo, CallMedia, CallState, ChatMessage, Contact,
-    DeliveryState, Direction, PathState, RelayState,
+    DeliveryState, Direction, PathState, RelayState, TransferInfo, pairing_code_text,
 };
 
 use crate::call::{CallSession, DeviceLists, MediaOptions};
 use crate::settings::SettingsView;
+use crate::transfer::{self, Action, TimelineItem};
 use crate::ui::VideoView;
 use tokio::sync::mpsc::UnboundedReceiver;
 
@@ -223,10 +226,9 @@ pub struct QrRows {
 }
 
 pub fn qr_rows(data: &str) -> Option<QrRows> {
-    let code =
-        qrcode::QrCode::with_error_correction_level(data.as_bytes(), qrcode::EcLevel::L).ok()?;
-    let w = code.width();
-    let colors = code.to_colors();
+    // Error correction level M (PNP-003-MUST-008), from the core.
+    let code = parolnet_app::qr::pairing_qr(data)?;
+    let w = code.width;
     const QUIET: usize = 4;
     let full = w + 2 * QUIET;
     let mut rows = Vec::with_capacity(full);
@@ -236,7 +238,7 @@ pub fn qr_rows(data: &str) -> Option<QrRows> {
     for y in 0..w {
         let mut runs: Vec<(bool, usize)> = vec![(false, QUIET)];
         for x in 0..w {
-            let dark = colors[y * w + x] == qrcode::Color::Dark;
+            let dark = code.is_dark(y, x);
             match runs.last_mut() {
                 Some((d, n)) if *d == dark => *n += 1,
                 _ => runs.push((dark, 1)),
@@ -287,15 +289,43 @@ struct ContactRow {
     path: PathState,
 }
 
+/// How long a pairing code is shown (the core's default pairing window).
+const PAIRING_CODE_MINUTES: u64 = 10;
+
+/// The Short Authentication String of a pairing, for the user to compare (PNP-003 §5.5).
+struct SasPrompt {
+    peer_id: String,
+    digits: String,
+    emoji: String,
+    /// The user confirmed; the contact's confirmation is awaited.
+    confirmed: bool,
+}
+
+/// A file being read for its hash before `offer_file` returns.
+struct Preparing {
+    token: u64,
+    peer: String,
+    path: PathBuf,
+}
+
 pub struct ChatView {
     app: AppHandle,
     relay: RelayState,
     contacts: Vec<ContactRow>,
     selected: Option<String>,
     messages: HashMap<String, Vec<ChatMessage>>,
+    /// Each conversation's file transfers, oldest first (`transfer.rs`).
+    transfers: HashMap<String, Vec<TransferInfo>>,
+    /// Files being prepared for an offer, in the order they were picked.
+    preparing: Vec<Preparing>,
+    next_token: u64,
     pane: Pane,
     pairing_code: Option<String>,
     qr: Option<QrRows>,
+    /// When the code on display expires (PNP-003-SHOULD-001).
+    pairing_expires: Option<std::time::Instant>,
+    /// A pairing waiting for the user to compare its Short Authentication String.
+    sas: Option<SasPrompt>,
     notice: Option<String>,
     code_input: Entity<InputState>,
     composer: Entity<InputState>,
@@ -376,6 +406,10 @@ impl ChatView {
                     loaded.insert(c.contact.peer_id.clone(), list);
                 }
             }
+            let mut files: HashMap<String, Vec<TransferInfo>> = HashMap::new();
+            for t in app2.transfers(None).await.unwrap_or_default() {
+                files.entry(t.peer_id.clone()).or_default().push(t);
+            }
             let _ = this.update(cx, |view, cx| {
                 view.relay = snapshot.relay;
                 view.contacts = snapshot
@@ -387,6 +421,9 @@ impl ChatView {
                     })
                     .collect();
                 view.messages = loaded;
+                for (peer, list) in files {
+                    transfer::merge_loaded(view.transfers.entry(peer).or_default(), list);
+                }
                 cx.notify();
             });
         })
@@ -398,9 +435,14 @@ impl ChatView {
             contacts: Vec::new(),
             selected: None,
             messages: HashMap::new(),
+            transfers: HashMap::new(),
+            preparing: Vec::new(),
+            next_token: 0,
             pane: Pane::Welcome,
             pairing_code: None,
             qr: None,
+            pairing_expires: None,
+            sas: None,
             notice: None,
             show_safety: false,
             runtime,
@@ -475,6 +517,46 @@ impl ChatView {
                 }
             }
             AppEvent::Notice(n) => self.notice = Some(n),
+            // PNP-003-MUST-009 / -MUST-048: the code and its QR code leave the display as
+            // soon as a contact used it, it expired or it was cancelled.
+            AppEvent::PairingCodeClosed => self.clear_pairing_code(),
+            AppEvent::ContactRemoved { peer_id } => {
+                self.contacts.retain(|r| r.contact.peer_id != peer_id);
+                if self.selected.as_deref() == Some(peer_id.as_str()) {
+                    self.selected = None;
+                    self.pane = Pane::Welcome;
+                }
+            }
+            // PNP-003-MUST-026: show the SAS.
+            AppEvent::SasVerification {
+                peer_id,
+                digits,
+                emoji,
+            } => {
+                self.sas = Some(SasPrompt {
+                    peer_id,
+                    digits,
+                    emoji,
+                    confirmed: false,
+                })
+            }
+            AppEvent::PairingComplete {
+                peer_id,
+                sas_verified,
+            } => {
+                if self.sas.as_ref().is_some_and(|s| s.peer_id == peer_id) {
+                    self.sas = None;
+                }
+                if sas_verified {
+                    self.notice = Some("Verification code confirmed on both devices.".into());
+                }
+            }
+            AppEvent::PairingFailed { peer_id, .. } => {
+                if self.sas.as_ref().is_some_and(|s| s.peer_id == peer_id) {
+                    self.sas = None;
+                }
+            }
+            AppEvent::Transfer(t) => self.on_transfer(t),
         }
         cx.notify();
     }
@@ -500,10 +582,142 @@ impl ChatView {
             .unwrap_or_default();
         self.name_input
             .update(cx, |s, cx| s.set_value(name, window, cx));
-        self.selected = Some(peer);
+        self.selected = Some(peer.clone());
         self.pane = Pane::Chat;
         self.notice = None;
+        self.load_transfers(peer, cx);
         cx.notify();
+    }
+
+    fn on_transfer(&mut self, t: TransferInfo) {
+        transfer::upsert(self.transfers.entry(t.peer_id.clone()).or_default(), t);
+    }
+
+    /// Reload a conversation's transfers from the core (when it opens).
+    fn load_transfers(&mut self, peer: String, cx: &mut Context<Self>) {
+        let app = self.app.clone();
+        cx.spawn(async move |this, cx| {
+            let Ok(list) = app.transfers(Some(&peer)).await else {
+                return;
+            };
+            let _ = this.update(cx, |view, cx| {
+                transfer::merge_loaded(view.transfers.entry(peer).or_default(), list);
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Offer files (picked or dropped) to a contact; folders are refused with a line.
+    fn offer_paths(&mut self, peer: String, paths: Vec<PathBuf>, cx: &mut Context<Self>) {
+        let (files, folders) = transfer::split_folders(&paths, |p| p.is_dir());
+        if let Some(line) = transfer::folders_refused_text(&folders) {
+            self.notice = Some(line);
+        }
+        for path in files {
+            self.offer(peer.clone(), path, cx);
+        }
+        cx.notify();
+    }
+
+    /// `offer_file` reads the whole file for its hash before it returns: the bubble says
+    /// "Preparing …" meanwhile, and the UI thread only awaits.
+    fn offer(&mut self, peer: String, path: PathBuf, cx: &mut Context<Self>) {
+        let token = self.next_token;
+        self.next_token += 1;
+        self.preparing.push(Preparing {
+            token,
+            peer: peer.clone(),
+            path: path.clone(),
+        });
+        let app = self.app.clone();
+        cx.spawn(async move |this, cx| {
+            let result = app.offer_file(&peer, path.clone()).await;
+            let _ = this.update(cx, |view, cx| {
+                view.preparing.retain(|p| p.token != token);
+                match result {
+                    Ok(info) => view.on_transfer(info),
+                    Err(e) => {
+                        view.notice =
+                            Some(format!("Not sent: {}: {e}", transfer::display_name(&path)))
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// The attach button: the system's file picker, then an offer per file.
+    fn attach(&mut self, cx: &mut Context<Self>) {
+        let Some(peer) = self.selected.clone() else {
+            return;
+        };
+        let picked = cx.prompt_for_paths(PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: true,
+            prompt: Some("Send".into()),
+        });
+        cx.spawn(async move |this, cx| {
+            let paths = match picked.await {
+                Ok(Ok(Some(paths))) => paths,
+                Ok(Ok(None)) | Err(_) => return, // dismissed
+                Ok(Err(e)) => {
+                    let _ = this.update(cx, |view, cx| {
+                        view.notice = Some(format!("Could not open the file picker: {e}"));
+                        cx.notify();
+                    });
+                    return;
+                }
+            };
+            let _ = this.update(cx, |view, cx| view.offer_paths(peer, paths, cx));
+        })
+        .detach();
+    }
+
+    /// A transfer bubble's button.
+    fn transfer_action(&mut self, t: &TransferInfo, action: Action, cx: &mut Context<Self>) {
+        match action {
+            Action::Open | Action::Reveal => {
+                let Some(path) = t.path.as_deref() else {
+                    return;
+                };
+                if !path.exists() {
+                    self.notice = Some(format!("{} is no longer at {}", t.name, path.display()));
+                    cx.notify();
+                    return;
+                }
+                // The system's default handler (or the file manager): the app never runs a
+                // received file itself.
+                if action == Action::Open {
+                    cx.open_with_system(path);
+                } else {
+                    cx.reveal_path(path);
+                }
+            }
+            Action::Accept | Action::Decline | Action::Cancel => {
+                let (app, id, name) = (self.app.clone(), t.id.clone(), t.name.clone());
+                cx.spawn(async move |this, cx| {
+                    let result = match action {
+                        Action::Accept => app.accept_transfer(&id).await,
+                        Action::Decline => app.decline_transfer(&id).await,
+                        _ => app.cancel_transfer(&id).await,
+                    };
+                    let _ = this.update(cx, |view, cx| {
+                        match result {
+                            Ok(info) => view.on_transfer(info),
+                            Err(e) => {
+                                view.notice =
+                                    Some(transfer::action_error(action, &name, &e.to_string()))
+                            }
+                        }
+                        cx.notify();
+                    });
+                })
+                .detach();
+            }
+        }
     }
 
     fn name_of(&self, peer: &str) -> String {
@@ -984,6 +1198,12 @@ impl ChatView {
         .detach();
     }
 
+    fn clear_pairing_code(&mut self) {
+        self.pairing_code = None;
+        self.qr = None;
+        self.pairing_expires = None;
+    }
+
     fn generate_code(&mut self, cx: &mut Context<Self>) {
         let app = self.app.clone();
         cx.spawn(async move |this, cx| {
@@ -993,6 +1213,10 @@ impl ChatView {
                     Ok(code) => {
                         view.qr = qr_rows(&code);
                         view.pairing_code = Some(code);
+                        view.pairing_expires = Some(
+                            std::time::Instant::now()
+                                + std::time::Duration::from_secs(60 * PAIRING_CODE_MINUTES),
+                        );
                     }
                     Err(e) => view.notice = Some(format!("Could not make a code: {e}")),
                 }
@@ -1023,6 +1247,71 @@ impl ChatView {
             });
         })
         .detach();
+    }
+
+    /// The verification step of a pairing (PNP-003 §5.5): the SAS as digits and as emoji,
+    /// what to do with it, and the two answers.
+    fn render_sas(&self, sas: &SasPrompt, cx: &mut Context<Self>) -> impl IntoElement {
+        let mut panel = div()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .p_3()
+            .border_1()
+            .border_color(rgb(0xd29922))
+            .rounded_md()
+            .child(heading("Verify your contact"))
+            .child(
+                div()
+                    .text_2xl()
+                    .font_weight(FontWeight::BOLD)
+                    .child(sas_spaced(&sas.digits)),
+            )
+            .child(div().text_2xl().child(sas.emoji.clone()))
+            .child(muted(SAS_INSTRUCTIONS));
+        if sas.confirmed {
+            panel = panel.child(muted(
+                "Waiting for your contact to confirm on their device.",
+            ));
+        } else {
+            let (confirm_peer, reject_peer) = (sas.peer_id.clone(), sas.peer_id.clone());
+            panel = panel
+                .child(
+                    Button::new("sas-confirm")
+                        .label("The codes match")
+                        .primary()
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.confirm_sas(confirm_peer.clone(), cx)
+                        })),
+                )
+                .child(
+                    Button::new("sas-reject")
+                        .label("They do not match")
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.app.reject_sas(&reject_peer);
+                            this.sas = None;
+                            cx.notify();
+                        })),
+                );
+        }
+        panel
+    }
+
+    fn confirm_sas(&mut self, peer: String, cx: &mut Context<Self>) {
+        if let Some(sas) = self.sas.as_mut() {
+            sas.confirmed = true;
+        }
+        let app = self.app.clone();
+        cx.spawn(async move |this, cx| {
+            if let Err(e) = app.confirm_sas(&peer).await {
+                let _ = this.update(cx, |view, cx| {
+                    view.notice = Some(format!("Could not confirm: {e}"));
+                    cx.notify();
+                });
+            }
+        })
+        .detach();
+        cx.notify();
     }
 
     fn rename(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
@@ -1154,7 +1443,8 @@ impl ChatView {
             .child(heading("Show my code"))
             .child(muted(
                 "Your contact scans this QR code (or pastes the text) in their ParolNet app. \
-                 It is valid for 30 minutes.",
+                 It is shown for 10 minutes and works for one contact. After pairing, both \
+                 devices show a verification code to compare.",
             ))
             .child(
                 Button::new("make-code")
@@ -1168,7 +1458,18 @@ impl ChatView {
         if let Some(qr) = &self.qr {
             show = show.child(render_qr(qr));
         }
-        if let Some(code) = self.pairing_code.clone() {
+        // PNP-003-SHOULD-001: the expiry indicator.
+        if let Some(expires) = self.pairing_expires {
+            let left = expires.saturating_duration_since(std::time::Instant::now());
+            show = show.child(
+                div()
+                    .text_sm()
+                    .text_color(rgb(0xd29922))
+                    .child(expiry_label(left)),
+            );
+        }
+        // As text, the code is shown in its form for copying (no blanks to lose).
+        if let Some(code) = self.pairing_code.as_deref().map(pairing_code_text) {
             show = show
                 .child(
                     div()
@@ -1198,21 +1499,19 @@ impl ChatView {
                     .primary()
                     .on_click(cx.listener(|this, _, window, cx| this.pair(window, cx))),
             );
-        div()
+        let page = div()
             .id("pair")
             .size_full()
             .overflow_y_scroll()
             .p_4()
             .flex()
             .flex_col()
-            .gap_6()
-            .child(show)
-            .child(enter)
-            .child(muted(
-                "Connections go directly between your devices. A contact you connect to can see \
+            .gap_6();
+        page.child(show).child(enter).child(muted(
+            "Connections go directly between your devices. A contact you connect to can see \
                  your IP address; strangers never can. To hide it, add your own TURN server in \
                  Settings.",
-            ))
+        ))
     }
 
     fn render_chat(&self, peer: &str, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1323,10 +1622,18 @@ impl ChatView {
                     )
             });
 
-        let empty = Vec::new();
-        let msgs = self.messages.get(peer).unwrap_or(&empty);
+        let (no_msgs, no_files) = (Vec::new(), Vec::new());
+        let msgs = self.messages.get(peer).unwrap_or(&no_msgs);
+        let files = self.transfers.get(peer).unwrap_or(&no_files);
         let mut list = div().flex().flex_col().gap_2().p_3();
-        for m in msgs.iter().rev().take(300).rev() {
+        for item in transfer::timeline(msgs, files, 300) {
+            let m = match item {
+                TimelineItem::Message(m) => m,
+                TimelineItem::Transfer(t) => {
+                    list = list.child(self.render_transfer(t, cx));
+                    continue;
+                }
+            };
             let sent = m.direction == Direction::Sent;
             let state = match (m.direction, m.state) {
                 (Direction::Sent, DeliveryState::Queued) => " · waiting",
@@ -1349,11 +1656,36 @@ impl ChatView {
                 ),
             );
         }
+        for p in self.preparing.iter().filter(|p| p.peer == peer) {
+            list = list.child(
+                div().flex().justify_end().child(
+                    div()
+                        .max_w(px(520.))
+                        .px_3()
+                        .py_2()
+                        .rounded_lg()
+                        .border_1()
+                        .border_color(rgb(0x1f6feb))
+                        .text_sm()
+                        .text_color(rgb(0xc9d1d9))
+                        .overflow_hidden()
+                        .whitespace_nowrap()
+                        .text_ellipsis_middle()
+                        .child(transfer::preparing_text(&p.path)),
+                ),
+            );
+        }
 
+        let drop_peer = peer.to_owned();
         div()
+            .id("conversation")
             .size_full()
             .flex()
             .flex_col()
+            .drag_over::<ExternalPaths>(|style, _, _, _| style.bg(rgb(0x161b22)))
+            .on_drop(cx.listener(move |this, paths: &ExternalPaths, _, cx| {
+                this.offer_paths(drop_peer.clone(), paths.paths().to_vec(), cx)
+            }))
             .child(header)
             .children(safety)
             .child(
@@ -1371,6 +1703,11 @@ impl ChatView {
                     .p_3()
                     .border_t_1()
                     .border_color(rgb(0x30363d))
+                    .child(
+                        Button::new("attach")
+                            .label("Attach")
+                            .on_click(cx.listener(|this, _, _, cx| this.attach(cx))),
+                    )
                     .child(div().flex_1().child(Input::new(&self.composer)))
                     .child(
                         Button::new("send")
@@ -1379,6 +1716,109 @@ impl ChatView {
                             .on_click(cx.listener(|this, _, window, cx| this.send(window, cx))),
                     ),
             )
+    }
+}
+
+/// What the user is asked to do with the verification code (PNP-003-SHOULD-002).
+pub const SAS_INSTRUCTIONS: &str = "Compare this code with the one on your contact's device, \
+     by voice or in person, not by message. If the codes differ, someone may be \
+     intercepting the pairing: choose \"They do not match\".";
+
+/// The 6-digit code in two groups of three.
+pub fn sas_spaced(digits: &str) -> String {
+    match digits.len() {
+        6 => format!("{} {}", &digits[..3], &digits[3..]),
+        _ => digits.to_owned(),
+    }
+}
+
+/// The text of the expiry indicator under a pairing code.
+pub fn expiry_label(left: std::time::Duration) -> String {
+    let secs = left.as_secs();
+    if secs == 0 {
+        "This code has expired. Make a new one.".to_owned()
+    } else if secs < 60 {
+        "Expires in less than a minute".to_owned()
+    } else {
+        let minutes = secs.div_ceil(60);
+        format!(
+            "Expires in {minutes} minute{}",
+            if minutes == 1 { "" } else { "s" }
+        )
+    }
+}
+
+impl ChatView {
+    /// A file's bubble: aligned like a text bubble, outlined until the file is on the other
+    /// device (filled once complete), with the name, size, status in words and buttons.
+    fn render_transfer(&self, t: &TransferInfo, cx: &mut Context<Self>) -> impl IntoElement {
+        let sent = t.direction == Direction::Sent;
+        let color = if sent { 0x1f6feb } else { 0x30363d };
+        let filled = transfer::filled(t);
+        let mut buttons = div().flex().flex_wrap().gap_2();
+        for action in transfer::actions(t) {
+            let info = t.clone();
+            let mut button =
+                Button::new(SharedString::from(format!("transfer-{}-{action:?}", t.id)))
+                    .label(action.label())
+                    .on_click(
+                        cx.listener(move |this, _, _, cx| this.transfer_action(&info, action, cx)),
+                    );
+            if action == Action::Accept {
+                button = button.primary();
+            }
+            buttons = buttons.child(button);
+        }
+        let mut bubble = div()
+            .max_w(px(520.))
+            .min_w(px(220.))
+            .px_3()
+            .py_2()
+            .rounded_lg()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .border_1()
+            .border_color(rgb(color))
+            .when(filled, |d| d.bg(rgb(color)))
+            .child(
+                div()
+                    .flex()
+                    .gap_2()
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .overflow_hidden()
+                            .whitespace_nowrap()
+                            .text_ellipsis_middle()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(rgb(0xffffff))
+                            .child(t.name.clone()),
+                    )
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(rgb(0xc9d1d9))
+                            .child(transfer::human_size(t.size)),
+                    ),
+            )
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(rgb(0xc9d1d9))
+                    .child(transfer::status_text(t)),
+            );
+        if let Some(percent) = transfer::progress_percent(t) {
+            bubble = bubble.child(
+                Progress::new(SharedString::from(format!("transfer-progress-{}", t.id)))
+                    .value(percent),
+            );
+        }
+        div()
+            .flex()
+            .when(sent, |d| d.justify_end())
+            .child(bubble.child(buttons))
     }
 }
 
@@ -1434,6 +1874,14 @@ impl Render for ChatView {
                 .child("Pick a contact, or add one.")
                 .into_any_element(),
         };
+        // PNP-003-MUST-042: while a pairing waits for it, the verification step is on top
+        // of whatever pane is open.
+        let sas = self.sas.as_ref().map(|sas| {
+            div()
+                .p_3()
+                .child(self.render_sas(sas, cx))
+                .into_any_element()
+        });
         let call = self.render_call(cx);
         let mut right = div()
             .flex_1()
@@ -1441,6 +1889,7 @@ impl Render for ChatView {
             .flex()
             .flex_col()
             .children(call)
+            .children(sas)
             .child(div().flex_1().min_h_0().child(main));
         if let Some(n) = &self.notice {
             right = right.child(
@@ -1471,6 +1920,12 @@ pub fn main(raw: &[String]) -> anyhow::Result<()> {
         .build()?;
     let mut config = AppConfig::new(opts.data_dir.clone(), opts.relay_url.clone());
     config.key_storage = opts.key_storage.clone();
+    // PNP-003-SHOULD-006: every pairing made here asks for the verification code (the
+    // core's default, stated here because the interface below depends on it).
+    config.request_sas = true;
+    config.pairing_window = std::time::Duration::from_secs(60 * PAIRING_CODE_MINUTES);
+    // Received files go to Downloads/ParolNet (the core's default is inside the data dir).
+    config.downloads_dir = transfer::default_downloads_dir();
     let (app, events) = runtime
         .block_on(parolnet_app::start(config))
         .with_context(|| {
@@ -1621,6 +2076,41 @@ mod tests {
             }),
             "Relay: online (signaling-only)"
         );
+    }
+
+    // PNP-003-MUST-008: error correction level M or higher. 114 alphanumeric characters
+    // fill version 4 at level L (33 modules); at level M version 4 holds 90, so the code
+    // shown must be version 5 (37 modules).
+    #[test]
+    fn qr_code_uses_error_correction_level_m() {
+        let text = "A".repeat(114);
+        let shown = qr_rows(&text).unwrap();
+        assert_eq!(shown.width - 8, 37, "not error correction level M");
+    }
+
+    #[test]
+    fn expiry_indicator_counts_down() {
+        use std::time::Duration;
+        assert_eq!(
+            expiry_label(Duration::from_secs(600)),
+            "Expires in 10 minutes"
+        );
+        assert_eq!(
+            expiry_label(Duration::from_secs(61)),
+            "Expires in 2 minutes"
+        );
+        assert_eq!(expiry_label(Duration::from_secs(60)), "Expires in 1 minute");
+        assert_eq!(
+            expiry_label(Duration::from_secs(5)),
+            "Expires in less than a minute"
+        );
+        assert!(expiry_label(Duration::ZERO).contains("expired"));
+    }
+
+    #[test]
+    fn sas_prompt_text() {
+        assert_eq!(sas_spaced("448362"), "448 362");
+        assert!(SAS_INSTRUCTIONS.contains("by voice or in person"));
     }
 
     #[test]

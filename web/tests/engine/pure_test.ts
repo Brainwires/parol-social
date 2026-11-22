@@ -1,14 +1,7 @@
 // The pure parts: byte helpers, the CBOR reader, wire formats, ICE policy and the probe
 // schedule. The pairing code, the envelope and the safety number come from the real wasm.
 import { assert, assertEquals, assertThrows } from "@std/assert";
-import {
-  cborDecode,
-  envelopeSourceHint,
-  fromHex,
-  isHex,
-  parsePairingCode,
-  toHex,
-} from "../../src/engine/bytes.ts";
+import { cborDecode, envelopeSourceHint, fromHex, isHex, toHex } from "../../src/engine/bytes.ts";
 import {
   fetchStun,
   hasCandidates,
@@ -30,6 +23,7 @@ import {
   parseIcePayload,
   parseSdpPayload,
   parseServerFrame,
+  relayEndpoint,
   shouldInitiate,
 } from "../../src/engine/wire.ts";
 import { FakeClock } from "./harness/fakes.ts";
@@ -55,17 +49,38 @@ Deno.test("cbor: the subset decodes and anything else throws", () => {
   assertThrows(() => cborDecode(fromHex("5affffffff")!)); // length beyond the buffer
 });
 
-Deno.test("pairing code: the public fields of a real code, and garbage is refused", async () => {
-  const wasm = await newWasm();
-  wasm.initialize();
-  const code = wasm.generate_qr_payload(wasm.get_public_key(), null);
-  const payload = parsePairingCode(code)!;
-  assertEquals(payload.identityKey, wasm.get_public_key());
+Deno.test("pairing code: base45 for the picture, no blanks as text, and garbage is refused", async () => {
+  const presenter = await newWasm();
+  const scanner = await newWasm();
+  presenter.initialize();
+  scanner.initialize();
+  const made = presenter.pairing_create_code(null);
+  // PNP-003-MUST-007: base45 of the CBOR payload.
+  assert(/^[0-9A-Z $%*+\-./:]+$/.test(made.code), made.code);
+  assertEquals(made.text, made.code.replaceAll(" ", "_"));
   const now = Math.floor(Date.now() / 1000);
-  assert(payload.ts % 300 === 0 && payload.ts <= now && now - payload.ts < 300);
-  assertEquals(parsePairingCode("zz"), null);
-  assertEquals(parsePairingCode("a0"), null);
-  assertEquals(parsePairingCode(code.slice(0, 40)), null);
+  const ts = Number(made.ts);
+  assert(ts % 300 === 0 && ts <= now && now - ts < 300);
+  assertEquals(Number(made.expires_secs), ts + 1800);
+
+  const refused = (text: string, at = Date.now()) => {
+    try {
+      scanner.pairing_initiate(text, true, at);
+      return "accepted";
+    } catch (e) {
+      return (e as Error).message;
+    }
+  };
+  assertEquals(refused("zz"), "code-invalid");
+  assertEquals(refused(made.code.slice(0, 40)), "code-invalid");
+  assertEquals(refused(made.text, (ts + 1801) * 1000), "code-expired");
+  assertEquals(scanner.has_session(presenter.get_peer_id()), false);
+  try {
+    presenter.pairing_initiate(made.code, true, Date.now());
+    throw new Error("its own code was accepted");
+  } catch (e) {
+    assertEquals((e as Error).message, "own-code");
+  }
 });
 
 Deno.test("envelope: the bootstrap envelope carries the scanner's identity key as source_hint", async () => {
@@ -73,19 +88,23 @@ Deno.test("envelope: the bootstrap envelope carries the scanner's identity key a
   const scanner = await newWasm();
   presenter.initialize();
   scanner.initialize();
-  const code = presenter.generate_qr_payload(presenter.get_public_key(), null);
-  const peer = scanner.process_scanned_qr(code).peer_id;
+  const made = presenter.pairing_create_code(null);
+  const started = scanner.pairing_initiate(made.text, false, Date.now());
+  const peer = started.peer_id;
   assertEquals(peer, presenter.get_peer_id());
+  assertEquals(started.identity_key, presenter.get_public_key());
+  assertEquals(scanner.pairing_state(peer), "secret_shared");
   const now = BigInt(Math.floor(Date.now() / 1000));
+  // PNP-001-MUST-063: the scanner's first envelope is its BOOTSTRAP_INIT, as HANDSHAKE.
   const bootstrap = scanner.envelope_encode(
     peer,
-    0x03,
-    new Uint8Array(0),
+    0x05,
+    fromHex(started.init_hex)!,
     now,
     scanner.get_public_key(),
   );
   assertEquals(envelopeSourceHint(bootstrap), scanner.get_public_key());
-  // SHA-256 of that key is the scanner's PeerId: the check the engine makes.
+  // SHA-256 of that key is the scanner's PeerId: the check the core makes.
   const digest = new Uint8Array(
     await crypto.subtle.digest("SHA-256", fromHex(scanner.get_public_key())! as BufferSource),
   );
@@ -94,10 +113,21 @@ Deno.test("envelope: the bootstrap envelope carries the scanner's identity key a
   assertEquals(envelopeSourceHint(plain), null);
   assertEquals(envelopeSourceHint("00".repeat(256)), null);
   assertEquals(envelopeSourceHint("8487"), null);
-  // The presenter's trial decrypt names the scanner by PeerId, not by key.
-  const d = presenter.trial_decrypt(bootstrap);
-  assertEquals(d.bootstrapped, true);
-  assertEquals(d.source_peer_id, scanner.get_peer_id());
+
+  // The presenter answers only the peer the envelope names, and only once.
+  let wrongPeer = "";
+  try {
+    presenter.pairing_respond("ab".repeat(32), bootstrap, false, Date.now());
+  } catch (e) {
+    wrongPeer = (e as Error).message;
+  }
+  assert(wrongPeer.length > 0, "an envelope from another peer was answered");
+  const answered = presenter.pairing_respond(scanner.get_peer_id(), bootstrap, false, Date.now());
+  assertEquals(answered.accepted, true);
+  assertEquals(answered.identity_key, scanner.get_public_key());
+  assertEquals(answered.steps.map((s) => s.kind), ["send"]);
+  assertEquals(presenter.export_pending_bootstrap?.(), undefined);
+  assertEquals(presenter.pairing_state(scanner.get_peer_id()), "handshaking");
 });
 
 Deno.test("safety number: the PNP-002 §10 vector", async () => {
@@ -113,6 +143,50 @@ Deno.test("safety number: the PNP-002 §10 vector", async () => {
   assertEquals(expected, "0203903273 2487506436 7022175877 9751782849 2461095953 2148788959");
   assertEquals(wasm.safety_number(a, b), expected);
   assertEquals(wasm.safety_number(b, a), expected);
+});
+
+Deno.test("register answer: the PNP-001 §10.7 vector", async () => {
+  const wasm = await newWasm();
+  const v = JSON.parse(
+    await Deno.readTextFile(
+      new URL("../../../specs/vectors/PNP-001/relay_register.json", import.meta.url),
+    ),
+  );
+  wasm.initialize_from_key(v.input.secret_key);
+  assertEquals(wasm.get_public_key(), v.expected.public_key);
+  // The name comes from the URL the socket is opened with.
+  const { host, port } = relayEndpoint(v.input.relay_url);
+  const name = wasm.relay_name(host, port);
+  assertEquals(name, v.expected.relay_name);
+  // Ed25519 is deterministic: the signature over the register message is the vector's.
+  assertEquals(wasm.sign_relay_register(v.input.nonce, name), v.expected.signature);
+  // Another relay, another signature; a name that is not canonical, or a nonce that is
+  // not 32 bytes, is not signed at all.
+  assert(wasm.sign_relay_register(v.input.nonce, "relay.example:443") !== v.expected.signature);
+  assertThrows(() => wasm.sign_relay_register(v.input.nonce, "Parol.Social:443"));
+  assertThrows(() => wasm.sign_relay_register(v.input.nonce, "parol.social"));
+  assertThrows(() => wasm.sign_relay_register("00ff", name));
+});
+
+Deno.test("wire: the endpoint of a relay URL", () => {
+  assertEquals(relayEndpoint("wss://Parol.Social/ws"), { host: "parol.social", port: 443 });
+  assertEquals(relayEndpoint("wss://parol.social:443/ws"), { host: "parol.social", port: 443 });
+  assertEquals(relayEndpoint("ws://relay.test/ws"), { host: "relay.test", port: 80 });
+  assertEquals(relayEndpoint("ws://127.0.0.1:9000/ws"), { host: "127.0.0.1", port: 9000 });
+  assertEquals(relayEndpoint("wss://[::1]:8443/ws"), { host: "[::1]", port: 8443 });
+  // What the URL parser reads as the host is what the socket connects to.
+  assertEquals(relayEndpoint("wss://relay.test\\@evil.test/ws").host, "relay.test");
+  for (
+    const url of [
+      "https://relay.test/ws",
+      "wss://user@relay.test/ws",
+      "wss://user:pw@relay.test/ws",
+      "relay.test:443",
+      "",
+    ]
+  ) {
+    assertThrows(() => relayEndpoint(url), Error, undefined, url);
+  }
 });
 
 Deno.test("wire: relay frames", () => {

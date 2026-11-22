@@ -9,8 +9,6 @@ apps/desktop/target/
 *.key
 coverage/
 node_modules/
-pwa/build-info.js
-pwa/pkg/
 docker-compose.override.yml
 .claude/worktrees/
 dist/

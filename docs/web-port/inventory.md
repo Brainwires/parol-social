@@ -3,7 +3,8 @@
 What the current vanilla-JS PWA (`pwa/`) does, so that the TypeScript rewrite works with the
 native client (`crates/parolnet-app`, the reference for current behaviour) and passes
 `apps/desktop/interop/pwa-interop.mjs`. This is documentation only. Every claim cites
-`file:line`. Unless marked otherwise:
+`file:line`. (`pwa/` has since been removed from the repository: `git show bd493e2:pwa/<path>`
+reads a file as cited here.) Unless marked otherwise:
 
 - paths are relative to the repository root;
 - PWA paths are as on `origin/master` `bd493e2`. `pwa/` and `crates/parolnet-wasm` are identical on
@@ -142,6 +143,7 @@ Sessions are re-exported after every encrypt and decrypt:
 | `get_peer_id` | `() → hex \| ""` | `boot.js:125` | own PeerId | PORT |
 | `get_public_key` | `() → Ed25519 pk hex` | `messaging.js:307`, `connection.js:173`, `ui-chat.js:935,984`, `token-pool.js:430` | relay auth; QR; bootstrap `source_hint` | PORT |
 | `sign_bytes` | `(dataHex) → sigHex64` (signs the hex-decoded bytes) | `messaging.js:306`, `connection.js:172`, `token-pool.js:429` | relay challenge | PORT |
+| `relay_name`, `sign_relay_register` | `(host, port) → "host:port"`; `(nonceHex, relayName) → sigHex64` over the register message of PNP-001 §10.7 | `messaging.js`, `connection.js`; `web/src/engine/engine.ts` | relay challenge since PNP-001 v0.17 (replaces `sign_bytes` there; `token-pool.js` still uses `sign_bytes`) | PORT |
 | `envelope_encode` | `(destPeerHex, msgType u8, plaintext Uint8Array, nowSecs BigInt, sourceHintHex?) → envelopeHex` (bucket-padded, `lib.rs:403-450`) | `messaging.js:86,279,911`, `ui-chat.js:310,938`, `webrtc.js:723`, `cover-traffic.js:81` | every outgoing envelope | PORT |
 | `trial_decrypt` | `(envelopeHex) → {source_peer_id, source_hint, msg_type, plaintext_hex, timestamp, bootstrapped}`; throws if nothing decrypts (`lib.rs:506-608`) | `messaging.js:1614` | every incoming envelope; presenter-side bootstrap (§7) | PORT |
 | `has_session` | `(peerHex) → bool` | `messaging.js:54,70,80,272,894`, `ui-chat.js:302,493`, `webrtc.js:716` | gate sends and binding | PORT |

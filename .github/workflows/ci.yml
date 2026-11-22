@@ -135,13 +135,13 @@ jobs:
         run: cargo xtask vectors --validate
 
   pwa-interop:
-    name: Desktop <-> PWA and web app interop (Chromium, Firefox, WebKit)
-    # The headless desktop core (parolnet-app's bot) against the real PWA in headless Chromium,
-    # Firefox and WebKit (Playwright) through the relay binary in its signaling-only profile:
-    # pairing both ways, chat both ways, the sender queue, the channel binding, calls both ways.
-    # Then the same seven cases against the web app that replaces the PWA (web/, INTEROP_APP=web),
-    # and the web app's own real flows between pages through the relay (web/tests/e2e/
-    # real.flows.ts). They are steps of this job because they need the same relay and bot.
+    name: Desktop <-> web app interop (Chromium, Firefox, WebKit)
+    # The headless desktop core (parolnet-app's bot) against the web app (web/, its test build)
+    # in headless Chromium, Firefox and WebKit (Playwright) through the relay binary in its
+    # signaling-only profile: pairing both ways, chat both ways, the sender queue, the channel
+    # binding, calls both ways, files. Then the web app's own real flows between pages through
+    # the relay (web/tests/e2e/real.flows.ts). They are steps of this job because they need the
+    # same relay and bot.
     # Chromium and Firefox twice each: as shipped (mDNS host candidates the desktop resolves) and
     # with loopback candidates. WebKit once (Playwright's Linux build gathers plain host
     # addresses). One job, browsers in sequence: the Rust build dominates and a browser run takes
@@ -169,7 +169,7 @@ jobs:
       - uses: actions/setup-node@v6
         with:
           node-version: 22
-      - name: Playwright and esbuild
+      - name: Playwright
         run: npm ci
       - uses: actions/cache@v6
         with:
@@ -183,38 +183,15 @@ jobs:
         run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
       - name: Install wasm-pack
         run: curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
-      - name: Build the PWA
-        run: npm run build:wasm && npm run build
       - name: Build the relay and the desktop bot
         run: cargo build -p parolnet-relay-server --bin parolnet-relay -p parolnet-app --example bot
-      - name: Chromium (mDNS host candidates)
-        id: first
-        run: INTEROP_BROWSER=chromium INTEROP_ICE=mdns node apps/desktop/interop/pwa-interop.mjs
-      # The remaining configurations run whatever the earlier ones did, unless the first was
-      # skipped (the build failed).
-      - name: Chromium (loopback host candidates)
-        if: ${{ !cancelled() && steps.first.conclusion != 'skipped' }}
-        run: INTEROP_BROWSER=chromium INTEROP_ICE=loopback node apps/desktop/interop/pwa-interop.mjs
-      - name: Firefox (mDNS host candidates)
-        if: ${{ !cancelled() && steps.first.conclusion != 'skipped' }}
-        run: INTEROP_BROWSER=firefox INTEROP_ICE=mdns node apps/desktop/interop/pwa-interop.mjs
-      - name: Firefox (loopback host candidates)
-        if: ${{ !cancelled() && steps.first.conclusion != 'skipped' }}
-        run: INTEROP_BROWSER=firefox INTEROP_ICE=loopback node apps/desktop/interop/pwa-interop.mjs
-      - name: WebKit (host candidates)
-        if: ${{ !cancelled() && steps.first.conclusion != 'skipped' }}
-        run: INTEROP_BROWSER=webkit INTEROP_ICE=host node apps/desktop/interop/pwa-interop.mjs
-
       # The web app (web/): its test build for the interop (it has the test hooks), its
       # production export for its own real flows.
       - name: Install Denext
-        if: ${{ !cancelled() && steps.first.conclusion != 'skipped' }}
         run: |
           curl -fsSL https://denext.dev/install.sh | sh
           echo "$HOME/.denext/bin" >> "$GITHUB_PATH"
       - name: Build the web app (wasm core, test build, production export)
-        id: web
-        if: ${{ !cancelled() && steps.first.conclusion != 'skipped' }}
         working-directory: web
         run: |
           denext runtime install
@@ -223,22 +200,24 @@ jobs:
           denext task build
           (cd tests/e2e && npm ci)
       - name: Web app, Chromium (mDNS host candidates)
-        if: ${{ !cancelled() && steps.web.conclusion == 'success' }}
-        run: INTEROP_APP=web INTEROP_BROWSER=chromium INTEROP_ICE=mdns node apps/desktop/interop/pwa-interop.mjs
+        id: first
+        run: INTEROP_BROWSER=chromium INTEROP_ICE=mdns node apps/desktop/interop/pwa-interop.mjs
+      # The remaining configurations run whatever the earlier ones did, unless the first was
+      # skipped (a build failed).
       - name: Web app, Chromium (loopback host candidates)
-        if: ${{ !cancelled() && steps.web.conclusion == 'success' }}
-        run: INTEROP_APP=web INTEROP_BROWSER=chromium INTEROP_ICE=loopback node apps/desktop/interop/pwa-interop.mjs
+        if: ${{ !cancelled() && steps.first.conclusion != 'skipped' }}
+        run: INTEROP_BROWSER=chromium INTEROP_ICE=loopback node apps/desktop/interop/pwa-interop.mjs
       - name: Web app, Firefox (mDNS host candidates)
-        if: ${{ !cancelled() && steps.web.conclusion == 'success' }}
-        run: INTEROP_APP=web INTEROP_BROWSER=firefox INTEROP_ICE=mdns node apps/desktop/interop/pwa-interop.mjs
+        if: ${{ !cancelled() && steps.first.conclusion != 'skipped' }}
+        run: INTEROP_BROWSER=firefox INTEROP_ICE=mdns node apps/desktop/interop/pwa-interop.mjs
       - name: Web app, Firefox (loopback host candidates)
-        if: ${{ !cancelled() && steps.web.conclusion == 'success' }}
-        run: INTEROP_APP=web INTEROP_BROWSER=firefox INTEROP_ICE=loopback node apps/desktop/interop/pwa-interop.mjs
+        if: ${{ !cancelled() && steps.first.conclusion != 'skipped' }}
+        run: INTEROP_BROWSER=firefox INTEROP_ICE=loopback node apps/desktop/interop/pwa-interop.mjs
       - name: Web app, WebKit (host candidates)
-        if: ${{ !cancelled() && steps.web.conclusion == 'success' }}
-        run: INTEROP_APP=web INTEROP_BROWSER=webkit INTEROP_ICE=host node apps/desktop/interop/pwa-interop.mjs
+        if: ${{ !cancelled() && steps.first.conclusion != 'skipped' }}
+        run: INTEROP_BROWSER=webkit INTEROP_ICE=host node apps/desktop/interop/pwa-interop.mjs
       - name: Web app, real flows between pages through the relay (three browsers)
-        if: ${{ !cancelled() && steps.web.conclusion == 'success' }}
+        if: ${{ !cancelled() && steps.first.conclusion != 'skipped' }}
         working-directory: web/tests/e2e
         env:
           PAROLNET_RELAY_BIN: ${{ github.workspace }}/target/debug/parolnet-relay

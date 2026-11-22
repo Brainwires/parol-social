@@ -169,6 +169,8 @@ async fn start_in(dir: &std::path::Path, relay: &Relay) -> (AppHandle, Events) {
     let mut cfg = AppConfig::new(dir.join("data"), relay.ws_url());
     cfg.stun_servers = Some(Vec::new());
     cfg.bind_ip = Some("127.0.0.1".parse().unwrap());
+    // No user to compare verification codes (as `common::App::start`).
+    cfg.request_sas = false;
     let (handle, mut events) = parolnet_app::start(cfg).await.expect("start app");
     wait(&mut events, "registered", 20, |e| {
         matches!(e, AppEvent::Relay(RelayState::Registered { .. }))

@@ -1,13 +1,9 @@
 use ed25519_dalek::{SigningKey, Verifier};
 use parolnet_protocol::address::PeerId;
-use parolnet_relay::circuit::{EstablishedCircuit, StandardCircuitBuilder};
+use parolnet_relay::circuit::EstablishedCircuit;
 use parolnet_relay::directory::{RelayDescriptor, RelayDirectory};
 use parolnet_relay::onion::{self, HopKeys};
-use parolnet_relay::relay_node::StandardRelayNode;
 use parolnet_relay::*;
-use rand::rngs::OsRng;
-use std::net::SocketAddr;
-use x25519_dalek::{PublicKey, StaticSecret};
 
 // ── Constants Tests ─────────────────────────────────────────────
 
@@ -98,57 +94,14 @@ fn test_circuit_id_nonzero() {
 
 // ── Relay Node Tests ────────────────────────────────────────────
 
-#[tokio::test]
-async fn test_relay_node_discards_padding() {
-    let node = StandardRelayNode::new();
-    let cell = RelayCell::padding(42);
-    let action = node.handle_cell(cell).await.unwrap();
-    assert!(matches!(action, RelayAction::Discard));
-}
-
-#[tokio::test]
-async fn test_relay_node_destroy_removes_circuit() {
-    let node = StandardRelayNode::new();
-    let keys = HopKeys::from_shared_secret(&[1u8; 32]).unwrap();
-    node.register_circuit(42, keys, None).unwrap();
-    assert_eq!(node.circuit_count(), 1);
-
-    let cell = RelayCell::destroy(42, 0x00);
-    let _ = node.handle_cell(cell).await.unwrap();
-    assert_eq!(node.circuit_count(), 0);
-}
-
-#[tokio::test]
-async fn test_relay_node_rejects_unknown_circuit() {
-    let node = StandardRelayNode::new();
-    let mut cell = RelayCell::padding(999);
-    cell.cell_type = CellType::Data;
-    cell.payload_len = 32;
-
-    let result = node.handle_cell(cell).await;
-    assert!(result.is_err());
-}
-
-#[tokio::test]
-async fn test_relay_node_circuit_limit() {
-    let node = StandardRelayNode::new();
-    for i in 0..relay_node::MAX_CIRCUITS {
-        let keys = HopKeys::from_shared_secret(
-            &(i as u32)
-                .to_be_bytes()
-                .repeat(8)
-                .try_into()
-                .unwrap_or([0u8; 32]),
-        )
-        .unwrap();
-        node.register_circuit(i as u32 + 1, keys, None).unwrap();
-    }
-    // One more should fail
-    let keys = HopKeys::from_shared_secret(&[0xFF; 32]).unwrap();
-    assert!(node.register_circuit(999999, keys, None).is_err());
-}
-
 // ── Directory Tests ─────────────────────────────────────────────
+
+fn now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+}
 
 fn make_descriptor(id: u8, uptime_days: u64) -> RelayDescriptor {
     let peer_id = PeerId([id; 32]);
@@ -156,10 +109,11 @@ fn make_descriptor(id: u8, uptime_days: u64) -> RelayDescriptor {
         peer_id,
         identity_key: [id; 32],
         x25519_key: [id; 32],
-        addr: format!("10.0.{id}.1:443").parse().unwrap(),
+        // One /16 per relay: no two hops of a path may share one.
+        addr: format!("10.{id}.0.1:443").parse().unwrap(),
         bandwidth_class: 1,
         uptime_secs: uptime_days * 86400,
-        timestamp: 1700000000,
+        timestamp: now(),
         signature: [0; 64],
         bandwidth_estimate: 1000,
         next_pubkey: None,
@@ -211,14 +165,16 @@ fn test_directory_random_excludes() {
 #[test]
 fn test_directory_prune_stale() {
     let mut dir = RelayDirectory::new();
-    dir.insert(make_descriptor(1, 10)); // timestamp 1700000000
+    let stamped = make_descriptor(1, 10);
+    let at = stamped.timestamp;
+    dir.insert(stamped);
 
     // Not stale yet
-    dir.prune_stale(1700000000 + 3600);
+    dir.prune_stale(at + 3600);
     assert_eq!(dir.len(), 1);
 
     // Now stale (25 hours later)
-    dir.prune_stale(1700000000 + 90000);
+    dir.prune_stale(at + 90000);
     assert_eq!(dir.len(), 0);
 }
 
@@ -240,56 +196,6 @@ fn test_directory_select_path() {
 }
 
 // ── Circuit Tests (new) ────────────────────────────────────────
-
-#[tokio::test]
-async fn test_circuit_build_wrong_hop_count() {
-    let builder = StandardCircuitBuilder::new();
-
-    // Build two RelayInfo structs (need 3)
-    let hops: Vec<RelayInfo> = (1u8..=2)
-        .map(|id| {
-            let secret = StaticSecret::random_from_rng(OsRng);
-            let public = PublicKey::from(&secret);
-            RelayInfo {
-                peer_id: PeerId([id; 32]),
-                identity_key: [id; 32],
-                x25519_key: *public.as_bytes(),
-                addr: format!("127.0.0.{id}:9000").parse().unwrap(),
-                bandwidth_class: 1,
-            }
-        })
-        .collect();
-
-    let result = builder.build_circuit(&hops).await;
-    assert!(result.is_err());
-    let err = result.err().unwrap();
-    assert!(
-        matches!(err, RelayError::CircuitBuildFailed(_)),
-        "expected CircuitBuildFailed, got: {err:?}"
-    );
-}
-
-#[tokio::test]
-async fn test_circuit_build_with_3_relays() {
-    let builder = StandardCircuitBuilder::new();
-
-    let hops: Vec<RelayInfo> = (1u8..=3)
-        .map(|id| {
-            let secret = StaticSecret::random_from_rng(OsRng);
-            let public = PublicKey::from(&secret);
-            RelayInfo {
-                peer_id: PeerId([id; 32]),
-                identity_key: [id; 32],
-                x25519_key: *public.as_bytes(),
-                addr: format!("127.0.0.{id}:9000").parse().unwrap(),
-                bandwidth_class: 1,
-            }
-        })
-        .collect();
-
-    let circuit = builder.build_circuit(&hops).await;
-    assert!(circuit.is_ok(), "build_circuit should succeed with 3 hops");
-}
 
 #[test]
 fn test_circuit_wrap_then_manual_peel() {
@@ -315,86 +221,6 @@ fn test_circuit_wrap_then_manual_peel() {
 }
 
 // ── Relay Node Forwarding Tests (new) ──────────────────────────
-
-#[tokio::test]
-async fn test_relay_node_data_exit_delivers() {
-    let node = StandardRelayNode::new();
-    let keys = HopKeys::from_shared_secret(&[50u8; 32]).unwrap();
-    let circuit_id = 77;
-
-    // Register as exit relay (no next_hop)
-    node.register_circuit(circuit_id, keys.clone(), None)
-        .unwrap();
-
-    // Encrypt one onion layer with the hop's forward key
-    let plaintext = b"exit-delivery-test";
-    let encrypted =
-        onion::onion_wrap(plaintext, &keys.forward_key, &keys.forward_nonce_seed, 0).unwrap();
-
-    // Build DATA cell with encrypted payload
-    let mut payload = [0u8; CELL_PAYLOAD_SIZE];
-    payload[..encrypted.len()].copy_from_slice(&encrypted);
-
-    let cell = RelayCell {
-        circuit_id,
-        cell_type: CellType::Data,
-        payload,
-        payload_len: encrypted.len() as u16,
-    };
-
-    let action = node.handle_cell(cell).await.unwrap();
-    match action {
-        RelayAction::Deliver { payload: delivered } => {
-            assert_eq!(delivered, plaintext);
-        }
-        other => panic!(
-            "expected Deliver, got: {:?}",
-            std::mem::discriminant(&other)
-        ),
-    }
-}
-
-#[tokio::test]
-async fn test_relay_node_data_with_next_hop_forwards() {
-    let node = StandardRelayNode::new();
-    let keys = HopKeys::from_shared_secret(&[60u8; 32]).unwrap();
-    let circuit_id = 88;
-    let next_addr: SocketAddr = "10.0.0.2:443".parse().unwrap();
-    let next_cid = 200;
-
-    // Register with a next_hop
-    node.register_circuit(circuit_id, keys.clone(), Some((next_addr, next_cid)))
-        .unwrap();
-
-    let plaintext = b"forward-test-payload";
-    let encrypted =
-        onion::onion_wrap(plaintext, &keys.forward_key, &keys.forward_nonce_seed, 0).unwrap();
-
-    let mut payload = [0u8; CELL_PAYLOAD_SIZE];
-    payload[..encrypted.len()].copy_from_slice(&encrypted);
-
-    let cell = RelayCell {
-        circuit_id,
-        cell_type: CellType::Data,
-        payload,
-        payload_len: encrypted.len() as u16,
-    };
-
-    let action = node.handle_cell(cell).await.unwrap();
-    match action {
-        RelayAction::Forward {
-            next_hop,
-            cell: forwarded,
-        } => {
-            assert_eq!(next_hop, next_addr);
-            assert_eq!(forwarded.circuit_id, next_cid);
-        }
-        other => panic!(
-            "expected Forward, got: {:?}",
-            std::mem::discriminant(&other)
-        ),
-    }
-}
 
 // ── Onion Edge Case Tests (new) ────────────────────────────────
 
@@ -563,106 +389,6 @@ fn test_gossip_accepts_valid_signed_descriptor() {
 }
 
 // ── DESTROY Forwarding Chain Tests ────────────────────────────
-
-#[tokio::test]
-async fn test_destroy_with_next_hop_forwards() {
-    let node = StandardRelayNode::new();
-    let keys = HopKeys::from_shared_secret(&[1u8; 32]).unwrap();
-    let next_addr: SocketAddr = "10.0.0.5:443".parse().unwrap();
-    let next_cid = 500;
-
-    node.register_circuit(42, keys, Some((next_addr, next_cid)))
-        .unwrap();
-
-    let cell = RelayCell::destroy(42, 0x01);
-    let action = node.handle_cell(cell).await.unwrap();
-
-    match action {
-        RelayAction::Forward {
-            next_hop,
-            cell: forwarded,
-        } => {
-            assert_eq!(next_hop, next_addr);
-            assert_eq!(forwarded.circuit_id, next_cid);
-            assert_eq!(forwarded.cell_type, CellType::Destroy);
-        }
-        other => panic!(
-            "expected Forward, got: {:?}",
-            std::mem::discriminant(&other)
-        ),
-    }
-
-    assert_eq!(node.circuit_count(), 0);
-}
-
-#[tokio::test]
-async fn test_destroy_without_next_hop_discards() {
-    let node = StandardRelayNode::new();
-    let keys = HopKeys::from_shared_secret(&[2u8; 32]).unwrap();
-
-    // Exit relay — no next_hop
-    node.register_circuit(77, keys, None).unwrap();
-
-    let cell = RelayCell::destroy(77, 0x02);
-    let action = node.handle_cell(cell).await.unwrap();
-
-    assert!(
-        matches!(action, RelayAction::Discard),
-        "exit relay should discard DESTROY"
-    );
-    assert_eq!(node.circuit_count(), 0);
-}
-
-#[tokio::test]
-async fn test_destroy_reason_codes_preserved() {
-    let node = StandardRelayNode::new();
-    let next_addr: SocketAddr = "10.0.0.9:443".parse().unwrap();
-
-    // Test reason code 0x03
-    let keys = HopKeys::from_shared_secret(&[3u8; 32]).unwrap();
-    node.register_circuit(100, keys, Some((next_addr, 200)))
-        .unwrap();
-
-    let cell = RelayCell::destroy(100, 0x03);
-    let action = node.handle_cell(cell).await.unwrap();
-
-    match &action {
-        RelayAction::Forward { cell: fwd, .. } => {
-            assert_eq!(fwd.payload[0], 0x03, "reason code 0x03 must be preserved");
-        }
-        other => panic!("expected Forward, got: {:?}", std::mem::discriminant(other)),
-    }
-
-    // Test reason code 0x00 (normal teardown)
-    let keys2 = HopKeys::from_shared_secret(&[4u8; 32]).unwrap();
-    node.register_circuit(101, keys2, Some((next_addr, 201)))
-        .unwrap();
-
-    let cell2 = RelayCell::destroy(101, 0x00);
-    let action2 = node.handle_cell(cell2).await.unwrap();
-
-    match &action2 {
-        RelayAction::Forward { cell: fwd, .. } => {
-            assert_eq!(fwd.payload[0], 0x00, "reason code 0x00 must be preserved");
-        }
-        other => panic!("expected Forward, got: {:?}", std::mem::discriminant(other)),
-    }
-}
-
-#[tokio::test]
-async fn test_destroy_unknown_circuit_discards() {
-    let node = StandardRelayNode::new();
-
-    // No circuits registered — send DESTROY for non-existent circuit
-    let cell = RelayCell::destroy(999, 0x01);
-    let action = node.handle_cell(cell).await.unwrap();
-
-    assert!(
-        matches!(action, RelayAction::Discard),
-        "DESTROY for unknown circuit should discard"
-    );
-    assert_eq!(node.circuit_count(), 0);
-}
 
 /// A descriptor signed by one key cannot claim the PeerId of another relay
 /// (PNP-008-MUST-027: the signature is checked against the relay's own key,

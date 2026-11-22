@@ -13,8 +13,8 @@ Mostly not. Large parts of the specs describe a design the product did not build
 | PNP-001 Wire protocol | 34 / 82 (14 more partial) | 7 / 19 | [PNP-001.md](PNP-001.md) |
 | PNP-002 Handshake | 12 / 44 | 0 / 12 | [PNP-002.md](PNP-002.md) |
 | PNP-003 Bootstrap | 1 / 52 | 0 / 8 | [PNP-003.md](PNP-003.md) |
-| PNP-004 Relay circuit | 5 / 58 | 0 / 7 | [PNP-004.md](PNP-004.md) |
-| PNP-005 Gossip mesh | 10 / 49 | 1 / 17 (SHOULD-017, added on the branch) | [PNP-005.md](PNP-005.md) |
+| PNP-004 Relay circuit | 5 / 58 (since then: 58 / 58, see the note in the file) | 0 / 7 (since then: 7 / 7) | [PNP-004.md](PNP-004.md) |
+| PNP-005 Gossip mesh | 10 / 49 (since then: 49 / 49, see the note in the file) | 1 / 17 (SHOULD-017, added on the branch; since then: 17 / 17) | [PNP-005.md](PNP-005.md) |
 | PNP-006 Traffic shaping | 6 / 45 | 0 / 15 (SHOULD-015 partial, added on the branch) | [PNP-006.md](PNP-006.md) |
 | PNP-007 Media and file transfer | 4 / 90 | 0 / 13 | [PNP-007.md](PNP-007.md) |
 | PNP-008 Relay federation | 32 / 98 | 0 / 11 | [PNP-008.md](PNP-008.md) |
@@ -44,7 +44,7 @@ Not verified:
 - The reviewers' verdicts in general. A strict reviewer can under-count: treat a "hollow" or "partial" verdict as a pointer to read that test, not as settled.
 - Every "Shipped?" cell outside PNP-001.
 - Every defect in the next section.
-- Anything in the legacy PWA or the web app's TypeScript. Where a file names `pwa/src/...`, a reviewer read it; nobody ran it.
+- Anything in the legacy PWA or the web app's TypeScript. Where a file names `pwa/src/...`, a reviewer read it; nobody ran it. The legacy PWA has since been removed from the repository, so those paths refer to the tree the audit read, and its "legacy PWA" rows no longer describe anything that ships.
 - MAY clauses: not audited.
 
 ## Reported defects, not verified

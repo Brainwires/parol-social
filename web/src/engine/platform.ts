@@ -4,23 +4,54 @@
 
 // ── wasm ─────────────────────────────────────────────────────────
 
-/** What `envelope_decode` and `trial_decrypt` return. */
+/** What `envelope_decode` returns. */
 export interface DecodedEnvelope {
-  /** `trial_decrypt` only: the sender's PeerId (hex). */
-  source_peer_id?: string;
   source_hint: string | null;
   msg_type: number;
   plaintext_hex: string;
   timestamp: number | bigint;
-  /** `trial_decrypt` only: the envelope materialised the presenter's session (PNP-001 §5.3.1). */
-  bootstrapped?: boolean;
 }
 
-export interface ScannedCode {
+/** `pairing_create_code`: a code to show, with its pending half kept in wasm memory. */
+export interface CreatedCode {
+  /** What the QR code encodes: base45 of the CBOR payload. */
+  code: string;
+  /** The same code for copying as text. */
+  text: string;
+  /** The payload's timestamp, seconds. */
+  ts: number | bigint;
+  /** When a scanner stops accepting it, seconds. */
+  expires_secs: number | bigint;
+}
+
+/**
+ * What to do next in a pairing, in order (crates/parolnet-wasm/src/pairing.rs):
+ * - `send`: send `payload_hex` as a HANDSHAKE envelope of the session held with the peer now;
+ * - `sas`: show the verification code and ask whether the contact shows the same;
+ * - `session`: call `pairing_install_session` (after every `send` before it was encrypted);
+ * - `established`: the pairing is over; an initiator sends the session's first message.
+ */
+export type PairingStep =
+  | { kind: "send"; payload_hex: string }
+  | { kind: "sas"; digits: string; emoji: string }
+  | { kind: "session" }
+  | { kind: "established"; sas_verified: boolean };
+
+/** `pairing_initiate`. */
+export interface PairingStarted {
   peer_id: string;
-  their_identity_key: string;
-  /** Secret. The engine never reads, stores or logs it. */
-  bootstrap_secret: string;
+  identity_key: string;
+  /** The BOOTSTRAP_INIT to send first. */
+  init_hex: string;
+}
+
+/** `pairing_respond`: the code is spent either way. */
+export interface PairingAnswered {
+  accepted: boolean;
+  identity_key?: string;
+  /** Why the bootstrap was aborted, when `accepted` is false. */
+  reason?: string;
+  steps: PairingStep[];
 }
 
 /**
@@ -37,8 +68,17 @@ export interface WasmApi {
   get_peer_id(): string;
   /** Ed25519 public key, hex. */
   get_public_key(): string;
-  /** Ed25519 signature (hex) over the hex-decoded bytes. */
-  sign_bytes(dataHex: string): string;
+  /**
+   * The canonical name (`host:port`) of the relay at a host and port (PNP-001 §10.7).
+   * Throws when the host is not one a relay can have.
+   */
+  relay_name(host: string, port: number): string;
+  /**
+   * The answer to a relay's register challenge: the Ed25519 signature (hex) over the
+   * register message for the 32-byte nonce and the relay's canonical name. Valid at that
+   * relay only.
+   */
+  sign_relay_register(nonceHex: string, relayName: string): string;
   /** Encrypt for a peer and pad to a bucket; returns the envelope hex. Advances the ratchet. */
   envelope_encode(
     destPeerIdHex: string,
@@ -52,8 +92,6 @@ export interface WasmApi {
     sourcePeerIdHex: string,
     envelopeHex: string,
   ): DecodedEnvelope;
-  /** Try every session, then the pending bootstrap. Throws when nothing decrypts. */
-  trial_decrypt(envelopeHex: string): DecodedEnvelope;
   has_session(peerIdHex: string): boolean;
   /** JSON `{peerHex: sessionHex}`, or `""` with no sessions. Secret. */
   export_sessions(): string;
@@ -65,13 +103,41 @@ export interface WasmApi {
     localSdp: string,
     remoteSdp: string,
   ): boolean;
-  /** Creates the presenter's pending bootstrap (in wasm memory only) and returns the code. */
-  generate_qr_payload(
-    identityKeyHex: string,
-    relayHint?: string | null,
-  ): string;
-  /** Scanner side: establishes the initiator session. */
-  process_scanned_qr(payloadHex: string): ScannedCode;
+
+  // ── PNP-003 pairing (crates/parolnet-wasm/src/pairing.rs) ──
+  // One pairing per peer is kept in wasm memory with its secrets; these calls return what
+  // the engine has to carry or show. Errors are short codes in the Error's message.
+  /** Makes a code and keeps its pending half (in wasm memory), replacing an earlier one. */
+  pairing_create_code(relayHint?: string | null): CreatedCode;
+  /**
+   * Scanner side: validates the code (either form), sets up the bootstrap session and starts
+   * the pairing. Throws `code-invalid`, `code-expired` or `own-code`.
+   */
+  pairing_initiate(text: string, requestSas: boolean, nowMs: number): PairingStarted;
+  /**
+   * Presenter side: the scanner's bootstrap envelope, from the peer the connection belongs
+   * to. Throws when it is not that (nothing changed, the code stays valid).
+   */
+  pairing_respond(
+    expectedPeerIdHex: string,
+    envelopeHex: string,
+    requestSas: boolean,
+    nowMs: number,
+  ): PairingAnswered;
+  /** A HANDSHAKE payload from the peer. Throws the reason when the pairing was aborted. */
+  pairing_on_message(peerIdHex: string, payloadHex: string, nowMs: number): PairingStep[];
+  /** An envelope of the peer's session decrypted: a waiting responder is established. */
+  pairing_first_message(peerIdHex: string): PairingStep[];
+  /** The user says the code matches. Throws `wrong-state` when none is waiting. */
+  pairing_confirm_sas(peerIdHex: string, nowMs: number): PairingStep[];
+  /** Carries out a `session` step: the PNP-002 session replaces the bootstrap session. */
+  pairing_install_session(peerIdHex: string): void;
+  /** Aborts a pairing: its secrets and its session are gone. True when there was one. */
+  pairing_abort(peerIdHex: string): boolean;
+  /** The peers whose pairing just timed out (each aborted as by `pairing_abort`). */
+  pairing_timeouts(nowMs: number): string[];
+  /** `secret_shared`, `sas_pending`, `handshaking`, `accepted`, or undefined: no pairing. */
+  pairing_state(peerIdHex: string): string | undefined;
   safety_number(peerAHex: string, peerBHex: string): string;
   version(): string;
   /**
@@ -96,6 +162,165 @@ export interface WasmApi {
   import_pending_bootstrap?(blobHex: string): void;
   /** Forgets the pending bootstrap: the code shown for it stops working. */
   clear_pending_bootstrap?(): void;
+
+  // ── PNP-010 file transfer (crates/parolnet-wasm/src/transfer.rs) ──
+  /** A new offer with a fresh id and file key. Throws when a field is outside the limits. */
+  pnp010_new_offer(name: string, size: number, mime: string, sha256Hex: string): TransferControl;
+  pnp010_encode_offer(
+    idHex: string,
+    name: string,
+    size: number,
+    mime: string,
+    sha256Hex: string,
+    keyHex: string,
+  ): Uint8Array;
+  /** `kind`: accept, decline, cancel (with `reason`) or complete. */
+  pnp010_encode_control(kind: string, idHex: string, reason: number): Uint8Array;
+  /** Throws when the body is not a well-formed PNP-010 message. */
+  pnp010_decode_control(body: Uint8Array): TransferControl;
+  /** `ignore`, `new`, or the phase the transfer moves to. */
+  pnp010_on_control(
+    role: string | undefined,
+    phase: string | undefined,
+    kind: string,
+  ): string;
+  /** The transfer id to serve, `close`, or `foreign`. */
+  pnp010_admit_channel(
+    label: string,
+    verified: boolean,
+    open: number,
+    role: string | undefined,
+    phase: string | undefined,
+  ): string;
+  pnp010_label_id(label: string): string | undefined;
+  pnp010_label(idHex: string): string;
+  pnp010_admit_offer(
+    size: number,
+    maxSize: number,
+    pending: number,
+    withinRate: boolean,
+  ): boolean;
+  pnp010_sanitize_file_name(offered: string): string;
+  pnp010_numbered_file_name(name: string, n: number): string;
+  pnp010_limits(): TransferLimits;
+  TransferOfferLimiter: new (nowMs: number) => WasmOfferLimiter;
+  TransferHasher: new () => WasmTransferHasher;
+  TransferSender: new (idHex: string, size: number, keyHex: string) => WasmTransferSender;
+  TransferReceiver: new (
+    idHex: string,
+    size: number,
+    sha256Hex: string,
+    keyHex: string,
+    next: number,
+  ) => WasmTransferReceiver;
+}
+
+/** A decoded `FILE_TRANSFER` message. `key` is secret: stored, never logged. */
+export interface TransferControl {
+  t: "offer" | "accept" | "decline" | "cancel" | "complete";
+  id: string;
+  name?: string;
+  size?: number;
+  mime?: string;
+  sha256?: string;
+  key?: string;
+  reason?: number;
+}
+
+/** The constants of PNP-010 (`pnp010_limits`). */
+export interface TransferLimits {
+  msgType: number;
+  chunkSize: number;
+  messageMax: number;
+  bufferHigh: number;
+  bufferLow: number;
+  maxConcurrent: number;
+  maxPendingOffers: number;
+  defaultMaxAcceptSize: number;
+  maxFileSize: number;
+  maxRecordFailures: number;
+  transferMaxAgeMs: number;
+  labelPrefix: string;
+  reservedPrefix: string;
+}
+
+export interface WasmOfferLimiter {
+  allow(nowMs: number): boolean;
+  free(): void;
+}
+
+export interface WasmTransferHasher {
+  update(bytes: Uint8Array): void;
+  length(): number;
+  /** Consumes the hasher. */
+  finalize(): string;
+}
+
+export interface WasmTransferSender {
+  /** Throws: close the channel. */
+  begin(resume: Uint8Array): Uint8Array;
+  /** -1 when there is nothing (more) to send in this attempt. */
+  next_offset(): number;
+  next_len(): number;
+  seal(chunk: Uint8Array): Uint8Array;
+  is_finished(): boolean;
+  sent_bytes(): number;
+  end_attempt(): void;
+  free(): void;
+}
+
+export interface WasmTransferReceiver {
+  absorb_stored(bytes: Uint8Array): void;
+  begin(): Uint8Array;
+  /** The plaintext to store, or undefined for START. Throws: close the channel. */
+  on_message(message: Uint8Array): Uint8Array | undefined;
+  end_attempt(): void;
+  next_record(): number;
+  stored_bytes(): number;
+  is_complete(): boolean;
+  record_failures(): number;
+  finish(): boolean;
+  free(): void;
+}
+
+// ── files ────────────────────────────────────────────────────────
+
+/** A file to send: the part of a browser `File` the engine uses. */
+export interface FileSource {
+  readonly name: string;
+  readonly size: number;
+  readonly type: string;
+  slice(start: number, end: number): { arrayBuffer(): Promise<ArrayBuffer> };
+}
+
+/** One segment of a received file being written. */
+export interface SegmentWriter {
+  write(chunk: Uint8Array): Promise<void>;
+  /** Finish the segment: from here on it is stored (durably, where the store is). */
+  close(): Promise<void>;
+  /** Drop what was written. */
+  abort(): Promise<void>;
+}
+
+/**
+ * Where a received file is kept while it arrives and until the user saves it: a sequence of
+ * segments per transfer, each written once, front to back. A file is never held in one
+ * piece in memory. The engine hands a store only ciphertext (./sealed-files.ts): a segment
+ * is opaque bytes to it, and `blob` is not what the person saves.
+ */
+export interface FileStore {
+  /** Stored parts survive a reload (OPFS), or not (memory). */
+  readonly persistent: boolean;
+  /** How many segments 0..n-1 are stored for a transfer. */
+  segments(id: string): Promise<number>;
+  readSegment(id: string, index: number): Promise<Uint8Array>;
+  /** Start segment `index`, dropping any stored segment from `index` on. */
+  writer(id: string, index: number): Promise<SegmentWriter>;
+  /** Segments 0..count-1 as one Blob of the given MIME type. */
+  blob(id: string, count: number, type: string): Promise<Blob>;
+  remove(id: string): Promise<void>;
+  /** Remove every stored part ("delete all data on this device"). */
+  clear(): Promise<void>;
 }
 
 // ── storage ──────────────────────────────────────────────────────
@@ -176,7 +401,11 @@ export interface DataChannel {
   onopen: (() => void) | null;
   onmessage: ((ev: { data: unknown }) => void) | null;
   onclose: (() => void) | null;
-  send(data: string): void;
+  /** Transfer channels: `"arraybuffer"`. */
+  binaryType?: string;
+  bufferedAmountLowThreshold?: number;
+  onbufferedamountlow?: (() => void) | null;
+  send(data: string | Uint8Array): void;
   close(): void;
 }
 
@@ -311,9 +540,15 @@ export interface Platform {
   random: Random;
   fetch: Fetch;
   sha256: Sha256;
+  /** WebCrypto: received files are sealed with it before they are stored (./sealed-files.ts). */
+  subtle: SubtleCrypto;
   log: Logger;
   /** Optional: calls need it. */
   media?: MediaDevices;
   /** Optional: single-instance guard. */
   lock?: InstanceLock;
+  /**
+   * Optional: where received files are kept, sealed (default: memory, lost on reload).
+   */
+  files?: FileStore;
 }

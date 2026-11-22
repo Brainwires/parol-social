@@ -78,6 +78,8 @@ async fn run(args: Args, runtime: tokio::runtime::Handle) -> anyhow::Result<()> 
     let mut cfg = AppConfig::new(args.data_dir, args.relay);
     // A headless check on a throwaway directory: the key file, never the user's keychain.
     cfg.key_storage = KeyStorage::File;
+    // Headless: nobody compares a verification code.
+    cfg.request_sas = false;
     cfg.stun_servers = Some(Vec::new());
     cfg.bind_ip = args.bind;
     let (app, mut events) = parolnet_app::start(cfg).await?;

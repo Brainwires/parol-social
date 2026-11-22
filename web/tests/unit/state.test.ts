@@ -161,6 +161,24 @@ Deno.test("fake store: a scanned code is verified in person, a pasted one is not
   assertEquals(bad.code, "InvalidCode");
 });
 
+Deno.test("fake store: a verification code on screen, confirmed or refused", async () => {
+  const store = createFakeStore({ empty: true });
+  const code = await store.createPairingCode();
+  assertEquals(code.text, code.code);
+  assertEquals(store.sas.value, null);
+  const sas = { peerId: "5a".repeat(32), digits: "042917", emoji: "abcde", confirmed: false };
+  store.setSas(sas);
+  await store.confirmSas("00".repeat(32));
+  assertEquals(store.sas.value, sas);
+  await store.confirmSas(sas.peerId);
+  assertEquals(store.sas.value?.confirmed, true);
+  await store.rejectSas(sas.peerId);
+  assertEquals(store.sas.value, null);
+  store.setSas(sas);
+  await store.stopPairing(sas.peerId);
+  assertEquals(store.sas.value, null);
+});
+
 Deno.test("thread: bubble kinds, groups and the single caption", () => {
   const store = createFakeStore();
   const items = threadItems(messagesOf(store, FAKE_PEERS.tomasz));

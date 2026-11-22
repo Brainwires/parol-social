@@ -1,0 +1,47 @@
+{
+  "clause": "PNP-010-MUST-018",
+  "description": "A two-record file sealed in two attempts: from record 0, and resumed at record 1 with a new nonce and salt. Plaintext byte i is (i * 7 + 3) mod 251. Record key: HKDF-SHA-256(salt = sender_salt || receiver_nonce, ikm = file key, info = 'PNP-010 record key v1' || id || next as u32 big-endian). Nonce: 7 zero bytes, record index u32 big-endian, 0x01 for the last record else 0x00. Long frames are given by length and SHA-256.",
+  "input": {
+    "file_key": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+    "id": "a0a1a2a3a4a5a6a7a8a9aaabacadaeaf",
+    "size": 65524,
+    "plaintext_rule": "byte[i] = (i * 7 + 3) mod 251"
+  },
+  "expected": {
+    "chunk_size": 65519,
+    "record_count": 2,
+    "file_sha256": "ed17146ecb6e51f9e9f88c5f5b802e515883a2179e4f1c26f9acd040b49fcc3b",
+    "attempts": [
+      {
+        "next": 0,
+        "receiver_nonce": "11111111111111111111111111111111",
+        "sender_salt": "22222222222222222222222222222222",
+        "resume_frame": "010000000011111111111111111111111111111111",
+        "start_frame": "020000000022222222222222222222222222222222",
+        "record_key": "10c08c3cc39680e99fc631e40c87f8b872cf72a82e9213a7b6a533a26966c049",
+        "record_frames": [
+          {
+            "length": 65536,
+            "sha256": "97cb4bb51bc41c4c383a4a213c2ef55b1b764a164658d7245d3fcf4a5ce7ed57"
+          },
+          {
+            "hex": "0352cbca5d163c7183cd96d4df2292d9a83ba499159e"
+          }
+        ]
+      },
+      {
+        "next": 1,
+        "receiver_nonce": "33333333333333333333333333333333",
+        "sender_salt": "44444444444444444444444444444444",
+        "resume_frame": "010000000133333333333333333333333333333333",
+        "start_frame": "020000000144444444444444444444444444444444",
+        "record_key": "41be425f1ebcc0d9beb791fbe8081d9c8ca09a6a3923ee0fcf97da5ec9ab5b2d",
+        "record_frames": [
+          {
+            "hex": "03d1a6e60529c13993a48d72ecc47e7300539188bdfc"
+          }
+        ]
+      }
+    ]
+  }
+}

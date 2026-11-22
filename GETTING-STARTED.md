@@ -1,6 +1,6 @@
 # Getting Started with ParolNet
 
-ParolNet is a secure, private communication app prototype designed for people who need to speak freely without being tracked. The current code supports encrypted sessions and a calculator-disguised PWA, but it is not yet a production-ready safety tool. See [IMPLEMENTATION_STATUS.md](IMPLEMENTATION_STATUS.md) for what is implemented today.
+ParolNet is a secure, private communication app prototype designed for people who need to speak freely without being tracked. The current code supports encrypted sessions and a web app (the PWA served at `/pwa/`), but it is not yet a production-ready safety tool. See [IMPLEMENTATION_STATUS.md](IMPLEMENTATION_STATUS.md) for what is implemented today.
 
 The app disguises itself as a calculator. To anyone looking at your phone, it appears to be a simple calculator app. Only you know the secret code that opens the real messenger inside.
 
@@ -11,6 +11,11 @@ This guide covers two things:
 ---
 
 ## For Users (Non-Technical)
+
+> **Out of date.** This section describes the legacy vanilla-JS PWA, which has been removed from
+> the repository. Its calculator disguise, unlock code and panic codes are not features of the
+> web app (`web/`) that replaced it; installing from the browser and pairing by QR code or code
+> still apply. The section is to be rewritten for the web app.
 
 ### What You Need to Know First
 
@@ -225,15 +230,16 @@ cargo test --workspace
 # Lint -- must pass with zero warnings
 cargo clippy --workspace
 
-# Build the WASM module and PWA
-cd pwa && bash build.sh
+# Build the web app (the wasm core, then the static export in web/out; needs the denext CLI,
+# see web/README.md)
+cd web && denext runtime install && denext task build-wasm && denext task build && cd ..
 ```
 
 ---
 
 ### Running Locally
 
-After building the PWA, you need to serve it over HTTP. The Service Worker requires either HTTPS or `localhost` to function.
+After building the web app, you need to serve it over HTTP. The Service Worker requires either HTTPS or `localhost` to function.
 
 #### Using Docker (Recommended)
 
@@ -243,18 +249,18 @@ docker compose up -d --build
 ```
 
 The image builds the relay and the web app (`web/`) from source, so no host-side build step is
-needed first. It serves the distribution landing page at `/` and the web app at `/pwa/` (the
-legacy `pwa/` client is no longer in the image). To stop:
+needed first. It serves the distribution landing page at `/` and the web app at `/pwa/`. To
+stop:
 
 ```bash
 docker compose down
 ```
 
-#### Using Node.js
+#### Using Denext
 
 ```bash
-npx serve pwa -l 1411
-# Open http://localhost:1411
+cd web && denext task serve
+# Open http://127.0.0.1:8787/pwa/ (RELAY_PORT=... puts a running relay behind it)
 ```
 
 #### Testing on Other Devices
@@ -289,20 +295,8 @@ parolnet/
 │   ├── parolnet-wasm/             # Browser WASM bindings via wasm-bindgen.
 │   ├── parolnet-relay-server/     # Axum WebSocket relay server.
 │   └── parolnet-authority-cli/    # Authority key and relay endorsement CLI.
-├── pwa/                           # Progressive Web App shell
-│   ├── index.html                 # App shell (calculator + messenger views)
-│   ├── app.js                     # Application logic (vanilla JS, zero dependencies)
-│   ├── styles.css                 # Messenger styles
-│   ├── calculator.css             # Calculator decoy styles
-│   ├── sw.js                      # Service Worker (offline caching, push notifications)
-│   ├── build.sh                   # Build script (wasm-pack + copy to pwa/pkg/)
-│   ├── manifest.json              # PWA manifest (standard)
-│   ├── manifest-calculator.json   # PWA manifest (calculator disguise)
-│   └── icons/                     # App icons (standard + calculator variants per OS)
-│       ├── icon.svg               # Standard ParolNet icon
-│       ├── calc-ios.svg           # Calculator icon for iOS
-│       ├── calc-android.svg       # Calculator icon for Android
-│       └── calc-windows.svg       # Calculator icon for Windows
+├── web/                           # The web app (Denext, TypeScript), served at /pwa/;
+│                                  #   see web/README.md
 ├── specs/                         # Protocol specifications (design target)
 │   ├── PNP-001-wire-protocol.md
 │   ├── PNP-002-handshake-protocol.md
@@ -384,11 +378,13 @@ ParolNet is designed to be distributed through many channels, including ones tha
 
 #### 1. Static Web Hosting
 
-Any static file server works. No backend, no database, no server-side logic.
+Any static file server that can send the app's headers works (the Content-Security-Policy and
+cache rules in `web/nginx.example.conf`). No database, no server-side logic; the app connects to
+the relay at the origin it was served from.
 
 ```bash
-cd pwa && bash build.sh
-# Upload the entire pwa/ directory to your web server
+cd web && denext runtime install && denext task build-wasm && denext task build && cd ..
+# Upload web/out to your web server under /pwa/
 ```
 
 #### 2. ZIP for USB / Sneakernet Distribution
@@ -396,30 +392,30 @@ cd pwa && bash build.sh
 For offline distribution -- copy the app onto USB drives, SD cards, or share it over local file transfer.
 
 ```bash
-cd pwa && bash build.sh
-zip -r parolnet-pwa.zip .
-# Share parolnet-pwa.zip however you can
+cd web && denext runtime install && denext task build-wasm && denext task build && cd ..
+(cd web/out && zip -r ../../parolnet-web.zip .)
+# Share parolnet-web.zip however you can
 ```
 
-Recipients extract the ZIP and open `index.html` in a browser. Some browser features, especially Service Worker installation, require HTTPS or `localhost`; a direct `file://` launch is useful for inspection or limited local use, not a complete PWA deployment.
+Recipients host the extracted files (as in 1). The app does not run from `file://`: it needs its
+Content-Security-Policy header, and the Service Worker needs HTTPS or `localhost`.
 
 #### 3. IPFS (Censorship-Resistant Hosting)
 
 IPFS distributes content across a decentralized network. No single server can be taken down.
 
 ```bash
-cd pwa && bash build.sh
-ipfs add -r .
+cd web && denext runtime install && denext task build-wasm && denext task build && cd ..
+ipfs add -r web/out
 # Returns a CID (content hash) that anyone can use to access the app
 ```
 
 #### 4. Tor Hidden Service
 
-Host the PWA as a Tor `.onion` site for anonymous access.
+Host the web app as a Tor `.onion` site for anonymous access.
 
 ```bash
-# Place the pwa/ directory in your Tor hidden service directory
-# Configure torrc to point to pwa/
+# Serve web/out under /pwa/ from the web server your Tor hidden service points at
 # Users access it via the .onion address in Tor Browser
 ```
 
@@ -436,7 +432,7 @@ Host the PWA as a Tor `.onion` site for anonymous access.
 | `cargo doc --workspace --no-deps --open` | Generate and open docs in browser |
 | `wasm-pack build crates/parolnet-wasm` | Build WASM bindings |
 | `wasm-pack build crates/parolnet-wasm --target web --release` | Build WASM for production |
-| `cd pwa && bash build.sh` | Build WASM + copy to PWA directory |
+| `cd web && denext task build-wasm && denext task build` | Build the wasm core and the web app's static export (`web/out`) |
 | `cargo test -p parolnet-crypto` | Test a specific crate |
 | `cargo tarpaulin --workspace --exclude parolnet-wasm --out Html` | Coverage report |
 
@@ -446,8 +442,8 @@ Host the PWA as a Tor `.onion` site for anonymous access.
 
 #### WASM module not loading
 
-- Make sure `wasm-pack` built successfully: check for errors in the `cd pwa && bash build.sh` output.
-- Verify the `pwa/pkg/` directory exists and contains `.wasm` and `.js` files.
+- Make sure `wasm-pack` built successfully: check for errors in the `denext task build-wasm` output (in `web/`).
+- Verify `web/public/wasm/` (and, after `denext task build`, `web/out/wasm/`) contains `manifest.json` and the hashed `.wasm` and `.js` files.
 - Check the browser console (F12) for error messages.
 
 #### Service Worker not registering

@@ -29,7 +29,7 @@ use parolnet_clause::clause;
 use parolnet_relay::handshake::CircuitHandshake;
 use parolnet_relay::probe::create_gate;
 use parolnet_relay::relay_node::StandardRelayNode;
-use parolnet_relay::{CELL_SIZE, RelayAction, RelayCell, RelayNode};
+use parolnet_relay::{CELL_SIZE, CellType, RelayCell, RelayNode};
 use parolnet_transport::conn_manager::{
     ConnectionManager, LIFETIME_MAX, LIFETIME_MIN, MAX_CONNECTIONS, MIN_CONNECTION_LIFETIME,
     MIN_CONNECTIONS, ManagerError, RECONNECT_WAIT,
@@ -1389,14 +1389,14 @@ async fn nothing_is_said_before_a_valid_create_cell() {
         let conn = listener.accept().await.expect("a ParolNet connection");
         let first: [u8; CELL_SIZE] = conn.recv().await.unwrap().try_into().unwrap();
         let node = StandardRelayNode::new();
-        let created = match node
-            .handle_cell(RelayCell::from_bytes(&first).unwrap())
-            .await
-            .unwrap()
-        {
-            RelayAction::Respond(cell) => cell,
-            _ => panic!("the relay did not answer the CREATE"),
-        };
+        let link = node.new_link();
+        node.handle_cell(link, RelayCell::from_bytes(&first).unwrap())
+            .await;
+        let created = node
+            .take_outgoing(link)
+            .pop()
+            .expect("the relay answers the CREATE");
+        assert_eq!(created.cell_type, CellType::Created);
         conn.send(&created.to_bytes()).await.unwrap();
         // The connection is ParolNet now: a second stream carries what it likes.
         let gossip = conn

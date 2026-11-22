@@ -1,10 +1,12 @@
-// The relay WebSocket client, in the page: connects, registers by Ed25519 challenge, keeps
+// The relay WebSocket client, in the page: connects, registers by Ed25519 challenge (the
+// answer is signed for the relay that was dialed and is of no use at another, PNP-001 §10.7),
+// keeps
 // the socket alive (PNP-001 §10.3: ping every 20 s, dead after 40 s of silence) and reconnects
 // with backoff and jitter. Signaling frames are never queued here: a frame given while the
 // socket is not registered is refused, and the engine retries at its own level.
 import type { Clock, Logger, Random, Socket, SocketFactory } from "./platform.ts";
 import type { RelayState } from "./types.ts";
-import { type ClientFrame, parseServerFrame, type ServerFrame } from "./wire.ts";
+import { type ClientFrame, parseServerFrame, relayEndpoint, type ServerFrame } from "./wire.ts";
 
 /** PNP-001-MUST-065. */
 export const PING_EVERY_MS = 20_000;
@@ -79,8 +81,16 @@ export interface RelayOptions {
   url: string;
   peerId: string;
   publicKey: string;
-  /** Signs the hex-decoded nonce with the identity key; returns the signature hex. */
-  sign(nonceHex: string): string;
+  /**
+   * The canonical name (`host:port`) of the relay at a host and port, or a throw when
+   * there is none (PNP-001 §10.7).
+   */
+  relayName(host: string, port: number): string;
+  /**
+   * Signs, with the identity key, the register message for the relay's 32-byte nonce and
+   * the canonical name of the relay that was dialed; returns the signature hex.
+   */
+  sign(nonceHex: string, relayName: string): string;
   sockets: SocketFactory;
   clock: Clock;
   random: Random;
@@ -110,6 +120,8 @@ export class RelayClient {
   private lastPing = 0;
   private lastCheck = 0;
   private signedRegisters = 0;
+  /** The canonical name of the relay the current socket was opened to. */
+  private relayName = "";
   private readonly budget = new SignalBudget();
 
   constructor(
@@ -202,6 +214,15 @@ export class RelayClient {
     if (!this.running || this.socket) return;
     const { clock, opts } = { clock: this.opts.clock, opts: this.opts };
     this.listener.onState({ kind: "Connecting" });
+    // The name of the relay this socket goes to. Without one there is nothing to sign the
+    // challenge answer for, so no socket is opened.
+    try {
+      const { host, port } = relayEndpoint(opts.url);
+      this.relayName = opts.relayName(host, port);
+    } catch {
+      this.down(null, "the relay URL names no relay");
+      return;
+    }
     let s: Socket;
     try {
       s = opts.sockets(opts.url);
@@ -246,11 +267,13 @@ export class RelayClient {
         if (
           this.registeredFlag || this.signedRegisters >= MAX_SIGNED_REGISTERS
         ) return;
-        if (!/^([0-9a-fA-F]{2})+$/.test(frame.nonce)) return;
+        // Only a 32-byte nonce is answered: the identity key signs the register message
+        // and nothing else here.
+        if (!/^[0-9a-fA-F]{64}$/.test(frame.nonce)) return;
         this.signedRegisters += 1;
         let signature: string;
         try {
-          signature = opts.sign(frame.nonce);
+          signature = opts.sign(frame.nonce, this.relayName);
         } catch {
           this.down(s, "could not sign the challenge");
           return;
@@ -261,6 +284,7 @@ export class RelayClient {
           pubkey: opts.publicKey,
           signature,
           nonce: frame.nonce,
+          relay: this.relayName,
         });
         return;
       }

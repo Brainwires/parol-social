@@ -122,6 +122,9 @@ pub enum RtcError {
     /// No relay candidate could be gathered although [`IcePolicy::Relay`] needs one.
     #[error("TURN: {0}")]
     Turn(String),
+    /// A send on a data channel that is not open (any more), or a message it cannot carry.
+    #[error("data channel: {0}")]
+    Channel(String),
     /// No local address could be bound.
     #[error("no usable network interface")]
     NoInterface,
@@ -402,6 +405,11 @@ pub enum RtcEvent {
     DataChannelOpen { id: usize, label: String },
     /// A data-channel message.
     DataChannelMessage { id: usize, payload: BytesMut },
+    /// A data channel closed (either side closed it, or the connection is going down).
+    DataChannelClose { id: usize },
+    /// A data channel's buffered amount fell to its low threshold
+    /// ([`DataSender::set_buffered_low`]): the sender may continue.
+    DataChannelBufferedLow { id: usize },
     /// The peer asked for a keyframe of our video track (RTCP PLI or FIR).
     KeyframeRequested,
     /// The peer's description changed whether it sends media of `kind` (a video section was
@@ -441,6 +449,12 @@ enum Command {
         id: usize,
         text: String,
     },
+    /// Like `SendText`; `acked` is answered once the peer has acknowledged the message.
+    SendTextAcked {
+        id: usize,
+        text: String,
+        acked: oneshot::Sender<()>,
+    },
     RequestKeyframe {
         track_id: MediaStreamTrackId,
     },
@@ -451,9 +465,80 @@ enum Command {
         samples: u32,
     },
     Stats(oneshot::Sender<(RTCStatsReport, u64)>),
+    OpenDataChannel {
+        label: String,
+    },
+    CloseDataChannel {
+        id: usize,
+    },
+    /// Like `SendData`, answered with the bytes the channel then holds unsent.
+    SendDataFlow {
+        id: usize,
+        data: BytesMut,
+        reply: oneshot::Sender<Result<usize, RtcError>>,
+    },
+    SetBufferedLow {
+        id: usize,
+        bytes: u32,
+    },
+    BufferedAmount {
+        id: usize,
+        reply: oneshot::Sender<usize>,
+    },
     Quality(oneshot::Sender<ConnectionQuality>),
     LocalAddrs(oneshot::Sender<Vec<SocketAddr>>),
     Close,
+}
+
+/// A cloneable handle for one connection's data channels beyond the first: sending with
+/// backpressure, and closing. For tasks that stream on a channel of their own (file
+/// transfer, PNP-010) while the connection's owner keeps the [`RtcHandle`].
+#[derive(Clone)]
+pub struct DataSender {
+    commands: mpsc::UnboundedSender<Command>,
+}
+
+impl DataSender {
+    /// Send a binary message on an open channel. Returns the bytes the channel holds unsent
+    /// afterwards (W3C `bufferedAmount`, counted until the peer acknowledged them): above
+    /// the caller's high mark, wait for [`RtcEvent::DataChannelBufferedLow`] or poll
+    /// [`DataSender::buffered_amount`]. An error means the message was not queued.
+    pub async fn send(&self, id: usize, data: Vec<u8>) -> Result<usize, RtcError> {
+        let (reply, rx) = oneshot::channel();
+        self.commands
+            .send(Command::SendDataFlow {
+                id,
+                // No copy: the vector's buffer becomes the message.
+                data: BytesMut::from(bytes::Bytes::from(data)),
+                reply,
+            })
+            .map_err(|_| RtcError::Stopped)?;
+        rx.await.map_err(|_| RtcError::Stopped)?
+    }
+
+    /// The bytes the channel holds unsent; 0 for a channel that is gone.
+    pub async fn buffered_amount(&self, id: usize) -> Result<usize, RtcError> {
+        let (reply, rx) = oneshot::channel();
+        self.commands
+            .send(Command::BufferedAmount { id, reply })
+            .map_err(|_| RtcError::Stopped)?;
+        rx.await.map_err(|_| RtcError::Stopped)
+    }
+
+    /// Ask for [`RtcEvent::DataChannelBufferedLow`] whenever the buffered amount falls from
+    /// above `bytes` to `bytes` or below.
+    pub fn set_buffered_low(&self, id: usize, bytes: u32) -> Result<(), RtcError> {
+        self.commands
+            .send(Command::SetBufferedLow { id, bytes })
+            .map_err(|_| RtcError::Stopped)
+    }
+
+    /// Close a data channel; [`RtcEvent::DataChannelClose`] follows on both sides.
+    pub fn close_channel(&self, id: usize) -> Result<(), RtcError> {
+        self.commands
+            .send(Command::CloseDataChannel { id })
+            .map_err(|_| RtcError::Stopped)
+    }
 }
 
 /// A cloneable handle that only sends media frames (for capture / encode threads).
@@ -575,6 +660,26 @@ impl RtcHandle {
         })
     }
 
+    /// Send a text message on an open data channel and learn when it has arrived: the
+    /// returned receiver resolves once the peer's SCTP has acknowledged every byte of the
+    /// message (on a reliable channel, which is what [`RtcHandle::open_data_channel`] and
+    /// browsers open by default; a channel with limited retransmissions also releases what
+    /// it gave up on). It resolves with an error, the sender dropped, when the channel or
+    /// the connection ended first: the message may then not have arrived.
+    pub fn send_text_acked(
+        &self,
+        id: usize,
+        text: impl Into<String>,
+    ) -> Result<oneshot::Receiver<()>, RtcError> {
+        let (acked, rx) = oneshot::channel();
+        self.send(Command::SendTextAcked {
+            id,
+            text: text.into(),
+            acked,
+        })?;
+        Ok(rx)
+    }
+
     /// Send one encoded frame on the local track of `kind`: a VP8 frame (`samples` in the
     /// 90 kHz clock, 3000 for 30 fps) or an Opus packet (`samples` at 48 kHz, 960 for 20 ms).
     /// It is packetized and sent once the track is negotiated and the connection is up;
@@ -590,6 +695,27 @@ impl RtcHandle {
             data: data.into(),
             samples,
         })
+    }
+
+    /// Open one more data channel (reliable, ordered) on a connection whose first channel
+    /// is up: it is set up in-band, without a new offer. [`RtcEvent::DataChannelOpen`] names
+    /// its id on both sides once it is usable.
+    pub fn open_data_channel(&self, label: impl Into<String>) -> Result<(), RtcError> {
+        self.send(Command::OpenDataChannel {
+            label: label.into(),
+        })
+    }
+
+    /// Close a data channel; [`RtcEvent::DataChannelClose`] follows.
+    pub fn close_data_channel(&self, id: usize) -> Result<(), RtcError> {
+        self.send(Command::CloseDataChannel { id })
+    }
+
+    /// A handle for streaming on this connection's data channels from another task.
+    pub fn data_sender(&self) -> DataSender {
+        DataSender {
+            commands: self.commands.clone(),
+        }
     }
 
     /// A sender of media frames that can move to another task or thread.
@@ -787,6 +913,7 @@ pub async fn spawn(config: RtcConfig) -> Result<(RtcHandle, mpsc::Receiver<RtcEv
         tracks: HashMap::new(),
         audio_jitter: config.jitter_buffer.then(HashMap::new),
         dropped_rtp: 0,
+        ack_waits: Vec::new(),
         senders: built
             .senders
             .into_iter()
@@ -1101,6 +1228,17 @@ struct QualityBase {
     last: ConnectionQuality,
 }
 
+/// A message whose acknowledgement someone waits for.
+struct AckWait {
+    /// The data channel it was sent on.
+    id: usize,
+    /// Bytes given to that channel after this message. The channel's outstanding bytes
+    /// (sent and not yet acknowledged) are released in the order they were sent, so the
+    /// message is acknowledged once no more than these are outstanding.
+    after: usize,
+    acked: oneshot::Sender<()>,
+}
+
 struct Driver {
     pc: RTCPeerConnection,
     /// The bound sockets, most preferred first.
@@ -1122,6 +1260,9 @@ struct Driver {
     /// Audio tracks whose packets are de-jittered before they are delivered.
     audio_jitter: Option<HashMap<MediaStreamTrackId, jitter::AudioJitterBuffer>>,
     dropped_rtp: u64,
+    /// Messages sent with [`RtcHandle::send_text_acked`] that the peer has not acknowledged
+    /// yet, oldest first.
+    ack_waits: Vec<AckWait>,
     /// Local tracks.
     senders: HashMap<MediaKind, LocalSender>,
     codecs: Codecs,
@@ -1193,6 +1334,7 @@ impl Driver {
                 return Ok(());
             }
             self.drain_reads().await;
+            self.release_acks();
 
             let now = now();
             let relay_deadline = self.relay.as_mut().and_then(turn::Relay::poll_timeout);
@@ -1429,6 +1571,32 @@ impl Driver {
         }
     }
 
+    /// `len` more bytes were given to data channel `id`: they are behind every message of
+    /// that channel whose acknowledgement is still awaited.
+    fn note_sent(&mut self, id: usize, len: usize) {
+        for wait in self.ack_waits.iter_mut().filter(|w| w.id == id) {
+            wait.after = wait.after.saturating_add(len);
+        }
+    }
+
+    /// Answer the [`RtcHandle::send_text_acked`] messages the peer has acknowledged since
+    /// the last pass, and forget those whose channel is gone (their senders are dropped:
+    /// not acknowledged).
+    fn release_acks(&mut self) {
+        if self.ack_waits.is_empty() {
+            return;
+        }
+        for wait in std::mem::take(&mut self.ack_waits) {
+            match self.pc.data_channel(wait.id).map(|c| c.outstanding_bytes()) {
+                Some(outstanding) if outstanding <= wait.after => {
+                    let _ = wait.acked.send(());
+                }
+                Some(_) => self.ack_waits.push(wait),
+                None => {}
+            }
+        }
+    }
+
     async fn emit(&mut self, event: RtcEvent) {
         let _ = self.events.send(event).await;
     }
@@ -1473,6 +1641,14 @@ impl Driver {
                         .map(|dc| dc.label().to_owned())
                         .unwrap_or_default();
                     self.emit(RtcEvent::DataChannelOpen { id, label }).await;
+                }
+                RTCPeerConnectionEvent::OnDataChannel(RTCDataChannelEvent::OnClose(id)) => {
+                    self.emit(RtcEvent::DataChannelClose { id }).await;
+                }
+                RTCPeerConnectionEvent::OnDataChannel(
+                    RTCDataChannelEvent::OnBufferedAmountLow(id),
+                ) => {
+                    self.emit(RtcEvent::DataChannelBufferedLow { id }).await;
                 }
                 _ => {}
             }
@@ -1616,12 +1792,29 @@ impl Driver {
             }
             Command::SendData { id, data } => {
                 if let Some(mut channel) = self.pc.data_channel(id) {
+                    let len = data.len();
                     channel.send(now, data)?;
+                    self.note_sent(id, len);
                 }
             }
             Command::SendText { id, text } => {
                 if let Some(mut channel) = self.pc.data_channel(id) {
+                    let len = text.len();
                     channel.send_text(now, text)?;
+                    self.note_sent(id, len);
+                }
+            }
+            Command::SendTextAcked { id, text, acked } => {
+                // Without the channel `acked` is dropped here: not sent, not acknowledged.
+                if let Some(mut channel) = self.pc.data_channel(id) {
+                    let len = text.len();
+                    channel.send_text(now, text)?;
+                    self.note_sent(id, len);
+                    self.ack_waits.push(AckWait {
+                        id,
+                        after: 0,
+                        acked,
+                    });
                 }
             }
             Command::RequestKeyframe { track_id } => {
@@ -1670,6 +1863,46 @@ impl Driver {
             Command::Stats(reply) => {
                 let report = self.pc.get_stats(now, StatsSelector::None);
                 let _ = reply.send((report, self.dropped_rtp));
+            }
+            // The commands below never end the connection: a channel that is gone, or a
+            // message it cannot carry, is that channel's problem.
+            Command::OpenDataChannel { label } => {
+                if let Err(err) = self.pc.create_data_channel(&label, None) {
+                    tracing::debug!(%err, "data channel not opened");
+                }
+            }
+            Command::CloseDataChannel { id } => {
+                if let Some(mut channel) = self.pc.data_channel(id)
+                    && let Err(err) = channel.close()
+                {
+                    tracing::debug!(id, %err, "data channel not closed");
+                }
+            }
+            Command::SendDataFlow { id, data, reply } => {
+                let len = data.len();
+                let result = match self.pc.data_channel(id) {
+                    Some(mut channel) => channel
+                        .send(now, data)
+                        .map(|()| channel.outstanding_bytes())
+                        .map_err(|e| RtcError::Channel(e.to_string())),
+                    None => Err(RtcError::Channel("closed".into())),
+                };
+                if result.is_ok() {
+                    self.note_sent(id, len);
+                }
+                let _ = reply.send(result);
+            }
+            Command::SetBufferedLow { id, bytes } => {
+                if let Some(mut channel) = self.pc.data_channel(id) {
+                    channel.set_buffered_amount_low_threshold(bytes);
+                }
+            }
+            Command::BufferedAmount { id, reply } => {
+                let amount = self
+                    .pc
+                    .data_channel(id)
+                    .map_or(0, |channel| channel.outstanding_bytes());
+                let _ = reply.send(amount);
             }
             Command::Quality(reply) => {
                 let quality = self.digest(now);

@@ -7,6 +7,7 @@ pub mod authority_keys;
 pub mod challenge;
 pub mod frames;
 pub mod identity;
+pub mod peers_auth;
 pub mod policy;
 pub mod rate_limit;
 pub mod storage;

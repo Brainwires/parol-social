@@ -54,8 +54,27 @@ export interface Contact {
   readonly addedMs: number;
   readonly verified: Verification;
   readonly verifiedMs: number | null;
+  /**
+   * Both people confirmed the verification code (the SAS of PNP-003 §5.5) when they paired.
+   * Kept across later pairings with the same identity.
+   */
+  readonly sasVerified?: boolean;
+  /**
+   * A pairing with this contact is under way: `new` when the pairing added the contact (it
+   * goes again if the pairing does not complete), `again` when it was a contact before.
+   * Until it completes nothing but the pairing itself is sent to it.
+   */
+  readonly pairing?: PairingMark;
   /** Web-only: restored from a backup, and no connection has passed its check since. */
   readonly restoredMs?: number;
+}
+
+/** See `Contact.pairing` (`PairingMark` in the native core). */
+export type PairingMark = "new" | "again";
+
+/** Whether the person checked this contact one way or another. */
+export function isVerified(contact: Contact): boolean {
+  return contact.verified !== "no" || contact.sasVerified === true;
 }
 
 export interface ChatMessage {
@@ -81,11 +100,45 @@ export interface ContactView {
 
 /** The pairing code this device is showing, while it can still be used. */
 export interface PairingCode {
-  /** Lower-case hex of the PNP-003 payload; the QR code encodes the same text. */
+  /** What the QR code encodes: base45 of the PNP-003 payload (it has blanks in it). */
   readonly code: string;
+  /** The same code for copying as text: no blanks. `pairWithCode` takes both forms. */
+  readonly text: string;
   /** When a scanner stops accepting it (the code's own lifetime, 1800 s from its timestamp). */
   readonly expiresAtMs: number;
 }
+
+/**
+ * The verification code of a pairing under way (the Short Authentication String of PNP-003
+ * §5.5). Both devices show the same one unless someone sits between them; the two people
+ * compare it by voice or in person and each says whether it matches.
+ */
+export interface SasCheck {
+  readonly peerId: string;
+  /** Six decimal digits. */
+  readonly digits: string;
+  /** The same value as five emoji. */
+  readonly emoji: string;
+  /** This device's user said it matches; the contact's answer is awaited. */
+  readonly confirmed: boolean;
+}
+
+/**
+ * Why a pairing ended without a contact:
+ * - `SasRejected`: this device's user said the verification codes differ;
+ * - `SasMismatch`: the contact's confirmation did not fit the code shown here;
+ * - `Timeout`: the contact did not answer, or a code was not compared, in time;
+ * - `ConnectionLost`: the connection was lost while pairing;
+ * - `Cancelled`: this device's user stopped it (`stopPairing`, or the contact was removed);
+ * - `Failed`: anything else (a proof that did not verify, a malformed message).
+ */
+export type PairingFailure =
+  | "Cancelled"
+  | "SasRejected"
+  | "SasMismatch"
+  | "Timeout"
+  | "ConnectionLost"
+  | "Failed";
 
 /** Why a call ended (`CallEnd`). */
 export type CallEnd =
@@ -119,6 +172,59 @@ export interface CallInfo {
   readonly cameraOff: boolean;
 }
 
+/** Why a transfer was cancelled (PNP-010 §4.4; `CancelReason` in the native core). */
+export type CancelReason =
+  /** The user cancelled. */
+  | "User"
+  /** The sender can no longer read the file. */
+  | "Unavailable"
+  /** A record or the final hash did not verify. */
+  | "Integrity"
+  /** The receiver could not store the file. */
+  | "Storage"
+  /** A limit of the side that cancelled. */
+  | "Limit"
+  | "Other";
+
+/** Where a file transfer is (`TransferState`). */
+export type TransferState =
+  /** Offered; the receiver has not answered. */
+  | { kind: "Offered" }
+  /** Accepted, and waiting for a direct connection or for its turn. */
+  | { kind: "Waiting" }
+  /** Records are flowing. */
+  | { kind: "Active" }
+  /** The whole file arrived and verified. */
+  | { kind: "Complete" }
+  | { kind: "Declined" }
+  | { kind: "Cancelled"; byPeer: boolean; reason: CancelReason };
+
+/** A file transfer as the UI shows it (`TransferInfo`). */
+export interface TransferInfo {
+  /** 32 hex digits. */
+  readonly id: string;
+  readonly peerId: string;
+  /** `Sent`: this device offers the file. `Received`: it was offered to us. */
+  readonly direction: Direction;
+  /** Safe to show and to use as a file name: never a path. */
+  readonly name: string;
+  readonly size: number;
+  /** The sender's claim; may be empty. */
+  readonly mime: string;
+  readonly state: TransferState;
+  readonly bytesDone: number;
+  /** Our latest message about it (offer, answer, cancel) still waits on this device. */
+  readonly pending: boolean;
+  readonly createdMs: number;
+  /** Web-only: a received, complete file is on this device and can be saved (`transferFile`). */
+  readonly available: boolean;
+}
+
+export function transferOver(t: TransferInfo): boolean {
+  return t.state.kind === "Complete" || t.state.kind === "Declined" ||
+    t.state.kind === "Cancelled";
+}
+
 /** A consistent picture of the engine's state (`Snapshot`). Immutable. */
 export interface Snapshot {
   readonly peerId: string;
@@ -128,6 +234,8 @@ export interface Snapshot {
   readonly pairingOpen: boolean;
   /** The code being shown, if one is still valid. */
   readonly pairing: PairingCode | null;
+  /** The verification code to compare, while a pairing waits for it (the oldest, if several). */
+  readonly sas: SasCheck | null;
   /** The user configured their own TURN server (its credential is never in a snapshot). */
   readonly turnConfigured: boolean;
   /** Connections use that TURN server only. */
@@ -150,6 +258,12 @@ export type AppEvent =
   | { kind: "MessageRemoved"; peerId: string; id: number }
   /** Web-only: the pairing window opened or closed. */
   | { kind: "Pairing"; pairing: PairingCode | null }
+  /** A pairing shows its verification code, or the user confirmed it (`SasVerification`). */
+  | { kind: "Sas"; sas: SasCheck }
+  /** The pairing with a contact completed; `sasVerified`: both confirmed the code. */
+  | { kind: "PairingComplete"; peerId: string; sasVerified: boolean }
+  /** A pairing was aborted. A contact it had added is gone (`ContactRemoved` came first). */
+  | { kind: "PairingFailed"; peerId: string; reason: PairingFailure }
   /** Web-only: unread count or last activity of a contact changed. */
   | {
     kind: "ContactActivity";
@@ -165,6 +279,10 @@ export type AppEvent =
    */
   | { kind: "Notice"; code: NoticeCode; text: string; peerId?: string }
   | { kind: "Call"; call: CallInfo }
+  /** A file transfer appeared, changed state or moved on. */
+  | { kind: "Transfer"; transfer: TransferInfo }
+  /** Web-only: a finished transfer was removed from the conversation (`removeTransfer`). */
+  | { kind: "TransferRemoved"; peerId: string; id: string }
   /** Web-only: the local or remote stream of a call changed (see `Engine.callMedia`). */
   | { kind: "CallMedia"; callId: string };
 
@@ -172,9 +290,10 @@ export type AppEvent =
  * What a `Notice` is about:
  * - `Storage`: a write to this device's storage failed;
  * - `BindingFailed`: a direct connection failed its end-to-end check and was closed;
- * - `TurnUnusable`: relay-only is on and the user's TURN server gave no path.
+ * - `TurnUnusable`: relay-only is on and the user's TURN server gave no path;
+ * - `Transfer`: a file transfer was stopped because what arrived did not verify.
  */
-export type NoticeCode = "Storage" | "BindingFailed" | "TurnUnusable";
+export type NoticeCode = "Storage" | "BindingFailed" | "TurnUnusable" | "Transfer";
 
 /** The user's own TURN server. The only TURN server the engine ever uses. */
 export interface TurnSettings {
@@ -193,11 +312,14 @@ export type EngineErrorCode =
   | "OwnCode"
   | "NoSession"
   | "UnknownContact"
+  | "NoPairing"
   | "Crypto"
   | "Config"
   | "NotConnected"
   | "Busy"
   | "UnknownCall"
+  | "UnknownTransfer"
+  | "Transfer"
   | "UnknownMessage"
   | "NotQueued"
   | "TooLong"

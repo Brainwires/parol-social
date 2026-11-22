@@ -6,15 +6,20 @@ import { AddContact } from "./screens/AddContact.tsx";
 import { CallLayer } from "./screens/Call.tsx";
 import { Conversation, ConversationPlaceholder } from "./screens/Conversation.tsx";
 import { ConversationList } from "./screens/ConversationList.tsx";
+import { SasScreen } from "./screens/SasCheck.tsx";
 import { Settings } from "./screens/Settings.tsx";
 import { FirstRun, Loading, Locked, OtherTab, StartFailed } from "./screens/Start.tsx";
-import { StoreProvider } from "./state/context.ts";
+import { StoreProvider, useStore } from "./state/context.ts";
 import type { AppStore } from "./state/store.ts";
 
 function Frame() {
+  const store = useStore();
   const current = route.value;
+  // A verification code that waits to be compared takes the main column wherever the person
+  // is (the add-a-contact screen shows it itself): the contact's device is waiting too.
+  const sas = current.name === "add" ? null : store.sas.value;
   // A phone shows one column: the list, or whatever was opened from it.
-  const view = current.name === "list" || current.name === "lab" ? "list" : "main";
+  const view = !sas && (current.name === "list" || current.name === "lab") ? "list" : "main";
 
   // Back on the list with focus left on something that is gone (the conversation that was
   // closed, the contact that was removed): put it on the list's title.
@@ -29,7 +34,9 @@ function Frame() {
         <ConversationList current={current} />
       </div>
       <main className="app__main">
-        {current.name === "conversation"
+        {sas
+          ? <SasScreen sas={sas} />
+          : current.name === "conversation"
           ? <Conversation key={current.peerId} peerId={current.peerId} />
           : current.name === "add"
           ? <AddContact />

@@ -95,6 +95,92 @@ pub const MAX_MESSAGE_AGE_SECS: u64 = 86400;
 /// Default gossip fanout.
 pub const DEFAULT_FANOUT: usize = 3;
 
+/// Gossip TTL of RELAY_DESCRIPTOR messages (PNP-005-SHOULD-003).
+pub const RELAY_DESCRIPTOR_TTL: u8 = 10;
+
+/// Expiry of RELAY_DESCRIPTOR messages, seconds after origination (PNP-005-SHOULD-003).
+pub const RELAY_DESCRIPTOR_EXPIRY_SECS: u64 = 21600;
+
+/// Largest frame the gossip layer will even decode. The payload limit proper
+/// ([`MAX_GOSSIP_PAYLOAD`]) is checked in its place among the validation steps of
+/// PNP-005 §5.1; this bound only keeps a peer from making a node parse megabytes.
+pub const MAX_GOSSIP_FRAME: usize = 16 * MAX_GOSSIP_PAYLOAD;
+
+fn encode_cbor<T: Serialize>(value: &T) -> Result<Vec<u8>, ProtocolError> {
+    let mut buf = Vec::new();
+    ciborium::into_writer(value, &mut buf)
+        .map_err(|e| ProtocolError::CborEncode(format!("CBOR encode: {e}")))?;
+    Ok(buf)
+}
+
+fn decode_cbor<T: serde::de::DeserializeOwned>(data: &[u8]) -> Result<T, ProtocolError> {
+    ciborium::from_reader(data).map_err(|e| ProtocolError::CborDecode(format!("CBOR decode: {e}")))
+}
+
+/// Payload of a RELAY_DESCRIPTOR gossip message (type 0x01): the relay's signed
+/// descriptor (PNP-004 §5.6) and, optionally, the proof-of-work difficulty the relay
+/// advertises for the network (PNP-005 §5.6 item 4).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RelayDescriptorGossip {
+    /// CBOR of the relay descriptor.
+    #[serde(with = "serde_bytes")]
+    pub descriptor: Vec<u8>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pow_difficulty: Option<u8>,
+}
+
+impl RelayDescriptorGossip {
+    pub fn to_cbor(&self) -> Result<Vec<u8>, ProtocolError> {
+        encode_cbor(self)
+    }
+
+    pub fn from_cbor(data: &[u8]) -> Result<Self, ProtocolError> {
+        decode_cbor(data)
+    }
+}
+
+/// Payload of a PEER_ANNOUNCEMENT gossip message (type 0x03): a node's current network
+/// addresses (PNP-005 §5.9 item 2).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PeerAnnouncement {
+    pub peer_id: PeerId,
+    /// Socket addresses, as `ip:port`.
+    pub addrs: Vec<String>,
+}
+
+impl PeerAnnouncement {
+    pub fn to_cbor(&self) -> Result<Vec<u8>, ProtocolError> {
+        encode_cbor(self)
+    }
+
+    pub fn from_cbor(data: &[u8]) -> Result<Self, ProtocolError> {
+        decode_cbor(data)
+    }
+}
+
+/// What the sender of an anonymous USER_MESSAGE puts inside the end-to-end encrypted
+/// body (PNP-005 §3.5 item 3): who it is, the key that proves it, and the message.
+/// The recipient reads it after decryption and verifies the gossip envelope's signature
+/// with `sender_pubkey` (PNP-005-MUST-008).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SenderBinding {
+    pub sender: PeerId,
+    #[serde(with = "serde_bytes")]
+    pub sender_pubkey: Vec<u8>,
+    #[serde(with = "serde_bytes")]
+    pub body: Vec<u8>,
+}
+
+impl SenderBinding {
+    pub fn to_cbor(&self) -> Result<Vec<u8>, ProtocolError> {
+        encode_cbor(self)
+    }
+
+    pub fn from_cbor(data: &[u8]) -> Result<Self, ProtocolError> {
+        decode_cbor(data)
+    }
+}
+
 impl GossipEnvelope {
     /// Encode this envelope to CBOR bytes.
     pub fn to_cbor(&self) -> Result<Vec<u8>, ProtocolError> {
@@ -159,6 +245,19 @@ impl GossipEnvelope {
         }
 
         Ok(env)
+    }
+
+    /// Decode a gossip envelope without judging it. A node receiving gossip runs the
+    /// checks of PNP-005 §5.1 itself, in the order the spec gives; [`Self::from_cbor`]
+    /// would refuse most bad envelopes before the first of them.
+    pub fn decode_unvalidated(data: &[u8]) -> Result<Self, ProtocolError> {
+        if data.len() > MAX_GOSSIP_FRAME {
+            return Err(ProtocolError::CborDecode(format!(
+                "gossip frame of {} bytes exceeds {MAX_GOSSIP_FRAME}",
+                data.len()
+            )));
+        }
+        decode_cbor(data)
     }
 
     /// Get the message ID as a fixed-size array.

@@ -36,16 +36,17 @@ The root Cargo workspace has 15 members; the desktop app is a separate workspace
 | `parolnet-clause`, `parolnet-conformance` | Spec-clause attribute and the conformance suite |
 | `parolnet-rtc` | **New (M0, extended in M1).** Async driver for the sans-I/O `webrtc-rs-rtc` engine |
 | `parolnet-store` | **New (M1).** Encrypted native persistence: SQLite with SQLCipher, key in the OS keychain or a key file; identity, contacts, sessions, messages, queue, settings |
-| `parolnet-app` | **New (M1).** Headless client core: identity, pairing, signaling, direct data channels, 1:1 chat |
+| `parolnet-app` | **New (M1).** Headless client core: identity, pairing, signaling, direct data channels, 1:1 chat, calls, file transfer |
+| `parolnet-transfer` | **New (M1).** PNP-010 file transfer without I/O (native and wasm): control messages, the sealed record stream, sender and receiver, limits |
 | `parolnet-media` | **New (M1).** Call media for native clients: frames, capture traits and synthetic sources, resampler, Opus, AEC3 / noise suppression / gain (sonora, pure Rust), the audio duplex path; opt-in features for libvpx VP8, cpal, nokhwa |
 | `xtask` | Clause and test-vector tooling |
 | `apps/desktop` (own workspace) | **New (M0/M1).** GPUI client: contacts, pairing, chat (UI v0); the M0 video spike behind `--spike` |
 
-## Web app (`web/`): the client that replaces the PWA
+## Web app (`web/`): the client that replaced the PWA
 
-Not deployed yet; `pwa/` is still the live client. [docs/web-port/app.md](docs/web-port/app.md)
-lists what is owed before the switch (encryption at rest and a backup, migration or a notice
-for people who have the old PWA, translations).
+The relay image serves it at `/pwa/`; the legacy vanilla-JS PWA it replaced has been removed
+from the repository. [docs/web-port/app.md](docs/web-port/app.md#still-owed) lists what is still
+owed (migration or a notice for people who have the old PWA, translations, ...).
 
 - **Engine** (`web/src/engine`, [docs/web-port/engine.md](docs/web-port/engine.md)): identity,
   relay client, PNP-003 pairing, one bound data channel per contact, 1:1 text with a sender-side
@@ -54,8 +55,8 @@ for people who have the old PWA, translations).
 - **App**: first run, add a contact (QR code made and scanned on the device, or a pasted code),
   conversations on real state, safety numbers, calls, settings, "open in another tab" with
   take-over; nine locales, English complete.
-- **Desktop ↔ web app** (`INTEROP_APP=web node apps/desktop/interop/pwa-interop.mjs`, steps of
-  the CI job `pwa-interop`; the same seven cases as the PWA matrix below, the web app driven
+- **Desktop ↔ web app** (`node apps/desktop/interop/pwa-interop.mjs`, steps of the CI job
+  `pwa-interop`; the seven cases of the legacy PWA's matrix below, and files, the web app driven
   through its interface):
 
   | | Chromium | Firefox | WebKit (Playwright, Linux) |
@@ -71,6 +72,35 @@ for people who have the old PWA, translations).
   delete all data. No CSP violation, no console error, no request leaving the test server.
 - Not covered: real Safari (macOS / iOS), a phone's camera, STUN / TURN paths in a browser,
   notifications (the permission cannot be granted in these runs).
+
+## M1 (in progress): fourth slice, files (PNP-010)
+
+- **Spec**: `specs/PNP-010-file-transfer.md` (36 MUST, 7 SHOULD, 2 MAY; vectors from an
+  independent implementation in `specs/vectors/PNP-010`); it supersedes PNP-007 §7. Message type
+  0x15 `FILE_TRANSFER` (PNP-001 v0.15).
+- **`parolnet-transfer`** (new): the offer (id, name, size, MIME type, SHA-256, a fresh 256-bit
+  file key) and accept / decline / cancel / complete as CBOR; the record stream on the data
+  channel `pn-file/<id>`: 64 KiB messages, ChaCha20-Poly1305 with STREAM nonces under a key
+  derived for each attempt from both sides' fresh random contributions; sender and receiver
+  state machines without I/O; the rules both clients share.
+- **`parolnet-rtc`**: further data channels on a live connection (in-band), sends that report
+  the buffered amount, buffered-amount-low and close events.
+- **`parolnet-app`**: `offer_file` / `accept_transfer` / `decline_transfer` / `cancel_transfer`
+  / `transfers`, `AppEvent::Transfer` with progress. Transfer state (offer with key, phase, the
+  control message still owed, the receiver's durable record count) is in the encrypted store.
+  A worker task per transfer streams records from and to disk; a transfer resumes after a lost
+  connection and after a restart of either app. Measured on loopback, release build: 2 GiB
+  with one killed connection and a restart of each app, verified, in 48.7 s (42 MiB/s overall,
+  the reconnects included).
+- **Web** (`web/src/engine/transfers.ts`, `files.ts`): the same protocol through
+  `parolnet-wasm`; received files are written as segments to the origin private file system
+  where the browser lets a page write it, else kept as Blobs in memory. A received part in OPFS
+  survives a reload; a file being sent does not (the page holds no file handle afterwards), so
+  that transfer is cancelled.
+- **Not done**: group files (PNP-009 codes 0x0E to 0x10 are unchanged and unused); a receiver
+  in a browser cannot slow the sender down (the data-channel API has no receive-side
+  backpressure), so a sender much faster than the browser's storage grows the page's memory;
+  the old `parolnet-core` / `parolnet-wasm` file helpers of PNP-007 §7 are still in the tree.
 
 ## M1 (in progress): third slice, media
 
@@ -120,7 +150,8 @@ See [docs/m1-desktop.md](docs/m1-desktop.md) for what runs end to end, the tests
   with no presence push behind it is offered to again with backoff under a probe budget.
 - **Desktop**: chat UI v0 (contact list with path badges, pairing screen with QR code and code
   entry, chat view with delivery state, rename, retry, the no-path message).
-- **Desktop ↔ PWA browser matrix** (`apps/desktop/interop/pwa-interop.mjs`, CI job `pwa-interop`,
+- **Desktop ↔ PWA browser matrix**, as recorded for the legacy PWA (since removed; the web app
+  runs the same cases, above) (`apps/desktop/interop/pwa-interop.mjs`, CI job `pwa-interop`,
   headless on ubuntu-latest with fake media devices; the seven cases are listed in
   [docs/m1-desktop.md](docs/m1-desktop.md)):
 
@@ -158,9 +189,9 @@ See [docs/m1-desktop.md](docs/m1-desktop.md) for what runs end to end, the tests
 
 ## Current User-Facing Path
 
-The current PWA path is:
+The current PWA path (the web app) is:
 
-1. Browser loads `pwa/index.html`, JavaScript, WASM, and service worker assets.
+1. Browser loads `/pwa/index.html` (the web app's static export, `web/out`), JavaScript, WASM, and service worker assets.
 2. Identity keys are generated or restored through WASM.
 3. QR bootstrap can establish a Double Ratchet session between contacts.
 4. Messages are encrypted in WASM when a session exists.
@@ -181,19 +212,12 @@ This path provides end-to-end content encryption when a Double Ratchet session e
 - Relay cell type, 512-byte cell serialization, onion encryption helpers, and partial circuit construction APIs.
 - Relay directory descriptors, signature verification, authority endorsement types, and `/endorse` endpoint.
 - Gossip envelope types, PoW checks, dedup/rate limiting, and store-forward primitives.
-- PWA encrypted IndexedDB mode using AES-GCM and PBKDF2.
-- PWA decoy calculator mode and panic wipe flow for browser storage/cache cleanup.
 - Browser-side WebSocket transport: `WasmWebSocket` wrapper over `web_sys::WebSocket` with binary send/recv, async `wait_open`, and JS exports (`ws_connect`, `ws_send`, `ws_recv`, `ws_close`, `ws_is_open`, `ws_wait_open`).
 - Relay health/reputation scoring: `RelayHealth` tracks latency EMA, success/failure counts, and computes weighted scores. `select_random()` and `select_guards()` use health-weighted selection.
 - Relay federation: gossip-based directory propagation via `POST /directory/push`, bidirectional pull+push sync, dynamic peer discovery from directory entries (capped at 50), push rate limiting, `merge_descriptors()` API.
-- 3-hop onion circuit support: WASM circuit builder constructs 3-hop circuits over WebSocket with X25519 handshake, layered ChaCha20-Poly1305 encryption, and HMAC key confirmation. Relay server processes binary relay cells (CREATE/EXTEND/DATA/DESTROY) with single-relay MVP mode. JS exports (`build_circuit`, `circuit_send`, `circuit_recv`, `circuit_destroy`) allow PWA to send messages through onion circuits.
+- 3-hop onion circuit support: WASM circuit builder constructs 3-hop circuits over WebSocket with X25519 handshake, layered ChaCha20-Poly1305 encryption, and HMAC key confirmation. Relay server processes binary relay cells (CREATE/EXTEND/DATA/DESTROY) with single-relay MVP mode. JS exports (`build_circuit`, `circuit_send`, `circuit_recv`, `circuit_destroy`) let a browser client send messages through onion circuits (the legacy PWA used them; the web app does not).
 - WebRTC: direct (host + srflx) with STUN by default, since the default relay profile is signaling-only and carries no user traffic; contacts on a direct connection see each other's IP address (the app shows a notice). Relay-only ICE is an opt-in setting that uses only a TURN server the user configures. `GET /turn-credentials` returns STUN URIs only on a signaling-only relay and time-limited HMAC-SHA1 TURN credentials on a relay-profile relay with `TURN_SECRET`. WASM `get_webrtc_privacy_config()` export.
-- Domain fronting & bridge relays: `BridgeAddress` type with QR encoding, relay server bridge mode (unlisted, X-Forwarded-For proxy support), PWA bridge relay discovery and priority connection, WASM bridge address parsing exports. CDN-side domain fronting is an operational deployment concern (configure CDN to proxy to bridge relay).
-- PWA group management UI: create/join/leave groups, group chat with per-group IndexedDB message history, member management modal, Chats/Groups tab switcher.
-- PWA file receive flow: incoming file offer accept/decline, chunked receive with progress, download link on completion.
-- PWA incoming call notifications: slide-down banner with accept/decline for 1:1 and group calls.
-- PWA group calls: participant grid (up to 8), mute toggle, group call invitations via structured messages.
-- PWA group file transfer: chunked send to all group members with progress tracking.
+- Domain fronting & bridge relays: `BridgeAddress` type with QR encoding, relay server bridge mode (unlisted, X-Forwarded-For proxy support), WASM bridge address parsing exports. CDN-side domain fronting is an operational deployment concern (configure CDN to proxy to bridge relay).
 - Sender key distribution for group encryption via structured `_pn_type: 'sender_key'` messages.
 - Reproducible builds: `Dockerfile.release` with pinned Rust 1.92.0, wasm-pack 0.13.1, and binaryen for deterministic WASM optimization. `scripts/reproducible-build.sh` builds artifacts and supports `--verify` mode (build twice, compare SHA-256 checksums). CI job generates and uploads release artifacts.
 
@@ -204,7 +228,7 @@ This path provides end-to-end content encryption when a Double Ratchet session e
 - TLS camouflage is an approximation using rustls settings: cipher suite order, key exchange group order, ALPN and SNI follow a fingerprint profile, and profiles are loadable CBOR files (PNP-006 §5.4). Full browser ClientHello mimicry (extension order, GREASE, signature algorithms) is not possible with rustls and is not implemented. The library TLS transport frames its traffic as HTTP/2 DATA; the shipped clients' relay socket is a WebSocket over HTTP/1.1.
 - Traffic shaping: the native client paces what it sends on direct data channels (one frame per padding interval, with jitter); constant-rate padding and dummy traffic exist for library circuits (`parolnet_relay::shaped`) and are not applied to the PWA relay path or by the web app.
 - Mesh discovery is implemented as obfuscated UDP broadcast, not mDNS/BLE as written in older spec text.
-- File, call, group call, and group file APIs: core/WASM primitives exist and PWA UI is wired for basic flows; messages are not yet routed through the full onion circuit protocol stack.
+- File, call, group call, and group file APIs: core/WASM primitives exist (the legacy PWA, since removed, had UI for their basic flows; the web app has 1:1 calls and PNP-010 files); messages are not yet routed through the full onion circuit protocol stack.
 - WebRTC data channels connect directly over STUN by default; pairs behind NATs that block a direct path need a user-supplied TURN server (no TURN on the signaling-only public relay). Offline delivery is the sender-side queue; there is no relay mailbox in the default profile.
 
 ## Not Yet Implemented

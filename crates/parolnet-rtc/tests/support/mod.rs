@@ -118,7 +118,9 @@ impl Peer {
             RtcEvent::RemoteOfferIgnored => self.seen.ignored_offers += 1,
             RtcEvent::KeyframeRequested => self.seen.keyframe_requests += 1,
             RtcEvent::Closed { error } => panic!("connection closed: {error:?}"),
-            RtcEvent::IceConnectionState(_) => {}
+            RtcEvent::IceConnectionState(_)
+            | RtcEvent::DataChannelClose { .. }
+            | RtcEvent::DataChannelBufferedLow { .. } => {}
         }
         None
     }

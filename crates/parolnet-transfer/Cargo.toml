@@ -1,0 +1,23 @@
+[package]
+name = "parolnet-transfer"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "PNP-010 file transfer: the offer, the sealed record stream and the sender / receiver state machines (sans-I/O, WASM-compatible)"
+
+[dependencies]
+chacha20poly1305.workspace = true
+hkdf.workspace = true
+sha2.workspace = true
+subtle.workspace = true
+zeroize.workspace = true
+rand_core.workspace = true
+ciborium.workspace = true
+hex.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+serde_json.workspace = true
+sha2.workspace = true

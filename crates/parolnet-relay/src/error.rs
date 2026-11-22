@@ -32,6 +32,15 @@ pub enum RelayError {
     #[error("circuit timeout")]
     Timeout,
 
+    #[error("hop {hop} did not answer in time")]
+    HopUnresponsive { hop: usize },
+
+    #[error("circuit closed (reason 0x{0:02x})")]
+    CircuitClosed(u8),
+
+    #[error("onion-layer cipher other than ChaCha20-Poly1305 requested")]
+    UnsupportedCipher,
+
     #[error("transport error: {0}")]
     Transport(#[from] parolnet_transport::TransportError),
 

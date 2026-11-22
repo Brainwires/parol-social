@@ -50,28 +50,44 @@ pub struct RelayDescriptor {
     pub next_pubkey: Option<[u8; 32]>,
 }
 
-/// Extract the /16 subnet prefix from a SocketAddr.
-///
-/// For IPv4, returns the first two octets. For IPv6-mapped IPv4, extracts
-/// the embedded IPv4 address. For native IPv6, returns the first two bytes
-/// of the address.
-fn subnet_prefix(addr: &std::net::SocketAddr) -> [u8; 2] {
+/// Guard set size (PNP-004 §5.7: "2-3 relays").
+pub const GUARD_SET_SIZE: usize = 3;
+/// A guard has been up for more than this long.
+pub const GUARD_MIN_UPTIME_SECS: u64 = 7 * 24 * 3600;
+/// The guard set is kept for this long before it is chosen anew.
+pub const GUARD_SET_LIFETIME_SECS: u64 = 30 * 24 * 3600;
+
+/// The network a relay sits in, for the diversity rule of PNP-004-MUST-047: the /16 of
+/// an IPv4 address (also of an IPv4-mapped IPv6 one), the /48 of an IPv6 address.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum Subnet {
+    V4([u8; 2]),
+    V6([u8; 6]),
+}
+
+/// The [`Subnet`] of an address.
+pub fn subnet_of(addr: &std::net::SocketAddr) -> Subnet {
+    let v4 = |ip: std::net::Ipv4Addr| {
+        let o = ip.octets();
+        Subnet::V4([o[0], o[1]])
+    };
     match addr.ip() {
-        std::net::IpAddr::V4(ip) => {
-            let octets = ip.octets();
-            [octets[0], octets[1]]
-        }
-        std::net::IpAddr::V6(ip) => {
-            // Check for IPv4-mapped IPv6 (::ffff:a.b.c.d)
-            if let Some(v4) = ip.to_ipv4_mapped() {
-                let octets = v4.octets();
-                [octets[0], octets[1]]
-            } else {
-                let octets = ip.octets();
-                [octets[0], octets[1]]
+        std::net::IpAddr::V4(ip) => v4(ip),
+        std::net::IpAddr::V6(ip) => match ip.to_ipv4_mapped() {
+            Some(mapped) => v4(mapped),
+            None => {
+                let o = ip.octets();
+                Subnet::V6([o[0], o[1], o[2], o[3], o[4], o[5]])
             }
-        }
+        },
     }
+}
+
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
 }
 
 impl RelayDescriptor {
@@ -103,6 +119,15 @@ impl RelayDescriptor {
             buf.push(0);
         }
         buf
+    }
+
+    /// The bytes an authority signs to endorse this descriptor
+    /// (PNP-008-MUST-002): its deterministic CBOR encoding, the relay's own
+    /// signature included. The `endorsements` array is not part of a
+    /// descriptor, so it is not covered.
+    pub fn endorsement_signable_bytes(&self) -> Vec<u8> {
+        parolnet_protocol::det_cbor::to_deterministic_cbor(self)
+            .expect("a relay descriptor always encodes as CBOR")
     }
 
     /// Whether this descriptor is its relay's own statement (PNP-008-MUST-027 item 1):
@@ -168,6 +193,8 @@ pub struct RelayDirectory {
     descriptors: HashMap<PeerId, RelayDescriptor>,
     /// Guard set: 2-3 stable relays reused across circuits.
     guards: Vec<PeerId>,
+    /// When the guard set was chosen (unix seconds).
+    guards_chosen_at: Option<u64>,
     /// Health metrics for known relays.
     health: HashMap<PeerId, RelayHealth>,
     /// Federation-peer reputation (PNP-008 §7). Populated lazily on first
@@ -189,6 +216,7 @@ impl RelayDirectory {
         Self {
             descriptors: HashMap::new(),
             guards: Vec::new(),
+            guards_chosen_at: None,
             health: HashMap::new(),
             reputation: HashMap::new(),
         }
@@ -277,6 +305,13 @@ impl RelayDirectory {
         &self.health
     }
 
+    /// Weight of a relay in random selection: its advertised bandwidth class
+    /// (PNP-004-SHOULD-005), its advertised bandwidth and its observed health.
+    fn selection_weight(&self, d: &RelayDescriptor) -> f64 {
+        let class = crate::capabilities::bandwidth_class(d.bandwidth_class) as f64 + 1.0;
+        self.health_score(&d.peer_id) * d.bandwidth_estimate.max(1) as f64 * class
+    }
+
     /// Select from candidates using health-weighted random selection.
     fn weighted_select(&self, candidates: &[&RelayDescriptor]) -> Option<RelayInfo> {
         use rand::Rng;
@@ -298,10 +333,7 @@ impl RelayDirectory {
             &eligible
         };
 
-        let weights: Vec<f64> = pool
-            .iter()
-            .map(|d| self.health_score(&d.peer_id) * d.bandwidth_estimate.max(1) as f64)
-            .collect();
+        let weights: Vec<f64> = pool.iter().map(|d| self.selection_weight(d)).collect();
 
         let total: f64 = weights.iter().sum();
         if total <= 0.0 {
@@ -350,69 +382,44 @@ impl RelayDirectory {
 
     /// Select guard nodes (PNP-004 Section 5.7).
     ///
-    /// Guards are selected from relays with uptime > 7 days using
-    /// bandwidth-weighted random selection. The guard set is stable for 30+ days.
+    /// Returns up to `count` relays of the guard set. The set holds up to
+    /// [`GUARD_SET_SIZE`] relays whose uptime exceeds 7 days, chosen with
+    /// bandwidth-weighted random selection, and stays as it is for 30 days.
     pub fn select_guards(&mut self, count: usize) -> Vec<RelayInfo> {
-        // If we already have enough guards, return them
-        if self.guards.len() >= count {
-            return self
-                .guards
-                .iter()
-                .take(count)
-                .filter_map(|id| self.descriptors.get(id))
-                .map(|d| d.to_relay_info())
-                .collect();
+        let mut guards = self.guard_set(unix_now());
+        guards.truncate(count);
+        guards
+    }
+
+    /// The guard set as of `now` (unix seconds), filling or renewing it when due
+    /// (PNP-004-SHOULD-004).
+    pub fn guard_set(&mut self, now: u64) -> Vec<RelayInfo> {
+        // After 30 days the set is chosen anew.
+        if self
+            .guards_chosen_at
+            .is_some_and(|at| now.saturating_sub(at) >= GUARD_SET_LIFETIME_SECS)
+        {
+            self.guards.clear();
+            self.guards_chosen_at = None;
         }
+        // A guard whose descriptor is gone is replaced; the others stay.
+        let descriptors = &self.descriptors;
+        self.guards.retain(|id| descriptors.contains_key(id));
 
-        // Select new guards: prefer high-uptime relays with bandwidth weighting
-        let seven_days = 7 * 24 * 3600;
-        let candidates: Vec<_> = self
-            .descriptors
-            .values()
-            .filter(|d| d.uptime_secs >= seven_days)
-            .collect();
-
-        if candidates.is_empty() {
-            return Vec::new();
-        }
-
-        // Bandwidth-weighted random selection
-        use rand::Rng;
-        let mut rng = rand::thread_rng();
-        let mut selected = Vec::new();
-        let mut selected_ids: Vec<PeerId> = Vec::new();
-
-        for _ in 0..count {
-            let remaining: Vec<_> = candidates
-                .iter()
-                .filter(|d| !selected_ids.contains(&d.peer_id))
+        while self.guards.len() < GUARD_SET_SIZE {
+            let candidates: Vec<&RelayDescriptor> = self
+                .descriptors
+                .values()
+                .filter(|d| d.uptime_secs > GUARD_MIN_UPTIME_SECS)
+                .filter(|d| now.saturating_sub(d.timestamp) < MAX_DESCRIPTOR_AGE_SECS)
+                .filter(|d| !self.guards.contains(&d.peer_id))
                 .collect();
-            if remaining.is_empty() {
+            let Some(pick) = self.weighted_select(&candidates) else {
                 break;
-            }
-
-            let weights: Vec<f64> = remaining
-                .iter()
-                .map(|d| self.health_score(&d.peer_id) * d.bandwidth_estimate.max(1) as f64)
-                .collect();
-            let total_weight: f64 = weights.iter().sum();
-            if total_weight <= 0.0 {
-                break;
-            }
-            let mut pick: f64 = rng.r#gen::<f64>() * total_weight;
-
-            for (j, desc) in remaining.iter().enumerate() {
-                let weight = weights[j];
-                if pick <= weight {
-                    selected_ids.push(desc.peer_id);
-                    selected.push(desc.peer_id);
-                    break;
-                }
-                pick -= weight;
-            }
+            };
+            self.guards.push(pick.peer_id);
+            self.guards_chosen_at.get_or_insert(now);
         }
-
-        self.guards = selected;
 
         self.guards
             .iter()
@@ -423,40 +430,30 @@ impl RelayDirectory {
 
     /// Select a random relay excluding the given PeerIds (PNP-004 Section 5.7).
     ///
-    /// Enforces /16 IPv4 subnet diversity: candidates that share a /16
-    /// prefix with any excluded peer are deprioritized. If no diverse
-    /// candidates exist, falls back to health-weighted random selection.
+    /// Enforces subnet diversity (PNP-004-MUST-047): a candidate in the /16 (IPv4) or
+    /// /48 (IPv6) of any excluded relay is never returned. `None` when no relay is left.
     pub fn select_random(&self, exclude: &[PeerId]) -> Option<RelayInfo> {
-        // Collect /16 prefixes of excluded peers
-        let excluded_subnets: Vec<[u8; 2]> = exclude
+        self.pick_hop(exclude, &[], None)
+    }
+
+    /// One hop for a circuit: not in `chosen` nor in any of their subnets, not in
+    /// `avoid`, and, when `now` is given, not stale (PNP-004-SHOULD-002).
+    fn pick_hop(&self, chosen: &[PeerId], avoid: &[PeerId], now: Option<u64>) -> Option<RelayInfo> {
+        let taken_subnets: Vec<Subnet> = chosen
             .iter()
             .filter_map(|pid| self.descriptors.get(pid))
-            .map(|d| subnet_prefix(&d.addr))
+            .map(|d| subnet_of(&d.addr))
             .collect();
 
         let candidates: Vec<_> = self
             .descriptors
             .values()
-            .filter(|d| !exclude.contains(&d.peer_id))
+            .filter(|d| !chosen.contains(&d.peer_id) && !avoid.contains(&d.peer_id))
+            .filter(|d| !taken_subnets.contains(&subnet_of(&d.addr)))
+            .filter(|d| now.is_none_or(|n| n.saturating_sub(d.timestamp) < MAX_DESCRIPTOR_AGE_SECS))
             .collect();
 
-        if candidates.is_empty() {
-            return None;
-        }
-
-        // Prefer candidates from diverse /16 subnets
-        let diverse: Vec<_> = candidates
-            .iter()
-            .filter(|d| !excluded_subnets.contains(&subnet_prefix(&d.addr)))
-            .copied()
-            .collect();
-
-        if !diverse.is_empty() {
-            self.weighted_select(&diverse)
-        } else {
-            // Fall back to any candidate if no diverse ones exist
-            self.weighted_select(&candidates)
-        }
+        self.weighted_select(&candidates)
     }
 
     /// Create a signed relay descriptor for this node.
@@ -547,8 +544,8 @@ impl RelayDirectory {
     /// Verifies the descriptor (its relay's signature and its age) and that it
     /// has sufficient authority endorsements (meeting the configured threshold),
     /// then inserts it into the directory unless a descriptor at least as recent
-    /// is already there (PNP-008-MUST-030): an endorsement outlives the
-    /// descriptors it was issued under, and an old one must not come back.
+    /// is already there (PNP-008-MUST-030): an endorsed descriptor stays
+    /// valid for seven days, and an older one must not replace a newer one.
     pub fn handle_endorsed_descriptor(
         &mut self,
         desc: EndorsedDescriptor,
@@ -648,16 +645,37 @@ impl RelayDirectory {
 
     /// Select a relay path: 1 guard + 2 random relays, with subnet diversity.
     pub fn select_path(&mut self) -> Option<[RelayInfo; 3]> {
-        let guards = self.select_guards(1);
-        let guard = guards.first()?;
+        self.select_path_at(unix_now(), &[])
+    }
 
-        let exclude = vec![guard.peer_id];
-        let middle = self.select_random(&exclude)?;
+    /// As [`Self::select_path`], leaving out the relays in `avoid` (those a previous
+    /// attempt failed on, PNP-004-MUST-029).
+    pub fn select_path_excluding(&mut self, avoid: &[PeerId]) -> Option<[RelayInfo; 3]> {
+        self.select_path_at(unix_now(), avoid)
+    }
 
-        let exclude = vec![guard.peer_id, middle.peer_id];
-        let exit = self.select_random(&exclude)?;
+    /// Select a path as of `now` (unix seconds).
+    ///
+    /// Hop 1 comes from the guard set (PNP-004-MUST-045). Hops 2 and 3 are drawn at
+    /// random from the other relays, never the guard and never each other
+    /// (PNP-004-MUST-046). No two hops share a /16 or a /48 (PNP-004-MUST-047), and no
+    /// descriptor older than 24 hours is used (PNP-004-SHOULD-002).
+    pub fn select_path_at(&mut self, now: u64, avoid: &[PeerId]) -> Option<[RelayInfo; 3]> {
+        use rand::seq::SliceRandom;
+        let fresh = |d: &RelayDescriptor| now.saturating_sub(d.timestamp) < MAX_DESCRIPTOR_AGE_SECS;
 
-        Some([guard.clone(), middle, exit])
+        let guards: Vec<RelayInfo> = self
+            .guard_set(now)
+            .into_iter()
+            .filter(|g| !avoid.contains(&g.peer_id))
+            .filter(|g| self.descriptors.get(&g.peer_id).is_some_and(fresh))
+            .collect();
+        let guard = guards.choose(&mut rand::thread_rng())?.clone();
+
+        let middle = self.pick_hop(&[guard.peer_id], avoid, Some(now))?;
+        let exit = self.pick_hop(&[guard.peer_id, middle.peer_id], avoid, Some(now))?;
+
+        Some([guard, middle, exit])
     }
 }
 

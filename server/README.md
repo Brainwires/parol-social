@@ -26,6 +26,8 @@ docker compose up -d
 docker compose down
 ```
 
+The compose file is the parol.social deployment: it sets `RELAY_PUBLIC_NAMES=parol.social`, the name clients dial the relay under. A client signs its registration for the name it dialed and the relay refuses any other (PNP-001 §10.7), so to use the app on a local run of the compose file start it with `RELAY_PUBLIC_NAMES=localhost:1411 docker compose up -d`. On your own host set it to your host name. (`docker run` below sets no name, and a relay without one accepts loopback clients, so `http://localhost:1411` works there as it is.)
+
 ### Using Docker directly
 
 ```bash
@@ -35,7 +37,7 @@ docker run -d -p 1411:80 parolnet
 
 The image builds the relay and the web app from source (multi-stage `Dockerfile`: no host-side build step) and runs them on `nginx:alpine`: the distribution landing page at `/`, the web app's static export (`web/out`) at `/pwa/`, the relay behind nginx at the same origin (`/ws`, `/turn-credentials`, ...). Deploy or update with `git pull && docker compose up -d --build`; check a running container with `scripts/image-smoke.sh http://127.0.0.1:1411`.
 
-The legacy PWA in `pwa/` is no longer part of the image. The new app's service worker at `/pwa/sw.js` takes over from the old one at the same scope and deletes its caches.
+The legacy PWA that was in `pwa/` has been removed from the repository. The new app's service worker at `/pwa/sw.js` takes over from the old one at the same scope and deletes its caches.
 
 ## Alternative Hosting Options
 

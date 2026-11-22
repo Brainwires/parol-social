@@ -4,8 +4,9 @@
 //! The circuit tests run the production sender (`parolnet_relay::shaped::ShapedCircuit` on an
 //! `EstablishedCircuit`) against three production relay nodes (`StandardRelayNode`). The link
 //! between the client and the guard is a channel that records every cell and when it was
-//! sent; the test then carries each cell from relay to relay. Time is tokio's paused clock,
-//! so an hour of padding takes milliseconds and the timings are exact.
+//! sent; the test then carries each cell from relay to relay, in the order the client sent
+//! them (the relays keep nonce counters). Time is tokio's paused clock, so an hour of
+//! padding takes milliseconds and the timings are exact.
 //!
 //! What the shipped clients do on a direct data channel is in `pnp_006_direct_path.rs`; TLS
 //! and connection behaviour are in `pnp_006_tls.rs`.
@@ -17,12 +18,13 @@ use std::time::Duration;
 use async_trait::async_trait;
 use parolnet_clause::clause;
 use parolnet_relay::circuit::EstablishedCircuit;
-use parolnet_relay::onion::HopKeys;
+use parolnet_relay::onion::{HopKeys, onion_peel};
 use parolnet_relay::relay_node::StandardRelayNode;
 use parolnet_relay::shaped::{
     FLAG_DUMMY, FLAG_REAL, Inner, MAX_SHAPED_DATA, SendSchedulerConfig, ShapedCircuit, open_inner,
 };
-use parolnet_relay::{CELL_SIZE, CellType, RelayAction, RelayCell, RelayNode};
+use parolnet_relay::stream::DataCommand;
+use parolnet_relay::{CELL_SIZE, CellType, LinkId, RelayAction, RelayCell, RelayNode};
 use parolnet_transport::noise::{
     BandwidthMode, SendChoice, SendScheduler, TrafficProfile, load_traffic_profile,
 };
@@ -103,13 +105,22 @@ fn seen(cell: &RelayCell) -> Seen {
     }
 }
 
-/// Where a cell ended.
+/// Where a cell ended. Every cell crosses all three relays (PNP-004 §5.9: PADDING is
+/// encrypted and carried exactly as DATA is).
 #[derive(Debug)]
 enum Fate {
-    /// The guard dropped it (a PADDING cell).
-    DroppedAtGuard,
-    /// It crossed all three relays; this is what the exit decrypted.
+    /// A PADDING cell: the exit decrypted it and handed nothing on.
+    Padding,
+    /// A DATA cell: the whole payload the exit decrypted (the PNP-004 §3.7 header, the
+    /// data, the random fill).
     Exit(Vec<u8>),
+}
+
+/// The data of a decrypted §3.7 payload: what the exit hands to the destination, and what
+/// `open_inner` reads.
+fn data_of(payload: &[u8]) -> &[u8] {
+    let len = u16::from_be_bytes([payload[5], payload[6]]) as usize;
+    &payload[7..7 + len]
 }
 
 /// A guard, a middle relay and an exit holding one circuit.
@@ -117,58 +128,126 @@ struct Path {
     guard: StandardRelayNode,
     middle: StandardRelayNode,
     exit: StandardRelayNode,
-    middle_addr: SocketAddr,
-    exit_addr: SocketAddr,
+    /// The client's link at the guard, and the guard's link to the middle relay.
+    guard_links: (LinkId, LinkId),
+    /// The guard's link at the middle relay, and the middle relay's link to the exit.
+    middle_links: (LinkId, LinkId),
+    /// The middle relay's link at the exit.
+    exit_link: LinkId,
+    /// The exit's forward keys, and how many cells have reached it: the test opens the
+    /// exit's layer a second time, to look at the plaintext the exit itself holds.
+    exit_keys: HopKeys,
+    carried: std::sync::atomic::AtomicU32,
 }
 
 impl Path {
     fn new(keys: &[HopKeys]) -> Path {
-        let middle_addr: SocketAddr = "10.0.0.2:443".parse().unwrap();
-        let exit_addr: SocketAddr = "10.0.0.3:443".parse().unwrap();
-        let path = Path {
-            guard: StandardRelayNode::new(),
-            middle: StandardRelayNode::new(),
-            exit: StandardRelayNode::new(),
-            middle_addr,
-            exit_addr,
-        };
-        path.guard
-            .register_circuit(CLIENT_CID, keys[0].clone(), Some((middle_addr, MIDDLE_CID)))
+        let guard = StandardRelayNode::new();
+        let middle = StandardRelayNode::new();
+        let exit = StandardRelayNode::new();
+        let guard_links = (guard.new_link(), guard.new_link());
+        let middle_links = (middle.new_link(), middle.new_link());
+        let exit_link = exit.new_link();
+        guard
+            .register_circuit(
+                guard_links.0,
+                CLIENT_CID,
+                keys[0].clone(),
+                Some((guard_links.1, MIDDLE_CID)),
+            )
             .unwrap();
-        path.middle
-            .register_circuit(MIDDLE_CID, keys[1].clone(), Some((exit_addr, EXIT_CID)))
+        middle
+            .register_circuit(
+                middle_links.0,
+                MIDDLE_CID,
+                keys[1].clone(),
+                Some((middle_links.1, EXIT_CID)),
+            )
             .unwrap();
-        path.exit
-            .register_circuit(EXIT_CID, keys[2].clone(), None)
+        exit.register_circuit(exit_link, EXIT_CID, keys[2].clone(), None)
             .unwrap();
-        path
+        Path {
+            guard,
+            middle,
+            exit,
+            guard_links,
+            middle_links,
+            exit_link,
+            exit_keys: keys[2].clone(),
+            carried: std::sync::atomic::AtomicU32::new(0),
+        }
     }
 
-    /// Carry one cell from the client as far as it goes. Returns what each relay received
-    /// (guard, middle, exit) and where the cell ended. A relay that cannot authenticate the
-    /// cell fails the test: every cell the client sends must pass every hop's AEAD.
+    /// Carry the client's next cell through the three relays. Returns what each relay
+    /// received (guard, middle, exit) and where the cell ended. A relay that cannot
+    /// authenticate the cell fails the test: every cell the client sends must pass every
+    /// hop's AEAD. Cells must be carried in the order they were sent.
     async fn carry(&self, cell: RelayCell) -> (Vec<Seen>, Fate) {
+        let cell_type = cell.cell_type;
         let mut hops = vec![seen(&cell)];
-        let to_middle = match self.guard.handle_cell(cell).await.expect("guard") {
-            RelayAction::Forward { next_hop, cell } => {
-                assert_eq!(next_hop, self.middle_addr);
-                cell
-            }
-            RelayAction::Discard => return (hops, Fate::DroppedAtGuard),
-            _ => panic!("unexpected action at the guard"),
-        };
+        // A relay forwards only what authenticates under its key and its counter.
+        self.guard.handle_cell(self.guard_links.0, cell).await;
+        let mut forwarded = self.guard.take_outgoing(self.guard_links.1);
+        assert_eq!(forwarded.len(), 1, "the guard did not forward the cell");
+        let to_middle = forwarded.remove(0);
+        assert_eq!(
+            (to_middle.circuit_id, to_middle.cell_type),
+            (MIDDLE_CID, cell_type)
+        );
         hops.push(seen(&to_middle));
-        let to_exit = match self.middle.handle_cell(to_middle).await.expect("middle") {
-            RelayAction::Forward { next_hop, cell } => {
-                assert_eq!(next_hop, self.exit_addr);
-                cell
-            }
-            _ => panic!("unexpected action at the middle relay"),
-        };
+        self.middle
+            .handle_cell(self.middle_links.0, to_middle)
+            .await;
+        let mut forwarded = self.middle.take_outgoing(self.middle_links.1);
+        assert_eq!(
+            forwarded.len(),
+            1,
+            "the middle relay did not forward the cell"
+        );
+        let to_exit = forwarded.remove(0);
+        assert_eq!(
+            (to_exit.circuit_id, to_exit.cell_type),
+            (EXIT_CID, cell_type)
+        );
         hops.push(seen(&to_exit));
-        match self.exit.handle_cell(to_exit).await.expect("exit") {
-            RelayAction::Deliver { payload } => (hops, Fate::Exit(payload)),
-            _ => panic!("unexpected action at the exit"),
+
+        // What the exit decrypts, opened here with the exit's key and counter.
+        let counter = self
+            .carried
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let plain = onion_peel(
+            to_exit.body(),
+            &self.exit_keys.forward_key,
+            &self.exit_keys.forward_nonce_seed,
+            counter,
+        )
+        .expect("the cell authenticates under the exit's key");
+        // And the exit itself: it delivers the data of a DATA cell and nothing of a
+        // PADDING cell.
+        let delivered: Vec<(DataCommand, Vec<u8>)> = self
+            .exit
+            .handle_cell(self.exit_link, to_exit)
+            .await
+            .into_iter()
+            .filter_map(|action| match action {
+                RelayAction::Deliver { command, data, .. } => Some((command, data)),
+                _ => None,
+            })
+            .collect();
+        match cell_type {
+            CellType::Padding => {
+                assert!(delivered.is_empty(), "the exit delivered a PADDING cell");
+                (hops, Fate::Padding)
+            }
+            CellType::Data => {
+                assert_eq!(
+                    delivered,
+                    [(DataCommand::Data, data_of(&plain).to_vec())],
+                    "the exit delivers the data of the cell it decrypted"
+                );
+                (hops, Fate::Exit(plain))
+            }
+            other => panic!("the client sent a {other:?} cell"),
         }
     }
 }
@@ -255,13 +334,13 @@ async fn an_idle_circuit_sends_a_cell_every_padding_interval_in_every_mode() {
             gaps.len()
         );
 
-        // Nothing was queued: every one of them is filler (a PADDING cell the guard drops,
+        // Nothing was queued: every one of them is filler (a PADDING cell the exit drops,
         // or a dummy that the exit recognises).
         for sent in cells {
             match path.carry(sent.cell).await {
-                (_, Fate::DroppedAtGuard) => {}
+                (_, Fate::Padding) => {}
                 (_, Fate::Exit(payload)) => {
-                    assert_eq!(open_inner(&payload).unwrap(), Inner::Dummy)
+                    assert_eq!(open_inner(data_of(&payload)).unwrap(), Inner::Dummy)
                 }
             }
         }
@@ -294,7 +373,7 @@ async fn a_real_message_takes_the_place_of_padding() {
     let mut real_slots = Vec::new();
     for (slot, sent) in cells.into_iter().enumerate() {
         if let (_, Fate::Exit(payload)) = path.carry(sent.cell).await
-            && let Inner::Real(data) = open_inner(&payload).unwrap()
+            && let Inner::Real(data) = open_inner(data_of(&payload)).unwrap()
         {
             real_slots.push((slot, data));
         }
@@ -340,7 +419,7 @@ async fn a_burst_drains_one_message_per_slot_in_order() {
         let Fate::Exit(payload) = fate else {
             panic!("padding was sent while real messages waited")
         };
-        match open_inner(&payload).unwrap() {
+        match open_inner(data_of(&payload)).unwrap() {
             Inner::Real(data) => order.push(data[0]),
             Inner::Dummy => panic!("a dummy was sent while real messages waited"),
         }
@@ -495,13 +574,13 @@ async fn idle_slots_are_padding_or_dummy_in_the_modes_proportion() {
         let (mut padding, mut dummy) = (0usize, 0usize);
         for sent in cells {
             match path.carry(sent.cell).await {
-                (hops, Fate::DroppedAtGuard) => {
+                (hops, Fate::Padding) => {
                     assert_eq!(hops[0].cell_type, CellType::Padding);
                     padding += 1;
                 }
                 (hops, Fate::Exit(payload)) => {
                     assert_eq!(hops[0].cell_type, CellType::Data);
-                    assert_eq!(open_inner(&payload).unwrap(), Inner::Dummy);
+                    assert_eq!(open_inner(data_of(&payload)).unwrap(), Inner::Dummy);
                     dummy += 1;
                 }
             }
@@ -596,7 +675,7 @@ async fn a_dummy_crosses_the_circuit_like_a_real_message_and_only_the_exit_can_t
                 "a relay before the exit could read the inner payload"
             );
         }
-        match open_inner(&payload).unwrap() {
+        match open_inner(data_of(&payload)).unwrap() {
             Inner::Real(data) => real.push(data),
             Inner::Dummy => dummies += 1,
         }
@@ -640,7 +719,7 @@ async fn the_dummy_flag_is_under_the_innermost_layer() {
     for sent in cells {
         let (hops, fate) = path.carry(sent.cell).await;
         let Fate::Exit(payload) = fate else { continue };
-        match open_inner(&payload).unwrap() {
+        match open_inner(data_of(&payload)).unwrap() {
             Inner::Real(data) => {
                 assert_eq!(payload[FLAG_OFFSET], FLAG_REAL);
                 assert_eq!(data, b"real");

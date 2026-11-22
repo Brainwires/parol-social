@@ -1,12 +1,16 @@
 # PNP-007: ParolNet Media and File Transfer Protocol
 
 ### Status: CANDIDATE
-### Version: 0.3
-### Date: 2026-11-20
+### Version: 0.4
+### Date: 2026-11-21
 
 ---
 
 ## Changelog
+
+**v0.4 (2026-11-21) — File transfer superseded by PNP-010**
+
+- §7 "File Transfer Protocol" (§7.1 – §7.8) is **SUPERSEDED** by PNP-010 (File Transfer): the offer travels as a `FILE_TRANSFER` (0x15) message in the session and the file as sealed 64 KiB records on a data channel of its own, peer to peer, with resume. The clauses of §7 (**PNP-007-MUST-054** … **MUST-066**, **MUST-090**, **SHOULD-006** … **SHOULD-008**, **SHOULD-013**, **MAY-003**) are `[DEPRECATED]`: their IDs are kept, per the registry rules, and new implementations follow PNP-010. Message-type codes 0x02, 0x09 and 0x0A stay allocated and are no longer sent by the reference clients. The rest of this document (calls, media) is unchanged until PNP-011.
 
 **v0.3 (2026-11-20) — Signaling-only relay profile**
 
@@ -412,6 +416,8 @@ ScreenShareStop = {
 Screen share frames reuse the video SRTP context established with HKDF info string `"pmftp-srtp-video-v1"` (§6.6). Since only one video stream is active at a time (§6.7.2), the SSRC and sequence number space are shared between camera and screen share. When switching sources, the SRTP sequence counter continues incrementing without reset. **PNP-007-MUST-053**
 
 ## 7. File Transfer Protocol
+
+> **[DEPRECATED] Superseded by PNP-010 (File Transfer).** This section is kept for reference and for the stability of its clause IDs. Every clause in §7.1 – §7.8 is `[DEPRECATED]`; the reference clients transfer files as PNP-010 specifies and do not send FILE (0x02), FILE_CHUNK (0x09) or FILE_CONTROL (0x0A) messages.
 
 ### 7.1 File Offer
 

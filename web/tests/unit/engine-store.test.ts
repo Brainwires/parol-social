@@ -9,8 +9,10 @@ import {
   type ContactView,
   EngineError,
   type Snapshot,
+  type TransferInfo,
   type TurnSettings,
 } from "../../src/engine/types.ts";
+import type { FileSource } from "../../src/engine/platform.ts";
 import {
   createEngineStore,
   type DeviceVault,
@@ -22,6 +24,7 @@ import {
   type StoreEnv,
   type Unlocked,
 } from "../../src/state/engine-store.ts";
+import type { SaveOutcome } from "../../src/state/save-file.ts";
 import { BackupError } from "../../src/engine/backup.ts";
 import { VaultError } from "../../src/engine/vault.ts";
 
@@ -43,6 +46,28 @@ function message(id: number, peerId: string, text: string, sent = false): ChatMe
   };
 }
 
+function transfer(
+  id: string,
+  peerId: string,
+  createdMs: number,
+  extra: Partial<TransferInfo> = {},
+): TransferInfo {
+  return {
+    id,
+    peerId,
+    direction: "Received",
+    name: `${id}.pdf`,
+    size: 1000,
+    mime: "application/pdf",
+    state: { kind: "Offered" },
+    bytesDone: 0,
+    pending: false,
+    createdMs,
+    available: false,
+    ...extra,
+  };
+}
+
 /** A scripted engine: tests change `snap` and `history`, then `emit`. */
 class FakeEngine implements EnginePort {
   readonly peerId = "ee".repeat(32);
@@ -53,11 +78,15 @@ class FakeEngine implements EnginePort {
     contacts: [],
     pairingOpen: false,
     pairing: null,
+    sas: null,
     turnConfigured: false,
     relayOnly: false,
     call: null,
   };
   history = new Map<string, ChatMessage[]>();
+  files = new Map<string, TransferInfo[]>();
+  blobs = new Map<string, Blob>();
+  persist = true;
   turn: TurnSettings | null = null;
   calls: string[] = [];
   stopped = false;
@@ -90,7 +119,19 @@ class FakeEngine implements EnginePort {
   messages = (peerId: string) => Promise.resolve(this.history.get(peerId) ?? []);
   createPairingCode() {
     this.calls.push("createPairingCode");
-    return Promise.resolve({ code: "c0de", expiresAtMs: 1 });
+    return Promise.resolve({ code: "C0 DE", text: "C0_DE", expiresAtMs: 1 });
+  }
+  confirmSas(peerId: string) {
+    this.calls.push(`confirmSas:${peerId.slice(0, 2)}`);
+    return Promise.resolve();
+  }
+  rejectSas(peerId: string) {
+    this.calls.push(`rejectSas:${peerId.slice(0, 2)}`);
+    return Promise.resolve();
+  }
+  stopPairing(peerId: string) {
+    this.calls.push(`stopPairing:${peerId.slice(0, 2)}`);
+    return Promise.resolve();
   }
   cancelPairing() {
     this.calls.push("cancelPairing");
@@ -168,6 +209,35 @@ class FakeEngine implements EnginePort {
     this.turn = settings;
     return Promise.resolve();
   }
+  offerFile(peerId: string, file: FileSource) {
+    this.calls.push(`offer:${peerId.slice(0, 2)}:${file.name}`);
+    if (file.size === 0) return Promise.reject(new EngineError("Transfer", "empty"));
+    return Promise.resolve(transfer("new", peerId, 5, { direction: "Sent", name: file.name }));
+  }
+  acceptTransfer(id: string) {
+    this.calls.push(`acceptTransfer:${id}`);
+    return Promise.resolve(transfer(id, ALICE, 1, { state: { kind: "Waiting" } }));
+  }
+  declineTransfer(id: string) {
+    this.calls.push(`declineTransfer:${id}`);
+    return Promise.resolve(transfer(id, ALICE, 1, { state: { kind: "Declined" } }));
+  }
+  cancelTransfer(id: string) {
+    this.calls.push(`cancelTransfer:${id}`);
+    return Promise.resolve(
+      transfer(id, ALICE, 1, { state: { kind: "Cancelled", byPeer: false, reason: "User" } }),
+    );
+  }
+  transfers = (peerId?: string) => Promise.resolve(peerId ? this.files.get(peerId) ?? [] : []);
+  transferFile(id: string) {
+    this.calls.push(`transferFile:${id}`);
+    return Promise.resolve(this.blobs.get(id) ?? null);
+  }
+  removeTransfer(id: string) {
+    this.calls.push(`removeTransfer:${id}`);
+    return Promise.resolve();
+  }
+  receivedFilesPersist = () => this.persist;
   shutdown() {
     this.stopped = true;
     return Promise.resolve();
@@ -191,6 +261,10 @@ function call(kind: "Outgoing" | "Incoming" | "Connecting" | "Active", peerId = 
 }
 
 interface Harness {
+  /** What `saveFile` was asked to save: the name and the blob it got. */
+  saved: Array<{ name: string; blob: Blob | null }>;
+  /** What the next `saveFile` returns. */
+  saveOutcome: SaveOutcome;
   /** Every `keepPlaying` call: the streams that may go on playing. */
   kept: Array<readonly unknown[]>;
   /** What the screens were shown (`callMedia`) at the moment of each of those calls. */
@@ -225,6 +299,8 @@ function harness(
   const engine = new FakeEngine();
   let handOver = () => {};
   const h: Harness = {
+    saved: [],
+    saveOutcome: "saved",
     kept: [],
     shownWhenKept: [],
     engine,
@@ -279,6 +355,10 @@ function harness(
     keepPlaying(streams) {
       h.kept.push(streams);
       h.shownWhenKept.push(h.store.callMedia.value);
+    },
+    async saveFile(name, getBlob) {
+      h.saved.push({ name, blob: await getBlob() });
+      return h.saveOutcome;
     },
     onEngine: (started) => void h.engines.push(started),
     onEvent: (event) => void h.events.push(event),
@@ -387,9 +467,12 @@ Deno.test("store: contacts, the line and pairing come from the snapshot on every
     ["Bob", "NoDirectPath", 3],
   ]);
 
-  h.engine.snap = { ...h.engine.snap, pairing: { code: "abcd", expiresAtMs: 5 } };
+  h.engine.snap = {
+    ...h.engine.snap,
+    pairing: { code: "AB CD", text: "AB_CD", expiresAtMs: 5 },
+  };
   h.engine.emit({ kind: "Pairing", pairing: h.engine.snap.pairing });
-  assertEquals(h.store.pairing.value, { code: "abcd", expiresAtMs: 5 });
+  assertEquals(h.store.pairing.value, { code: "AB CD", text: "AB_CD", expiresAtMs: 5 });
   h.engine.snap = { ...h.engine.snap, pairing: null };
   h.engine.emit({ kind: "Pairing", pairing: null });
   assertEquals(h.store.pairing.value, null);
@@ -414,6 +497,9 @@ Deno.test("store: intents become engine commands; a refusal reaches the screen",
   await h.store.createPairingCode();
   await h.store.cancelPairing();
   await h.store.pair("c0de", "scan");
+  await h.store.confirmSas(ALICE);
+  await h.store.rejectSas(ALICE);
+  await h.store.stopPairing(ALICE);
   await h.store.rename(ALICE, "Ally");
   await h.store.setCompared(ALICE, true);
   await h.store.setCompared(ALICE, false);
@@ -427,6 +513,9 @@ Deno.test("store: intents become engine commands; a refusal reaches the screen",
     "createPairingCode",
     "cancelPairing",
     "pair:c0de:scan",
+    "confirmSas:a1",
+    "rejectSas:a1",
+    "stopPairing:a1",
     "rename:Ally",
     "verify:compared",
     "verify:no",
@@ -578,6 +667,42 @@ Deno.test("store: notices; a failed security check is left to the conversation's
   assertEquals(h.store.notice.value, null);
 });
 
+Deno.test("store: the verification code of a pairing, and how a pairing ended", async () => {
+  const h = harness();
+  await h.store.start();
+  assertEquals(h.store.sas.value, null);
+
+  // The engine shows a code: the store holds the one of the snapshot.
+  const sas = { peerId: ALICE, digits: "042917", emoji: "abcde", confirmed: false };
+  h.engine.snap = { ...h.engine.snap, sas };
+  h.engine.emit({ kind: "Sas", sas });
+  assertEquals(h.store.sas.value, sas);
+  // Other events do not replace what is on screen while nothing about it changed.
+  const shown = h.store.sas.value;
+  h.engine.snap = { ...h.engine.snap, sas: { ...sas } };
+  h.engine.emit({ kind: "Relay", state: h.engine.snap.relay });
+  assertEquals(h.store.sas.value === shown, true);
+  h.engine.snap = { ...h.engine.snap, sas: { ...sas, confirmed: true } };
+  h.engine.emit({ kind: "Sas", sas: { ...sas, confirmed: true } });
+  assertEquals(h.store.sas.value?.confirmed, true);
+
+  // It ended without a contact: the code goes, and a panel says why.
+  h.engine.snap = { ...h.engine.snap, sas: null };
+  h.engine.emit({ kind: "PairingFailed", peerId: ALICE, reason: "SasMismatch" });
+  assertEquals(h.store.sas.value, null);
+  assertEquals(h.store.notice.value, { code: "Pairing", peerId: ALICE, pairing: "SasMismatch" });
+  // The next one that completes takes that panel away.
+  h.engine.emit({ kind: "PairingComplete", peerId: BOB, sasVerified: true });
+  assertEquals(h.store.notice.value, null);
+  // What the person stopped themselves needs no words.
+  h.engine.emit({ kind: "PairingFailed", peerId: ALICE, reason: "Cancelled" });
+  assertEquals(h.store.notice.value, null);
+  // A notice about something else is not a pairing's to clear.
+  h.engine.emit({ kind: "Notice", code: "TurnUnusable", text: "x" });
+  h.engine.emit({ kind: "PairingComplete", peerId: BOB, sasVerified: false });
+  assertEquals(h.store.notice.value?.code, "TurnUnusable");
+});
+
 Deno.test("store: another tab has ParolNet; 'Use it here' takes it over", async () => {
   const h = harness();
   h.starts.push(busy, busy);
@@ -629,6 +754,115 @@ Deno.test("store: delete all data wipes the engine and the preferences, then sta
   assertEquals(h.engine.wiped, true);
   assertEquals(h.cleared, 1);
   assertEquals(h.reloads, 1);
+});
+
+Deno.test("store: transfers load per conversation and follow Transfer / TransferRemoved", async () => {
+  const h = harness();
+  h.engine.view(ALICE, "Alice");
+  h.engine.view(BOB, "Bob");
+  h.engine.files.set(ALICE, [transfer("t1", ALICE, 10), transfer("t2", ALICE, 20)]);
+  h.engine.persist = false;
+  await h.store.start();
+  const ids = (peer: string) =>
+    h.store.transfers.value.get(peer)?.map((t) => `${t.id}:${t.state.kind}`);
+  assertEquals(ids(ALICE), ["t1:Offered", "t2:Offered"]);
+  assertEquals(ids(BOB), []);
+  assertEquals(h.store.filesPersist.value, false);
+
+  // A change replaces the transfer in place; a new one goes in by time.
+  h.engine.emit({
+    kind: "Transfer",
+    transfer: transfer("t1", ALICE, 10, { state: { kind: "Active" }, bytesDone: 400 }),
+  });
+  h.engine.emit({ kind: "Transfer", transfer: transfer("t0", ALICE, 5) });
+  h.engine.emit({ kind: "Transfer", transfer: transfer("b1", BOB, 1) });
+  assertEquals(ids(ALICE), ["t0:Offered", "t1:Active", "t2:Offered"]);
+  assertEquals(h.store.transfers.value.get(ALICE)?.[1].bytesDone, 400);
+  assertEquals(ids(BOB), ["b1:Offered"]);
+
+  h.engine.emit({ kind: "TransferRemoved", peerId: ALICE, id: "t2" });
+  assertEquals(ids(ALICE), ["t0:Offered", "t1:Active"]);
+
+  // Removing a contact takes its transfers with it.
+  h.engine.snap = { ...h.engine.snap, contacts: h.engine.snap.contacts.slice(1) };
+  h.engine.emit({ kind: "ContactRemoved", peerId: ALICE });
+  assertEquals(h.store.transfers.value.has(ALICE), false);
+  assertEquals(h.events.map((e) => e.kind).filter((k) => k.startsWith("Transfer")), [
+    "Transfer",
+    "Transfer",
+    "Transfer",
+    "TransferRemoved",
+  ]);
+});
+
+Deno.test("store: a transfer event delivered while the list loads wins over the list", async () => {
+  const h = harness();
+  h.engine.view(ALICE, "Alice");
+  let release: (list: TransferInfo[]) => void = () => {};
+  h.engine.transfers = () => new Promise((resolve) => (release = resolve));
+  const starting = h.store.start();
+  await new Promise((done) => setTimeout(done, 0));
+  h.engine.emit({
+    kind: "Transfer",
+    transfer: transfer("t1", ALICE, 10, { state: { kind: "Waiting" } }),
+  });
+  h.engine.emit({ kind: "TransferRemoved", peerId: ALICE, id: "t3" });
+  release([transfer("t1", ALICE, 10), transfer("t2", ALICE, 20), transfer("t3", ALICE, 30)]);
+  await starting;
+  assertEquals(
+    h.store.transfers.value.get(ALICE)?.map((t) => `${t.id}:${t.state.kind}`),
+    ["t1:Waiting", "t2:Offered"],
+  );
+});
+
+Deno.test("store: transfer intents become engine commands", async () => {
+  const h = harness();
+  h.engine.view(ALICE, "Alice");
+  await h.store.start();
+  const file = new File(["hello"], "notes.txt", { type: "text/plain" });
+  const offered = await h.store.offerFile(ALICE, file);
+  assertEquals(offered.name, "notes.txt");
+  await h.store.acceptTransfer("t1");
+  await h.store.declineTransfer("t2");
+  await h.store.cancelTransfer("t3");
+  await h.store.removeTransfer("t4");
+  assertEquals(h.engine.calls, [
+    "offer:a1:notes.txt",
+    "acceptTransfer:t1",
+    "declineTransfer:t2",
+    "cancelTransfer:t3",
+    "removeTransfer:t4",
+  ]);
+  // A file the engine cannot offer is refused with its code, for the screen to word.
+  const error = await assertRejects(
+    () => h.store.offerFile(ALICE, new File([], "empty.txt")),
+    EngineError,
+  );
+  assertEquals(error.code, "Transfer");
+});
+
+Deno.test("store: saving hands the engine's blob, under the transfer's name, to the saver", async () => {
+  const h = harness();
+  h.engine.view(ALICE, "Alice");
+  h.engine.files.set(ALICE, [
+    transfer("t1", ALICE, 1, { name: "report.pdf", state: { kind: "Complete" }, available: true }),
+  ]);
+  const blob = new Blob(["%PDF"], { type: "application/pdf" });
+  h.engine.blobs.set("t1", blob);
+  await h.store.start();
+  await h.store.saveTransfer("t1");
+  assertEquals(h.saved.length, 1);
+  assertEquals(h.saved[0].name, "report.pdf");
+  assert(h.saved[0].blob === blob, "the engine's own blob, type and all");
+
+  // Closing the save dialog is not a problem; a file no longer on this device is.
+  h.saveOutcome = "cancelled";
+  await h.store.saveTransfer("t1");
+  h.saveOutcome = "missing";
+  const missing = await assertRejects(() => h.store.saveTransfer("t1"), EngineError);
+  assertEquals(missing.code, "UnknownTransfer");
+  const unknown = await assertRejects(() => h.store.saveTransfer("nope"), EngineError);
+  assertEquals(unknown.code, "UnknownTransfer");
 });
 
 Deno.test("store: switching the camera off lets the self view go before the track is disabled", async () => {

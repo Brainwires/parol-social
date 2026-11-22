@@ -67,8 +67,16 @@ export function ContactDetailsSheet({ view, onClose, onVerify, onRemove }: {
         </Button>
       </form>
       <div className="sheet__section">
-        <p data-testid="details-verified" data-verified={contact.verified}>
-          {t(VERIFIED[contact.verified])}
+        <p
+          data-testid="details-verified"
+          data-verified={contact.verified}
+          data-sas={contact.sasVerified ? "true" : "false"}
+        >
+          {t(
+            contact.verified === "no" && contact.sasVerified
+              ? "details.verifiedSas"
+              : VERIFIED[contact.verified],
+          )}
         </p>
         <Button testId="details-verify" onClick={onVerify}>{t("verify.open")}</Button>
       </div>

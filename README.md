@@ -31,8 +31,8 @@ relying on it.
 - **Content.** Messages, files, calls and data channels are end-to-end encrypted between devices.
   Relays, TURN servers and (from M2) media servers see ciphertext only.
 - **Identity.** An identity is an Ed25519 key; its `PeerId` is the SHA-256 of the public key. You
-  add contacts by QR code or a pairing code and verify them with safety numbers. There is nothing
-  to register.
+  add contacts by QR code or a pairing code, compare a short verification code with them while you
+  do, and can compare safety numbers later. There is nothing to register.
 - **Servers anyone can run.** Relays federate; you choose your home relay or run your own.
 - **Signaling-only public relay.** By default a relay only helps contacts set up direct connections
   (registration, WebRTC offer / answer / ICE between two online contacts, presence, STUN URIs); no
@@ -41,7 +41,10 @@ relying on it.
   connect to sees your IP address unless you relay through your own TURN server (Settings; the
   relay never offers one and the apps have none built in); messages to an offline
   contact wait on your device. Operators who want store-and-forward, tokens, TURN credentials or
-  federation run the relay profile (`SIGNALING_ONLY=0`).
+  federation run the relay profile (`SIGNALING_ONLY=0`). A registration is signed for the relay
+  it is made at (its `host:port`, which an operator sets in `RELAY_PUBLIC_NAMES`), so one relay
+  cannot register you at another, and a signaling-only relay answers no HTTP request about who
+  is online ([PNP-001 §10.7](specs/PNP-001-wire-protocol.md)).
 - **Metadata, honestly stated.** Your home relay learns your `PeerId`, your IP address, when you are
   online and the `PeerId`s you exchange signaling with (and, on a relay-profile relay, envelopes). A media server (M2) learns who is in a room
   and packet sizes and timing. The default mode does **not** hide that you use ParolNet, resist
@@ -67,17 +70,18 @@ apps/desktop (GPUI)      web/ (TS + wasm)        later: iOS / Android shells (Un
 | --- | --- | --- |
 | `parolnet-crypto` | Ed25519 identity, X3DH, Double Ratchet, AEAD, KDF (pure Rust, wasm) | exists |
 | `parolnet-protocol` | Envelopes, CBOR, message padding, the PNP-006 send scheduler (bandwidth modes, send slots, jitter) (wasm) | exists |
-| `parolnet-transport`, `-relay`, `-mesh` | Relay connections, federation, directory, tokens; onion circuits with cover traffic, an HTTP/2-framed TLS transport and mesh (optional) | exists |
+| `parolnet-transport`, `-relay`, `-mesh` | Relay connections, federation, directory, tokens; onion circuits (PNP-004: relay node and service, circuit builder and pool, descriptor publishing) with PNP-006 cover traffic, an HTTP/2-framed TLS transport and the gossip mesh (PNP-005: validation and forwarding, store-and-forward, sync, scoring, mDNS and UDP discovery). Library code and the opt-in relay profile; the default clients do not use them | exists |
 | `parolnet-core` | Client library: bootstrap, sessions, groups, files | exists |
 | `parolnet-wasm` | Browser bindings for the PWA | exists |
 | `parolnet-relay-server` | Axum relay: signaling-only by default (register, SDP / ICE, presence, STUN URIs); opt-in relay profile with store-and-forward, federation, TURN credentials | exists |
 | `parolnet-rtc` | Async driver for the sans-I/O [`webrtc-rs-rtc`](https://github.com/Brainwires/webrtc-rs-rtc) engine (native): sockets on every interface (IPv4 and IPv6), STUN and the user's TURN server, data channels, RTP with RTX, ICE restart, track renegotiation, the congestion controller's estimate, a statistics digest; runs on real sockets or, in virtual time, on `parolnet-simnet` | M1 |
 | `parolnet-store` | Encrypted native persistence: SQLite with SQLCipher (bundled), database key in the OS keychain (`keyring`) or an owner-only key file on machines without one; identity, contacts, sessions, messages, sender queue, settings; schema migrations, incremental transactional writes, import of the earlier plaintext data directory, wipe | M1 |
-| `parolnet-app` | Headless client core: identity, PWA-compatible pairing, signaling-only relay client, a direct data channel per contact bound to the E2EE session (DTLS fingerprints, PNP-001 §10.5.1), 1:1 encrypted chat paced by the PNP-006 bandwidth mode, sender-side queue, 1:1 voice / video calls | M1 |
+| `parolnet-app` | Headless client core: identity, PNP-003 pairing (code or QR, verification code, the same exchange as the web app), signaling-only relay client, a direct data channel per contact bound to the E2EE session (DTLS fingerprints, PNP-001 §10.5.1), 1:1 encrypted chat paced by the PNP-006 bandwidth mode, sender-side queue, 1:1 voice / video calls, file transfer that survives a lost connection and a restart (PNP-010) | M1 |
 | `apps/desktop` | GPUI desktop client: contacts, pairing, chat (UI v0), 1:1 calls with camera, echo cancellation and device menus; the M0 video spike behind `--spike` | M1 |
 | `parolnet-media` | Call media for native clients (no dependency on the rest of the workspace): frames, the capture traits and synthetic sources, resampling, Opus, echo cancellation / noise suppression / gain (AEC3, pure Rust), the audio duplex path; behind opt-in features, VP8 through libvpx, microphone and speakers (cpal), camera capture (nokhwa) | M1 |
+| `parolnet-transfer` | File transfer (PNP-010) without I/O, for native and wasm: the offer and its answers, sealed 64 KiB records (ChaCha20-Poly1305, STREAM nonces, a key per attempt), resume at the record the receiver names, the final SHA-256 check, limits. `parolnet-app` streams files from and to disk with it; the web app drives it through `parolnet-wasm` | M1 |
 | `parolnet-simnet` | Test-only: a deterministic in-memory network (loss, jitter, reordering, a rate cap) that runs `parolnet-rtc` in virtual time, and the M1 call checks on it (setup, renegotiation, ICE restart, the estimate; 2% loss, 300 kbit/s cap, 100 ms jitter) | M1 |
-| `parolnet-call`, `-transfer`, `-simnet` | Calls, PNP-010 transfer, network simulator | M1 |
+| `parolnet-call` | Calls | M1 |
 | `parolnet-mls`, `-sframe`, `-sfu` | MLS groups and devices, SFrame, the SFU | M2 |
 
 Media: Opus audio with echo cancellation (AEC3), VP8 video (VP9 / AV1 later), DTLS-SRTP end to end
@@ -134,10 +138,6 @@ first build takes a while (Rust twice: the relay and the wasm core); later build
 Rust and Denext layers when only the app changes. `scripts/image-smoke.sh http://127.0.0.1:1411`
 checks a running container (CI's `image` job runs it). See [server/README.md](server/README.md).
 
-`pwa/` is the legacy vanilla-JS client. It is no longer built into or served by the image and
-stays in the repository for now (the desktop interop suite still has a `pwa` target); `npm run
-build:all` builds it for that suite.
-
 ### Web app rewrite (`web/`)
 
 The PWA is rewritten as a [Denext](https://denext.dev) app with a new design
@@ -151,9 +151,9 @@ with a passphrase ([docs/web-port/at-rest.md](docs/web-port/at-rest.md), which a
 that does not protect against); a device can be backed up to one encrypted file and restored
 from it ([docs/web-port/backup.md](docs/web-port/backup.md)). Nine languages, eight of them
 machine-translated and awaiting review. It passes the seven desktop ↔ browser interop cases in Chromium,
-Firefox and WebKit. It is the client the relay image serves at `/pwa/`, in place of the legacy
-`pwa/` (what [app.md](docs/web-port/app.md#owed-before-this-replaces-the-old-pwa) lists as owed
-still applies). See [web/README.md](web/README.md).
+Firefox and WebKit. It is the client the relay image serves at `/pwa/`; the legacy vanilla-JS client it replaced
+has been removed from the repository (what [app.md](docs/web-port/app.md#still-owed) lists as
+owed still applies). See [web/README.md](web/README.md).
 
 ```bash
 cd web

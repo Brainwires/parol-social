@@ -13,6 +13,14 @@ pub struct ContactRecord {
     /// The contact's Ed25519 identity key (hex) at pairing time.
     pub identity_key: Option<String>,
     pub added_ms: u64,
+    /// Both users confirmed the Short Authentication String when they paired (PNP-003 §5.5).
+    #[serde(default)]
+    pub sas_verified: bool,
+    /// A pairing with the contact is under way: 0 none, 1 the pairing added the contact,
+    /// 2 the contact existed before. A pairing does not survive a restart, so a contact
+    /// found with a mark at start is one that was never finished.
+    #[serde(default)]
+    pub pairing: u8,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
