@@ -1762,7 +1762,7 @@ pub fn generate_qr_payload(
         ratchet_secret: result.ratchet_secret,
     });
 
-    Ok(hex::encode(result.payload_bytes))
+    Ok(hex::encode(&result.payload_bytes))
 }
 
 /// Version byte of the [`export_pending_bootstrap`] blob.
@@ -2598,7 +2598,7 @@ mod tests {
     fn generate_qr_payload_for_test(identity_key_hex: &str) -> String {
         let ik = try_decode_32(identity_key_hex).unwrap();
         let other = parolnet_core::bootstrap::generate_qr_payload_with_ratchet(&ik, None).unwrap();
-        hex::encode(other.payload_bytes)
+        hex::encode(&other.payload_bytes)
     }
 
     #[test]
