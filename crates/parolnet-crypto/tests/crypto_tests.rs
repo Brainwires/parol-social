@@ -510,3 +510,61 @@ fn test_x3dh_different_bundles_different_secrets() {
         "different Bob bundles must produce different shared secrets"
     );
 }
+
+// ── Argon2id ───────────────────────────────────────────────────────
+
+// Reference values from an independent implementation (OpenSSL 3, through Node's
+// `crypto.argon2Sync("argon2id", ...)`), no secret and no associated data.
+#[test]
+fn test_argon2id_matches_an_independent_implementation() {
+    let key = kdf::argon2id(
+        b"correct horse battery staple",
+        b"0123456789abcdef",
+        1024,
+        2,
+        1,
+        32,
+    )
+    .unwrap();
+    assert_eq!(
+        hex::encode(&*key),
+        "94902f24ba7806d7269922ac2617c4ee3fe6cf48bae9bb7a927741a87afbd218"
+    );
+}
+
+// The web app's parameters (64 MiB, 3 passes, 1 lane), 64 bytes out.
+#[test]
+fn test_argon2id_at_the_web_apps_cost() {
+    let key = kdf::argon2id(b"pw", &[7u8; 16], 65536, 3, 1, 64).unwrap();
+    assert_eq!(
+        hex::encode(&*key),
+        "a5ba002de3c0d85ac7f72f8a89b1900751403061fb9989b1dc8213a81631e9bb\
+         ccf39ce096c3cf5c7284b5029778bcb18e5171b49292a46b368b87b53da2f56c"
+    );
+}
+
+#[test]
+fn test_argon2id_depends_on_passphrase_and_salt() {
+    let a = kdf::argon2id(b"one", b"0123456789abcdef", 64, 1, 1, 32).unwrap();
+    let b = kdf::argon2id(b"two", b"0123456789abcdef", 64, 1, 1, 32).unwrap();
+    let c = kdf::argon2id(b"one", b"fedcba9876543210", 64, 1, 1, 32).unwrap();
+    assert_ne!(*a, *b);
+    assert_ne!(*a, *c);
+}
+
+#[test]
+fn test_argon2id_refuses_costs_out_of_range() {
+    let salt = b"0123456789abcdef";
+    assert!(kdf::argon2id(b"pw", salt, kdf::ARGON2ID_MAX_MEMORY_KIB + 1, 1, 1, 32).is_err());
+    assert!(kdf::argon2id(b"pw", salt, 64, kdf::ARGON2ID_MAX_PASSES + 1, 1, 32).is_err());
+    assert!(kdf::argon2id(b"pw", salt, 64, 1, 1, 65).is_err());
+    assert!(kdf::argon2id(b"pw", salt, 64, 0, 1, 32).is_err());
+    assert!(
+        kdf::argon2id(b"pw", salt, 4, 1, 1, 32).is_err(),
+        "less than 8 KiB a lane"
+    );
+    assert!(
+        kdf::argon2id(b"pw", b"short", 64, 1, 1, 32).is_err(),
+        "a salt under 8 bytes"
+    );
+}

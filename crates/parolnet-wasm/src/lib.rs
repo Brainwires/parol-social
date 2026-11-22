@@ -2096,6 +2096,24 @@ pub fn panic_wipe() {
     state.call_manager.prune_finished();
 }
 
+/// Argon2id (RFC 9106, version 0x13): stretch a passphrase into `len` bytes of key. The web
+/// app's passphrase lock and backup files use it (`docs/web-port/backup.md`); the result is
+/// secret and is the caller's to wipe. Throws on parameters out of range
+/// (`parolnet_crypto::kdf::argon2id`).
+#[wasm_bindgen]
+pub fn argon2id(
+    passphrase: &[u8],
+    salt: &[u8],
+    memory_kib: u32,
+    passes: u32,
+    lanes: u32,
+    len: u32,
+) -> Result<Vec<u8>, JsError> {
+    parolnet_crypto::kdf::argon2id(passphrase, salt, memory_kib, passes, lanes, len as usize)
+        .map(|key| key.to_vec())
+        .map_err(|_| JsError::new("argon2id: parameters out of range"))
+}
+
 /// Get the ParolNet version.
 #[wasm_bindgen]
 pub fn version() -> String {

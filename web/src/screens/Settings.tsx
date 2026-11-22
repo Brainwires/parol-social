@@ -23,6 +23,7 @@ import { hrefOf } from "../router.ts";
 import { useStore } from "../state/context.ts";
 import type { RelayState } from "../state/model.ts";
 import { errorText } from "./errors.ts";
+import { BackupSetting, LockSetting, RestoreSetting } from "./Protection.tsx";
 
 function Group(
   { title, testId, children }: { title: string; testId: string; children: ReactNode },
@@ -88,6 +89,9 @@ function You() {
           {t("settings.you.showCode")}
         </a>
       </div>
+      <LockSetting />
+      <BackupSetting />
+      <RestoreSetting />
       <div className="settings__item">
         <h3 className="settings__item-title">{t("settings.wipe")}</h3>
         <p className="field__help">{t("settings.wipe.body")}</p>

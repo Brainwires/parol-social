@@ -89,12 +89,51 @@ changing, so "more often with `pause()`" is a hint and no more. Pages that never
 while other containers were being stopped answered and are not counted.)
 
 This is the app's "Turn camera off": the self view goes away, and comes back with "Turn camera on".
-In the call flow the page of the person who pressed the button froze there in 2 of 45 runs on a busy
-machine. Leaving the self view attached and hidden (`camera-toggle`) was tried in the app: the
-button no longer froze the page (0 of 43 runs), but the same person's page then froze once in those
-43 runs at the end of the call, in the detaching of the elements, which it had not done in 260 runs
-before. One freeze for another: the app was left as it was, and the flow names this freeze as the
-one it expects (`KNOWN_WEBKIT_FREEZE` in `real.flows.ts`).
+In the call flow the page of the person who pressed the button froze there in 2 of 45 runs, later in
+3 of 156, on a busy machine. Leaving the self view attached and hidden (`camera-toggle`) was tried
+in the app first: the button no longer froze the page (0 of 43 runs), but the same person's page
+then froze once in those 43 runs at the end of the call, in the detaching of the elements, which it
+had not done in 260 runs before. One freeze for another, so that was dropped.
+
+### What avoids it: let the stream go first, then switch the camera off
+
+Two more orders, each 20 pages of 30 rounds, three pages at a time, in the same session as a new
+baseline (container, arm64, `--cpus 4`, `hold=1`, no `pause()`, the machine busy with other work):
+
+| `order`                         | what it does                                                                                                                 | pages frozen |
+| ------------------------------- | ---------------------------------------------------------------------------------------------------------------------------- | ------------ |
+| `camera-off`                    | `enabled = false`, a task, `srcObject = null` (what the app did)                                                             | 15 of 20     |
+| `camera-off-detach-first`       | `srcObject = null`, then `enabled = false`; `enabled = true` before the stream is attached again (what the app does now)     | 0 of 20      |
+| `camera-off-detach-first&gap=1` | the same with a task between the two                                                                                         | 0 of 20      |
+| `camera-off-clone`              | the element plays a clone of the camera track; off: disable the camera, detach, a task later stop the clone; on: a new clone | 0 of 20      |
+| `camera-off-clone-keep`         | one clone for the whole page, only detached and attached                                                                     | 1 of 20      |
+
+So the element must not be holding the stream at the moment its track is disabled: detached before,
+nothing freezes; detached after, most pages do within 30 rounds. A clone also works when it is
+stopped the safe way after each use, at the price of a second capture and of its own
+stop-while-playing hazard; kept alive and merely detached and re-attached, it froze one page.
+
+The app takes the simple one. The store detaches the self view (`StoreEnv.keepPlaying` with only the
+remote stream) in the same turn in which it then tells the engine to switch the camera off, and
+allows the local stream again before it tells the engine to switch it on
+(`src/state/engine-store.ts`, `setCameraOff`). Measured with the app's call flow in the same
+container, `--cpus 4`, three at a time, the machine busy:
+
+| build                            | runs | froze at "Turn camera off" | other                                                                                                            |
+| -------------------------------- | ---- | -------------------------- | ---------------------------------------------------------------------------------------------------------------- |
+| before (detach after disabling)  | 60   | 1                          |                                                                                                                  |
+| after (detach first), two series | 120  | 0                          | 1 run failed before the button was pressed: one page's remote video showed no frame in 30 s; both pages answered |
+| after, the final code, no skip   | 120  | 0                          | 1 run failed the same way, before the button was pressed; both pages answered                                    |
+
+Together with the earlier series, "before" is 6 freezes in 261 runs; "after" is 0 in 240. The flow
+no longer treats a freeze at that step as an expected failure (`KNOWN_WEBKIT_FREEZE` is gone from
+`real.flows.ts`): a frozen page fails the test.
+
+The two runs that failed "after" are another matter, seen with the machine at a load of 12 to 19:
+one page's `<video>` for the other person's stream stayed at 0 by 0 for 30 seconds after the call
+connected, with both pages answering and both connections up. It happens before any camera button is
+pressed, and it is not a freeze. It was not seen in the 216 "before" runs of this session and the
+last one; whether that is chance (2 of 240 against 0 of 216) is not known.
 
 ## Running it
 

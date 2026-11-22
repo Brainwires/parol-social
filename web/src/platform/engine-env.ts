@@ -1,9 +1,24 @@
 // The page's side of the store (src/state/engine-store.ts): loads the wasm core, opens the
 // engine's storage, starts the engine, and lets tabs of the app talk to each other.
-import { attachLifecycle, browserPlatform, consoleLogger, wasmApi } from "../engine/browser.ts";
+import {
+  attachLifecycle,
+  browserPlatform,
+  browserVaultCrypto,
+  consoleLogger,
+  openBrowserVault,
+  wasmApi,
+} from "../engine/browser.ts";
 import { Engine } from "../engine/engine.ts";
-import type { Platform, WasmApi } from "../engine/platform.ts";
-import { type EnginePort, StartError, type StoreEnv } from "../state/engine-store.ts";
+import type { WasmApi } from "../engine/platform.ts";
+import { SealedStorage } from "../engine/sealed-storage.ts";
+import type { Vault } from "../engine/vault.ts";
+import {
+  type EnginePort,
+  StartError,
+  type StoreEnv,
+  type Unlocked,
+} from "../state/engine-store.ts";
+import { deviceVault } from "./device-vault.ts";
 import { callMedia } from "./devices.ts";
 import { keepOnly } from "./playback.ts";
 import { clearPrefs } from "./prefs.ts";
@@ -32,23 +47,48 @@ export function browserEnv(options: EnvOptions): StoreEnv {
       } catch {
         throw new StartError("core");
       }
-      let platform: Platform;
-      let hasIdentity: boolean;
+      // The database, sealed (a plaintext one of the earlier version is sealed here). With
+      // a passphrase set, nothing in it can be read until the person has typed it.
+      let vault: Vault;
       try {
-        platform = await browserPlatform({ wasm, media: callMedia, log: consoleLogger });
-        hasIdentity = (await platform.storage.get("identity", "self")) !== undefined;
+        vault = await openBrowserVault(wasm);
       } catch {
         throw new StartError("storage");
       }
+      const unlocked = async (): Promise<Unlocked> => {
+        const storage = new SealedStorage(vault);
+        try {
+          const platform = await browserPlatform({
+            wasm,
+            storage,
+            media: callMedia,
+            log: consoleLogger,
+          });
+          return {
+            hasIdentity: (await storage.get("identity", "self")) !== undefined,
+            device: deviceVault(vault, storage, browserVaultCrypto(wasm)),
+            start: (): Promise<EnginePort> =>
+              Engine.start(platform, {
+                relayUrl: relayUrl(),
+                // No name until the person gives one: the screens say "New contact" until
+                // then, and ask for a name (src/state/names.ts).
+                defaultContactName: "",
+              }),
+          };
+        } catch {
+          throw new StartError("storage");
+        }
+      };
+      if (!vault.locked) return await unlocked();
       return {
-        hasIdentity,
-        start: (): Promise<EnginePort> =>
-          Engine.start(platform, {
-            relayUrl: relayUrl(),
-            // No name until the person gives one: the screens say "New contact" until
-            // then, and ask for a name (src/state/names.ts).
-            defaultContactName: "",
-          }),
+        locked: {
+          retryAtMs: () => vault.retryAtMs(),
+          async unlock(passphrase) {
+            await vault.unlock(passphrase);
+            return await unlocked();
+          },
+          destroy: () => vault.destroy(),
+        },
       };
     },
 

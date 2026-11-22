@@ -16,6 +16,12 @@
     ?order=camera-end     camera off and on with the element attached (&hide=1: hidden meanwhile),
                           then the element is detached &after= ms later
     ?order=camera-toggle  as camera-off, but the element stays attached: only `enabled` changes
+    ?order=camera-off-detach-first  as camera-off, in the other order: the element is detached,
+                          then the camera is disabled (&gap=1: a task between the two)
+    ?order=camera-off-clone  the element plays a clone of the camera track; "off" disables the
+                          camera, detaches the element and, a task later, stops the clone; "on"
+                          makes a new clone (what the app does)
+    ?order=camera-off-clone-keep  as camera-off-clone, but one clone lives for the whole page
     &pause=0              detach with srcObject = null alone, without pause() first
     &rounds=N             calls to make (default 1)
     &hold=1               also hold a second microphone capture for the whole page, as the flows do
@@ -61,6 +67,51 @@ async function cameraOff(round, local) {
   if (pauseFirst) timed("self-a pause", () => self.pause());
   timed("self-a srcObject = null", () => (self.srcObject = null));
   for (const track of local.getVideoTracks()) track.enabled = true;
+  say(`round ${round}: done`);
+}
+
+// As `camera-off`, the other way round: the element lets the stream go first, and only then
+// is the camera switched off. It comes back on before the stream is attached again.
+async function cameraOffDetachFirst(round, local) {
+  const self = document.getElementById("self-a");
+  for (const track of local.getVideoTracks()) track.enabled = true;
+  self.srcObject = local;
+  self.play().catch(() => {});
+  await playing(self);
+  await new Promise((done) => setTimeout(done, 300));
+  say(`round ${round}: camera playing, detaching and then switching it off`);
+  timed("self-a srcObject = null", () => (self.srcObject = null));
+  if (q.get("gap") === "1") await task();
+  for (const track of local.getVideoTracks()) {
+    timed("enabled = false", () => (track.enabled = false));
+  }
+  await new Promise((done) => setTimeout(done, 100));
+  say(`round ${round}: done`);
+}
+
+// The element never plays the camera's own track, only a clone of it, so its stream never
+// carries a track that is switched off. "Off" disables the camera (what a call sends), takes
+// the clone's stream from the element and stops the clone a task later (the order that is
+// safe for a track that ends, above); "on" makes a new clone. With `keep`, one clone lives
+// for the whole page and is only detached and attached.
+let keptClone = null;
+async function cameraOffClone(round, local, keep) {
+  const self = document.getElementById("self-a");
+  const camera = local.getVideoTracks()[0];
+  camera.enabled = true;
+  const clone = keep ? (keptClone ??= camera.clone()) : camera.clone();
+  self.srcObject = new MediaStream([clone]);
+  self.play().catch(() => {});
+  await playing(self);
+  await new Promise((done) => setTimeout(done, 300));
+  say(`round ${round}: a clone of the camera playing, switching the camera off (keep=${keep})`);
+  timed("enabled = false", () => (camera.enabled = false));
+  timed("self-a srcObject = null", () => (self.srcObject = null));
+  if (!keep) {
+    await task();
+    timed("clone.stop()", () => clone.stop());
+  }
+  await new Promise((done) => setTimeout(done, 100));
   say(`round ${round}: done`);
 }
 
@@ -204,6 +255,9 @@ async function call(round) {
       "camera-off": cameraOff,
       "camera-toggle": cameraToggle,
       "camera-end": cameraEnd,
+      "camera-off-detach-first": cameraOffDetachFirst,
+      "camera-off-clone": (round, local) => cameraOffClone(round, local, false),
+      "camera-off-clone-keep": (round, local) => cameraOffClone(round, local, true),
     }[order];
     const camera = cameraRounds
       ? await navigator.mediaDevices.getUserMedia({ audio: true, video: true })

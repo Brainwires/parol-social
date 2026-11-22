@@ -10,7 +10,8 @@ export type PrefKey =
   | "devices"
   | "notify"
   | "persistAsked"
-  | "installDismissed";
+  | "installDismissed"
+  | "backupHintDismissed";
 
 export function readPref(key: PrefKey): string | null {
   try {
