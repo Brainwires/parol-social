@@ -74,7 +74,7 @@ jobs:
           "$perl" -v | sed -n 2p
           echo "OPENSSL_SRC_PERL=$perl" >> "$GITHUB_ENV"
 
-      - uses: actions/setup-node@v6
+      - uses: actions/setup-node@v7
         with:
           node-version: 22
       - name: Chromium for the sender (puppeteer)
