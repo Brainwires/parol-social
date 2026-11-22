@@ -43,7 +43,10 @@ serde_bytes = { workspace = true }
 serde_json = { workspace = true }
 ciborium = { workspace = true }
 hex = { workspace = true }
-tokio = { workspace = true }
+# test-util: the PNP-004 / PNP-005 tests run on a paused clock (padding rates, the 90 s
+# dead-circuit rule, forwarding jitter, the 30 s sync phase).
+tokio = { workspace = true, features = ["test-util"] }
+async-trait = { workspace = true }
 # The black-box harness (tests/common): a scripted peer on the relay and on a data channel.
 tokio-tungstenite = { workspace = true }
 futures-util = { workspace = true }
