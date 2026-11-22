@@ -2,10 +2,15 @@
 //! scripted peer.
 //!
 //! The scripted peer ([`RawPeer`]) speaks the same protocols as a client but does only what a
-//! test tells it to: it registers on the relay, scans the app's pairing code, offers a
-//! WebRTC connection through the relay and then sends, withholds or corrupts envelopes on the
-//! data channel. What the app does in response is observed from outside: its events and what
-//! arrives on the channel.
+//! test tells it to: it registers on the relay, scans the app's pairing code (or shows one
+//! for the app to scan), builds a WebRTC connection through the relay and then sends,
+//! withholds or corrupts envelopes on the data channel. What the app does in response is
+//! observed from outside: its events and what arrives on the channel.
+//!
+//! Pairing is PNP-003's exchange: [`RawPeer::send_bootstrap`] sends the BootstrapHandshake
+//! and [`RawPeer::receive`] first carries the pairing through to the PNP-002 session, the
+//! way a client does, before it hands envelopes to the test. A test that wants to play the
+//! pairing by hand uses [`RawPeer::next_envelope`] and [`RawPeer::apply`] instead.
 //!
 //! The relay binary is `PAROLNET_RELAY_BIN` when set, else `parolnet-relay` in this test's
 //! target directory (built with `cargo build -p parolnet-relay-server` on demand, as
@@ -22,7 +27,12 @@ use std::time::Duration;
 use ed25519_dalek::Signer as _;
 use futures_util::{SinkExt as _, StreamExt as _};
 use parolnet_app::{AppConfig, AppEvent, AppHandle, RelayState};
+use parolnet_core::bootstrap::NonceTracker;
+use parolnet_core::bootstrap::pairing::{
+    BootstrapKey, MSG_TYPE_HANDSHAKE, Pairing, PairingOutput, PairingState, Sas,
+};
 use parolnet_core::envelope::{DecryptedEnvelope, decrypt_from_envelope, encrypt_into_envelope};
+use parolnet_crypto::IdentityKeyPair;
 use parolnet_crypto::double_ratchet::DoubleRatchetSession;
 use parolnet_protocol::address::PeerId;
 use parolnet_rtc::rtc::peer_connection::sdp::RTCSessionDescription;
@@ -261,6 +271,11 @@ pub struct Identity {
 }
 
 impl Identity {
+    /// The same key as the crypto crate's identity type.
+    pub fn keypair(&self) -> IdentityKeyPair {
+        IdentityKeyPair::from_secret_bytes(&self.key.to_bytes())
+    }
+
     pub fn new() -> Identity {
         let key = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
         let public = key.verifying_key().to_bytes();
@@ -319,10 +334,23 @@ impl Drop for App {
 impl App {
     /// A fresh client on loopback, registered on `relay`.
     pub async fn start(relay: &Relay) -> App {
+        App::start_with(relay, |_| {}).await
+    }
+
+    /// Where the client keeps its files.
+    pub fn data_dir(&self) -> PathBuf {
+        self.dir.join("data")
+    }
+
+    /// [`App::start`] with the configuration adjusted by `configure`.
+    pub async fn start_with(relay: &Relay, configure: impl FnOnce(&mut AppConfig)) -> App {
         let dir = unique_dir("app");
         let mut cfg = AppConfig::new(dir.join("data"), relay.ws_url());
         cfg.stun_servers = Some(Vec::new());
         cfg.bind_ip = Some("127.0.0.1".parse().unwrap());
+        // No user to compare verification codes, unless a test plays one.
+        cfg.request_sas = false;
+        configure(&mut cfg);
         let (handle, events) = parolnet_app::start(cfg).await.expect("start app");
         let mut app = App {
             handle,
@@ -385,8 +413,20 @@ impl App {
 pub struct RawPeer {
     pub id: Identity,
     pub app_peer: PeerId,
-    /// The Double Ratchet session of the pairing (we are its initiator).
+    /// The Double Ratchet session with the app: the bootstrap session of PNP-001 §5.3.1
+    /// first, the PNP-002 session once the pairing is through.
     pub session: DoubleRatchetSession,
+    /// The app's identity key and the Bootstrap Secret of the pairing.
+    pub app_ik: [u8; 32],
+    pub bs: [u8; 32],
+    /// The pairing under way, if any.
+    pub pairing: Option<Pairing>,
+    pub nonces: NonceTracker,
+    /// The SAS the pairing asked us to show, and whether it ended SAS-verified.
+    pub sas: Option<Sas>,
+    pub sas_verified: Option<bool>,
+    /// Envelopes of the app read while the pairing was carried through.
+    backlog: std::collections::VecDeque<DecryptedEnvelope>,
     pub ws: Ws,
     pub rtc: Option<RtcHandle>,
     pub events: Receiver<RtcEvent>,
@@ -409,8 +449,7 @@ impl RawPeer {
     /// the app and wait for the data channel. Nothing is sent on the channel yet.
     pub async fn connect(relay: &Relay, code: &str) -> RawPeer {
         let id = Identity::new();
-        let qr = parolnet_core::bootstrap::parse_qr_payload(&hex::decode(code).unwrap())
-            .expect("pairing code");
+        let qr = parolnet_core::bootstrap::parse_qr_text(code).expect("pairing code");
         let app_ik: [u8; 32] = qr.ik.as_slice().try_into().unwrap();
         let seed: [u8; 32] = qr.seed.as_slice().try_into().unwrap();
         let rk: [u8; 32] = qr.rk.as_slice().try_into().unwrap();
@@ -428,6 +467,13 @@ impl RawPeer {
             id,
             app_peer,
             session,
+            app_ik,
+            bs,
+            pairing: None,
+            nonces: NonceTracker::default(),
+            sas: None,
+            sas_verified: None,
+            backlog: Default::default(),
             ws,
             rtc: Some(link.rtc),
             events: link.events,
@@ -494,11 +540,118 @@ impl RawPeer {
         self.send_bytes(&env);
     }
 
-    /// The bootstrap-completing envelope (PNP-001 §5.3.1): our identity key as source hint.
+    /// The bootstrap-completing envelope (PNP-001 §5.3.1): our identity key as source hint,
+    /// our BootstrapHandshake (PNP-003 §5.4) as its content. [`RawPeer::receive`] carries
+    /// the pairing on from here.
     pub fn send_bootstrap(&mut self) {
+        self.send_bootstrap_requesting_sas(false);
+    }
+
+    pub fn send_bootstrap_requesting_sas(&mut self, request_sas: bool) {
+        let mut bs = self.bs;
+        let (pairing, init) = Pairing::initiate(
+            &self.id.keypair(),
+            &mut bs,
+            self.app_ik,
+            request_sas,
+            now_secs() * 1000,
+        )
+        .unwrap();
+        self.pairing = Some(pairing);
+        self.send_bootstrap_payload(&init);
+    }
+
+    /// A bootstrap-completing envelope with `payload` as its content.
+    pub fn send_bootstrap_payload(&mut self, payload: &[u8]) {
         let hint = Some(PeerId(self.id.public));
-        let env = self.seal(0x03, &[], hint);
+        let env = self.seal(MSG_TYPE_HANDSHAKE, payload, hint);
         self.send_bytes(&env);
+    }
+
+    /// Do what a pairing step asks for: send its messages, switch to its session, send the
+    /// new session's first message.
+    pub fn apply(&mut self, outputs: Vec<PairingOutput>) {
+        for output in outputs {
+            match output {
+                PairingOutput::Send(payload) => self.send(MSG_TYPE_HANDSHAKE, &payload),
+                PairingOutput::ShowSas(sas) => self.sas = Some(sas),
+                PairingOutput::Session(session) => self.session = *session,
+                PairingOutput::Established { sas_verified } => {
+                    self.sas_verified = Some(sas_verified);
+                    if self.pairing.as_ref().is_some_and(|p| {
+                        p.role() == parolnet_core::bootstrap::pairing::Role::Initiator
+                    }) {
+                        self.send(0x03, &[]);
+                    }
+                    self.pairing = None;
+                }
+            }
+        }
+    }
+
+    /// Feed a handshake message of the app to our pairing.
+    pub fn on_handshake(&mut self, payload: &[u8]) {
+        let Some(pairing) = self.pairing.as_mut() else {
+            return;
+        };
+        let outputs = pairing
+            .on_message(payload, &mut self.nonces, now_secs() * 1000)
+            .expect("the app's handshake message is valid");
+        self.apply(outputs);
+    }
+
+    /// Whether our pairing still has protocol steps to take without a user (it is not
+    /// waiting for our SAS confirmation).
+    fn pairing_running(&self) -> bool {
+        self.pairing.as_ref().is_some_and(|p| {
+            p.state() != PairingState::SasPending || p.awaiting_peer_confirmation()
+        })
+    }
+
+    /// The next envelope the app sends within `window`, as wire bytes.
+    pub async fn next_raw(&mut self, window: Duration) -> Option<Vec<u8>> {
+        let deadline = tokio::time::Instant::now() + window;
+        while let Ok(Some(ev)) = tokio::time::timeout_at(deadline, self.events.recv()).await {
+            let RtcEvent::DataChannelMessage { payload, .. } = ev else {
+                continue;
+            };
+            let Ok(v) = serde_json::from_slice::<Value>(&payload) else {
+                continue;
+            };
+            if v["type"] != "chat" {
+                continue;
+            }
+            return Some(hex::decode(v["payload"].as_str().unwrap()).unwrap());
+        }
+        None
+    }
+
+    /// The next envelope the app sends within `window`, decrypted, whatever its type.
+    pub async fn next_envelope(&mut self, window: Duration) -> Option<DecryptedEnvelope> {
+        let bytes = self.next_raw(window).await?;
+        Some(
+            decrypt_from_envelope(&mut self.session, &bytes)
+                .expect("an envelope from the app decrypts under the session"),
+        )
+    }
+
+    /// Carry the pairing through: answer the app's handshake messages until the PNP-002
+    /// session is established (or the pairing waits for a user). Other envelopes read on
+    /// the way are kept for [`RawPeer::receive`].
+    pub async fn complete_pairing(&mut self) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        while self.pairing_running() {
+            let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+            let d = self
+                .next_envelope(left)
+                .await
+                .expect("the app carries the pairing on");
+            if d.msg_type == MSG_TYPE_HANDSHAKE {
+                self.on_handshake(&d.plaintext);
+            } else {
+                self.backlog.push_back(d);
+            }
+        }
     }
 
     /// The binding a conforming peer sends for this connection (PNP-001 §10.5.1).
@@ -510,7 +663,8 @@ impl RawPeer {
         .unwrap()
     }
 
-    /// Envelopes the app sends within `window`, decrypted (identity frames are skipped).
+    /// Envelopes the app sends within `window`, decrypted (identity frames are skipped, and
+    /// so are the handshake messages of a pairing under way, which are answered).
     /// Stops early once `until` holds for a received envelope.
     pub async fn receive(
         &mut self,
@@ -518,20 +672,23 @@ impl RawPeer {
         mut until: impl FnMut(&DecryptedEnvelope) -> bool,
     ) -> Vec<DecryptedEnvelope> {
         let deadline = tokio::time::Instant::now() + window;
+        self.complete_pairing().await;
         let mut out = Vec::new();
-        while let Ok(Some(ev)) = tokio::time::timeout_at(deadline, self.events.recv()).await {
-            let RtcEvent::DataChannelMessage { payload, .. } = ev else {
-                continue;
+        loop {
+            let d = match self.backlog.pop_front() {
+                Some(d) => d,
+                None => {
+                    let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+                    match self.next_envelope(left).await {
+                        Some(d) => d,
+                        None => break,
+                    }
+                }
             };
-            let Ok(v) = serde_json::from_slice::<Value>(&payload) else {
-                continue;
-            };
-            if v["type"] != "chat" {
+            if d.msg_type == MSG_TYPE_HANDSHAKE && self.pairing.is_some() {
+                self.on_handshake(&d.plaintext);
                 continue;
             }
-            let bytes = hex::decode(v["payload"].as_str().unwrap()).unwrap();
-            let d = decrypt_from_envelope(&mut self.session, &bytes)
-                .expect("an envelope from the app decrypts under the pairing session");
             let stop = until(&d);
             out.push(d);
             if stop {
@@ -539,6 +696,107 @@ impl RawPeer {
             }
         }
         out
+    }
+
+    /// The app scans a code of ours: register, show `app` the code, answer its offer and
+    /// read its bootstrap-completing envelope. Returns the peer (holding the bootstrap
+    /// session, no pairing yet), the seed of the code and the app's BootstrapHandshake.
+    pub async fn presented(relay: &Relay, app: &App) -> (RawPeer, [u8; 32], DecryptedEnvelope) {
+        use parolnet_protocol::ProtocolCodec as _;
+        let id = Identity::new();
+        let qr =
+            parolnet_core::bootstrap::generate_qr_payload_with_ratchet(&id.public, None).unwrap();
+        let mut ws = relay.ws().await;
+        let r = register(&mut ws, &id).await;
+        assert_eq!(r["type"], "registered", "{r}");
+        app.handle
+            .pair_with_code(&qr.text)
+            .await
+            .expect("the app takes our code");
+        let app_hex = app.handle.peer_id().to_owned();
+        let app_ik: [u8; 32] = hex::decode(app.handle.public_key())
+            .unwrap()
+            .try_into()
+            .unwrap();
+        let mut link = Link::answer(&mut ws, &app_hex).await;
+        // The app's first envelope: its identity key as source hint.
+        let bytes = loop {
+            let ev = next_rtc(&mut link.events, 20).await;
+            let RtcEvent::DataChannelMessage { payload, .. } = ev else {
+                continue;
+            };
+            let Ok(v) = serde_json::from_slice::<Value>(&payload) else {
+                continue;
+            };
+            if v["type"] == "chat" {
+                break hex::decode(v["payload"].as_str().unwrap()).unwrap();
+            }
+        };
+        let envelope = parolnet_protocol::codec::CborCodec.decode(&bytes).unwrap();
+        assert_eq!(
+            envelope.cleartext_header.source_hint,
+            Some(PeerId(app_ik)),
+            "PNP-001-MUST-063: the scanner's first envelope carries its identity key"
+        );
+        let bs = parolnet_core::bootstrap::derive_bootstrap_secret(&qr.seed, &id.public, &app_ik)
+            .unwrap();
+        let mut session = DoubleRatchetSession::initialize_responder(
+            bs,
+            x25519_dalek::StaticSecret::from(qr.ratchet_secret),
+        )
+        .unwrap();
+        let first = decrypt_from_envelope(&mut session, &bytes)
+            .expect("the app's bootstrap envelope decrypts under the code's session");
+        let peer = RawPeer {
+            id,
+            app_peer: PeerId::from_public_key(&app_ik),
+            session,
+            app_ik,
+            bs,
+            pairing: None,
+            nonces: NonceTracker::default(),
+            sas: None,
+            sas_verified: None,
+            backlog: Default::default(),
+            ws,
+            rtc: Some(link.rtc),
+            events: link.events,
+            channel: link.channel,
+            local_sdp: link.local_sdp,
+            remote_sdp: link.remote_sdp,
+            opened_at: link.opened_at,
+        };
+        (peer, qr.seed, first)
+    }
+
+    /// Answer the app's BootstrapHandshake `init` as the presenter of the code with `seed`.
+    pub fn respond(&mut self, seed: &[u8; 32], init: &[u8], request_sas: bool) {
+        let (pairing, outputs) = Pairing::respond(
+            &self.id.keypair(),
+            &BootstrapKey::Seed(seed),
+            init,
+            Some(&self.app_ik),
+            &mut self.nonces,
+            request_sas,
+            now_secs() * 1000,
+        )
+        .expect("the app's BootstrapHandshake verifies");
+        self.pairing = Some(pairing);
+        self.apply(outputs);
+    }
+
+    /// The presenter's last step: the next envelope of the app is the first message of the
+    /// PNP-002 session.
+    pub async fn expect_first_message(&mut self) -> DecryptedEnvelope {
+        let d = self
+            .next_envelope(Duration::from_secs(20))
+            .await
+            .expect("the app sends the session's first message");
+        if let Some(pairing) = self.pairing.as_mut() {
+            let outputs = pairing.on_first_message();
+            self.apply(outputs);
+        }
+        d
     }
 }
 

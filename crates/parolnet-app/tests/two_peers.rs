@@ -109,6 +109,8 @@ fn config(dir: &Path, relay: &Relay, name: &str) -> AppConfig {
     let mut cfg = AppConfig::new(dir.join(name), format!("ws://127.0.0.1:{}/ws", relay.port));
     cfg.stun_servers = Some(Vec::new());
     cfg.bind_ip = Some("127.0.0.1".parse().unwrap());
+    // No user here to compare verification codes.
+    cfg.request_sas = false;
     cfg
 }
 

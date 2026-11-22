@@ -3040,6 +3040,7 @@ dependencies = [
  "parolnet-protocol",
  "parolnet-rtc",
  "parolnet-store",
+ "qrcode",
  "rand 0.8.5",
  "reqwest",
  "rustls",
@@ -3110,6 +3111,7 @@ dependencies = [
 name = "parolnet-conformance"
 version = "0.1.0"
 dependencies = [
+ "base64 0.22.1",
  "ciborium",
  "curve25519-dalek",
  "ed25519-dalek",
@@ -3128,6 +3130,7 @@ dependencies = [
  "parolnet-rtc",
  "parolnet-transport",
  "proptest",
+ "qrcode",
  "rand 0.8.5",
  "rand_core 0.6.4",
  "serde",
@@ -3148,8 +3151,10 @@ name = "parolnet-core"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "base64 0.22.1",
  "ciborium",
  "codec2",
+ "ed25519-dalek",
  "hex",
  "hmac 0.13.0",
  "js-sys",
@@ -3640,6 +3645,12 @@ name = "pxfm"
 version = "0.1.30"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d55d956fa96f5ec02be2e13af0e20391a5aa83d6a074e3ad368959d0fab299ea"
+
+[[package]]
+name = "qrcode"
+version = "0.14.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d68782463e408eb1e668cf6152704bd856c78c5b6417adaee3203d8f4c1fc9ec"
 
 [[package]]
 name = "quick-error"

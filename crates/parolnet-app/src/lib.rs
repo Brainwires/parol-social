@@ -8,10 +8,15 @@
 //! - **Storage** ([`store`]): the identity, contacts, sessions, history and queue live in an
 //!   encrypted database in the data directory (`parolnet-store`: SQLite with SQLCipher); its
 //!   key is kept where [`AppConfig::key_storage`] says. [`delete_all_data`] removes both.
-//! - **Pairing**: the PWA's QR / code bootstrap (PNP-003 + PNP-001 §5.3.1). The presenter
-//!   shows [`AppHandle::create_pairing_code`]; the scanner calls
-//!   [`AppHandle::pair_with_code`], which establishes the Double Ratchet session and sends
-//!   the bootstrap envelope over the first data channel.
+//! - **Pairing**: the QR / code bootstrap (PNP-003 + PNP-001 §5.3.1). The presenter shows
+//!   [`AppHandle::create_pairing_code`] (the base45 text of a QR code); the scanner calls
+//!   [`AppHandle::pair_with_code`], which derives the Bootstrap Secret and sends its
+//!   BootstrapHandshake as the bootstrap envelope over the first data channel. Both prove
+//!   knowledge of the secret, exchange pre-key bundles, compare a Short Authentication String
+//!   when either asked for it ([`AppConfig::request_sas`], [`AppEvent::SasVerification`],
+//!   [`AppHandle::confirm_sas`]) and run the PNP-002 handshake, whose session replaces the
+//!   bootstrap one ([`AppEvent::PairingComplete`]). A pairing that fails removes the contact
+//!   it added ([`AppEvent::PairingFailed`], [`AppEvent::ContactRemoved`]).
 //! - **Signaling**: the relay's signaling-only profile (register by challenge, `watch` /
 //!   `presence`, non-trickle `rtc_offer` / `rtc_answer`, `rtc_ice` for late candidates).
 //! - **Transport**: one direct WebRTC connection per contact through `parolnet-rtc`, with
@@ -39,6 +44,7 @@
 pub mod call;
 mod engine;
 pub mod ice;
+pub mod qr;
 pub mod reconnect;
 mod signaling;
 pub mod store;
@@ -56,6 +62,9 @@ pub use call::{
     CallEnd, CallInfo, CallMedia, CallQuality, CallState, FrameSink, MediaEvent, VideoChange,
     Weakness, video_bitrate_for,
 };
+/// A pairing code in the form to show for copying as text (the QR code shows the code
+/// itself): [`AppHandle::pair_with_code`] takes both.
+pub use parolnet_core::bootstrap::qr_text_for_copying as pairing_code_text;
 pub use parolnet_rtc::{CandidateKind, ConnectionQuality, MediaKind};
 pub use reconnect::ReconnectConfig;
 pub use store::KeyStorage;
@@ -87,6 +96,8 @@ pub enum AppError {
     UnknownCall(String),
     #[error("the contact's app cannot change a call that is under way")]
     CannotRenegotiate,
+    #[error("no pairing with {0} is waiting for a SAS confirmation")]
+    NoPairing(String),
     #[error("the app core has stopped")]
     Stopped,
 }
@@ -109,13 +120,23 @@ pub struct AppConfig {
     /// `None`: every usable address of every interface, IPv4 and IPv6, and the core watches
     /// the interfaces and restarts ICE when they change.
     pub bind_ip: Option<IpAddr>,
-    /// How long a contact's code stays acceptable after it is shown (and offers from
-    /// strangers are accepted).
+    /// How long a pairing code is shown and accepted (and offers from strangers are
+    /// accepted): 10 minutes unless changed (PNP-003-SHOULD-001, -SHOULD-003). At most 30
+    /// minutes: a scanner refuses older codes (PNP-003-MUST-011).
     pub pairing_window: Duration,
     /// Optional name to give contacts by default (`None`: the first 8 hex digits).
     pub default_contact_name: Option<String>,
     /// How contacts the relay called offline are re-probed.
     pub reconnect: ReconnectConfig,
+    /// Ask for SAS verification in every pairing (PNP-003 §5.5): both peers then show a
+    /// 6-digit code (and five emoji) that the users compare, and the contact is established
+    /// only once both confirmed it. On unless turned off (PNP-003-SHOULD-004, -SHOULD-006):
+    /// a peer without a user to compare codes (a bot, a test) turns it off, and still
+    /// verifies the SAS when the contact's side asks for it.
+    pub request_sas: bool,
+    /// Relays to name in pairing codes, one per code in turn (PNP-003-SHOULD-008), as
+    /// `hostname:port`. Empty: codes carry no relay hint.
+    pub relay_hints: Vec<String>,
     /// Take part in ICE restarts and call renegotiation (PNP-011 sections 7 and 8): list the
     /// features, send and answer `reoffer`s and restart offers. Off, this peer behaves as
     /// one that knows neither (the PWA, the web app today): a network change waits for the
@@ -131,9 +152,11 @@ impl AppConfig {
             relay_url: relay_url.into(),
             stun_servers: None,
             bind_ip: None,
-            pairing_window: Duration::from_secs(30 * 60),
+            pairing_window: Duration::from_secs(10 * 60),
             default_contact_name: None,
             reconnect: ReconnectConfig::default(),
+            request_sas: true,
+            relay_hints: Vec::new(),
             renegotiation: true,
         }
     }
@@ -218,6 +241,37 @@ pub enum AppEvent {
     Relay(RelayState),
     ContactAdded(Contact),
     ContactUpdated(Contact),
+    /// The pairing code is no longer waiting for a contact (one bootstrapped with it, it
+    /// expired or it was cancelled): take it and its QR code off the display.
+    PairingCodeClosed,
+    /// A contact was removed: the pairing that added it failed (PNP-003 §4, NO_CONTACT).
+    ContactRemoved {
+        peer_id: String,
+    },
+    /// A pairing reached SAS_PENDING (PNP-003 §5.5): show the user this Short Authentication
+    /// String, as digits and as emoji, and ask them to compare it with what the contact's
+    /// device shows, by voice or in person. Then [`AppHandle::confirm_sas`] or
+    /// [`AppHandle::reject_sas`]. The pairing is dropped after 10 minutes without both
+    /// confirmations.
+    SasVerification {
+        peer_id: String,
+        /// The 6-digit SAS.
+        digits: String,
+        /// The same value as five emoji.
+        emoji: String,
+    },
+    /// The pairing is complete: the PNP-002 session is established and the bootstrap secret
+    /// is erased. `sas_verified`: both users confirmed the SAS.
+    PairingComplete {
+        peer_id: String,
+        sas_verified: bool,
+    },
+    /// The pairing was aborted (a proof or SAS that did not verify, a rejection, a timeout,
+    /// a lost connection): nothing of it is kept.
+    PairingFailed {
+        peer_id: String,
+        reason: String,
+    },
     Path {
         peer_id: String,
         state: PathState,
@@ -257,6 +311,13 @@ pub struct Snapshot {
     pub relay: RelayState,
     pub contacts: Vec<ContactView>,
     pub pairing_open: bool,
+    /// The pairing code to display, while one is waiting for a contact: `None` as soon as a
+    /// contact bootstrapped with it, it expired or it was cancelled (PNP-003-MUST-009,
+    /// -MUST-048).
+    pub pairing_code: Option<String>,
+    /// When that code stops being shown (Unix milliseconds), for the expiry indicator
+    /// (PNP-003-SHOULD-001).
+    pub pairing_expires_ms: Option<u64>,
     /// The user configured their own TURN server (its credential is never in a snapshot).
     pub turn_configured: bool,
     /// Connections use that TURN server only.
@@ -317,6 +378,9 @@ impl Drop for TurnSettings {
 pub(crate) enum Command {
     CreatePairingCode(oneshot::Sender<Result<String, AppError>>),
     PairWithCode(String, oneshot::Sender<Result<Contact, AppError>>),
+    CancelPairingCode,
+    ConfirmSas(String, oneshot::Sender<Result<(), AppError>>),
+    RejectSas(String),
     SendText(
         String,
         String,
@@ -373,17 +437,44 @@ impl AppHandle {
         rx.await.map_err(|_| AppError::Stopped)
     }
 
-    /// Show this to a contact (as a QR code or text). It stays valid for the pairing window;
-    /// a new call replaces the previous code.
+    /// Show this to a contact (as a QR code, error correction level M or higher, or as
+    /// text). It stays valid for the pairing window and for one pairing; a new call replaces
+    /// the previous code.
     pub async fn create_pairing_code(&self) -> Result<String, AppError> {
         self.ask(Command::CreatePairingCode).await?
     }
 
-    /// Pair with a contact's code (the PWA's QR payload, hex). Establishes the session,
-    /// queues the bootstrap envelope and starts connecting.
+    /// Pair with a contact's code (the text of their QR code: base45 of the PNP-003 QR
+    /// payload). Derives the Bootstrap Secret and starts connecting; the BootstrapHandshake
+    /// goes out when the data channel opens. The contact is listed at once, and removed
+    /// again if the pairing fails ([`AppEvent::PairingFailed`]).
     pub async fn pair_with_code(&self, code: &str) -> Result<Contact, AppError> {
         let code = code.to_owned();
         self.ask(|tx| Command::PairWithCode(code, tx)).await?
+    }
+
+    /// Stop waiting for a contact: the current pairing code is forgotten and must come off
+    /// the display.
+    pub fn cancel_pairing_code(&self) {
+        let _ = self
+            .tx
+            .send(engine::Input::Command(Command::CancelPairingCode));
+    }
+
+    /// The user compared the SAS of [`AppEvent::SasVerification`] and it matches: send our
+    /// confirmation (PNP-003-MUST-028). The pairing completes once the contact's
+    /// confirmation has arrived and verified.
+    pub async fn confirm_sas(&self, peer_id: &str) -> Result<(), AppError> {
+        let p = peer_id.to_owned();
+        self.ask(|tx| Command::ConfirmSas(p, tx)).await?
+    }
+
+    /// The SAS does not match (or the user will not compare it): abort the pairing and
+    /// erase its state.
+    pub fn reject_sas(&self, peer_id: &str) {
+        let _ = self.tx.send(engine::Input::Command(Command::RejectSas(
+            peer_id.to_owned(),
+        )));
     }
 
     /// Send a text message: at once over an open data channel, else queued on this device.

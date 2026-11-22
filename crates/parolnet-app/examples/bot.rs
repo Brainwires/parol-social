@@ -180,6 +180,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Headless (CI, containers): there is no keychain service, so the store's key is a file
     // in the data directory.
     cfg.key_storage = KeyStorage::File;
+    // No user to compare verification codes; a contact who asks for the SAS still gets it
+    // (the `sas` event) and can be answered with `sas-confirm` / `sas-reject`.
+    cfg.request_sas = false;
     if host_only {
         cfg.stun_servers = Some(Vec::new());
     }
@@ -219,6 +222,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                     AppEvent::Message(_) | AppEvent::MessageState { .. } => {}
                     AppEvent::Notice(n) => out(json!({"event": "notice", "text": n})),
+                    AppEvent::PairingCodeClosed => out(json!({"event": "code_closed"})),
+                    AppEvent::ContactRemoved { peer_id } => {
+                        out(json!({"event": "contact_removed", "peer_id": peer_id}))
+                    }
+                    AppEvent::SasVerification { peer_id, digits, emoji } => out(json!({
+                        "event": "sas", "peer_id": peer_id, "digits": digits, "emoji": emoji
+                    })),
+                    AppEvent::PairingComplete { peer_id, sas_verified } => out(json!({
+                        "event": "paired", "peer_id": peer_id, "sas_verified": sas_verified
+                    })),
+                    AppEvent::PairingFailed { peer_id, reason } => out(json!({
+                        "event": "pairing_failed", "peer_id": peer_id, "reason": reason
+                    })),
                     AppEvent::Call(c) => {
                         let state = match &c.state {
                             CallState::Ended(why) => format!("Ended({why:?})"),
@@ -261,6 +277,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         Ok(c) => out(json!({"event": "paired", "peer_id": c.peer_id})),
                         Err(e) => out(json!({"event": "error", "text": e.to_string()})),
                     },
+                    Some("sas-confirm") => {
+                        if let Err(e) = app.confirm_sas(words.next().unwrap_or("")).await {
+                            out(json!({"event": "error", "text": e.to_string()}));
+                        }
+                    }
+                    Some("sas-reject") => app.reject_sas(words.next().unwrap_or("")),
                     Some("send") => {
                         let rest = line.strip_prefix("send").unwrap_or("").trim_start();
                         let (peer, text) = rest.split_once(' ').unwrap_or((rest, ""));

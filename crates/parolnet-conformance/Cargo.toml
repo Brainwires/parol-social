@@ -54,3 +54,7 @@ ed25519-dalek = { workspace = true }
 sha1 = { workspace = true }
 voprf = { workspace = true }
 curve25519-dalek = { workspace = true }
+# PNP-003: the mDNS TXT record of a discovery announcement is base64; reference QR codes at
+# each error correction level.
+base64 = { workspace = true }
+qrcode = { version = "0.14", default-features = false }
