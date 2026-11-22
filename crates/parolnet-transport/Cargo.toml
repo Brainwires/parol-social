@@ -19,6 +19,14 @@ thiserror.workspace = true
 tracing.workspace = true
 async-trait.workspace = true
 futures-util.workspace = true
+serde.workspace = true
+ciborium.workspace = true
+# HTTP/2 framing of the TLS transport (PNP-006 §5.3).
+h2 = "0.4"
+http = "1"
+bytes = "1"
+# TCP keepalive (PNP-006-MUST-027).
+socket2 = { version = "0.6", features = ["all"] }
 
 [dev-dependencies]
 tokio-test.workspace = true
