@@ -22,3 +22,5 @@ tracing.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["full", "test-util"] }
+# The record stream of PNP-010, for the transfer that crosses an ICE restart.
+parolnet-transfer.workspace = true

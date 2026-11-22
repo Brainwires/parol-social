@@ -14,6 +14,8 @@ export function deviceVault(
   vault: Vault,
   storage: SealedStorage,
   crypto: VaultCrypto,
+  /** Removes every received file kept on this device (they are not part of a backup). */
+  clearFiles: () => Promise<void> = () => Promise.resolve(),
 ): DeviceVault {
   return {
     hasPassphrase: () => vault.hasPassphrase,
@@ -39,6 +41,9 @@ export function deviceVault(
       // Read and checked in full before anything on this device is touched.
       const contents = await decodeBackup(crypto, passphrase, file);
       await storage.replaceAll(restoredRows(contents, crypto.now()));
+      // The transfers' rows went with everything else, and with them the keys of the files
+      // received on this device: what is left of those files is unreadable. Remove it.
+      await clearFiles().catch(() => {});
     },
 
     async lastBackupMs() {

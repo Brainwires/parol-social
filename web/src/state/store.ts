@@ -3,6 +3,7 @@
 // (./fake.ts). Everything readable is a signal; everything else is an intent. Intents that
 // touch the engine are asynchronous and reject with an `EngineError` (its `code` says why).
 import type { ReadonlySignal } from "denext/signals";
+import type { FileSource } from "../engine/platform.ts";
 import type {
   CallInfo,
   ChatMessage,
@@ -12,6 +13,7 @@ import type {
   PairingCode,
   PathState,
   RelayState,
+  TransferInfo,
 } from "./model.ts";
 import { shownName } from "./names.ts";
 
@@ -77,6 +79,13 @@ export interface AppStore {
   readonly contacts: ReadonlySignal<readonly ContactView[]>;
   /** Messages by contact, oldest first. */
   readonly messages: ReadonlySignal<ReadonlyMap<string, readonly ChatMessage[]>>;
+  /** File transfers by contact, oldest first (by `createdMs`), finished ones included. */
+  readonly transfers: ReadonlySignal<ReadonlyMap<string, readonly TransferInfo[]>>;
+  /**
+   * Received files survive a reload of this page (kept in the browser's file storage). False
+   * where they are kept only in memory, until the page is closed or reloaded.
+   */
+  readonly filesPersist: ReadonlySignal<boolean>;
   /** The current call; an ended one stays for a moment so the screen can say how it ended. */
   readonly call: ReadonlySignal<CallInfo | null>;
   readonly callMedia: ReadonlySignal<CallMediaStreams>;
@@ -126,6 +135,20 @@ export interface AppStore {
   connect(peerId: string): void;
   markRead(peerId: string): void;
 
+  /**
+   * Offer a file to a contact. It is read once for its hash first (a large file takes a
+   * moment), then sent only directly between the two devices, whenever a direct path exists.
+   */
+  offerFile(peerId: string, file: FileSource): Promise<TransferInfo>;
+  acceptTransfer(id: string): Promise<void>;
+  declineTransfer(id: string): Promise<void>;
+  /** Stop a transfer for good, as sender or receiver. */
+  cancelTransfer(id: string): Promise<void>;
+  /** Hand a received, complete file to the person (a save dialog, or a download). */
+  saveTransfer(id: string): Promise<void>;
+  /** Take a finished transfer out of the conversation; a received file is deleted. */
+  removeTransfer(id: string): Promise<void>;
+
   /** A fresh code to show; the previous one stops working. */
   createPairingCode(): Promise<PairingCode>;
   /** The code being shown stops working (the person left the screen that shows it). */
@@ -174,6 +197,10 @@ export interface FakeControls {
 
 export function messagesOf(store: AppStore, peerId: string): readonly ChatMessage[] {
   return store.messages.value.get(peerId) ?? [];
+}
+
+export function transfersOf(store: AppStore, peerId: string): readonly TransferInfo[] {
+  return store.transfers.value.get(peerId) ?? [];
 }
 
 export function contactOf(store: AppStore, peerId: string): ContactView | undefined {

@@ -96,15 +96,29 @@ export async function controlled(page: Page): Promise<void> {
   });
 }
 
-/** The build version the controlling worker serves. */
-export function workerVersion(page: Page): Promise<string> {
-  return page.evaluate(() =>
-    new Promise<string>((resolve) => {
+/**
+ * The build version the controlling worker serves. Waits for a controller first: between
+ * `controlled` and this call the page can be one that has none for a moment (the worker that
+ * claimed it is replaced, or the document is a newer one than the one `controlled` saw).
+ */
+export async function workerVersion(page: Page): Promise<string> {
+  await controlled(page);
+  return await page.evaluate(async () => {
+    await navigator.serviceWorker.ready;
+    const controller = navigator.serviceWorker.controller ??
+      await new Promise<ServiceWorker>((resolve) =>
+        navigator.serviceWorker.addEventListener(
+          "controllerchange",
+          () => resolve(navigator.serviceWorker.controller!),
+          { once: true },
+        )
+      );
+    return await new Promise<string>((resolve) => {
       const channel = new MessageChannel();
       channel.port1.onmessage = (event) => resolve(event.data.version);
-      navigator.serviceWorker.controller!.postMessage({ type: "GET_VERSION" }, [channel.port2]);
-    })
-  );
+      controller.postMessage({ type: "GET_VERSION" }, [channel.port2]);
+    });
+  });
 }
 
 function freePort(): Promise<number> {

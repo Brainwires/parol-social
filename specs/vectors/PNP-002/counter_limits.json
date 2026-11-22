@@ -1,0 +1,11 @@
+{
+  "clauses": ["PNP-002-MUST-045", "PNP-002-MUST-046", "PNP-002-MUST-047"],
+  "description": "Double Ratchet counter limits (PNP-002 §5.9): a chain carries MAX_CHAIN_LENGTH = 2^24 messages. Message numbers run from 0 to 2^24 - 1; a previous chain length, and each of the stored counters Ns, Nr and PN, is at most 2^24.",
+  "max_chain_length": 16777216,
+  "accepted_message_numbers": [0, 1, 16777215],
+  "rejected_message_numbers": [16777216, 16777217, 4294967294, 4294967295],
+  "accepted_previous_chain_lengths": [0, 16777215, 16777216],
+  "rejected_previous_chain_lengths": [16777217, 4294967295],
+  "accepted_stored_counters": [0, 16777216],
+  "rejected_stored_counters": [16777217, 4294967295]
+}

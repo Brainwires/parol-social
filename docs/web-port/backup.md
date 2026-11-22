@@ -81,11 +81,23 @@ The rows are the engine's own ([engine.md](engine.md), "Storage schema").
 ratchet sessions; the person's own relay (TURN) server, password included; optionally the
 history and the queue.
 
-**What is not:** the pairing code on screen and its pending secret; settings that belong to the
+**What is not:** file transfers and received files (see below); the pairing code on screen
+and its pending secret; settings that belong to the
 device (the date of the last backup); the preferences kept outside the database (theme,
 language, chosen devices, a custom address of the app's server); the storage keys and any
 passphrase lock (a restored device is sealed under its own keys, and locked only if that
 device has a passphrase).
+
+**Files are not backed up.** A backup holds no file a contact sent, no part of one still
+arriving, and no transfer's row (a transfer's rows are `settings` rows that are not on the
+list of settings a backup takes). A backup is one file built in memory and capped at 256 MiB;
+received files can be many times that, and they can be saved out of the app one by one, which
+is what the app offers for keeping them. Consequently **a restore removes the received files
+on the device it is done on**: it replaces every row, the transfers' rows and the files' keys
+with them, and then deletes what the origin private file system held, which nothing could
+open any more. A transfer that was under way is gone on the restored device; the other side
+sees it wait and can cancel it, and the file can be offered again. "Save" what should be kept
+before restoring.
 
 After decryption the contents are checked (version, a 32-byte identity secret, well-formed
 contacts, history rows that belong to listed contacts). Contents that fail are `Invalid`, and
@@ -123,8 +135,9 @@ and no backup has been made, the conversation list suggests one in a line with "
 The file is decrypted and checked in full before anything on the device is touched; a wrong
 passphrase or a bad file changes nothing. Then **every row the engine keeps is replaced in one
 transaction** (identity, sessions, contacts, contact state, messages, queue, settings), the
-storage refuses any further write from an engine still running on the old state, and the page
-reloads into the restored identity. The storage keys and a passphrase lock on the device stay
+storage refuses any further write from an engine still running on the old state, the received
+files kept on the device are deleted (their keys were in the rows that were replaced), and
+the page reloads into the restored identity. The storage keys and a passphrase lock on the device stay
 as they were.
 
 ### One identity, one device

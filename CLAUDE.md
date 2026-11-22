@@ -46,7 +46,7 @@ These are non-negotiable and must be maintained in every change:
 - Licences: permissive only (MIT, Apache-2.0, BSD, ISC, Zlib, ...). No GPL / LGPL / AGPL, ever; MPL-2.0 only for the crates `deny.toml` names. `cargo-deny` enforces it in CI
 - The realtime engine is `rtc` from `Brainwires/webrtc-rs-rtc`, pinned by git **tag** in the root `Cargo.toml`, never a branch. ParolNet never carries engine patches: fixes land in the fork with a release tag first
 - GPUI is pinned exactly (`gpui-pre`, `gpui-component`) in `apps/desktop/Cargo.toml` with `Cargo.lock` committed; upgrades are their own change
-- `parolnet-crypto` and `parolnet-protocol` must remain WASM-compatible (no tokio dependency)
+- `parolnet-crypto`, `parolnet-protocol` and `parolnet-transfer` must remain WASM-compatible (no tokio dependency)
 - Prefer audited, well-maintained crates from established projects (dalek-cryptography, RustCrypto)
 
 ## Documentation Requirements
@@ -72,7 +72,9 @@ parolnet-transport (depends on crypto + protocol, native only)
   v
 parolnet-core (depends on all above)
 
-parolnet-wasm (depends on crypto + protocol, WASM target only)
+parolnet-wasm (depends on crypto + protocol + transfer, WASM target only)
+
+parolnet-transfer (PNP-010 file transfer, sans-I/O; no workspace deps, WASM-compatible: no tokio)
 
 parolnet-rtc (native only; drives the sans-I/O `rtc` engine; no workspace deps)
   |
@@ -81,7 +83,8 @@ parolnet-rtc (native only; drives the sans-I/O `rtc` engine; no workspace deps)
 parolnet-store (native only; encrypted persistence: SQLite + SQLCipher, key in the OS keychain; no workspace deps)
   |
   v
-parolnet-app (native; headless client core: crypto + protocol + core (no default features) + rtc + store)
+parolnet-app (native; headless client core: crypto + protocol + core (no default features) + rtc + store
+  + transfer)
 
 parolnet-media (native only; call media; no workspace deps. Default features are pure Rust
   (Opus, AEC3, conversion); `vpx` (system libvpx), `audio-io` (cpal) and `camera` (nokhwa) are
@@ -100,4 +103,4 @@ systems, a vendored OpenSSL libcrypto elsewhere). Security invariant 6 covers th
 
 ## Protocol Specifications
 
-The `specs/` directory contains formal RFC-style specifications (PNP-001 through PNP-009, and PNP-011 for 1:1 calls, which supersedes PNP-007's call and media sections; PNP-010 file transfer comes in M1 and supersedes the rest of PNP-007). These define the wire formats, state machines, and behavioral rules. Code implementations must match the specs. If the spec needs to change, update the spec document first, then update the code.
+The `specs/` directory contains formal RFC-style specifications (PNP-001 through PNP-011; PNP-010 is file transfer and supersedes PNP-007 §7; PNP-011 is 1:1 calls and supersedes PNP-007's call and media sections). These define the wire formats, state machines, and behavioral rules. Code implementations must match the specs. If the spec needs to change, update the spec document first, then update the code.
