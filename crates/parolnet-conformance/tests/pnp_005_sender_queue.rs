@@ -92,13 +92,21 @@ async fn messages_for_an_absent_contact_wait_and_arrive_over_the_next_channel() 
     })
     .await;
 
-    // The contact drops its connection (it stays registered on the relay).
+    // The contact drops its connection (it stays registered on the relay). The app shows
+    // `Connecting` as soon as the path is gone but keeps the verified connection through a
+    // grace period (or an ICE restart) in case the path comes back; only once it gives the
+    // connection up (`Unknown`, or `Offline` if the relay says so) is there no channel left
+    // to hand a message to.
     peer.disconnect().await;
-    app.wait(
-        "the lost path",
-        30,
-        |e| matches!(e, AppEvent::Path { state, .. } if *state != PathState::Direct),
-    )
+    app.wait("the connection given up", 30, |e| {
+        matches!(
+            e,
+            AppEvent::Path {
+                state: PathState::Unknown | PathState::Offline,
+                ..
+            }
+        )
+    })
     .await;
     for text in ["first", "second", "third"] {
         let m = app.handle.send_text(&peer_id, text).await.unwrap();

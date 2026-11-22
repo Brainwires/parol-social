@@ -1218,7 +1218,15 @@ async fn main() {
     // Install rustls crypto provider for reqwest TLS support
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 
-    tracing_subscriber::fmt::init();
+    // `info` unless RUST_LOG says otherwise. `fmt::init()` alone gave `info` when the binary
+    // was built by itself but `error` when a workspace build unified tracing-subscriber's
+    // `env-filter` feature in (parolnet-app enables it), so the default log differed by build.
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
+        .init();
 
     let port: u16 = std::env::var("RELAY_PORT")
         .ok()
