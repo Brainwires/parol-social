@@ -1774,6 +1774,8 @@ impl Engine {
                         if verified {
                             self.set_path(peer, PathState::Direct);
                             self.flush_call_signals(peer);
+                            // What a transfer owed the contact while there was no path.
+                            self.transfers_on_verified(peer);
                         }
                     }
                     RTCPeerConnectionState::Failed => self.conn_failed(peer, FailReason::IceFailed),

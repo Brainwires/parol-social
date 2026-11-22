@@ -7,6 +7,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use parolnet_core::envelope::encrypt_for_peer;
+use parolnet_rtc::rtc::peer_connection::state::RTCPeerConnectionState;
 use parolnet_transfer::{
     CancelReason, ChannelAdmission, Control, FileKey, MAX_CONCURRENT_PER_CONNECTION,
     MSG_TYPE_FILE_TRANSFER, Offer, OfferLimiter, Phase, Role, TRANSFER_MAX_AGE_MS, TransferId,
@@ -117,6 +118,20 @@ impl Engine {
             .and_then(|p| p.conn.as_ref())
             .filter(|c| c.is_verified())
             .map(|c| c.epoch)
+    }
+
+    /// Whether a control message can be handed to the contact's connection now: it is
+    /// verified and has a working path. While a connection looks for a new path (its ICE
+    /// restart is under way, PNP-011 section 8) a message would sit in its buffer and be lost
+    /// with it if no path is found, and nothing would send it again: so it waits in the
+    /// transfer's row until the connection is connected again or a new one verified.
+    fn control_path(&self, peer: &str) -> bool {
+        self.peers
+            .get(peer)
+            .and_then(|p| p.conn.as_ref())
+            .is_some_and(|c| {
+                c.is_verified() && c.last_state == Some(RTCPeerConnectionState::Connected)
+            })
     }
 
     // ── Commands ──────────────────────────────────────────────────
@@ -308,7 +323,7 @@ impl Engine {
         let Some(pid) = peer_id_of(peer) else {
             return false;
         };
-        if self.verified_epoch(peer).is_none() {
+        if !self.control_path(peer) {
             return false;
         }
         let Ok(mut body) = control.encode() else {
@@ -338,7 +353,7 @@ impl Engine {
     /// Send every control message this device still owes the contact (PNP-010-MUST-006:
     /// only on a verified connection; until then they wait here).
     pub(super) fn flush_transfer_controls(&mut self, peer: &str) {
-        if self.verified_epoch(peer).is_none() {
+        if !self.control_path(peer) {
             return;
         }
         let owed: Vec<(String, PendingControl)> = self
@@ -519,8 +534,8 @@ impl Engine {
 
     // ── Channels ──────────────────────────────────────────────────
 
-    /// The contact's connection verified: send what is owed and open channels for the
-    /// transfers we receive (PNP-010-MUST-024).
+    /// The contact's connection verified, or found its path again after an ICE restart:
+    /// send what is owed and open channels for the transfers we receive (PNP-010-MUST-024).
     pub(super) fn transfers_on_verified(&mut self, peer: &str) {
         self.flush_transfer_controls(peer);
         self.pump_transfers(peer);
