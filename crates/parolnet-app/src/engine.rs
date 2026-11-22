@@ -13,6 +13,7 @@ use parolnet_protocol::PeerId;
 use parolnet_protocol::ProtocolCodec as _;
 use parolnet_protocol::channel_binding::{BindingError, ChannelBinding};
 use parolnet_protocol::codec::CborCodec;
+use parolnet_protocol::shaping::{BandwidthMode, SendChoice, SendScheduler};
 use parolnet_rtc::rtc::peer_connection::sdp::{RTCSdpType, RTCSessionDescription};
 use parolnet_rtc::rtc::peer_connection::state::RTCPeerConnectionState;
 use parolnet_rtc::rtc::peer_connection::transport::RTCIceCandidateInit;
@@ -158,6 +159,11 @@ pub(crate) enum Timer {
     Retry {
         peer: String,
     },
+    /// The next send slot of a contact's data channel is due (PNP-006 §4.1).
+    Pace {
+        peer: String,
+        epoch: u64,
+    },
     // A soft-offline contact is due for a probe (see `reconnect`).
     Probe,
 }
@@ -173,6 +179,16 @@ impl Drop for PendingBootstrap {
         self.seed.zeroize();
         self.ratchet_secret.zeroize();
     }
+}
+
+/// What waits for a send slot on a data channel ahead of the content queue: the frames that
+/// set the channel up and call signals (PNP-006-MAY-002).
+enum Outgoing {
+    /// A frame that exists only for this connection (identity, our binding, a call signal).
+    Frame(String),
+    /// The bootstrap-completing envelope that leads the contact's stored queue. It stays in
+    /// the store until its slot, so a connection that ends first loses nothing.
+    Bootstrap,
 }
 
 struct Conn {
@@ -206,6 +222,15 @@ struct Conn {
     restarts_done: u32,
     /// The peer's restart offer was applied and the connection has not come back yet.
     peer_restarting: bool,
+    /// The channel's send schedule (PNP-006 §4.1 to §4.4): one frame per slot, slots a
+    /// padding interval plus jitter apart. Its own queue holds the [`Outgoing`] frames;
+    /// content waits in the stored queue. Cover traffic is off: a direct path carries none
+    /// (PNP-006-SHOULD-015).
+    pace: SendScheduler<Outgoing>,
+    /// When this channel last sent a frame.
+    last_send: Option<Instant>,
+    /// A `Timer::Pace` is under way.
+    pace_armed: bool,
 }
 
 /// An ICE restart of a data connection that we started.
@@ -382,6 +407,7 @@ pub(crate) async fn start(
     let (sig_tx, mut sig_rx) = mpsc::unbounded_channel();
     let sig = signaling::spawn(
         cfg.relay_url.clone(),
+        cfg.relay_trust_anchors.clone(),
         me.clone(),
         hex::encode(my_pk),
         signer,
@@ -507,7 +533,7 @@ impl Engine {
         while let Some(input) = rx.recv().await {
             match input {
                 Input::Command(Command::Shutdown(reply)) => {
-                    self.shutdown();
+                    self.shutdown().await;
                     let _ = reply.send(());
                     return;
                 }
@@ -527,10 +553,10 @@ impl Engine {
                 Input::CallRtc { call_id, event } => self.on_call_rtc(&call_id, event),
             }
         }
-        self.shutdown();
+        self.shutdown().await;
     }
 
-    fn shutdown(&mut self) {
+    async fn shutdown(&mut self) {
         let calls: Vec<String> = self.calls.keys().cloned().collect();
         for id in calls {
             self.hangup_call(&id);
@@ -544,7 +570,9 @@ impl Engine {
         if let Err(e) = self.store.flush() {
             tracing::error!(%e, "flushing the store failed");
         }
-        self.sig.stop();
+        // The relay socket is closed properly: close frame, then TLS close_notify
+        // (PNP-006-MUST-026).
+        self.sig.stop().await;
     }
 
     // ── Small helpers ─────────────────────────────────────────────
@@ -711,6 +739,9 @@ impl Engine {
             Command::SetTurnSettings(settings, reply) => {
                 let _ = reply.send(self.set_turn(settings));
             }
+            Command::SetBandwidthMode(mode, reply) => {
+                let _ = reply.send(self.set_bandwidth_mode(mode));
+            }
             Command::Shutdown(_) => unreachable!("handled in run"),
         }
     }
@@ -741,7 +772,24 @@ impl Engine {
             pairing_open: self.pairing_open(),
             turn_configured: self.state.turn.is_some(),
             relay_only: self.state.turn.as_ref().is_some_and(|t| t.relay_only),
+            bandwidth_mode: self.state.bandwidth_mode,
         }
+    }
+
+    /// The user chose a traffic-shaping mode (PNP-006-MUST-002): store it, move every
+    /// connection's schedule to it and say what it costs (PNP-006-MUST-042).
+    fn set_bandwidth_mode(&mut self, mode: BandwidthMode) -> String {
+        self.state.bandwidth_mode = mode;
+        for conn in self.peers.values_mut().filter_map(|p| p.conn.as_mut()) {
+            conn.pace.set_mode(mode);
+        }
+        self.save();
+        let warning = format!(
+            "{} Direct connections to your contacts carry no cover traffic.",
+            mode.bandwidth_warning()
+        );
+        self.emit(AppEvent::Notice(warning.clone()));
+        warning
     }
 
     /// The user's TURN server and the ICE policy for a new connection. Nothing here comes
@@ -948,7 +996,7 @@ impl Engine {
         .map_err(|e| AppError::Crypto(e.to_string()))?;
         let envelope = hex::encode(envelope);
         let id = self.state.alloc_message_id();
-        let mut msg = ChatMessage {
+        let msg = ChatMessage {
             id,
             peer_id: peer.to_owned(),
             direction: Direction::Sent,
@@ -956,21 +1004,22 @@ impl Engine {
             timestamp_ms: now_ms(),
             state: DeliveryState::Queued,
         };
-        if self.send_on_channel(peer, &envelope) {
-            msg.state = DeliveryState::Sent;
-        } else {
-            let dropped = self.state.enqueue(
-                QueuedEnvelope {
-                    peer_id: peer.to_owned(),
-                    envelope,
-                    created_ms: msg.timestamp_ms,
-                    message_id: Some(id),
-                },
-                now_ms(),
-            );
-            for (p, d) in dropped_owners(&self.state, dropped) {
-                self.mark_message(&p, d, DeliveryState::Dropped);
-            }
+        // Every message waits in the stored queue for its send slot (PNP-006-MUST-007 /
+        // MUST-008): on a verified channel that is the next slot, otherwise the first slot
+        // of the next channel.
+        let dropped = self.state.enqueue(
+            QueuedEnvelope {
+                peer_id: peer.to_owned(),
+                envelope,
+                created_ms: msg.timestamp_ms,
+                message_id: Some(id),
+            },
+            now_ms(),
+        );
+        for (p, d) in dropped_owners(&self.state, dropped) {
+            self.mark_message(&p, d, DeliveryState::Dropped);
+        }
+        if !self.has_verified_channel(peer) {
             self.connect(peer, false);
             // A soft-offline contact is now waited for: its next probe may be due sooner.
             self.arm_probe_wake();
@@ -978,6 +1027,7 @@ impl Engine {
         self.state.push_message(msg.clone());
         self.persist_sessions();
         self.emit(AppEvent::Message(msg.clone()));
+        self.pump(peer);
         Ok(msg)
     }
 
@@ -992,51 +1042,145 @@ impl Engine {
         }
     }
 
-    /// Send a content envelope on the contact's data channel once its binding has verified
-    /// (PNP-001-SHOULD-018). False when there is no verified channel.
-    fn send_on_channel(&mut self, peer: &str, envelope_hex: &str) -> bool {
-        if !self
-            .peers
+    /// The contact's data channel is open and its binding has verified.
+    fn has_verified_channel(&self, peer: &str) -> bool {
+        self.peers
             .get(peer)
             .and_then(|p| p.conn.as_ref())
             .is_some_and(Conn::is_verified)
-        {
+    }
+
+    /// Give a call signal to the contact's data channel once its binding has verified
+    /// (PNP-001-SHOULD-018). False when there is no verified channel. It goes out in the
+    /// channel's next send slot, ahead of queued content (PNP-006-MAY-002).
+    fn send_on_channel(&mut self, peer: &str, envelope_hex: &str) -> bool {
+        if !self.has_verified_channel(peer) {
             return false;
         }
         self.send_raw(peer, envelope_hex)
     }
 
-    /// Send an envelope on the open data channel, verified or not (the bootstrap envelope
-    /// and our own binding).
+    /// Give an envelope to the open data channel, verified or not (our own binding). It
+    /// goes out in the channel's next send slot.
     fn send_raw(&mut self, peer: &str, envelope_hex: &str) -> bool {
-        let Some(conn) = self.peers.get(peer).and_then(|p| p.conn.as_ref()) else {
-            return false;
-        };
-        let (Some(dc), Some(handle)) = (conn.dc, conn.handle.as_ref()) else {
-            return false;
-        };
-        handle.send_text(dc, DcFrame::chat(envelope_hex)).is_ok()
+        self.send_frame(peer, Outgoing::Frame(DcFrame::chat(envelope_hex)))
     }
 
-    /// Send the queued bootstrap-completing envelopes (no chat message; they lead the
+    /// Queue `out` for the open data channel's next free send slot. False when there is no
+    /// open channel.
+    fn send_frame(&mut self, peer: &str, out: Outgoing) -> bool {
+        let Some(conn) = self.peers.get_mut(peer).and_then(|p| p.conn.as_mut()) else {
+            return false;
+        };
+        if conn.dc.is_none() || conn.handle.is_none() {
+            return false;
+        }
+        conn.pace.push(out);
+        self.pump(peer);
+        true
+    }
+
+    /// Schedule the queued bootstrap-completing envelopes (no chat message; they lead the
     /// queue) before the binding: the presenter needs one to have a session at all.
     fn flush_bootstrap(&mut self, peer: &str) {
-        let entries = self.state.take_queue_for(peer);
-        let mut rest = Vec::new();
-        let mut sent = false;
-        for e in entries {
-            if rest.is_empty() && e.message_id.is_none() && self.send_raw(peer, &e.envelope) {
-                sent = true;
-                continue;
+        let leading = self
+            .state
+            .queue
+            .iter()
+            .filter(|e| e.peer_id == peer)
+            .take_while(|e| e.message_id.is_none())
+            .count();
+        for _ in 0..leading {
+            self.send_frame(peer, Outgoing::Bootstrap);
+        }
+    }
+
+    /// Arm the data channel's next send slot when something waits for one (PNP-006 §4.1,
+    /// §4.2, §4.4). The wait is what is left of the padding interval since the channel's
+    /// last send, plus a fresh jitter: no frame leaves without one.
+    fn pump(&mut self, peer: &str) {
+        let queued = self.state.queued_for(peer);
+        let Some(conn) = self.peers.get_mut(peer).and_then(|p| p.conn.as_mut()) else {
+            return;
+        };
+        if !conn.is_open() || conn.pace_armed {
+            return;
+        }
+        // Content waits for the peer's binding (PNP-001-SHOULD-018).
+        let content = if conn.verified { queued } else { 0 };
+        if conn.pace.is_empty() && content == 0 {
+            return;
+        }
+        let since = conn.last_send.map(|at| at.elapsed());
+        let delay = conn.pace.next_delay_with_backlog(since, content);
+        conn.pace_armed = true;
+        let epoch = conn.epoch;
+        self.after(
+            delay,
+            Timer::Pace {
+                peer: peer.to_owned(),
+                epoch,
+            },
+        );
+    }
+
+    /// A send slot: exactly one frame leaves (PNP-006-MUST-005). Channel set-up frames and
+    /// call signals first, in the order they were given; then the oldest queued content
+    /// (PNP-006-MUST-009).
+    fn on_pace(&mut self, peer: &str, epoch: u64) {
+        let Some(conn) = self.conn_mut(peer, epoch) else {
+            return;
+        };
+        conn.pace_armed = false;
+        let (Some(dc), Some(handle)) = (conn.dc, conn.handle.as_ref()) else {
+            return;
+        };
+        // Cover traffic is off here, so a slot with nothing of the channel's own to carry
+        // is free for content.
+        let bootstrap_only = match conn.pace.on_slot() {
+            Some(SendChoice::Real(Outgoing::Frame(frame))) => {
+                conn.last_send = Some(Instant::now());
+                if handle.send_text(dc, frame).is_ok() {
+                    self.pump(peer);
+                }
+                return;
             }
-            rest.push(e);
-        }
-        for e in rest.into_iter().rev() {
-            self.state.enqueue_front(e);
-        }
-        if sent {
+            Some(SendChoice::Real(Outgoing::Bootstrap)) => true,
+            _ if conn.verified => false,
+            _ => return,
+        };
+        if let Some(entry) = self.pop_queued(peer, bootstrap_only) {
+            let sent = self.conn_mut(peer, epoch).is_some_and(|conn| {
+                conn.last_send = Some(Instant::now());
+                conn.handle
+                    .as_ref()
+                    .is_some_and(|h| h.send_text(dc, DcFrame::chat(&entry.envelope)).is_ok())
+            });
+            if !sent {
+                // The channel is going away: the envelope waits for the next one.
+                self.state.enqueue_front(entry);
+                return;
+            }
+            if let Some(id) = entry.message_id {
+                self.mark_message(peer, id, DeliveryState::Sent);
+            }
             self.save();
         }
+        self.pump(peer);
+    }
+
+    /// Take the contact's oldest queued envelope out of the stored queue; with
+    /// `bootstrap_only`, only when it is a bootstrap-completing one.
+    fn pop_queued(&mut self, peer: &str, bootstrap_only: bool) -> Option<QueuedEnvelope> {
+        let mut entries = self.state.take_queue_for(peer);
+        let first = match entries.first() {
+            Some(e) if !bootstrap_only || e.message_id.is_none() => Some(entries.remove(0)),
+            _ => None,
+        };
+        for e in entries.into_iter().rev() {
+            self.state.enqueue_front(e);
+        }
+        first
     }
 
     /// PNP-001-MUST-079: our CHANNEL_BINDING, once the channel is open and we hold a session.
@@ -1133,25 +1277,9 @@ impl Engine {
         }
     }
 
+    /// The channel verified: queued content starts to drain, one envelope per send slot.
     fn flush_queue(&mut self, peer: &str) {
-        let entries = self.state.take_queue_for(peer);
-        if entries.is_empty() {
-            return;
-        }
-        let mut rest = Vec::new();
-        for e in entries {
-            if !rest.is_empty() || !self.send_on_channel(peer, &e.envelope) {
-                rest.push(e);
-                continue;
-            }
-            if let Some(id) = e.message_id {
-                self.mark_message(peer, id, DeliveryState::Sent);
-            }
-        }
-        for e in rest.into_iter().rev() {
-            self.state.enqueue_front(e);
-        }
-        self.save();
+        self.pump(peer);
     }
 
     // ── Signaling ─────────────────────────────────────────────────
@@ -1509,6 +1637,8 @@ impl Engine {
     ) {
         self.next_epoch += 1;
         let epoch = self.next_epoch;
+        let mut pace = SendScheduler::new(self.state.bandwidth_mode);
+        pace.set_cover(false);
         let st = self.peer_mut(peer);
         st.conn = Some(Conn {
             epoch,
@@ -1529,6 +1659,9 @@ impl Engine {
             unsent: None,
             restarts_done: 0,
             peer_restarting: false,
+            pace,
+            last_send: None,
+            pace_armed: false,
         });
         st.fallback_armed = false;
         // A background probe of a contact believed offline shows nothing until it is answered.
@@ -1728,9 +1861,7 @@ impl Engine {
                     return;
                 }
                 conn.dc = Some(id);
-                if let Some(h) = conn.handle.as_ref() {
-                    let _ = h.send_text(id, DcFrame::identity(&me, renegotiation));
-                }
+                self.send_frame(peer, Outgoing::Frame(DcFrame::identity(&me, renegotiation)));
                 self.mark_online(peer);
                 tracing::info!(peer = %crate::short_id(peer), "data channel open; binding");
                 // PNP-001 §10.5.1: the bootstrap-completing envelope first (we scanned the
@@ -1849,11 +1980,23 @@ impl Engine {
     }
 
     fn drop_conn(&mut self, peer: &str) {
-        if let Some(conn) = self.peers.get_mut(peer).and_then(|p| p.conn.take())
-            && let Some(h) = conn.handle
-        {
-            tokio::spawn(h.close());
+        let Some(mut conn) = self.peers.get_mut(peer).and_then(|p| p.conn.take()) else {
+            return;
+        };
+        let Some(h) = conn.handle.take() else {
+            return;
+        };
+        // We are closing the channel: what still waits for a send slot (a call's hang-up,
+        // say) goes out now, since there is no later slot to give it. Queued content is
+        // not touched; it stays in the store for the next channel.
+        if let Some(dc) = conn.dc {
+            for out in conn.pace.drain() {
+                if let Outgoing::Frame(frame) = out {
+                    let _ = h.send_text(dc, frame);
+                }
+            }
         }
+        tokio::spawn(h.close());
     }
 
     fn conn_failed(&mut self, peer: &str, reason: FailReason) {
@@ -1946,6 +2089,7 @@ impl Engine {
 
     fn on_timer(&mut self, t: Timer) {
         match t {
+            Timer::Pace { peer, epoch } => self.on_pace(&peer, epoch),
             Timer::AnswerTimeout { peer, epoch } => {
                 if self.conn_mut(&peer, epoch).is_some_and(|c| !c.remote_set) {
                     tracing::info!(peer = %crate::short_id(&peer), "no answer");

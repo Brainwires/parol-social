@@ -40,6 +40,7 @@ pub mod call;
 mod engine;
 pub mod ice;
 pub mod reconnect;
+pub mod relay_socket;
 mod signaling;
 pub mod store;
 pub mod wire;
@@ -56,6 +57,7 @@ pub use call::{
     CallEnd, CallInfo, CallMedia, CallQuality, CallState, FrameSink, MediaEvent, VideoChange,
     Weakness, video_bitrate_for,
 };
+pub use parolnet_protocol::shaping::BandwidthMode;
 pub use parolnet_rtc::{CandidateKind, ConnectionQuality, MediaKind};
 pub use reconnect::ReconnectConfig;
 pub use store::KeyStorage;
@@ -102,6 +104,9 @@ pub struct AppConfig {
     pub key_storage: KeyStorage,
     /// The home relay's WebSocket URL, e.g. `wss://parol.social/ws`.
     pub relay_url: String,
+    /// Extra TLS trust anchors (DER certificates) for the relay's certificate, next to the
+    /// public roots: a self-hosted relay behind a private CA, and tests. Empty by default.
+    pub relay_trust_anchors: Vec<Vec<u8>>,
     /// STUN servers. `None` fetches them from the relay's `/turn-credentials`; `Some(vec![])`
     /// uses host candidates only (tests, one network).
     pub stun_servers: Option<Vec<String>>,
@@ -129,6 +134,7 @@ impl AppConfig {
             data_dir: data_dir.into(),
             key_storage: KeyStorage::File,
             relay_url: relay_url.into(),
+            relay_trust_anchors: Vec::new(),
             stun_servers: None,
             bind_ip: None,
             pairing_window: Duration::from_secs(30 * 60),
@@ -158,7 +164,7 @@ pub enum Direction {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DeliveryState {
-    /// Waiting on this device for the contact's data channel.
+    /// Waiting on this device for the contact's data channel or for its next send slot.
     Queued,
     /// Handed to the contact's data channel.
     Sent,
@@ -261,6 +267,8 @@ pub struct Snapshot {
     pub turn_configured: bool,
     /// Connections use that TURN server only.
     pub relay_only: bool,
+    /// The traffic-shaping mode in force (PNP-006 §3).
+    pub bandwidth_mode: BandwidthMode,
 }
 
 /// The user's own TURN server ("Relay through my own TURN server"). The only TURN server
@@ -335,6 +343,7 @@ pub(crate) enum Command {
     NetworkChanged,
     TurnSettings(oneshot::Sender<Option<TurnSettings>>),
     SetTurnSettings(Option<TurnSettings>, oneshot::Sender<Result<(), AppError>>),
+    SetBandwidthMode(BandwidthMode, oneshot::Sender<String>),
     Shutdown(oneshot::Sender<()>),
 }
 
@@ -386,7 +395,11 @@ impl AppHandle {
         self.ask(|tx| Command::PairWithCode(code, tx)).await?
     }
 
-    /// Send a text message: at once over an open data channel, else queued on this device.
+    /// Send a text message. It is returned as `Queued`: every message waits for a send slot
+    /// of the contact's data channel (PNP-006 §4.2; on an idle verified channel that is a
+    /// jitter of at most 100 ms in NORMAL mode, after other messages one padding interval
+    /// each) or, without a channel, on this device. `Sent` follows as
+    /// [`AppEvent::MessageState`].
     pub async fn send_text(&self, peer_id: &str, text: &str) -> Result<ChatMessage, AppError> {
         let (p, t) = (peer_id.to_owned(), text.to_owned());
         self.ask(|tx| Command::SendText(p, t, tx)).await?
@@ -488,6 +501,27 @@ impl AppHandle {
     /// Forget the TURN server: connections are direct again.
     pub async fn clear_turn_settings(&self) -> Result<(), AppError> {
         self.ask(|tx| Command::SetTurnSettings(None, tx)).await?
+    }
+
+    /// The traffic-shaping mode in force (PNP-006 §3): NORMAL unless the user chose another.
+    pub async fn bandwidth_mode(&self) -> Result<BandwidthMode, AppError> {
+        Ok(self.snapshot().await?.bandwidth_mode)
+    }
+
+    /// Choose the traffic-shaping mode (PNP-006-MUST-002). It is stored, and every open
+    /// connection follows it from its next send slot. Returns what the user must be told
+    /// about the mode's bandwidth use (PNP-006-MUST-042, the text of
+    /// [`BandwidthMode::bandwidth_warning`], which a settings screen can also show for
+    /// each mode before the choice); the same text is emitted as an [`AppEvent::Notice`].
+    /// `MediaCall` is not a user's choice and is refused.
+    pub async fn set_bandwidth_mode(&self, mode: BandwidthMode) -> Result<String, AppError> {
+        if !BandwidthMode::SELECTABLE.contains(&mode) {
+            return Err(AppError::Config(format!(
+                "{} is not a mode a user can choose",
+                mode.name()
+            )));
+        }
+        self.ask(|tx| Command::SetBandwidthMode(mode, tx)).await
     }
 
     /// Close every connection, save state and stop the core.

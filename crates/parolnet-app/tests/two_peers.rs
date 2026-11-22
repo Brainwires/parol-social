@@ -217,13 +217,14 @@ async fn pair_chat_and_queue_across_restart() {
         .send_text(alice.peer_id(), "hello from bob")
         .await
         .unwrap();
-    assert_eq!(sent.state, DeliveryState::Sent);
+    // A message waits for its send slot (PNP-006 §4.2): `Sent` follows as an event.
+    assert_eq!(sent.state, DeliveryState::Queued);
     received(&mut alice_rx, bob.peer_id(), "hello from bob").await;
     let reply = alice
         .send_text(bob.peer_id(), "hi bob, alice here")
         .await
         .unwrap();
-    assert_eq!(reply.state, DeliveryState::Sent);
+    assert_eq!(reply.state, DeliveryState::Queued);
     received(&mut bob_rx, alice.peer_id(), "hi bob, alice here").await;
     for i in 0..5 {
         bob.send_text(alice.peer_id(), &format!("burst {i}"))
@@ -565,7 +566,7 @@ async fn reconnects_by_itself_after_peer_offline_without_a_presence_push() {
     path(&mut alice_rx, "alice reconnected", 30, PathState::Direct).await;
     path(&mut bob2_rx, "bob answered", 30, PathState::Direct).await;
     let sent = alice.send_text(&bob_id, "found you").await.unwrap();
-    assert_eq!(sent.state, DeliveryState::Sent);
+    assert_eq!(sent.state, DeliveryState::Queued);
     received(&mut bob2_rx, alice.peer_id(), "found you").await;
 
     alice.shutdown().await;
@@ -730,7 +731,7 @@ async fn relay_only_through_the_users_own_turn_server() {
     while bob_rx.try_recv().is_ok() {}
     let idle = turn.relayed_datagrams();
     let sent = alice.send_text(bob.peer_id(), "direct now").await.unwrap();
-    assert_eq!(sent.state, DeliveryState::Sent);
+    assert_eq!(sent.state, DeliveryState::Queued);
     received(&mut bob_rx, alice.peer_id(), "direct now").await;
     assert_eq!(turn.relayed_datagrams(), idle, "nothing crosses the relay");
 
@@ -969,7 +970,7 @@ async fn a_network_change_restarts_ice_instead_of_rebuilding() {
         .send_text(bob.peer_id(), "after the restart")
         .await
         .unwrap();
-    assert_eq!(sent.state, DeliveryState::Sent);
+    assert_eq!(sent.state, DeliveryState::Queued);
     received(&mut bob_rx, alice.peer_id(), "after the restart").await;
     bob.send_text(alice.peer_id(), "and back").await.unwrap();
     received(&mut alice_rx, bob.peer_id(), "and back").await;
