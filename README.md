@@ -67,7 +67,7 @@ apps/desktop (GPUI)      web/ (TS + wasm)        later: iOS / Android shells (Un
 | --- | --- | --- |
 | `parolnet-crypto` | Ed25519 identity, X3DH, Double Ratchet, AEAD, KDF (pure Rust, wasm) | exists |
 | `parolnet-protocol` | Envelopes, CBOR, message padding (wasm) | exists |
-| `parolnet-transport`, `-relay`, `-mesh` | Relay connections, federation, directory, tokens; onion circuits and mesh (optional) | exists |
+| `parolnet-transport`, `-relay`, `-mesh` | Relay connections, federation, directory, tokens; onion circuits (PNP-004: relay node and service, circuit builder and pool, descriptor publishing) and the gossip mesh (PNP-005: validation and forwarding, store-and-forward, sync, scoring, mDNS and UDP discovery). Library code and the opt-in relay profile; the default clients do not use them | exists |
 | `parolnet-core` | Client library: bootstrap, sessions, groups, files | exists |
 | `parolnet-wasm` | Browser bindings for the PWA | exists |
 | `parolnet-relay-server` | Axum relay: signaling-only by default (register, SDP / ICE, presence, STUN URIs); opt-in relay profile with store-and-forward, federation, TURN credentials | exists |
