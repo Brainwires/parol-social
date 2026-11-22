@@ -3,6 +3,7 @@
   "specifiers": {
     "jsr:@denext/avif@0.2": "0.2.0",
     "jsr:@denext/denext@^4.21.0": "4.21.0",
+    "jsr:@denext/docs-corpus@4.21.0": "4.21.0",
     "jsr:@denext/lightningcss@^1.0.0-rc.72": "1.0.0-rc.72.1",
     "jsr:@denext/og@~0.1.2": "0.1.2",
     "jsr:@denext/photon@~0.3.6": "0.3.6",
@@ -38,6 +39,7 @@
       "integrity": "3bfb9321d2fbd27db6cc54062ca58050f89cb66ba2fe5232f9a2d3512179c196",
       "dependencies": [
         "jsr:@denext/avif",
+        "jsr:@denext/docs-corpus",
         "jsr:@denext/lightningcss",
         "jsr:@denext/og",
         "jsr:@denext/photon",
@@ -55,6 +57,9 @@
         "npm:sass",
         "npm:ws"
       ]
+    },
+    "@denext/docs-corpus@4.21.0": {
+      "integrity": "be59a39e8d33b95006620bafbaff41857cfbe7aacf61e0e4f3fa0289ed942a1c"
     },
     "@denext/lightningcss@1.0.0-rc.72.1": {
       "integrity": "3c719d7987f85f8c35e129cddbc715ad5ca159c209ea9f2e739dea9a33beafb8"

@@ -801,7 +801,11 @@ async fn a_pairing_leaves_no_log_or_record_of_the_bootstrap() {
     );
     // No file holds the code, its seed or a bootstrap event in the clear.
     for name in &after {
-        let bytes = std::fs::read(app.data_dir().join(name)).unwrap();
+        // SQLite's `-wal` and `-shm` files go when the store finishes closing, which can be
+        // a moment after `shutdown` returns: a file that is gone holds nothing.
+        let Ok(bytes) = std::fs::read(app.data_dir().join(name)) else {
+            continue;
+        };
         let contains = |needle: &[u8]| bytes.windows(needle.len()).any(|w| w == needle);
         assert!(!contains(code.as_bytes()), "{name} holds the pairing code");
         assert!(!contains(&seed), "{name} holds the seed");

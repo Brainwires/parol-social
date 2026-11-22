@@ -558,7 +558,7 @@ test("a code works only while its screen is open; someone who used it is asked f
 
   // Leaving "Add a contact" closes Ana's code; coming back makes a fresh one.
   const first = await ownCode(ana.page);
-  expect(first).toMatch(/^[0-9a-f]{200,}$/);
+  expect(first).toMatch(CODE_AS_TEXT);
   await expect(ana.page.getByTestId("pairing-help")).toHaveText(
     "Keep this screen open while they add you.",
   );
