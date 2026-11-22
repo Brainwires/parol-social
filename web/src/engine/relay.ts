@@ -15,6 +15,11 @@ const CHECK_EVERY_MS = 5_000;
 const CATCH_UP_GRACE_MS = 5_000;
 export const BACKOFF_MIN_MS = 1_000;
 export const BACKOFF_MAX_MS = 30_000;
+/**
+ * After a connection to the relay ended, the next one is not opened before this long has
+ * passed (PNP-006-MUST-024): no rapid connect / disconnect pattern on the wire.
+ */
+export const RECONNECT_WAIT_MS = 30_000;
 const BACKOFF_JITTER = 0.25;
 /** From `new WebSocket` to `registered` (the relay itself closes at 10 s unregistered). */
 const REGISTER_TIMEOUT_MS = 15_000;
@@ -93,6 +98,10 @@ export class RelayClient {
   private registeredFlag = false;
   private running = false;
   private backoffMs = BACKOFF_MIN_MS;
+  /** The current socket reached `open`: a connection existed. */
+  private opened = false;
+  /** No new connection before this time (PNP-006-MUST-024); 0 when nothing is owed. */
+  private earliestConnect = 0;
   private reconnectTimer: unknown = null;
   private registerTimer: unknown = null;
   private pingTimer: unknown = null;
@@ -136,16 +145,26 @@ export class RelayClient {
   }
 
   /**
-   * The network came back or the page became visible: reconnect now if we were waiting to,
-   * and check the socket if we have one.
+   * The network came back or the page became visible: reconnect if we were waiting to
+   * (without the backoff, but not before the wait after a disconnect is over), and check
+   * the socket if we have one.
    */
   nudge(): void {
     if (!this.running) return;
     if (this.socket === null) {
-      this.opts.clock.clearTimeout(this.reconnectTimer);
+      const { clock } = this.opts;
+      clock.clearTimeout(this.reconnectTimer);
       this.reconnectTimer = null;
       this.backoffMs = BACKOFF_MIN_MS;
-      this.connect();
+      const wait = this.earliestConnect - clock.now();
+      if (wait <= 0) {
+        this.connect();
+      } else {
+        this.reconnectTimer = clock.setTimeout(() => {
+          this.reconnectTimer = null;
+          this.connect();
+        }, wait);
+      }
     } else if (this.registeredFlag) {
       this.check();
     }
@@ -191,6 +210,7 @@ export class RelayClient {
       return;
     }
     this.socket = s;
+    this.opened = false;
     this.signedRegisters = 0;
     this.registerTimer = clock.setTimeout(() => {
       if (this.socket === s && !this.registeredFlag) {
@@ -199,6 +219,7 @@ export class RelayClient {
     }, REGISTER_TIMEOUT_MS);
     s.onopen = () => {
       if (this.socket !== s) return;
+      this.opened = true;
       this.lastInbound = clock.now();
       // Exactly two `register` frames per socket: this one, then the signed one.
       this.raw(s, { type: "register", peer_id: opts.peerId });
@@ -336,10 +357,18 @@ export class RelayClient {
     }
     this.socket = null;
     this.registeredFlag = false;
+    // A connection that existed is not replaced before RECONNECT_WAIT_MS has passed,
+    // whatever asks for it. An attempt that never opened left nothing to wait after.
+    const now = this.opts.clock.now();
+    if (this.opened) this.earliestConnect = now + RECONNECT_WAIT_MS;
+    this.opened = false;
     this.listener.onState({ kind: "Disconnected", reason });
     if (!this.running) return;
     const base = this.backoffMs;
-    const delay = base + base * BACKOFF_JITTER * this.opts.random.next();
+    const delay = Math.max(
+      base + base * BACKOFF_JITTER * this.opts.random.next(),
+      this.earliestConnect - now,
+    );
     // Reset only by `registered`, never by a mere TCP open.
     this.backoffMs = Math.min(base * 2, BACKOFF_MAX_MS);
     this.reconnectTimer = this.opts.clock.setTimeout(() => {

@@ -7,6 +7,7 @@ import {
   OFFER_WINDOW_MS,
   RATE_LIMIT_BASE_MS,
 } from "../../src/engine/engine.ts";
+import { RECONNECT_WAIT_MS } from "../../src/engine/relay.ts";
 import { EngineError } from "../../src/engine/types.ts";
 import { type Device, orderedPair, withWorld, type World } from "./harness/world.ts";
 
@@ -335,9 +336,9 @@ Deno.test(
         credential: "c",
       }],
     });
-    // Re-register to fetch again with that answer.
+    // Re-register to fetch again with that answer (the reconnect waits 30 s, PNP-006-MUST-024).
     w.relay.socketOf(a.id)!.drop();
-    await w.advance(2_000);
+    await w.advance(RECONNECT_WAIT_MS + 2_000);
     assertEquals(
       new Set(a.fetched),
       new Set(["http://relay.test/turn-credentials"]),
