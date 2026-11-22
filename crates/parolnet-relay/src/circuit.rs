@@ -112,6 +112,16 @@ impl EstablishedCircuit {
         Ok(result)
     }
 
+    /// Send one PADDING cell on the link to the guard (PNP-004 §3.9): the idle filler of the
+    /// PNP-006 constant-rate schedule.
+    pub async fn send_padding(&self) -> Result<(), RelayError> {
+        let cell = RelayCell::padding(self.circuit_id);
+        self.guard()?
+            .send(&cell.to_bytes())
+            .await
+            .map_err(RelayError::Transport)
+    }
+
     /// Get the circuit ID.
     pub fn id(&self) -> u32 {
         self.circuit_id

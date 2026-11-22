@@ -25,7 +25,9 @@ pub mod onion;
 pub mod padding;
 pub mod pool;
 pub mod presence;
+pub mod probe;
 pub mod relay_node;
+pub mod shaped;
 pub mod tokens;
 pub mod trust_roots;
 
