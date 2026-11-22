@@ -1062,28 +1062,58 @@ describe('relay directory verification', () => {
     const AUTH2 = '02'.repeat(32);
     const ATTACKER = '99'.repeat(32);
     const SIG = 'cc'.repeat(64);
-    const FUTURE = Math.floor(Date.now() / 1000) + 7 * 24 * 3600;
-    const PAST = Math.floor(Date.now() / 1000) - 3600;
     const NOW = Math.floor(Date.now() / 1000);
+    const WEEK = 7 * 24 * 3600;
 
-    // WASM stub: returns true only when the authority pubkey is in our
-    // baked-in set. The real WASM impl also checks the Ed25519 signature,
-    // but for the JS-side verification logic we only need to assert that
-    // the threshold-counting + expiry rules hold.
-    function wasmStub(allow = [AUTH1, AUTH2]) {
+    // WASM stub. `descriptor_endorsement_message` stands in for the
+    // deterministic CBOR of the descriptor (PNP-008-MUST-002): it returns a
+    // string that changes with every field, so a test can tell which
+    // descriptor a signature was checked against. `verify_authority_signature`
+    // accepts a signature only from an allowed authority and only over the
+    // message of the descriptor in `signedFor`.
+    function wasmStub({ allow = [AUTH1, AUTH2], signedFor = descriptor() } = {}) {
+        const message = (d) => Buffer.from(JSON.stringify(d)).toString('hex');
+        const fields = (d) => ({
+            peer_id: d.peer_id, identity_key: d.identity_key, x25519_key: d.x25519_key,
+            addr: d.addr, bandwidth_class: d.bandwidth_class, uptime_secs: d.uptime_secs,
+            timestamp: d.timestamp, signature: d.signature,
+            bandwidth_estimate: d.bandwidth_estimate, next_pubkey: d.next_pubkey ?? null,
+        });
         return {
-            verify_authority_signature(pubHex, _msgHex, _sigHex) {
-                return allow.includes(pubHex);
+            descriptor_endorsement_message: (d) => message(d),
+            verify_authority_signature(pubHex, msgHex, _sigHex) {
+                return allow.includes(pubHex) && msgHex === message(fields(signedFor));
             }
         };
     }
 
-    function desc(endorsements) {
+    function descriptor(overrides = {}) {
         return {
-            descriptor: { peer_id: PEER_ID_HEX },
+            peer_id: PEER_ID_HEX,
+            identity_key: 'bb'.repeat(32),
+            x25519_key: 'dd'.repeat(32),
+            addr: '198.51.100.7:443',
+            bandwidth_class: 1,
+            uptime_secs: 3600,
+            timestamp: NOW - 60,
+            signature: 'ee'.repeat(64),
+            bandwidth_estimate: 1000,
+            next_pubkey: null,
+            ...overrides,
+        };
+    }
+
+    function desc(endorsements, overrides = {}) {
+        return {
+            descriptor: descriptor(overrides),
             endorsements,
         };
     }
+
+    const BOTH = [
+        { authority_pubkey: AUTH1, signature: SIG },
+        { authority_pubkey: AUTH2, signature: SIG },
+    ];
 
     async function loadVerify() {
         return await import('../relay-client.js?t=' + Math.random());
@@ -1091,11 +1121,7 @@ describe('relay directory verification', () => {
 
     test('authority-signed entry with threshold met is accepted', async () => {
         const { verifyAuthorityEndorsements } = await loadVerify();
-        const d = desc([
-            { authority_pubkey: AUTH1, signature: SIG, endorsed_at: PAST, expires_at: FUTURE },
-            { authority_pubkey: AUTH2, signature: SIG, endorsed_at: PAST, expires_at: FUTURE },
-        ]);
-        assert.equal(verifyAuthorityEndorsements(d, wasmStub(), NOW), true);
+        assert.equal(verifyAuthorityEndorsements(desc(BOTH), wasmStub(), NOW), true);
     });
 
     test('unsigned entry (no endorsements) is rejected', async () => {
@@ -1107,26 +1133,65 @@ describe('relay directory verification', () => {
     test('entry signed only by non-authority pubkeys is rejected', async () => {
         const { verifyAuthorityEndorsements } = await loadVerify();
         const d = desc([
-            { authority_pubkey: ATTACKER, signature: SIG, endorsed_at: PAST, expires_at: FUTURE },
-            { authority_pubkey: ATTACKER, signature: SIG, endorsed_at: PAST, expires_at: FUTURE },
+            { authority_pubkey: ATTACKER, signature: SIG },
+            { authority_pubkey: ATTACKER, signature: SIG },
         ]);
         // wasmStub only whitelists AUTH1/AUTH2 — attacker sigs get false.
         assert.equal(verifyAuthorityEndorsements(d, wasmStub(), NOW), false);
     });
 
-    test('entry with expired endorsements is purged', async () => {
+    test('endorsements of another descriptor of the same relay do not count', async () => {
         const { verifyAuthorityEndorsements } = await loadVerify();
-        const d = desc([
-            { authority_pubkey: AUTH1, signature: SIG, endorsed_at: PAST - 10, expires_at: PAST },
-            { authority_pubkey: AUTH2, signature: SIG, endorsed_at: PAST - 10, expires_at: PAST },
-        ]);
-        assert.equal(verifyAuthorityEndorsements(d, wasmStub(), NOW), false);
+        // The authorities signed the descriptor at 198.51.100.7; the entry
+        // presents the same PeerId at another address, then with another key.
+        for (const overrides of [
+            { addr: '203.0.113.66:443' },
+            { x25519_key: '00'.repeat(32) },
+            { timestamp: NOW - 61 },
+            { signature: 'ef'.repeat(64) },
+        ]) {
+            assert.equal(
+                verifyAuthorityEndorsements(desc(BOTH, overrides), wasmStub(), NOW),
+                false,
+                JSON.stringify(overrides),
+            );
+        }
+    });
+
+    test('entry whose descriptor is older than seven days is purged', async () => {
+        const { verifyAuthorityEndorsements } = await loadVerify();
+        const old = { timestamp: NOW - WEEK };
+        const stub = wasmStub({ signedFor: descriptor(old) });
+        assert.equal(verifyAuthorityEndorsements(desc(BOTH, old), stub, NOW), false);
+        const fresh = { timestamp: NOW - WEEK + 60 };
+        const stub2 = wasmStub({ signedFor: descriptor(fresh) });
+        assert.equal(verifyAuthorityEndorsements(desc(BOTH, fresh), stub2, NOW), true);
+    });
+
+    test('entry with a malformed descriptor is rejected', async () => {
+        const { verifyAuthorityEndorsements } = await loadVerify();
+        for (const overrides of [
+            { peer_id: 'aa' },
+            { addr: undefined },
+            { timestamp: 'soon' },
+            { signature: undefined },
+            { next_pubkey: 'zz' },
+        ]) {
+            assert.equal(
+                verifyAuthorityEndorsements(desc(BOTH, overrides), wasmStub(), NOW),
+                false,
+                JSON.stringify(overrides),
+            );
+        }
+        // An older wasm core without the message function verifies nothing.
+        const noMessage = { verify_authority_signature: () => true };
+        assert.equal(verifyAuthorityEndorsements(desc(BOTH), noMessage, NOW), false);
     });
 
     test('single-authority endorsement below threshold is rejected', async () => {
         const { verifyAuthorityEndorsements } = await loadVerify();
         const d = desc([
-            { authority_pubkey: AUTH1, signature: SIG, endorsed_at: PAST, expires_at: FUTURE },
+            { authority_pubkey: AUTH1, signature: SIG },
         ]);
         // AUTHORITY_THRESHOLD is 2 in dev config; 1 valid sig fails.
         assert.equal(verifyAuthorityEndorsements(d, wasmStub(), NOW), false);
@@ -1135,8 +1200,8 @@ describe('relay directory verification', () => {
     test('duplicate signatures from same authority do not count twice', async () => {
         const { verifyAuthorityEndorsements } = await loadVerify();
         const d = desc([
-            { authority_pubkey: AUTH1, signature: SIG, endorsed_at: PAST, expires_at: FUTURE },
-            { authority_pubkey: AUTH1, signature: SIG, endorsed_at: PAST, expires_at: FUTURE },
+            { authority_pubkey: AUTH1, signature: SIG },
+            { authority_pubkey: AUTH1, signature: SIG },
         ]);
         // Same authority twice → distinctAuthorities set has size 1 < threshold 2.
         assert.equal(verifyAuthorityEndorsements(d, wasmStub(), NOW), false);

@@ -16,6 +16,7 @@
 pub mod address;
 pub mod channel_binding;
 pub mod codec;
+pub mod det_cbor;
 pub mod envelope;
 pub mod ephemeral;
 pub mod error;

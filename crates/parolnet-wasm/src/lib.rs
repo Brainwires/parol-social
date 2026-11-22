@@ -1975,6 +1975,59 @@ pub fn get_authority_threshold() -> usize {
     federation::AUTHORITY_THRESHOLD
 }
 
+/// The bytes an authority signs to endorse a relay descriptor
+/// (PNP-008-MUST-002), as hex: the deterministic CBOR encoding of the
+/// descriptor, the relay's own signature included.
+///
+/// `descriptor` is an object with the descriptor's fields: `peer_id`,
+/// `identity_key`, `x25519_key` and `signature` as hex strings, `addr` as
+/// `"ip:port"`, `next_pubkey` as a hex string or null, and the numeric
+/// fields as numbers. Pair the result with [`verify_authority_signature`].
+#[wasm_bindgen]
+pub fn descriptor_endorsement_message(descriptor: JsValue) -> Result<String, JsError> {
+    #[derive(serde::Deserialize)]
+    struct Fields {
+        peer_id: String,
+        identity_key: String,
+        x25519_key: String,
+        addr: String,
+        bandwidth_class: u8,
+        uptime_secs: u64,
+        timestamp: u64,
+        signature: String,
+        bandwidth_estimate: u64,
+        next_pubkey: Option<String>,
+    }
+    fn bytes<const N: usize>(name: &str, hex_str: &str) -> Result<[u8; N], JsError> {
+        hex::decode(hex_str)
+            .ok()
+            .and_then(|b| b.try_into().ok())
+            .ok_or_else(|| JsError::new(&format!("{name} must be {N} bytes of hex")))
+    }
+    let f: Fields = serde_wasm_bindgen::from_value(descriptor)
+        .map_err(|e| JsError::new(&format!("invalid descriptor: {e}")))?;
+    let descriptor = federation::RelayDescriptor {
+        peer_id: parolnet_protocol::address::PeerId(bytes("peer_id", &f.peer_id)?),
+        identity_key: bytes("identity_key", &f.identity_key)?,
+        x25519_key: bytes("x25519_key", &f.x25519_key)?,
+        addr: f
+            .addr
+            .parse()
+            .map_err(|_| JsError::new("addr must be ip:port"))?,
+        bandwidth_class: f.bandwidth_class,
+        uptime_secs: f.uptime_secs,
+        timestamp: f.timestamp,
+        signature: bytes("signature", &f.signature)?,
+        bandwidth_estimate: f.bandwidth_estimate,
+        next_pubkey: f
+            .next_pubkey
+            .as_deref()
+            .map(|k| bytes("next_pubkey", k))
+            .transpose()?,
+    };
+    Ok(hex::encode(descriptor.endorsement_signable_bytes()))
+}
+
 /// Verify a raw Ed25519 signature against an authority public key.
 ///
 /// Used by the PWA H12 multi-relay directory-verification path so the
