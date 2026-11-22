@@ -1,9 +1,9 @@
 // Identity, pairing (PNP-003) and the channel binding (PNP-001 §10.5.1), with real crypto.
 import { assert, assertEquals, assertRejects } from "@std/assert";
-import { parsePairingCode } from "../../src/engine/bytes.ts";
 import { BINDING_TIMEOUT_MS } from "../../src/engine/engine.ts";
 import { MemoryStorage } from "../../src/engine/storage.ts";
 import { EngineError } from "../../src/engine/types.ts";
+import { chatFrame } from "../../src/engine/wire.ts";
 import { withWorld } from "./harness/world.ts";
 
 Deno.test(
@@ -52,14 +52,18 @@ Deno.test(
   }),
 );
 
+/** Base45 (RFC 9285): what a QR code's alphanumeric mode holds. */
+const BASE45 = /^[0-9A-Z $%*+\-./:]{100,}$/;
+
 Deno.test(
-  "pairing: both sides get the contact, a verified channel and the right verification state",
+  "pairing: both compare the verification code, then both have the contact and a verified channel",
   withWorld(async (w) => {
     const a = await w.device("a");
     const b = await w.device("b");
-    const { code, expiresAtMs } = await a.engine.createPairingCode();
-    assert(/^[0-9a-f]{100,}$/.test(code));
-    assertEquals(parsePairingCode(code)?.identityKey, a.engine.publicKey);
+    const { code, text, expiresAtMs } = await a.engine.createPairingCode();
+    // PNP-003-MUST-007: the code is base45; as text it has no blanks.
+    assert(BASE45.test(code), code);
+    assertEquals(text, code.replaceAll(" ", "_"));
     // The window is the code's own lifetime: 1800 s from its (300 s floored) timestamp.
     const left = expiresAtMs - w.clock.now();
     assert(left > 1500_000 - 1 && left <= 1800_000, `window ${left}`);
@@ -68,28 +72,110 @@ Deno.test(
     const contact = await b.engine.pairWithCode(code, { via: "scan" });
     assertEquals(contact.peerId, a.id);
     assertEquals(contact.identityKey, a.engine.publicKey);
-    assertEquals(contact.verified, "in-person");
+    // Not a contact to talk to yet: it is being added.
+    assertEquals(contact.pairing, "new");
+    assertEquals(contact.verified, "no");
     await w.settle();
 
-    assertEquals(b.path(a), "Direct");
-    assertEquals(a.path(b), "Direct");
-    const seen = a.engine.snapshot().contacts[0].contact;
-    assertEquals(seen.peerId, b.id);
-    // The presenter learns the scanner's identity key from the bootstrap envelope...
-    assertEquals(seen.identityKey, b.engine.publicKey);
-    // ...but cannot know how its code was obtained.
-    assertEquals(seen.verified, "no");
-    // The code is used up: the window closed with it.
+    // The code is used up: the window closed with it (PNP-003-MUST-009, -MUST-040).
     assert(!a.engine.snapshot().pairingOpen);
     assertEquals(a.eventsOf("Pairing").at(-1)?.pairing, null);
+    // Both show the same verification code, as digits and as emoji (PNP-003-MUST-026, -027).
+    const [shownA, shownB] = [a.engine.snapshot().sas!, b.engine.snapshot().sas!];
+    assertEquals(shownA.peerId, b.id);
+    assertEquals(shownB.peerId, a.id);
+    assert(/^\d{6}$/.test(shownA.digits));
+    assertEquals([...shownA.emoji].length, 5);
+    assertEquals([shownA.digits, shownA.emoji], [shownB.digits, shownB.emoji]);
+    // The channel's binding verified meanwhile, but the path is not usable before the
+    // pairing completes, and nothing is a contact for good.
     for (const d of [a, b]) {
-      assert(
-        d.logs.some((l) => l.startsWith("[WebRTC] direct channel verified with ")),
-      );
+      assert(d.logs.some((l) => l.startsWith("[WebRTC] direct channel verified with ")));
     }
+    assertEquals([a.path(b), b.path(a)], ["Connecting", "Connecting"]);
+    assertEquals([a.contact(b)?.pairing, b.contact(a)?.pairing], ["new", "new"]);
+    assertEquals((await b.storage.get<{ pairing?: string }>("contacts", a.id))?.pairing, "new");
+
+    // One confirmation is not enough (PNP-003-MUST-029).
+    await a.engine.confirmSas(b.id);
+    await w.settle();
+    assertEquals(a.engine.snapshot().sas?.confirmed, true);
+    assertEquals(a.contact(b)?.pairing, "new");
+    assertEquals(a.eventsOf("PairingComplete"), []);
+    const twice = await assertRejects(() => a.engine.confirmSas(b.id), EngineError);
+    assertEquals(twice.code, "NoPairing");
+
+    await b.engine.confirmSas(a.id);
+    await w.settle();
+    for (const [d, other] of [[a, b], [b, a]] as const) {
+      assertEquals(d.eventsOf("PairingComplete"), [
+        { kind: "PairingComplete", peerId: other.id, sasVerified: true },
+      ]);
+      assertEquals(d.engine.snapshot().sas, null);
+      assertEquals(d.path(other), "Direct");
+      assertEquals(d.contact(other)?.pairing, undefined);
+      assertEquals(d.contact(other)?.sasVerified, true);
+      assertEquals(d.wasm.pairing_state(other.id), undefined);
+      assertEquals(d.eventsOf("PairingFailed"), []);
+    }
+    // The presenter learns the scanner's identity key from the bootstrap envelope...
+    assertEquals(a.contact(b)?.identityKey, b.engine.publicKey);
+    // ...but cannot know how its code was obtained; the scanner used its camera.
+    assertEquals(a.contact(b)?.verified, "no");
+    assertEquals(b.contact(a)?.verified, "in-person");
     // Exactly one peer connection each, and nothing queued.
     assertEquals(w.rtc.open.length, 2);
     assertEquals((await b.storage.getAll("outbox")).length, 0);
+    // The contact as stored: verified, and no longer marked as being added.
+    const stored = await b.storage.get<{ pairing?: string; sasVerified?: boolean }>(
+      "contacts",
+      a.id,
+    );
+    assertEquals([stored?.pairing, stored?.sasVerified], [undefined, true]);
+
+    // Content flows both ways under the new session, and survives a restart.
+    await a.engine.sendText(b.id, "hello");
+    await b.engine.sendText(a.id, "hi");
+    await w.settle();
+    assertEquals((await b.engine.messages(a.id)).map((m) => m.text), ["hello", "hi"]);
+    const again = await w.restart(b);
+    assertEquals(again.contact(a)?.sasVerified, true);
+    assertEquals(again.contact(a)?.verified, "in-person");
+    await w.advance(30_000);
+    await a.engine.sendText(again.id, "after the restart");
+    await w.advance(30_000);
+    assertEquals((await again.engine.messages(a.id)).at(-1)?.text, "after the restart");
+  }),
+);
+
+Deno.test(
+  "pairing: nothing but the pairing crosses the channel until it completes; texts wait",
+  withWorld(async (w) => {
+    const a = await w.device("a");
+    const b = await w.device("b", { media: true });
+    const { text } = await a.engine.createPairingCode();
+    await b.engine.pairWithCode(text, { via: "paste" });
+    await w.settle();
+    assert(a.engine.snapshot().sas && b.engine.snapshot().sas);
+
+    // Typed while the verification code is on screen.
+    assertEquals((await b.engine.sendText(a.id, "early")).state, "Queued");
+    assertEquals((await a.engine.sendText(b.id, "early too")).state, "Queued");
+    await w.settle();
+    assertEquals(await a.engine.messages(b.id).then((m) => m.map((x) => x.direction)), ["Sent"]);
+    const err = await assertRejects(() => b.engine.startCall(a.id, false), EngineError);
+    assertEquals(err.code, "NotConnected");
+
+    await w.confirmSas(a, b);
+    await w.settle();
+    assertEquals((await a.engine.messages(b.id)).map((m) => [m.text, m.state]), [
+      ["early too", "Sent"],
+      ["early", "Received"],
+    ]);
+    assertEquals((await b.engine.messages(a.id)).map((m) => [m.text, m.state]), [
+      ["early", "Sent"],
+      ["early too", "Received"],
+    ]);
   }),
 );
 
@@ -99,7 +185,8 @@ Deno.test(
     const a = await w.device("a");
     const b = await w.device("b");
     await w.pair(a, b, "paste");
-    assertEquals(b.engine.snapshot().contacts[0].contact.verified, "no");
+    assertEquals(b.contact(a)?.verified, "no");
+    assertEquals(b.contact(a)?.sasVerified, true);
     const number = b.engine.safetyNumber(a.id);
     assertEquals(number, a.engine.safetyNumber(b.id));
     assert(/^(\d{10} ){5}\d{10}$/.test(number!));
@@ -107,29 +194,264 @@ Deno.test(
     assertEquals(c.verified, "compared");
     assert(c.verifiedMs !== null);
     assertEquals((await b.engine.setVerification(a.id, "no")).verified, "no");
+    // The confirmed verification code is not what `setVerification` takes back.
+    assertEquals(b.contact(a)?.sasVerified, true);
   }),
 );
 
 Deno.test(
-  "pairing: rename is local and survives incoming traffic and a restart",
+  "pairing: without the verification code on either device the contact is made, unverified",
+  withWorld(async (w) => {
+    const quiet = { config: { requestSas: false } };
+    const a = await w.device("a", quiet);
+    const b = await w.device("b", quiet);
+    await w.pair(a, b, "paste");
+    for (const [d, other] of [[a, b], [b, a]] as const) {
+      assertEquals(d.eventsOf("Sas"), []);
+      assertEquals(d.eventsOf("PairingComplete"), [
+        { kind: "PairingComplete", peerId: other.id, sasVerified: false },
+      ]);
+      assertEquals(d.contact(other)?.sasVerified, undefined);
+      assertEquals(d.contact(other)?.pairing, undefined);
+    }
+    await a.engine.sendText(b.id, "hello");
+    await w.settle();
+    assertEquals((await b.engine.messages(a.id)).map((m) => m.text), ["hello"]);
+  }),
+);
+
+Deno.test(
+  "pairing: one device asking for the verification code is enough for both to show it",
+  withWorld(async (w) => {
+    for (const asks of ["presenter", "scanner"] as const) {
+      const a = await w.device(`a-${asks}`, { config: { requestSas: asks === "presenter" } });
+      const b = await w.device(`b-${asks}`, { config: { requestSas: asks === "scanner" } });
+      const { code } = await a.engine.createPairingCode();
+      await b.engine.pairWithCode(code, { via: "scan" });
+      await w.settle();
+      assertEquals(a.engine.snapshot().sas?.digits, b.engine.snapshot().sas?.digits, asks);
+      assert(a.engine.snapshot().sas !== null, asks);
+      await w.confirmSas(a, b);
+      await w.settle();
+      assertEquals([a.contact(b)?.sasVerified, b.contact(a)?.sasVerified], [true, true], asks);
+      assertEquals([a.path(b), b.path(a)], ["Direct", "Direct"], asks);
+    }
+  }),
+);
+
+Deno.test(
+  "pairing: codes that differ end it; neither device keeps the contact or a session",
+  withWorld(async (w) => {
+    const a = await w.device("a");
+    const b = await w.device("b");
+    const { code } = await a.engine.createPairingCode();
+    await b.engine.pairWithCode(code, { via: "scan" });
+    await w.settle();
+    await b.engine.sendText(a.id, "never sent");
+    assert(a.engine.snapshot().sas && b.engine.snapshot().sas);
+
+    await b.engine.rejectSas(a.id);
+    await w.settle();
+    // The one who said no, and the one whose connection went with it (PNP-003 §4).
+    assertEquals(b.eventsOf("PairingFailed"), [
+      { kind: "PairingFailed", peerId: a.id, reason: "SasRejected" },
+    ]);
+    assertEquals(a.eventsOf("PairingFailed"), [
+      { kind: "PairingFailed", peerId: b.id, reason: "ConnectionLost" },
+    ]);
+    for (const [d, other] of [[a, b], [b, a]] as const) {
+      assertEquals(d.engine.snapshot().contacts, []);
+      assertEquals(d.engine.snapshot().sas, null);
+      assertEquals(d.eventsOf("ContactRemoved"), [{ kind: "ContactRemoved", peerId: other.id }]);
+      assertEquals(d.eventsOf("PairingComplete"), []);
+      assertEquals(d.wasm.has_session(other.id), false);
+      assertEquals(d.wasm.pairing_state(other.id), undefined);
+      assertEquals(await d.storage.getAll("contacts"), []);
+      assertEquals(await d.storage.getAll("contactState"), []);
+      assertEquals(await d.storage.getAll("outbox"), []);
+      assertEquals(await d.storage.getAll("messages"), []);
+      const saved = await d.storage.get<{ json: string }>("sessions", "blob");
+      assertEquals(saved?.json ?? "", "");
+    }
+    assertEquals(w.rtc.open.length, 0);
+    // Nothing comes back by itself, and nothing reconnects.
+    await w.advance(120_000);
+    assertEquals(w.rtc.open.length, 0);
+    const gone = await assertRejects(() => a.engine.confirmSas(b.id), EngineError);
+    assertEquals(gone.code, "NoPairing");
+
+    // A new code works, and this time the codes are confirmed.
+    await w.pair(a, b, "scan");
+    assertEquals(b.contact(a)?.sasVerified, true);
+  }),
+);
+
+Deno.test(
+  "pairing: a verification code nobody answers times out on both devices",
+  withWorld(async (w) => {
+    const a = await w.device("a");
+    const b = await w.device("b");
+    const { code } = await a.engine.createPairingCode();
+    await b.engine.pairWithCode(code, { via: "scan" });
+    await w.settle();
+    assert(a.engine.snapshot().sas && b.engine.snapshot().sas);
+    await w.advance(9 * 60_000);
+    assert(a.engine.snapshot().sas && b.engine.snapshot().sas);
+    // PNP-003 §4: SAS_PENDING lasts 10 minutes.
+    await w.advance(90_000);
+    for (const d of [a, b]) {
+      assertEquals(d.engine.snapshot().contacts, []);
+      assertEquals(d.engine.snapshot().sas, null);
+      assertEquals(d.eventsOf("PairingFailed").length, 1);
+      assertEquals(await d.storage.getAll("contacts"), []);
+    }
+    assert(
+      [a, b].some((d) => d.eventsOf("PairingFailed")[0].reason === "Timeout"),
+      "one of them timed out first",
+    );
+  }),
+);
+
+Deno.test(
+  "pairing: a scanned code whose owner never answers is given up after five minutes",
+  withWorld(async (w) => {
+    const a = await w.device("a");
+    const b = await w.device("b");
+    const { code } = await a.engine.createPairingCode();
+    // b's offers never arrive.
+    w.relay.swallow.add("rtc_offer");
+    await b.engine.pairWithCode(code, { via: "paste" });
+    await w.settle();
+    assertEquals(b.contact(a)?.pairing, "new");
+    // PNP-003 §4: SECRET_SHARED lasts 5 minutes.
+    await w.advance(5 * 60_000 + 30_000);
+    assertEquals(b.eventsOf("PairingFailed"), [
+      { kind: "PairingFailed", peerId: a.id, reason: "Timeout" },
+    ]);
+    assertEquals(b.engine.snapshot().contacts, []);
+    assertEquals(b.wasm.has_session(a.id), false);
+    // It no longer offers to someone who is not a contact.
+    w.relay.swallow.clear();
+    const offers = w.relay.framesFrom(b.id, "rtc_offer").length;
+    await w.advance(10 * 60_000);
+    assertEquals(w.relay.framesFrom(b.id, "rtc_offer").length, offers);
+    assertEquals(a.engine.snapshot().contacts, []);
+  }),
+);
+
+Deno.test(
+  "pairing: stopping while the devices reach each other removes what was begun",
+  withWorld(async (w) => {
+    const a = await w.device("a");
+    const b = await w.device("b");
+    const { code } = await a.engine.createPairingCode();
+    w.relay.swallow.add("rtc_offer");
+    await b.engine.pairWithCode(code, { via: "paste" });
+    await w.settle();
+    await b.engine.stopPairing(a.id);
+    await w.settle();
+    assertEquals(b.eventsOf("PairingFailed"), [
+      { kind: "PairingFailed", peerId: a.id, reason: "Cancelled" },
+    ]);
+    assertEquals(b.engine.snapshot().contacts, []);
+    assertEquals(await b.storage.getAll("contacts"), []);
+    assertEquals(b.wasm.has_session(a.id), false);
+    // Stopping what is not under way does nothing.
+    await b.engine.stopPairing(a.id);
+    assertEquals(b.eventsOf("PairingFailed").length, 1);
+  }),
+);
+
+Deno.test(
+  "pairing: a restart in the middle removes the half-made contact and its session",
+  withWorld(async (w) => {
+    const a = await w.device("a");
+    const b = await w.device("b");
+    const { code } = await a.engine.createPairingCode();
+    await b.engine.pairWithCode(code, { via: "scan" });
+    await w.settle();
+    await b.engine.sendText(a.id, "typed while adding");
+    assert(a.engine.snapshot().sas && b.engine.snapshot().sas);
+    // On record while it is under way: the contact, marked, and the bootstrap session.
+    assertEquals((await b.storage.get<{ pairing?: string }>("contacts", a.id))?.pairing, "new");
+    const before = await b.storage.get<{ json: string }>("sessions", "blob");
+    assertEquals(Object.keys(JSON.parse(before!.json)), [a.id]);
+
+    // The scanner's page is reloaded; the presenter's a little later.
+    const b2 = await w.restart(b);
+    assertEquals(b2.engine.snapshot().contacts, []);
+    assertEquals(b2.engine.snapshot().sas, null);
+    assertEquals(b2.wasm.has_session(a.id), false);
+    assertEquals(await b2.storage.getAll("contacts"), []);
+    assertEquals(await b2.storage.getAll("contactState"), []);
+    assertEquals(await b2.storage.getAll("outbox"), []);
+    assertEquals(await b2.storage.getAll("messages"), []);
+    assertEquals((await b2.storage.get<{ json: string }>("sessions", "blob"))?.json, "");
+    assert(b2.logs.some((l) => l.includes("an unfinished pairing")));
+
+    // The presenter lost the connection its pairing was on: over there too (PNP-003 §4).
+    await w.settle();
+    assertEquals(a.eventsOf("PairingFailed"), [
+      { kind: "PairingFailed", peerId: b.id, reason: "ConnectionLost" },
+    ]);
+    assertEquals(a.engine.snapshot().contacts, []);
+    assertEquals(await a.storage.getAll("contacts"), []);
+
+    // The other way round: this time the presenter's page is reloaded.
+    const { code: next } = await a.engine.createPairingCode();
+    await b2.engine.pairWithCode(next, { via: "scan" });
+    await w.settle();
+    assert(a.engine.snapshot().sas && b2.engine.snapshot().sas);
+    assertEquals((await a.storage.get<{ pairing?: string }>("contacts", b.id))?.pairing, "new");
+    const a2 = await w.restart(a);
+    assertEquals(a2.engine.snapshot().contacts, []);
+    assertEquals(a2.engine.snapshot().sas, null);
+    assertEquals(a2.wasm.has_session(b.id), false);
+    assertEquals(await a2.storage.getAll("contacts"), []);
+    // The used code did not come back with the reload.
+    assertEquals(a2.engine.snapshot().pairing, null);
+    assertEquals(await a2.storage.get("identity", "pairing"), undefined);
+    await w.settle();
+    assertEquals(b2.engine.snapshot().contacts, []);
+    assertEquals(b2.eventsOf("PairingFailed").map((e) => e.reason), ["ConnectionLost"]);
+
+    // Starting over works.
+    await w.pair(a2, b2, "scan");
+    assertEquals(b2.contact(a2)?.sasVerified, true);
+  }),
+);
+
+Deno.test(
+  "pairing: a restart while adding an existing contact again keeps the contact, without a session",
   withWorld(async (w) => {
     const a = await w.device("a");
     const b = await w.device("b");
     await w.pair(a, b, "scan");
-    await b.engine.renameContact(a.id, "  Alice  ");
-    await a.engine.sendText(b.id, "hello");
+    await b.engine.renameContact(a.id, "Alice");
+    await a.engine.sendText(b.id, "before");
     await w.settle();
-    const view = b.engine.snapshot().contacts[0];
-    assertEquals(view.contact.name, "Alice");
-    assertEquals(view.contact.identityKey, a.engine.publicKey);
-    assertEquals(view.contact.verified, "in-person");
-    assertEquals(view.unread, 1);
-    const again = await w.restart(b);
-    assertEquals(again.engine.snapshot().contacts[0].contact.name, "Alice");
-    assertEquals(
-      again.engine.snapshot().contacts[0].contact.verified,
-      "in-person",
-    );
+
+    // b adds a again with a new code, and the page goes away before the codes are compared.
+    const { code } = await a.engine.createPairingCode();
+    const again = await b.engine.pairWithCode(code, { via: "paste" });
+    assertEquals(again.pairing, "again");
+    await w.settle();
+    assert(b.engine.snapshot().sas, "the verification code is asked for again");
+    assertEquals((await b.engine.sendText(a.id, "typed while adding")).state, "Queued");
+    const b2 = await w.restart(b);
+
+    const kept = b2.contact(a)!;
+    assertEquals([kept.name, kept.pairing, kept.sasVerified], ["Alice", undefined, true]);
+    assertEquals(kept.verified, "in-person");
+    assertEquals(b2.wasm.has_session(a.id), false);
+    // The history stays; what was waiting for the lost session is dropped, not left queued.
+    assertEquals((await b2.engine.messages(a.id)).map((m) => [m.text, m.state]), [
+      ["before", "Received"],
+      ["typed while adding", "Dropped"],
+    ]);
+    assertEquals(await b2.storage.getAll("outbox"), []);
+    const err = await assertRejects(() => b2.engine.sendText(a.id, "x"), EngineError);
+    assertEquals(err.code, "NoSession");
   }),
 );
 
@@ -138,20 +460,28 @@ Deno.test(
   withWorld(async (w) => {
     const a = await w.device("a");
     const b = await w.device("b");
-    const { code } = await a.engine.createPairingCode();
+    const { code, text } = await a.engine.createPairingCode();
     const err = async (c: string, d = b) =>
       (await assertRejects(
         () => d.engine.pairWithCode(c, { via: "paste" }),
         EngineError,
       )).code;
     assertEquals(await err(code, a), "OwnCode");
+    assertEquals(await err(text, a), "OwnCode");
     assertEquals(await err("hello"), "InvalidCode");
+    assertEquals(await err(""), "InvalidCode");
     assertEquals(await err(a.id), "InvalidCode"); // a bare PeerId is not a code
     assertEquals(await err("ab".repeat(80)), "InvalidCode");
-    // Quotes and whitespace around a pasted code are tolerated.
+    assertEquals(await err(text.slice(0, text.length - 20)), "InvalidCode");
+    // PNP-003-MUST-011: 30 minutes after its timestamp a code is refused. Quotes and
+    // whitespace around a pasted code are tolerated.
     await w.advance(1801_000);
-    assertEquals(await err(` "${code}"\n`), "CodeExpired");
+    assertEquals(await err(` "${text}"\n`), "CodeExpired");
+    assertEquals(await err(code), "CodeExpired");
+    // Nothing was begun for any of them.
     assertEquals(b.engine.snapshot().contacts.length, 0);
+    assertEquals(b.wasm.has_session(a.id), false);
+    assertEquals(b.eventsOf("PairingFailed"), []);
   }),
 );
 
@@ -161,16 +491,17 @@ Deno.test(
     const a = await w.device("a");
     const b = await w.device("b");
     const { code, expiresAtMs } = await a.engine.createPairingCode();
-    // b scans in time (the session exists on b) but only offers after a's window closed.
+    // b takes the code a minute before it expires, but its offers only arrive afterwards.
+    await w.advance(expiresAtMs - w.clock.now() - 60_000);
     w.relay.swallow.add("rtc_offer");
     await b.engine.pairWithCode(code, { via: "paste" });
     await w.settle();
-    await w.advance(expiresAtMs - w.clock.now() + 1);
+    await w.advance(61_000);
     assert(!a.engine.snapshot().pairingOpen);
     assertEquals(a.engine.snapshot().pairing, null);
     assertEquals(a.eventsOf("Pairing").at(-1)?.pairing, null);
+    assertEquals(a.wasm.export_pending_bootstrap?.(), undefined);
     w.relay.swallow.clear();
-    b.engine.connect(a.id);
     await w.advance(60_000);
     assertEquals(a.engine.snapshot().contacts.length, 0);
     assert(
@@ -190,6 +521,7 @@ Deno.test(
     await b.engine.pairWithCode(code, { via: "paste" });
     await w.advance(30_000);
     assertEquals(a.engine.snapshot().contacts.length, 0);
+    assert(a.logs.some((l) => l.includes("ignoring an offer from a non-contact")));
   }),
 );
 
@@ -213,6 +545,71 @@ Deno.test(
     );
     assert(!a.wasm.has_session(c.id));
     assert(!a.wasm.has_session(shown));
+    assertEquals(a.wasm.pairing_state(shown), undefined);
+    assertEquals(a.eventsOf("Sas"), []);
+  }),
+);
+
+Deno.test(
+  "pairing: the holder of a code who sends something else than the handshake is not added",
+  withWorld(async (w) => {
+    const a = await w.device("a");
+    const b = await w.device("b");
+    const { code } = await a.engine.createPairingCode();
+    // Nothing b's engine sends on the channel arrives...
+    w.rtc.dropFrame = (from, data) => b.pcs.includes(from) && JSON.parse(data).type === "chat";
+    await b.engine.pairWithCode(code, { via: "paste" });
+    await w.settle();
+    // ...and what a gets instead as b's first envelope is content under the bootstrap
+    // session, not its BootstrapHandshake (what a client of the older pairing sent):
+    // PNP-003-MUST-022.
+    const content = b.wasm.envelope_encode(
+      a.id,
+      0x01,
+      new TextEncoder().encode("hello"),
+      BigInt(Math.floor(w.clock.now() / 1000)),
+      b.engine.publicKey,
+    );
+    b.pcs.at(-1)!.channels[0].inject(chatFrame(content));
+    await w.settle();
+    assertEquals(a.engine.snapshot().contacts, []);
+    assertEquals(a.eventsOf("PairingFailed"), [
+      { kind: "PairingFailed", peerId: b.id, reason: "Failed" },
+    ]);
+    assertEquals(a.eventsOf("ContactAdded"), []);
+    assertEquals(a.eventsOf("Message"), []);
+    assertEquals(a.wasm.has_session(b.id), false);
+    // The code is spent all the same: one try per code (PNP-003-MUST-040).
+    assert(!a.engine.snapshot().pairingOpen);
+    assertEquals(await a.storage.getAll("contacts"), []);
+  }),
+);
+
+Deno.test(
+  "pairing: a relay between the two devices is caught by the binding and no contact is made",
+  withWorld(async (w) => {
+    const a = await w.device("a");
+    const b = await w.device("b");
+    w.relay.rewrite = (kind, _from, _to, payload) =>
+      kind === "rtc_offer"
+        ? payload.replace(/sha-256 [0-9A-F]{2}:[0-9A-F]{2}/, "sha-256 00:00")
+        : payload;
+    const { code } = await a.engine.createPairingCode();
+    await b.engine.pairWithCode(code, { via: "paste" });
+    await w.settle();
+    for (const d of [a, b]) {
+      assert(d.notices().some((n) => n.includes("failed its end-to-end check")));
+      assert(!d.logs.some((l) => l.includes("direct channel verified")));
+      assertEquals(d.engine.snapshot().contacts, []);
+      assertEquals(d.eventsOf("PairingFailed").map((e) => e.reason), ["ConnectionLost"]);
+      assertEquals(await d.storage.getAll("contacts"), []);
+    }
+    assertEquals(w.rtc.open.length, 0);
+    assertEquals(a.wasm.has_session(b.id), false);
+    assertEquals(b.wasm.has_session(a.id), false);
+    // With an honest relay a new code pairs them.
+    w.relay.rewrite = null;
+    await w.pair(a, b);
   }),
 );
 
@@ -221,26 +618,29 @@ Deno.test(
   withWorld(async (w) => {
     const a = await w.device("a");
     const b = await w.device("b");
-    const { code, expiresAtMs } = await a.engine.createPairingCode();
-    const stored = await a.storage.get<{ code: string; pendingHex: string }>(
+    const { code, text, expiresAtMs } = await a.engine.createPairingCode();
+    const stored = await a.storage.get<{ code: string; text: string; pendingHex: string }>(
       "identity",
       "pairing",
     );
-    assertEquals(stored?.code, code);
+    assertEquals([stored?.code, stored?.text], [code, text]);
     assert(/^01[0-9a-f]{128}$/.test(stored!.pendingHex));
 
     const again = await w.restart(a);
-    assertEquals(again.engine.snapshot().pairing, { code, expiresAtMs });
+    assertEquals(again.engine.snapshot().pairing, { code, text, expiresAtMs });
     assert(again.engine.snapshot().pairingOpen);
-    await b.engine.pairWithCode(code, { via: "paste" });
+    await b.engine.pairWithCode(text, { via: "paste" });
+    await w.settle();
+    // Used up as soon as b's handshake arrived: gone from the snapshot, from wasm memory and
+    // from storage, before the verification code is even answered.
+    assertEquals(again.engine.snapshot().pairing, null);
+    assertEquals(again.wasm.export_pending_bootstrap?.(), undefined);
+    assertEquals(await again.storage.get("identity", "pairing"), undefined);
+    await w.confirmSas(again, b);
     await w.settle();
     assertEquals(again.path(b), "Direct");
     assertEquals(b.path(again), "Direct");
     assertEquals(again.engine.snapshot().contacts.map((v) => v.contact.peerId), [b.id]);
-    // Used up: gone from the snapshot, from wasm memory and from storage.
-    assertEquals(again.engine.snapshot().pairing, null);
-    assertEquals(again.wasm.export_pending_bootstrap?.(), undefined);
-    assertEquals(await again.storage.get("identity", "pairing"), undefined);
   }),
 );
 
@@ -300,22 +700,23 @@ Deno.test(
   withWorld(async (w) => {
     const a = await w.device("a");
     const b = await w.device("b");
+    await w.pair(a, b);
+    // From the next connection on, the relay sits in between.
     w.relay.rewrite = (kind, _from, _to, payload) =>
       kind === "rtc_offer"
         ? payload.replace(/sha-256 [0-9A-F]{2}:[0-9A-F]{2}/, "sha-256 00:00")
         : payload;
-    const { code } = await a.engine.createPairingCode();
-    await b.engine.pairWithCode(code, { via: "paste" });
-    await w.settle();
+    a.pcs.at(-1)!.close();
+    await w.advance(16_000);
     for (const [d, other] of [[a, b], [b, a]] as const) {
       assertEquals(d.path(other), "BindingFailed");
       assert(
         d.notices().some((n) => n.includes("failed its end-to-end check")),
       );
-      assert(!d.logs.some((l) => l.includes("direct channel verified")));
     }
     assertEquals(w.rtc.open.length, 0);
-    // Content stays on the device.
+    // The contact stays (it was made before), and content stays on the device.
+    assertEquals(b.engine.snapshot().contacts.length, 1);
     const m = await b.engine.sendText(a.id, "secret");
     assertEquals(m.state, "Queued");
     // The binding is rebuilt from the live descriptions on every attempt: an honest relay
@@ -334,7 +735,8 @@ Deno.test(
   withWorld(async (w) => {
     const a = await w.device("a");
     const b = await w.device("b");
-    // Like the interop driver: once the connection is up, the description a's binding is
+    await w.pair(a, b);
+    // Like the interop driver: once a connection is up, the description a's binding is
     // built from names another fingerprint.
     const factory = a.platform.peerConnections;
     a.platform.peerConnections = (config) => {
@@ -354,11 +756,33 @@ Deno.test(
       });
       return pc;
     };
-    const { code } = await a.engine.createPairingCode();
-    await b.engine.pairWithCode(code, { via: "paste" });
-    await w.settle();
+    a.pcs.at(-1)!.close();
+    await w.advance(16_000);
     assertEquals(b.path(a), "BindingFailed");
     assert(b.notices().some((n) => n.includes("failed its end-to-end check")));
+  }),
+);
+
+Deno.test(
+  "pairing: rename is local and survives incoming traffic and a restart",
+  withWorld(async (w) => {
+    const a = await w.device("a");
+    const b = await w.device("b");
+    await w.pair(a, b, "scan");
+    await b.engine.renameContact(a.id, "  Alice  ");
+    await a.engine.sendText(b.id, "hello");
+    await w.settle();
+    const view = b.engine.snapshot().contacts[0];
+    assertEquals(view.contact.name, "Alice");
+    assertEquals(view.contact.identityKey, a.engine.publicKey);
+    assertEquals(view.contact.verified, "in-person");
+    assertEquals(view.unread, 1);
+    const again = await w.restart(b);
+    assertEquals(again.engine.snapshot().contacts[0].contact.name, "Alice");
+    assertEquals(
+      again.engine.snapshot().contacts[0].contact.verified,
+      "in-person",
+    );
   }),
 );
 

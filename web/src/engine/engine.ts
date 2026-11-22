@@ -3,16 +3,7 @@
 // become mailbox tasks, so the logic reads like the native actor it mirrors
 // (crates/parolnet-app/src/engine.rs). No DOM, no framework: everything comes in through
 // `Platform`.
-import {
-  envelopeSourceHint,
-  fromHex,
-  fromUtf8,
-  parsePairingCode,
-  toHex,
-  utf8,
-  wipe,
-} from "./bytes.ts";
-import { PAIRING_CODE_LIFETIME_SECS } from "./bytes.ts";
+import { fromHex, fromUtf8, utf8, wipe } from "./bytes.ts";
 import { CallManager } from "./calls.ts";
 import { TransferManager } from "./transfers.ts";
 import { fetchStun, hasCandidates, peerConfig, validateTurn } from "./ice.ts";
@@ -22,6 +13,9 @@ import type {
   IceCandidateInit,
   IceServer,
   MediaStreamLike,
+  PairingAnswered,
+  PairingStarted,
+  PairingStep,
   PeerConfig,
   PeerConnection,
   Platform,
@@ -48,8 +42,10 @@ import {
   type DeliveryState,
   EngineError,
   type PairingCode,
+  type PairingFailure,
   type PathState,
   type RelayState,
+  type SasCheck,
   shortId,
   type Snapshot,
   type TransferInfo,
@@ -131,6 +127,50 @@ export interface EngineConfig {
   defaultContactName?: string;
   /** File offers above this size are declined without asking (PNP-010 §8; default 4 GiB). */
   maxAcceptSize?: number;
+  /**
+   * Ask for the verification code (the SAS of PNP-003 §5.5) in every pairing: both devices
+   * then show it and the contact is made only once both people confirmed it. On unless
+   * turned off (PNP-003-SHOULD-004, -SHOULD-006); a device that turns it off still shows and
+   * checks the code when the contact's device asks for it.
+   */
+  requestSas?: boolean;
+}
+
+/** One pairing (PNP-003) under way with a peer. The protocol state is in wasm. */
+interface PairingSlot {
+  /** We scanned or pasted the peer's code (the initiator), else we showed ours. */
+  readonly initiator: boolean;
+  /** HANDSHAKE payloads (hex) waiting for the data channel. */
+  outbox: string[];
+  /**
+   * Our next envelope is the bootstrap-completing one: it carries our identity key as
+   * `source_hint` (PNP-001-MUST-063).
+   */
+  hint: boolean;
+  /** A handshake message went out or came in: losing the connection now ends the pairing. */
+  started: boolean;
+  /** This pairing added the contact (it goes again if the pairing fails). */
+  readonly createdContact: boolean;
+  /** The code was scanned with the camera: the contact is verified in person once paired. */
+  readonly inPerson: boolean;
+  /** The verification code, once the pairing shows it. */
+  sas: { digits: string; emoji: string } | null;
+  /** The user said the code matches. */
+  confirmed: boolean;
+}
+
+/** The reason a wasm pairing call gave (the Error's message) as the engine reports it. */
+function pairingFailure(error: unknown): PairingFailure {
+  switch ((error as Error)?.message) {
+    case "sas-mismatch":
+      return "SasMismatch";
+    case "sas-rejected":
+      return "SasRejected";
+    case "timeout":
+      return "Timeout";
+    default:
+      return "Failed";
+  }
 }
 
 type FailReason =
@@ -222,6 +262,8 @@ export class Engine {
   private outbox: OutboxRow[] = [];
   private readonly peers = new Map<string, PeerState>();
   private pairing: (PairingCode & { timer: unknown }) | null = null;
+  /** The pairings under way, by peer. In memory only: none survives a restart. */
+  private readonly pairings = new Map<string, PairingSlot>();
   private stun: string[] = [];
   private turn: TurnSettings | null = null;
   private nextMessageId = 1;
@@ -357,19 +399,34 @@ export class Engine {
 
   private async load(): Promise<void> {
     const { wasm, storage, clock } = this.p;
+    for (const c of await storage.getAll<ContactRow>("contacts")) {
+      if (isPeerId(c.peerId)) this.contacts.set(c.peerId, c);
+    }
+    // A pairing lives in memory only, so a contact still marked as pairing was never
+    // finished (the page was closed or reloaded meanwhile). The session stored for it is the
+    // bootstrap session, or a PNP-002 session the contact never saw confirmed: it is not
+    // loaded, and the rest is cleaned up below.
+    const unfinished = [...this.contacts.values()].filter((c) => c.pairing !== undefined);
     const sessions = await storage.get<SessionsRow>("sessions", "blob");
-    if (sessions && sessions.json) {
+    let sessionsJson = sessions?.json ?? "";
+    if (sessionsJson && unfinished.length > 0) {
       try {
-        wasm.import_sessions(sessions.json);
-        this.sessionsJson = sessions.json;
+        const all = JSON.parse(sessionsJson) as Record<string, string>;
+        for (const c of unfinished) delete all[c.peerId];
+        sessionsJson = Object.keys(all).length > 0 ? JSON.stringify(all) : "";
+      } catch {
+        sessionsJson = "";
+      }
+    }
+    if (sessionsJson) {
+      try {
+        wasm.import_sessions(sessionsJson);
+        this.sessionsJson = sessionsJson;
       } catch {
         this.p.log.warn(
           "[Engine] stored sessions are unreadable; contacts must pair again",
         );
       }
-    }
-    for (const c of await storage.getAll<ContactRow>("contacts")) {
-      if (isPeerId(c.peerId)) this.contacts.set(c.peerId, c);
     }
     for (const s of await storage.getAll<ContactStateRow>("contactState")) {
       this.contactState.set(s.peerId, s);
@@ -388,9 +445,55 @@ export class Engine {
     if (this.cfg.stunServers) this.stun = [...this.cfg.stunServers];
     await this.restorePairing();
     await this.files.load();
+    if (unfinished.length > 0) {
+      await this.forgetUnfinishedPairings(unfinished, sessionsJson);
+    }
     // Entries that outlived the queue's age limit while the app was closed.
     const ops = await this.dropOps(this.expired(clock.now()));
     if (ops.length > 0) await storage.write(ops);
+  }
+
+  /**
+   * What `load` does with contacts whose pairing a restart interrupted: one the pairing had
+   * added goes with everything kept about it; one that was a contact before stays, without
+   * a session, and what was waiting for it is dropped. `sessionsJson` is the stored sessions
+   * without theirs.
+   */
+  private async forgetUnfinishedPairings(
+    unfinished: readonly ContactRow[],
+    sessionsJson: string,
+  ): Promise<void> {
+    const { storage } = this.p;
+    const ops: WriteOp[] = [{
+      op: "put",
+      store: "sessions",
+      value: { id: "blob", json: sessionsJson } satisfies SessionsRow,
+    }];
+    for (const c of unfinished) {
+      const peer = c.peerId;
+      const queued = this.outbox.filter((e) => e.peerId === peer);
+      if (c.pairing === "new") {
+        this.contacts.delete(peer);
+        this.contactState.delete(peer);
+        this.outbox = this.outbox.filter((e) => e.peerId !== peer);
+        ops.push(
+          { op: "delete", store: "contacts", key: peer },
+          { op: "delete", store: "contactState", key: peer },
+          ...queued.map((e): WriteOp => ({ op: "delete", store: "outbox", key: e.id })),
+          ...(await this.files.forgetPeer(peer)),
+        );
+        for (const m of await storage.getAllByPeer<MessageRow>("messages", peer)) {
+          ops.push({ op: "delete", store: "messages", key: m.id });
+        }
+      } else {
+        const row = { ...c };
+        delete row.pairing;
+        this.contacts.set(peer, row);
+        ops.push({ op: "put", store: "contacts", value: row }, ...(await this.dropOps(queued)));
+      }
+    }
+    await storage.write(ops);
+    this.p.log.info("[Engine] removed what an unfinished pairing left behind");
   }
 
   // ── Mailbox, timers, events ──────────────────────────────────────
@@ -546,9 +649,33 @@ export class Engine {
     return this.pairingOpen() && this.pairing
       ? Object.freeze({
         code: this.pairing.code,
+        text: this.pairing.text,
         expiresAtMs: this.pairing.expiresAtMs,
       })
       : null;
+  }
+
+  private sasOf(peer: string): SasCheck | null {
+    const slot = this.pairings.get(peer);
+    return slot?.sas
+      ? Object.freeze({
+        peerId: peer,
+        digits: slot.sas.digits,
+        emoji: slot.sas.emoji,
+        confirmed: slot.confirmed,
+      })
+      : null;
+  }
+
+  /** The verification code to show: the pairing that has waited longest for its user. */
+  private currentSas(): SasCheck | null {
+    let waiting: SasCheck | null = null;
+    for (const peer of this.pairings.keys()) {
+      const sas = this.sasOf(peer);
+      if (sas && !sas.confirmed) return sas;
+      waiting ??= sas;
+    }
+    return waiting;
   }
 
   /** A consistent, immutable picture of the engine's state. */
@@ -570,6 +697,7 @@ export class Engine {
       contacts: Object.freeze(contacts),
       pairingOpen: this.pairingOpen(),
       pairing: this.currentPairing(),
+      sas: this.currentSas(),
       turnConfigured: this.turn !== null,
       relayOnly: this.turn?.relayOnly === true,
       call: this.calls.current(),
@@ -622,12 +750,14 @@ export class Engine {
 
   /**
    * Add a contact or fill in what is missing. Never overwrites a name or downgrades a
-   * verification (the old PWA rewrote the whole row on every incoming message).
+   * verification (the old PWA rewrote the whole row on every incoming message). With
+   * `pairing`, the row is marked as being paired (see `ContactRow.pairing`).
    */
   private upsertContact(
     peer: string,
     identityKey: string | null,
     verified: Verification | null,
+    pairing = false,
   ): { row: ContactRow; isNew: boolean; changed: boolean } {
     const now = this.p.clock.now();
     const existing = this.contacts.get(peer);
@@ -648,6 +778,12 @@ export class Engine {
         delete row.restoredMs;
         changed = true;
       }
+      // A pairing that replaces one still under way keeps what that one knew: a contact the
+      // first one added is still one that goes if this one fails.
+      if (pairing && row.pairing === undefined) {
+        row.pairing = "again";
+        changed = true;
+      }
       if (changed) this.contacts.set(peer, row);
       return { row, isNew: false, changed };
     }
@@ -659,6 +795,7 @@ export class Engine {
       verified: verified ?? "no",
       verifiedMs: verified && verified !== "no" ? now : null,
     };
+    if (pairing) row.pairing = "new";
     this.contacts.set(peer, row);
     return { row, isNew: true, changed: true };
   }
@@ -717,6 +854,13 @@ export class Engine {
       const { wasm, storage } = this.p;
       const call = this.calls.current();
       if (call && call.peerId === peerId) await this.calls.hangup(call.callId);
+      // A pairing under way with it ends here; everything else about it goes below.
+      const paired = this.pairings.delete(peerId);
+      if (paired) {
+        try {
+          wasm.pairing_abort(peerId);
+        } catch { /* nothing under way in wasm */ }
+      }
       this.dropConn(peerId);
 
       // The saved sessions without this contact's.
@@ -757,6 +901,7 @@ export class Engine {
       this.forgetSession(peerId, sessionsJson);
       this.sendWatch();
       this.emit({ kind: "ContactRemoved", peerId });
+      if (paired) this.emit({ kind: "PairingFailed", peerId, reason: "Cancelled" });
     });
   }
 
@@ -840,25 +985,27 @@ export class Engine {
    */
   createPairingCode(): Promise<PairingCode> {
     return this.post(async () => {
-      let code: string;
+      let made: { code: string; text: string; expiresAtMs: number };
       try {
-        code = this.p.wasm.generate_qr_payload(this.publicKey, null)
-          .toLowerCase();
+        const created = this.p.wasm.pairing_create_code(null);
+        made = {
+          code: String(created.code),
+          text: String(created.text),
+          // The scanner measures the code's age from its own timestamp, which is floored to
+          // 300 s: the window is exactly as long as the code can still be scanned.
+          expiresAtMs: Number(created.expires_secs) * 1000,
+        };
       } catch {
         throw new EngineError("Crypto", "could not create a pairing code");
       }
-      const payload = parsePairingCode(code);
-      if (!payload) {
+      if (!made.code || !Number.isFinite(made.expiresAtMs)) {
         throw new EngineError("Crypto", "could not create a pairing code");
       }
-      // The scanner measures the code's age from its own timestamp, which is floored to
-      // 300 s: the window is exactly as long as the code can still be scanned.
-      const expiresAtMs = (payload.ts + PAIRING_CODE_LIFETIME_SECS) * 1000;
       // The new pending half has replaced the old one in wasm; the stored row is replaced
       // below.
       this.closePairing(false, false);
-      await this.storePairing(code, expiresAtMs);
-      this.openPairing(code, expiresAtMs);
+      await this.storePairing(made.code, made.text, made.expiresAtMs);
+      this.openPairing(made.code, made.text, made.expiresAtMs);
       const pairing = this.currentPairing()!;
       this.emit({ kind: "Pairing", pairing });
       return pairing;
@@ -870,16 +1017,16 @@ export class Engine {
     return this.post(() => this.closePairing(true));
   }
 
-  private openPairing(code: string, expiresAtMs: number): void {
+  private openPairing(code: string, text: string, expiresAtMs: number): void {
     const timer = this.after(
       expiresAtMs - this.p.clock.now(),
       () => this.closePairing(true),
     );
-    this.pairing = { code, expiresAtMs, timer };
+    this.pairing = { code, text, expiresAtMs, timer };
   }
 
   /** Keep the code and its pending half for a reload, where the core can export it. */
-  private async storePairing(code: string, expiresAtMs: number): Promise<void> {
+  private async storePairing(code: string, text: string, expiresAtMs: number): Promise<void> {
     const { wasm } = this.p;
     if (typeof wasm.export_pending_bootstrap !== "function") return;
     const pendingHex = wasm.export_pending_bootstrap();
@@ -887,7 +1034,7 @@ export class Engine {
     await this.save([{
       op: "put",
       store: "identity",
-      value: { id: "pairing", code, expiresAtMs, pendingHex } satisfies PendingPairingRow,
+      value: { id: "pairing", code, text, expiresAtMs, pendingHex } satisfies PendingPairingRow,
     }]);
   }
 
@@ -899,11 +1046,11 @@ export class Engine {
     if (
       typeof wasm.import_pending_bootstrap === "function" &&
       typeof row.pendingHex === "string" && typeof row.code === "string" &&
-      clock.now() < row.expiresAtMs
+      typeof row.text === "string" && clock.now() < row.expiresAtMs
     ) {
       try {
         wasm.import_pending_bootstrap(row.pendingHex);
-        this.openPairing(row.code, row.expiresAtMs);
+        this.openPairing(row.code, row.text, row.expiresAtMs);
         return;
       } catch {
         this.p.log.warn("[Engine] the stored pairing code is unreadable; a new one is needed");
@@ -934,99 +1081,82 @@ export class Engine {
     if (announce) this.emit({ kind: "Pairing", pairing: null });
   }
 
+  private requestSas(): boolean {
+    return this.cfg.requestSas !== false;
+  }
+
   /**
-   * Pair with a contact's code. `via` says how the user obtained it: a camera scan means the
-   * two devices were together (`verified: "in-person"`); a pasted code proves nothing.
-   * Establishes the session, queues the bootstrap envelope and starts connecting.
+   * Pair with a contact's code (PNP-003 §5.1, §5.4), in either form (`PairingCode.code` or
+   * `.text`). `via` says how the user obtained it: a camera scan means the two devices were
+   * together (`verified: "in-person"` once the pairing completes); a pasted code proves
+   * nothing. Starts the pairing and connects. The contact is returned at once, marked
+   * `pairing`: it can be used when `PairingComplete` follows; if `PairingFailed` follows
+   * instead, a contact this pairing added is removed again.
    */
   pairWithCode(code: string, how: { via: "scan" | "paste" }): Promise<Contact> {
     return this.post(async () => {
       const { wasm, clock } = this.p;
-      const clean = String(code).replace(/[\s"']/g, "").toLowerCase();
-      const payload = clean.length > 64 ? parsePairingCode(clean) : null;
-      if (!payload) {
-        throw new EngineError(
-          "InvalidCode",
-          "expected the full pairing code from the contact's app",
-        );
-      }
-      if (payload.identityKey === this.publicKey) {
-        throw new EngineError("OwnCode", "that is your own code");
-      }
-      if (
-        Math.floor(clock.now() / 1000) - payload.ts > PAIRING_CODE_LIFETIME_SECS
-      ) {
-        throw new EngineError(
-          "CodeExpired",
-          "that code has expired; ask for a new one",
-        );
-      }
-      let peer: string;
+      const sessionsBefore = this.sessionsJson;
+      let started: PairingStarted;
       try {
-        const scanned = wasm.process_scanned_qr(clean);
-        peer = String(scanned.peer_id).toLowerCase();
+        // Validated in the core: decoded, well-formed, not older than 30 minutes
+        // (PNP-003-MUST-010, -MUST-011).
+        started = wasm.pairing_initiate(String(code), this.requestSas(), clock.now());
       } catch (e) {
-        if (/expired/i.test(String((e as Error)?.message))) {
-          throw new EngineError(
-            "CodeExpired",
-            "that code has expired; ask for a new one",
-          );
+        switch ((e as Error)?.message) {
+          case "code-expired":
+            throw new EngineError("CodeExpired", "that code has expired; ask for a new one");
+          case "own-code":
+            throw new EngineError("OwnCode", "that is your own code");
+          default:
+            throw new EngineError(
+              "InvalidCode",
+              "expected the full pairing code from the contact's app",
+            );
         }
-        throw new EngineError(
-          "InvalidCode",
-          "that pairing code cannot be used",
-        );
       }
-      if (!isPeerId(peer)) {
-        throw new EngineError(
-          "InvalidCode",
-          "that pairing code cannot be used",
-        );
-      }
-
-      // PNP-001 §5.3.1 / MUST-063: the first envelope carries our identity key as
-      // source_hint so the presenter can materialise its responder session.
-      let bootstrap: string;
-      try {
-        bootstrap = wasm.envelope_encode(
-          peer,
-          MsgType.CONTROL,
-          new Uint8Array(0),
-          this.nowSecs(),
-          this.publicKey,
-        );
-      } catch {
-        throw new EngineError("Crypto", "could not start the session");
-      }
-      // The new session replaces an earlier bootstrap envelope. Queued texts stay: they are
-      // plaintext until flushed, so they go out under the new session.
-      const stale = this.outbox.filter((e) => e.peerId === peer && e.kind === "bootstrap");
-      const entry: OutboxRow = {
-        id: this.nextOutboxId++,
-        peerId: peer,
-        kind: "bootstrap",
-        envelopeHex: bootstrap,
-        createdMs: clock.now(),
-      };
+      const peer = String(started.peer_id).toLowerCase();
+      const previous = this.contacts.get(peer);
       const { row, isNew } = this.upsertContact(
         peer,
-        payload.identityKey,
-        how?.via === "scan" ? "in-person" : null,
+        String(started.identity_key).toLowerCase(),
+        null,
+        true,
       );
-      const ops: WriteOp[] = [
-        this.sessionsOp(),
-        { op: "put", store: "outbox", value: entry },
-        { op: "put", store: "contacts", value: row },
-        ...stale.map((e): WriteOp => ({
-          op: "delete",
-          store: "outbox",
-          key: e.id,
-        })),
-      ];
+      // It takes the place of a pairing still under way with that peer. The bootstrap
+      // session carries the handshake and is replaced by the PNP-002 session; queued texts
+      // stay as they are (plaintext until flushed) and go out under that one.
+      this.pairings.set(peer, {
+        initiator: true,
+        outbox: [started.init_hex],
+        hint: true,
+        started: false,
+        createdContact: row.pairing === "new",
+        inPerson: how?.via === "scan",
+        sas: null,
+        confirmed: false,
+      });
+      const ops: WriteOp[] = [this.sessionsOp(), { op: "put", store: "contacts", value: row }];
       if (!this.contactState.has(peer)) ops.push(this.activityOp(peer, 0));
-      await this.save(ops);
-      this.outbox = this.outbox.filter((e) => !stale.includes(e));
-      this.outbox.push(entry);
+      try {
+        // On record before anything is sent: if the page goes away now, the next start
+        // removes what this pairing left.
+        await this.save(ops);
+      } catch (e) {
+        this.pairings.delete(peer);
+        try {
+          wasm.pairing_abort(peer);
+        } catch { /* nothing under way in wasm */ }
+        if (previous) this.contacts.set(peer, previous);
+        else {
+          this.contacts.delete(peer);
+          this.contactState.delete(peer);
+        }
+        // The session this replaced comes back.
+        this.sessionsJson = sessionsBefore;
+        this.rollbackSessions();
+        throw e;
+      }
       const contact = toContact(row);
       this.emit(
         isNew ? { kind: "ContactAdded", contact } : { kind: "ContactUpdated", contact },
@@ -1044,6 +1174,364 @@ export class Engine {
       this.dial(peer, true);
       return contact;
     });
+  }
+
+  /**
+   * The user says the verification code is the one the contact's device shows
+   * (PNP-003-MUST-028). The pairing goes on once the contact has confirmed too.
+   * `EngineError("NoPairing")` when no code is waiting for an answer.
+   */
+  confirmSas(peerId: string): Promise<void> {
+    return this.post(async () => {
+      const { wasm, clock } = this.p;
+      const slot = this.pairings.get(peerId);
+      const none = () =>
+        new EngineError("NoPairing", `no verification code is waiting for ${shortId(peerId)}`);
+      if (!slot || !slot.sas || slot.confirmed) throw none();
+      let steps: PairingStep[];
+      try {
+        steps = wasm.pairing_confirm_sas(peerId, clock.now());
+      } catch (e) {
+        // `wrong-state` changes nothing; anything else ended the pairing.
+        if (wasm.pairing_state(peerId) === undefined) {
+          await this.abortPairing(peerId, pairingFailure(e));
+        }
+        throw none();
+      }
+      slot.confirmed = true;
+      this.emitSas(peerId);
+      await this.applySteps(peerId, steps);
+    });
+  }
+
+  /**
+   * The user says the verification codes differ (or will not compare them): the pairing is
+   * aborted, its secrets are erased and a contact it added is removed (PNP-003 §4).
+   */
+  rejectSas(peerId: string): Promise<void> {
+    return this.post(async () => {
+      if (this.pairings.get(peerId)?.sas) await this.abortPairing(peerId, "SasRejected");
+    });
+  }
+
+  /**
+   * Stop a pairing that is still under way (the user does not want to wait for it): as
+   * `rejectSas`, at any point of it. Nothing happens when there is none.
+   */
+  stopPairing(peerId: string): Promise<void> {
+    return this.post(() => this.abortPairing(peerId, "Cancelled"));
+  }
+
+  private emitSas(peer: string): void {
+    const sas = this.sasOf(peer);
+    if (sas) this.emit({ kind: "Sas", sas });
+  }
+
+  /** A pairing has a message waiting for the connection to its peer. */
+  private pairingWaits(peer: string): boolean {
+    return (this.pairings.get(peer)?.outbox.length ?? 0) > 0;
+  }
+
+  /**
+   * Send the waiting handshake messages on the open data channel, as HANDSHAKE envelopes of
+   * the session held with the peer. A scanner's first one is the bootstrap-completing
+   * envelope and carries our identity key (PNP-001 §5.3.1). As everywhere, the advanced
+   * ratchet is saved before the envelope goes on the wire.
+   */
+  private async flushPairing(peer: string): Promise<void> {
+    const { wasm, log } = this.p;
+    for (;;) {
+      const slot = this.pairings.get(peer);
+      const conn = this.peers.get(peer)?.conn;
+      if (!slot || slot.outbox.length === 0 || !conn || !conn.open) return;
+      if (!wasm.has_session(peer)) return;
+      const payload = fromHex(slot.outbox[0]);
+      if (!payload) {
+        slot.outbox.shift();
+        continue;
+      }
+      let envelope: string;
+      try {
+        envelope = wasm.envelope_encode(
+          peer,
+          MsgType.HANDSHAKE,
+          payload,
+          this.nowSecs(),
+          slot.hint ? this.publicKey : null,
+        );
+      } catch {
+        log.warn(`[Engine] could not encrypt a pairing message for ${shortId(peer)}`);
+        return;
+      }
+      await this.save([this.sessionsOp()]);
+      if (this.pairings.get(peer) !== slot || !this.live(peer, conn)) return;
+      if (!this.sendRaw(conn, envelope)) return;
+      slot.outbox.shift();
+      slot.hint = false;
+      slot.started = true;
+    }
+  }
+
+  /**
+   * The presenter's side of PNP-001 §5.3.1 step 6: the scanner's first envelope decrypted
+   * under the session the code's seed materialised. That used the code up (one bootstrap per
+   * code, PNP-003-MUST-040). The core accepted it only as a BootstrapHandshake with a valid
+   * proof (PNP-003-MUST-022); otherwise the bootstrap is aborted and nothing is kept.
+   */
+  private async onBootstrap(
+    peer: string,
+    conn: Conn,
+    answered: PairingAnswered,
+  ): Promise<void> {
+    const had = this.pairings.has(peer);
+    // The code is spent either way: the window closes and strangers are not answered any more.
+    this.closePairing(true);
+    if (!answered.accepted || typeof answered.identity_key !== "string") {
+      this.p.log.info(`[Engine] bootstrap from ${shortId(peer)} aborted`);
+      // An earlier pairing with that peer went with it (the core removed its session).
+      if (had) {
+        await this.abortPairing(peer, "Failed");
+        return;
+      }
+      await this.save([this.sessionsOp()]);
+      this.emit({ kind: "PairingFailed", peerId: peer, reason: "Failed" });
+      if (!this.contacts.has(peer) && this.live(peer, conn)) this.dropConn(peer);
+      return;
+    }
+    const { row, isNew } = this.upsertContact(
+      peer,
+      answered.identity_key.toLowerCase(),
+      null,
+      true,
+    );
+    this.pairings.set(peer, {
+      initiator: false,
+      outbox: [],
+      hint: false,
+      started: true,
+      createdContact: row.pairing === "new",
+      inPerson: false,
+      sas: null,
+      confirmed: false,
+    });
+    const ops: WriteOp[] = [
+      this.sessionsOp(),
+      { op: "put", store: "contacts", value: row },
+      // With the contact, so that a reload cannot bring the used code back.
+      { op: "delete", store: "identity", key: "pairing" },
+    ];
+    if (!this.contactState.has(peer)) ops.push(this.activityOp(peer, 0));
+    try {
+      await this.save(ops);
+    } catch (e) {
+      await this.abortPairing(peer, "Failed").catch(() => {});
+      throw e;
+    }
+    const contact = toContact(row);
+    this.emit(isNew ? { kind: "ContactAdded", contact } : { kind: "ContactUpdated", contact });
+    this.sendWatch();
+    await this.applySteps(peer, answered.steps);
+    // We hold the session only now: our binding can go out. One that went out before (to a
+    // contact that is being added again) was made under the session this one replaced, and
+    // the peer could not read it.
+    conn.bindingSent = false;
+    if (this.live(peer, conn)) await this.sendBinding(peer, conn);
+  }
+
+  /** A HANDSHAKE envelope from a peer a pairing is under way with. */
+  private async onHandshake(peer: string, payloadHex: string): Promise<void> {
+    const { wasm, clock, log } = this.p;
+    const slot = this.pairings.get(peer);
+    if (!slot) {
+      log.debug(`[Engine] a handshake message from ${shortId(peer)} without a pairing`);
+      return;
+    }
+    slot.started = true;
+    let steps: PairingStep[];
+    try {
+      steps = wasm.pairing_on_message(peer, payloadHex, clock.now());
+    } catch (e) {
+      // A proof or a confirmation that did not verify, a replay, a broken handshake: the
+      // core has aborted the pairing and erased its secrets (PNP-003-MUST-022, -MUST-029).
+      await this.abortPairing(peer, pairingFailure(e));
+      return;
+    }
+    await this.applySteps(peer, steps);
+  }
+
+  /** Carry out what the core asks for after a step of a pairing, in order. */
+  private async applySteps(peer: string, steps: readonly PairingStep[]): Promise<void> {
+    const { wasm } = this.p;
+    for (const step of steps) {
+      const slot = this.pairings.get(peer);
+      if (!slot) return;
+      switch (step.kind) {
+        case "send":
+          slot.outbox.push(step.payload_hex);
+          await this.flushPairing(peer);
+          break;
+        case "sas":
+          // PNP-003-MUST-026, -MUST-027: shown as digits and as emoji.
+          slot.sas = { digits: String(step.digits), emoji: String(step.emoji) };
+          this.emitSas(peer);
+          break;
+        case "session":
+          // What is still waiting was meant for the session this one replaces.
+          if (slot.outbox.length > 0) {
+            await this.abortPairing(peer, "ConnectionLost");
+            return;
+          }
+          try {
+            wasm.pairing_install_session(peer);
+          } catch {
+            await this.abortPairing(peer, "Failed");
+            return;
+          }
+          await this.save([this.sessionsOp()]);
+          break;
+        case "established":
+          await this.pairingEstablished(peer, slot, step.sas_verified === true);
+          break;
+      }
+    }
+  }
+
+  /**
+   * The PNP-002 session is ESTABLISHED and the core has erased the Bootstrap Secret
+   * (PNP-003-MUST-024): the contact is made, and content flows from here on.
+   */
+  private async pairingEstablished(
+    peer: string,
+    slot: PairingSlot,
+    sasVerified: boolean,
+  ): Promise<void> {
+    const { wasm, clock, log } = this.p;
+    this.pairings.delete(peer);
+    let first: string | null = null;
+    if (slot.initiator) {
+      // PNP-002-MUST-021: the first Double Ratchet message confirms the session to the peer.
+      try {
+        first = wasm.envelope_encode(
+          peer,
+          MsgType.CONTROL,
+          new Uint8Array(0),
+          this.nowSecs(),
+          null,
+        );
+      } catch {
+        log.warn(`[Engine] could not confirm the session to ${shortId(peer)}`);
+      }
+    }
+    const ops: WriteOp[] = [this.sessionsOp()];
+    const existing = this.contacts.get(peer);
+    let contact: Contact | null = null;
+    if (existing) {
+      const row = { ...existing };
+      delete row.pairing;
+      // About the identity, not about one pairing: never taken back by a later one.
+      if (sasVerified) row.sasVerified = true;
+      if (slot.inPerson && row.verified !== "in-person") {
+        row.verified = "in-person";
+        row.verifiedMs = clock.now();
+      }
+      this.contacts.set(peer, row);
+      ops.push({ op: "put", store: "contacts", value: row });
+      contact = toContact(row);
+    }
+    await this.save(ops);
+    const conn = this.peers.get(peer)?.conn;
+    if (first !== null && conn) this.sendRaw(conn, first);
+    if (contact) this.emit({ kind: "ContactUpdated", contact });
+    this.emit({ kind: "PairingComplete", peerId: peer, sasVerified });
+    // The channel may have verified while the pairing was under way: it is usable now.
+    const verified = this.verifiedConn(peer);
+    if (verified) await this.usable(peer, verified);
+  }
+
+  /**
+   * Abort a pairing (PNP-003 §4: back to NO_CONTACT). Everything in memory happens here, at
+   * once: the core erases the pairing's secrets and removes its session, a contact the
+   * pairing added goes, the connection is closed. Returns what is left to do in storage, or
+   * null when no pairing was under way.
+   */
+  private abortPairingNow(
+    peer: string,
+    reason: PairingFailure,
+  ): (() => Promise<void>) | null {
+    const slot = this.pairings.get(peer);
+    if (!slot) return null;
+    const { wasm, storage } = this.p;
+    this.pairings.delete(peer);
+    try {
+      wasm.pairing_abort(peer);
+    } catch { /* the core already dropped it */ }
+    // What a failed decrypt is rolled back to must not bring the session back.
+    this.sessionsOp();
+    const row = this.contacts.get(peer);
+    const removed = slot.createdContact && row !== undefined;
+    const queued = this.outbox.filter((e) => e.peerId === peer);
+    let kept: ContactRow | null = null;
+    if (removed) {
+      this.contacts.delete(peer);
+      this.contactState.delete(peer);
+      this.outbox = this.outbox.filter((e) => e.peerId !== peer);
+      this.probes.clear(peer);
+    } else if (row) {
+      kept = { ...row };
+      delete kept.pairing;
+      this.contacts.set(peer, kept);
+    }
+    this.dropConn(peer);
+    if (removed) {
+      this.peers.delete(peer);
+      this.emit({ kind: "ContactRemoved", peerId: peer });
+      this.sendWatch();
+    } else {
+      this.setPath(peer, "Unknown");
+      if (kept) this.emit({ kind: "ContactUpdated", contact: toContact(kept) });
+    }
+    this.emit({ kind: "PairingFailed", peerId: peer, reason });
+    return async () => {
+      const ops: WriteOp[] = [this.sessionsOp()];
+      let dropped: OutboxRow[] = [];
+      if (removed) {
+        // Unless the same contact was added again meanwhile.
+        if (!this.contacts.has(peer)) {
+          ops.push(
+            { op: "delete", store: "contacts", key: peer },
+            { op: "delete", store: "contactState", key: peer },
+            ...queued.map((e): WriteOp => ({ op: "delete", store: "outbox", key: e.id })),
+            ...(await this.files.forgetPeer(peer)),
+          );
+          for (const m of await storage.getAllByPeer<MessageRow>("messages", peer)) {
+            ops.push({ op: "delete", store: "messages", key: m.id });
+          }
+        }
+      } else if (kept && this.contacts.get(peer) === kept) {
+        // The contact stays, without a session: what was waiting for it cannot be sent.
+        dropped = queued.filter((e) => this.outbox.includes(e));
+        ops.push({ op: "put", store: "contacts", value: kept }, ...(await this.dropOps(dropped)));
+      }
+      await this.save(ops);
+      this.announceDropped(dropped);
+    };
+  }
+
+  /** `abortPairingNow` and its storage, for callers inside a mailbox task. */
+  private async abortPairing(peer: string, reason: PairingFailure): Promise<void> {
+    const persist = this.abortPairingNow(peer, reason);
+    if (persist) await persist();
+  }
+
+  /**
+   * The connection to `peer` is gone. A pairing whose handshake was under way on it is over:
+   * its messages are not repeated on another connection. True when one was aborted.
+   */
+  private pairingConnGone(peer: string): boolean {
+    if (this.stopped || !this.pairings.get(peer)?.started) return false;
+    const persist = this.abortPairingNow(peer, "ConnectionLost");
+    if (persist) void this.internal(persist);
+    return true;
   }
 
   // ── Chat and the sender-side queue ───────────────────────────────
@@ -1240,7 +1728,13 @@ export class Engine {
     }
   }
 
+  /**
+   * The contact's data channel, once it can carry content: open, its binding verified, and
+   * no pairing under way (while one is, the session is about to be replaced and nothing but
+   * the pairing's own messages uses the channel).
+   */
   private verifiedConn(peer: string): Conn | null {
+    if (this.pairings.has(peer)) return null;
     const conn = this.peers.get(peer)?.conn;
     return conn && conn.open && conn.verified ? conn : null;
   }
@@ -1269,11 +1763,9 @@ export class Engine {
     for (;;) {
       const conn = this.verifiedConn(peer);
       if (!conn) return sent;
-      const chunk = this.outbox
-        .filter((e): e is OutboxRow & { kind: "text" } => e.peerId === peer && e.kind === "text")
-        .slice(0, FLUSH_CHUNK);
+      const chunk = this.outbox.filter((e) => e.peerId === peer).slice(0, FLUSH_CHUNK);
       if (chunk.length === 0) return sent;
-      const ready: { entry: OutboxRow & { kind: "text" }; envelope: string }[] = [];
+      const ready: { entry: OutboxRow; envelope: string }[] = [];
       const failed: OutboxRow[] = [];
       for (const entry of chunk) {
         const plaintext = utf8(entry.text);
@@ -1298,7 +1790,7 @@ export class Engine {
       }
       await this.save([this.sessionsOp(), ...(await this.dropOps(failed))]);
       this.announceDropped(failed);
-      const delivered: (OutboxRow & { kind: "text" })[] = [];
+      const delivered: OutboxRow[] = [];
       for (const r of ready) {
         if (
           this.verifiedConn(peer) !== conn || !this.sendRaw(conn, r.envelope)
@@ -1320,9 +1812,7 @@ export class Engine {
           });
         }
       }
-      this.outbox = this.outbox.filter((e) =>
-        !delivered.includes(e as OutboxRow & { kind: "text" })
-      );
+      this.outbox = this.outbox.filter((e) => !delivered.includes(e));
       await this.save(ops);
       for (const e of delivered) {
         sent.add(e.messageId);
@@ -1344,29 +1834,6 @@ export class Engine {
         await this.sleep(50);
       }
     }
-  }
-
-  /**
-   * Send the bootstrap-completing envelope (we scanned the peer's code) before the binding:
-   * the presenter needs it to have a session at all.
-   */
-  private async flushBootstrap(peer: string, conn: Conn): Promise<void> {
-    const entries = this.outbox.filter((e) => e.peerId === peer && e.kind === "bootstrap");
-    const sentEntries: OutboxRow[] = [];
-    for (const e of entries) {
-      if (e.kind === "bootstrap" && this.sendRaw(conn, e.envelopeHex)) {
-        sentEntries.push(e);
-      } else break;
-    }
-    if (sentEntries.length === 0) return;
-    this.outbox = this.outbox.filter((e) => !sentEntries.includes(e));
-    await this.save(
-      sentEntries.map((e): WriteOp => ({
-        op: "delete",
-        store: "outbox",
-        key: e.id,
-      })),
-    );
   }
 
   /** PNP-001-MUST-079: our CHANNEL_BINDING, once the channel is open and we hold a session. */
@@ -1440,6 +1907,14 @@ export class Engine {
     // A presenter whose session appeared with this very connection binds now.
     await this.sendBinding(peer, conn);
     if (!this.live(peer, conn)) return;
+    // While the contact's pairing is still under way the path is not usable yet: it is shown
+    // as direct when the pairing completes.
+    if (this.pairings.has(peer)) return;
+    await this.usable(peer, conn);
+  }
+
+  /** The contact's channel is verified and no pairing is in the way: content flows. */
+  private async usable(peer: string, conn: Conn): Promise<void> {
     this.setPath(peer, "Direct");
     this.connTimer(peer, conn, RESTORED_PROVEN_MS, () => this.restoredProven(peer));
     await this.flushQueue(peer);
@@ -1491,7 +1966,7 @@ export class Engine {
       // a fresh pairing gets no push).
       for (const c of this.contacts.values()) {
         if (
-          this.queuedFor(c.peerId) > 0 || this.hasBootstrapQueued(c.peerId) ||
+          this.queuedFor(c.peerId) > 0 || this.pairingWaits(c.peerId) ||
           this.files.wants(c.peerId)
         ) {
           this.dial(c.peerId, false);
@@ -1520,10 +1995,6 @@ export class Engine {
       })
     );
     this.after(STUN_WAIT_MS, go);
-  }
-
-  private hasBootstrapQueued(peer: string): boolean {
-    return this.outbox.some((e) => e.peerId === peer && e.kind === "bootstrap");
   }
 
   /** The network came back or the page became visible: reconnect to the relay now. */
@@ -1710,6 +2181,9 @@ export class Engine {
    */
   private dial(peer: string, force: boolean): void {
     if (peer === this.peerId || !isPeerId(peer) || !this.registered) return;
+    // Offering shows our address to whoever receives it: contacts only (a retry may come due
+    // after its contact was removed).
+    if (!this.contacts.has(peer)) return;
     const st = this.peer(peer);
     if (st.conn) return;
     if (st.online === false && !force) return;
@@ -1851,7 +2325,9 @@ export class Engine {
       void this.internal(() =>
         this.files.onRemoteChannel(
           peer,
-          this.live(peer, conn) && conn.open && conn.verified ? conn : null,
+          this.live(peer, conn) && conn.open && conn.verified && !this.pairings.has(peer)
+            ? conn
+            : null,
           channel,
           early,
         )
@@ -1982,8 +2458,9 @@ export class Engine {
       conn.dc.send(identityFrame(this.peerId));
     } catch { /* the close handler deals with it */ }
     this.markOnline(peer);
-    // PNP-001 §10.5.1: the bootstrap-completing envelope first (we scanned the peer's code),
-    // then our binding. Everything else waits for the peer's binding.
+    // PNP-001 §10.5.1: the bootstrap-completing envelope first (we scanned the peer's code:
+    // it carries the pairing's BOOTSTRAP_INIT), then our binding. Everything else waits for
+    // the peer's binding.
     this.connTimer(peer, conn, BINDING_TIMEOUT_MS, () => {
       if (!conn.verified) {
         this.p.log.info(
@@ -1992,7 +2469,7 @@ export class Engine {
         this.connFailed(peer, conn, "Timeout");
       }
     });
-    await this.flushBootstrap(peer, conn);
+    await this.flushPairing(peer);
     if (this.live(peer, conn)) await this.sendBinding(peer, conn);
   }
 
@@ -2021,6 +2498,7 @@ export class Engine {
       st.conn = null;
       this.closeConn(conn);
       void this.internal(() => this.files.onConnGone(peer));
+      this.pairingConnGone(peer);
     }
   }
 
@@ -2032,6 +2510,8 @@ export class Engine {
     this.p.log.info(
       `[WebRTC] connection to ${shortId(peer)} ended (${reason})`,
     );
+    // A pairing that was under way on it is over, and with it the reason to connect again.
+    if (this.pairingConnGone(peer)) return;
     this.afterFailure(peer, conn.open, conn.initiator, reason);
   }
 
@@ -2109,7 +2589,7 @@ export class Engine {
   }
 
   private probeActive = (peer: string): boolean =>
-    this.queuedFor(peer) > 0 || this.hasBootstrapQueued(peer) ||
+    this.queuedFor(peer) > 0 || this.pairingWaits(peer) ||
     this.files.wants(peer) ||
     this.peers.get(peer)?.wanted === true;
 
@@ -2171,6 +2651,10 @@ export class Engine {
         await this.save(await this.dropOps(expired));
         this.announceDropped(expired);
       }
+      // The timeouts of PNP-003 §4 and of the PNP-002 handshake.
+      for (const peer of this.p.wasm.pairing_timeouts(this.p.clock.now())) {
+        await this.abortPairing(String(peer).toLowerCase(), "Timeout");
+      }
       if (!this.registered) return;
       for (const c of this.contacts.values()) {
         const st = this.peer(c.peerId);
@@ -2179,7 +2663,7 @@ export class Engine {
         }
         if (
           st.online === null &&
-          (this.queuedFor(c.peerId) > 0 || this.hasBootstrapQueued(c.peerId) ||
+          (this.queuedFor(c.peerId) > 0 || this.pairingWaits(c.peerId) ||
             this.files.wants(c.peerId))
         ) {
           this.dial(c.peerId, false);
@@ -2216,10 +2700,9 @@ export class Engine {
     conn: Conn,
     envelopeHex: string,
   ): Promise<void> {
-    const { wasm, log } = this.p;
+    const { wasm, log, clock } = this.p;
     let msgType: number | null = null;
     let plaintextHex = "";
-    let bootstrappedKey: string | null = null;
 
     // Only the session of the channel's own peer may decrypt what arrives on it.
     if (wasm.has_session(peer)) {
@@ -2233,59 +2716,45 @@ export class Engine {
       }
     }
     // PNP-001 §5.3.1: while our code is valid, the scanner's first envelope materialises
-    // our session. Its cleartext source_hint is the scanner's identity key and must hash to
-    // the PeerId this channel was signalled with, or anyone holding the code could pair us
-    // with a third party's identity.
+    // our session. The core refuses it unless its cleartext source_hint (the scanner's
+    // identity key) hashes to the PeerId this channel was signalled with, or anyone holding
+    // the code could pair us with a third party's identity; and what it carries has to be
+    // the scanner's BootstrapHandshake (PNP-003 §5.4).
     if (msgType === null && this.pairingOpen()) {
-      const hint = envelopeSourceHint(envelopeHex);
-      const hintBytes = hint === null ? null : fromHex(hint);
-      if (
-        hint !== null && hintBytes !== null &&
-        toHex(await this.p.sha256(hintBytes)) === peer
-      ) {
-        if (!this.live(peer, conn) || !this.pairingOpen()) return;
-        try {
-          const d = wasm.trial_decrypt(envelopeHex);
-          if (
-            d.bootstrapped === true &&
-            String(d.source_peer_id).toLowerCase() === peer
-          ) {
-            msgType = d.msg_type;
-            plaintextHex = d.plaintext_hex;
-            bootstrappedKey = hint;
-          }
-        } catch {
-          log.info(`[Engine] bootstrap from ${shortId(peer)} failed`);
-        }
-        // `trial_decrypt` tries every existing session before the pending bootstrap: undo
-        // what that did to them (and keep the session it may just have made for this peer).
-        this.rollbackSessions(bootstrappedKey !== null ? peer : null);
+      let answered: PairingAnswered | null = null;
+      try {
+        answered = wasm.pairing_respond(peer, envelopeHex, this.requestSas(), clock.now());
+      } catch {
+        log.info(`[Engine] bootstrap from ${shortId(peer)} failed`);
       }
+      if (answered) await this.onBootstrap(peer, conn, answered);
+      return;
     }
     if (msgType === null) return;
 
-    const ops: WriteOp[] = [this.sessionsOp()];
-    const events: AppEvent[] = [];
-    if (bootstrappedKey !== null) {
-      // The code is used up: the pending half is gone and the window closes with it.
-      this.closePairing(true);
-      const { row, isNew } = this.upsertContact(peer, bootstrappedKey, null);
-      ops.push({ op: "put", store: "contacts", value: row });
-      if (!this.contactState.has(peer)) ops.push(this.activityOp(peer, 0));
-      const contact = toContact(row);
-      events.push(
-        isNew ? { kind: "ContactAdded", contact } : { kind: "ContactUpdated", contact },
-      );
+    // The responder of a PNP-002 handshake waits for the session's first message: this is it.
+    if (this.pairings.has(peer)) {
+      const steps = wasm.pairing_first_message(peer);
+      if (steps.length > 0) await this.applySteps(peer, steps);
     }
 
-    // PNP-001-MUST-081 / SHOULD-018: until the binding verifies, only the bootstrap envelope
-    // and the binding itself are acted on.
-    const early = msgType === MsgType.CONTROL ||
+    const ops: WriteOp[] = [this.sessionsOp()];
+    const events: AppEvent[] = [];
+
+    // PNP-001-MUST-081 / SHOULD-018: until the binding verifies, only a pairing's own
+    // messages and the binding itself are acted on. The same holds while a pairing is under
+    // way, whose session is about to be replaced.
+    const early = msgType === MsgType.CONTROL || msgType === MsgType.HANDSHAKE ||
       msgType === MsgType.CHANNEL_BINDING;
+    const content = conn.verified && !this.pairings.has(peer);
     let received: MessageRow | null = null;
-    if (!conn.verified && !early) {
+    if (!content && !early) {
       log.warn(
-        `[Engine] dropped a message from ${shortId(peer)} that came before the binding`,
+        conn.verified
+          ? `[Engine] dropped a message from ${
+            shortId(peer)
+          } that came before its pairing completed`
+          : `[Engine] dropped a message from ${shortId(peer)} that came before the binding`,
       );
     } else if (msgType === MsgType.TEXT) {
       const bytes = fromHex(plaintextHex) ?? new Uint8Array(0);
@@ -2317,18 +2786,19 @@ export class Engine {
       this.emitActivity(peer);
     }
     if (!this.live(peer, conn)) return;
-    // We may hold a session only now (the presenter, on the scanner's bootstrap envelope).
     if (msgType !== MsgType.CHANNEL_BINDING) await this.sendBinding(peer, conn);
     if (!this.live(peer, conn)) return;
 
     if (msgType === MsgType.CHANNEL_BINDING) {
       const body = fromHex(plaintextHex);
       if (body) await this.onBinding(peer, conn, body);
-    } else if (msgType === MsgType.CALL_SIGNAL && conn.verified) {
+    } else if (msgType === MsgType.HANDSHAKE) {
+      await this.onHandshake(peer, plaintextHex);
+    } else if (msgType === MsgType.CALL_SIGNAL && content) {
       const bytes = fromHex(plaintextHex);
       const sig = bytes ? parseCallSignal(fromUtf8(bytes)) : null;
       if (sig) await this.calls.onSignal(peer, sig);
-    } else if (msgType === MsgType.FILE_TRANSFER && conn.verified) {
+    } else if (msgType === MsgType.FILE_TRANSFER && content) {
       const body = fromHex(plaintextHex);
       if (body) {
         await this.files.onControl(peer, body);
@@ -2336,7 +2806,8 @@ export class Engine {
         wipe(body);
       }
     }
-    // CONTROL carries nothing; DECOY and unknown types are discarded (PNP-001-MUST-008).
+    // CONTROL carries nothing (the first message of a new session); DECOY and unknown types
+    // are discarded (PNP-001-MUST-008).
   }
 
   // ── Calls ────────────────────────────────────────────────────────
@@ -2577,6 +3048,7 @@ export class Engine {
     } catch { /* wasm state is gone with the page anyway */ }
     this.contacts.clear();
     this.contactState.clear();
+    this.pairings.clear();
     this.outbox = [];
     this.turn = null;
     await this.files.clear();

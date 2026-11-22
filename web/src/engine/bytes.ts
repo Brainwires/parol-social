@@ -124,41 +124,6 @@ export function cborDecode(bytes: Uint8Array): Cbor {
   return new Reader(bytes).item();
 }
 
-/** The public fields of a PNP-003 pairing code. */
-export interface PairingPayload {
-  /** The presenter's Ed25519 identity key, hex. */
-  identityKey: string;
-  /** Seconds since the epoch, floored to 300 s by the presenter. */
-  ts: number;
-}
-
-/** A pairing code is valid for this long after its `ts` (parolnet-core `QR_MAX_AGE_SECS`). */
-export const PAIRING_CODE_LIFETIME_SECS = 1800;
-
-/**
- * Read the public fields of a pairing code (`{v:1, ik, seed, rk, relay, ts, net}`). `null`
- * when it is not one. The seed is read past, never kept.
- */
-export function parsePairingCode(codeHex: string): PairingPayload | null {
-  const bytes = fromHex(codeHex);
-  if (!bytes) return null;
-  try {
-    const v = cborDecode(bytes);
-    if (!(v instanceof Map)) return null;
-    const ik = v.get("ik");
-    const ts = v.get("ts");
-    if (v.get("v") !== 1 || !(ik instanceof Uint8Array) || ik.length !== 32) {
-      return null;
-    }
-    if (typeof ts !== "number" || ts < 0) return null;
-    return { identityKey: toHex(ik), ts };
-  } catch {
-    return null;
-  } finally {
-    wipe(bytes);
-  }
-}
-
 /**
  * The cleartext `source_hint` of an envelope (hex), or `null` when it has none or is
  * malformed. An envelope is the CBOR array `[cleartext_header, ratchet_header, ciphertext,

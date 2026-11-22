@@ -331,8 +331,8 @@ Deno.test(
     await a.engine.sendText(b.id, "one");
     await b.engine.sendText(a.id, "two");
     await w.settle();
-    // The core's ratchet advances before it authenticates. Pairing c makes a trial-decrypt
-    // c's bootstrap envelope with b's session first; that must not cost a its session with b.
+    // Pairing c (a new session, and a pairing's own messages on another channel) must not
+    // cost a its session with b.
     await w.pair(a, c);
     // And an envelope that does not decrypt, on b's own channel (c's envelope for a, which
     // carries a ratchet key b's session has never seen).
