@@ -370,12 +370,14 @@ fn bootstrap_and_decrypt(
         ));
     }
 
-    let bs = crate::bootstrap::derive_bootstrap_secret(seed, our_ik, &their_ik)?;
+    let mut bs = crate::bootstrap::derive_bootstrap_secret(seed, our_ik, &their_ik)?;
 
     // Candidate session — held on the stack, not yet in the session manager.
     let ratchet_sk = StaticSecret::from(*our_ratchet_secret);
-    let mut candidate =
-        DoubleRatchetSession::initialize_responder(bs, ratchet_sk).map_err(CoreError::Crypto)?;
+    let candidate = DoubleRatchetSession::initialize_responder(bs, ratchet_sk);
+    // The session holds its own copy as root key; ours is erased here.
+    zeroize::Zeroize::zeroize(&mut bs);
+    let mut candidate = candidate.map_err(CoreError::Crypto)?;
 
     let header_bytes = encode_header(&envelope.cleartext_header)?;
     let plaintext = candidate

@@ -8,7 +8,7 @@ import type {
   PathState,
 } from "../engine/types.ts";
 
-export { transferOver } from "../engine/types.ts";
+export { isVerified, transferOver } from "../engine/types.ts";
 
 export type {
   CallEnd,
@@ -21,8 +21,10 @@ export type {
   Direction,
   NoticeCode,
   PairingCode,
+  PairingFailure,
   PathState,
   RelayState,
+  SasCheck,
   TransferInfo,
   TransferState,
   Verification,

@@ -5600,6 +5600,7 @@ dependencies = [
  "parolnet-rtc",
  "parolnet-store",
  "parolnet-transfer",
+ "qrcode",
  "rand 0.8.8",
  "reqwest",
  "rustls",
@@ -5617,7 +5618,9 @@ name = "parolnet-core"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "base64 0.22.1",
  "ciborium",
+ "ed25519-dalek",
  "hex",
  "hmac 0.13.0",
  "parolnet-crypto",

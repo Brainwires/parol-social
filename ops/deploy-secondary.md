@@ -160,8 +160,8 @@ docker compose up -d
 (or set them under `build: args:` in a `docker-compose.override.yml` so that a plain
 `git pull && docker compose up -d --build` keeps them.)
 
-The legacy PWA's `pwa/build.sh --network-name … --bootstrap-relays …` generated a
-`network-config.js` with a bootstrap relay list. The web app has no such list: it uses the
+The legacy PWA (since removed from the repository) had `pwa/build.sh --network-name …
+--bootstrap-relays …`, which generated a `network-config.js` with a bootstrap relay list. The web app has no such list: it uses the
 relay at the origin it was served from, and a person can name another under Settings,
 Advanced. Each relay therefore serves the app for its own users; steps 9 and 9a describe the
 legacy PWA's multi-relay behaviour and do not apply to the web app as it stands.

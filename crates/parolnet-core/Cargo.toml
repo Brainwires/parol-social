@@ -40,6 +40,9 @@ serde_json.workspace = true
 x25519-dalek.workspace = true
 zeroize.workspace = true
 serde_bytes.workspace = true
+# PNP-003: the mDNS TXT record of a discovery announcement is base64; pre-key signatures.
+base64.workspace = true
+ed25519-dalek.workspace = true
 # web-time removed — it pulls in performance.now() which breaks WASM instantiation
 opus-rs = { workspace = true, optional = true }
 codec2 = { workspace = true, optional = true }

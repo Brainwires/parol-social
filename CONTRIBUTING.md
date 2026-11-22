@@ -14,7 +14,7 @@ We welcome contributors from all backgrounds, especially those from communities 
 
 ### Repository Structure
 
-ParolNet is a Cargo workspace with 9 crates and a PWA shell:
+ParolNet is a Cargo workspace with 9 crates and a web app:
 
 ```
 crates/
@@ -27,7 +27,7 @@ crates/
   parolnet-wasm         Browser bindings via wasm-bindgen
   parolnet-relay-server Axum WebSocket relay server
   parolnet-authority-cli Authority key and relay endorsement CLI
-pwa/                    Installable PWA shell (HTML/JS/manifest)
+web/                    The web app (Denext, TypeScript), served at /pwa/
 specs/                  Protocol specifications PNP-001 through PNP-009
 ```
 

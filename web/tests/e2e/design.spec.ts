@@ -1101,6 +1101,33 @@ test("someone used this device's code while the person was elsewhere: the conver
   await expect(page.getByTestId("row-c3c3c3c3")).toContainText("Lea");
 });
 
+test("a verification code waits to be compared wherever the person is, and takes two answers", async ({ page, server }) => {
+  await page.setViewportSize(PHONE);
+  await open(page, server, "#/lab");
+  await page.getByTestId("lab-sas").click();
+  // Not on the add-a-contact screen: the code takes the main column all the same.
+  await go(page, "#/");
+  await expect(page.getByTestId("sas-screen-title")).toHaveText(
+    "Compare the verification code",
+  );
+  await expect(page.getByTestId("sas-screen-title")).toBeFocused();
+  await expect(page.getByTestId("sas-digits")).toHaveText("042 917");
+  await expect(page.getByTestId("sas-emoji").locator("span")).toHaveCount(5);
+  // Codes run left to right in every language.
+  expect(
+    await page.getByTestId("sas-digits").evaluate((el) => getComputedStyle(el).direction),
+  ).toBe("ltr");
+  await expect(page.getByTestId("sas-body")).toHaveText(
+    "Your contact's device shows a code too. Compare the two by voice or in person, not by message.",
+  );
+  await expect(page.getByTestId("sas-no-match")).toHaveText("They don't match");
+  await page.getByTestId("sas-match").click();
+  await expect(page.getByTestId("sas-waiting")).toHaveText(
+    "Waiting for your contact to confirm the code on their device.",
+  );
+  await expect(page.getByTestId("sas-match")).toHaveCount(0);
+});
+
 test("the naming prompt can be put away; the row keeps saying New contact", async ({ page, server }) => {
   await open(page, server, "#/lab");
   await page.getByTestId("lab-someone-used-code").click();

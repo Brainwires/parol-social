@@ -9,6 +9,8 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use parolnet_core::bootstrap::NonceTracker;
+use parolnet_core::bootstrap::pairing::PairingState;
 use parolnet_core::envelope::{decrypt_for_peer, encrypt_for_peer, try_bootstrap_and_decrypt};
 use parolnet_core::{ParolNet, ParolNetConfig};
 use parolnet_protocol::PeerId;
@@ -192,16 +194,25 @@ pub(crate) enum Timer {
     },
 }
 
-/// The presenter's half of a QR bootstrap (PNP-003), kept while its code is valid.
+#[path = "pairing.rs"]
+mod pairing;
+use pairing::PairingSlot;
+
+/// The presenter's half of a QR bootstrap (PNP-003), kept while its code is valid and until
+/// one peer has bootstrapped with it (PNP-003-MUST-040).
 struct PendingBootstrap {
     seed: [u8; 32],
     ratchet_secret: [u8; 32],
+    /// The code as shown (the text of the QR code) and when it stops being shown.
+    code: String,
+    expires_ms: u64,
 }
 
 impl Drop for PendingBootstrap {
     fn drop(&mut self) {
         self.seed.zeroize();
         self.ratchet_secret.zeroize();
+        self.code.zeroize();
     }
 }
 
@@ -345,6 +356,12 @@ struct Engine {
     peers: HashMap<String, PeerState>,
     pending_bootstrap: Option<PendingBootstrap>,
     pairing_until: Option<Instant>,
+    /// Bootstraps under way, by peer (PNP-003 §4 from SECRET_SHARED on).
+    pairings: HashMap<String, PairingSlot>,
+    /// Bootstrap handshake nonces of the last 60 minutes (PNP-003-MUST-043).
+    nonces: NonceTracker,
+    /// Pairing codes made so far (picks the relay hint of the next one).
+    codes_made: u64,
     stun: Vec<String>,
     /// How connections bind: one address, or every interface.
     gather: Gather,
@@ -388,7 +405,13 @@ pub(crate) async fn start(
     });
 
     let client = ParolNet::from_identity(ParolNetConfig::default(), identity);
-    let state = store.load_state()?;
+    let mut state = store.load_state()?;
+    // A pairing that a restart interrupted is over: its half-made contact and its session
+    // are removed before anything can use them.
+    if state.forget_unfinished_pairings() {
+        tracing::info!("removed what an unfinished pairing left behind");
+        store.save_state(&state)?;
+    }
     let mut sessions = Vec::with_capacity(state.sessions.len());
     for (pid, data) in &state.sessions {
         match (decode_32(pid), hex::decode(data)) {
@@ -494,6 +517,9 @@ pub(crate) async fn start(
         peers: HashMap::new(),
         pending_bootstrap: None,
         pairing_until: None,
+        pairings: HashMap::new(),
+        nonces: NonceTracker::default(),
+        codes_made: rand::thread_rng().r#gen(),
         stun,
         gather,
         bind_ip,
@@ -684,6 +710,8 @@ impl Engine {
             name: self.default_name(peer),
             identity_key,
             added_ms: now_ms(),
+            sas_verified: false,
+            pairing: None,
         };
         self.state.contacts.push(contact.clone());
         (contact, true)
@@ -699,6 +727,11 @@ impl Engine {
             Command::PairWithCode(code, reply) => {
                 let _ = reply.send(self.pair_with_code(&code));
             }
+            Command::CancelPairingCode => self.close_pairing_code(),
+            Command::ConfirmSas(peer, reply) => {
+                let _ = reply.send(self.confirm_sas(&peer));
+            }
+            Command::RejectSas(peer) => self.reject_sas(&peer),
             Command::SendText(peer, text, reply) => {
                 let _ = reply.send(self.send_text(&peer, &text));
             }
@@ -801,6 +834,8 @@ impl Engine {
                 })
                 .collect(),
             pairing_open: self.pairing_open(),
+            pairing_code: self.shown_code().map(|pb| pb.code.clone()),
+            pairing_expires_ms: self.shown_code().map(|pb| pb.expires_ms),
             turn_configured: self.state.turn.is_some(),
             relay_only: self.state.turn.as_ref().is_some_and(|t| t.relay_only),
         }
@@ -899,105 +934,13 @@ impl Engine {
         Ok(())
     }
 
-    fn create_pairing_code(&mut self) -> Result<String, AppError> {
-        let result = parolnet_core::bootstrap::generate_qr_payload_with_ratchet(&self.my_pk, None)
-            .map_err(|e| AppError::Crypto(e.to_string()))?;
-        self.pending_bootstrap = Some(PendingBootstrap {
-            seed: result.seed,
-            ratchet_secret: result.ratchet_secret,
-        });
-        self.pairing_until = Some(Instant::now() + self.cfg.pairing_window);
-        Ok(hex::encode(&result.payload_bytes))
-    }
-
-    fn pair_with_code(&mut self, code: &str) -> Result<Contact, AppError> {
-        let clean: String = code
-            .chars()
-            .filter(|c| !c.is_whitespace() && *c != '"' && *c != '\'')
-            .collect();
-        if clean.len() <= 64 || !clean.bytes().all(|b| b.is_ascii_hexdigit()) {
-            return Err(AppError::InvalidCode(
-                "expected the full pairing code (hex) from the contact's app".into(),
-            ));
-        }
-        let bytes = hex::decode(&clean).map_err(|e| AppError::InvalidCode(e.to_string()))?;
-        let (payload, bs) = self
-            .client
-            .process_qr(&bytes)
-            .map_err(|e| AppError::InvalidCode(e.to_string()))?;
-        let their_ik: [u8; 32] = payload
-            .ik
-            .as_slice()
-            .try_into()
-            .map_err(|_| AppError::InvalidCode("identity key must be 32 bytes".into()))?;
-        if their_ik == self.my_pk {
-            return Err(AppError::OwnCode);
-        }
-        let ratchet_key: [u8; 32] = payload
-            .rk
-            .as_slice()
-            .try_into()
-            .map_err(|_| AppError::InvalidCode("the code has no ratchet key".into()))?;
-        let their_pid = PeerId::from_public_key(&their_ik);
-        let peer = hex::encode(their_pid.0);
-        self.client
-            .establish_session(
-                their_pid,
-                parolnet_crypto::SharedSecret(bs),
-                &ratchet_key,
-                true,
-            )
-            .map_err(|e| AppError::Crypto(e.to_string()))?;
-
-        // PNP-001 §5.3.1 / MUST-063: the first envelope carries our identity key as
-        // source_hint so the presenter can materialize its responder session.
-        let bootstrap = encrypt_for_peer(
-            self.client.sessions(),
-            &their_pid,
-            msg_type::SYSTEM,
-            &[],
-            now_secs(),
-            Some(PeerId(self.my_pk)),
-        )
-        .map_err(|e| AppError::Crypto(e.to_string()))?;
-        // A new session replaces whatever was queued under the old one.
-        let stale = self.state.take_queue_for(&peer);
-        for e in stale {
-            if let Some(id) = e.message_id {
-                self.mark_message(&peer, id, DeliveryState::Dropped);
-            }
-        }
-        self.state.enqueue_front(QueuedEnvelope {
-            peer_id: peer.clone(),
-            envelope: hex::encode(bootstrap),
-            created_ms: now_ms(),
-            message_id: None,
-        });
-        let (contact, new) = self.upsert_contact(&peer, Some(hex::encode(their_ik)));
-        self.emit(if new {
-            AppEvent::ContactAdded(contact.clone())
-        } else {
-            AppEvent::ContactUpdated(contact.clone())
-        });
-        self.persist_sessions();
-        self.send_watch();
-        // The presenter does not know us yet, so it neither watches us nor offers: offer now.
-        let st = self.peer_mut(&peer);
-        st.online = None;
-        st.offline_by_error = false;
-        st.quiet_probe = false;
-        st.attempt = 0;
-        st.failures = 0;
-        self.probes.clear(&peer);
-        self.drop_conn(&peer);
-        self.connect(&peer, true);
-        Ok(contact)
-    }
-
     fn send_text(&mut self, peer: &str, text: &str) -> Result<ChatMessage, AppError> {
         let pid = peer_id_of(peer).ok_or_else(|| AppError::UnknownContact(peer.to_owned()))?;
         if !self.client.has_session(&pid) {
             return Err(AppError::NoSession(peer.to_owned()));
+        }
+        if self.pairings.contains_key(peer) {
+            return Ok(self.defer_text(peer, text));
         }
         let envelope = encrypt_for_peer(
             self.client.sessions(),
@@ -1057,6 +1000,10 @@ impl Engine {
     /// Send a content envelope on the contact's data channel once its binding has verified
     /// (PNP-001-SHOULD-018). False when there is no verified channel.
     fn send_on_channel(&mut self, peer: &str, envelope_hex: &str) -> bool {
+        // Content waits for the pairing to complete: its session is about to be replaced.
+        if self.pairings.contains_key(peer) {
+            return false;
+        }
         if !self
             .peers
             .get(peer)
@@ -1078,27 +1025,6 @@ impl Engine {
             return false;
         };
         handle.send_text(dc, DcFrame::chat(envelope_hex)).is_ok()
-    }
-
-    /// Send the queued bootstrap-completing envelopes (no chat message; they lead the
-    /// queue) before the binding: the presenter needs one to have a session at all.
-    fn flush_bootstrap(&mut self, peer: &str) {
-        let entries = self.state.take_queue_for(peer);
-        let mut rest = Vec::new();
-        let mut sent = false;
-        for e in entries {
-            if rest.is_empty() && e.message_id.is_none() && self.send_raw(peer, &e.envelope) {
-                sent = true;
-                continue;
-            }
-            rest.push(e);
-        }
-        for e in rest.into_iter().rev() {
-            self.state.enqueue_front(e);
-        }
-        if sent {
-            self.save();
-        }
     }
 
     /// PNP-001-MUST-079: our CHANNEL_BINDING, once the channel is open and we hold a session.
@@ -1175,10 +1101,14 @@ impl Engine {
                 tracing::info!(peer = %crate::short_id(peer), "direct channel verified");
                 // A presenter whose session appeared with this very envelope binds now.
                 self.send_binding(peer);
-                self.set_path(peer, PathState::Direct);
-                self.flush_queue(peer);
-                self.transfers_on_verified(peer);
-                self.flush_call_signals(peer);
+                // While the contact's pairing is still under way the path is not usable
+                // yet: it is shown as direct when the pairing completes.
+                if !self.pairings.contains_key(peer) {
+                    self.set_path(peer, PathState::Direct);
+                    self.flush_queue(peer);
+                    self.transfers_on_verified(peer);
+                    self.flush_call_signals(peer);
+                }
             }
             Err(e) => {
                 tracing::warn!(peer = %crate::short_id(peer), %e, "channel binding refused");
@@ -1796,7 +1726,7 @@ impl Engine {
                 tracing::info!(peer = %crate::short_id(peer), "data channel open; binding");
                 // PNP-001 §10.5.1: the bootstrap-completing envelope first (we scanned the
                 // peer's code), then our binding. Everything else waits for the peer's binding.
-                self.flush_bootstrap(peer);
+                self.flush_pairing(peer);
                 self.send_binding(peer);
                 self.after(
                     BINDING_TIMEOUT,
@@ -1927,6 +1857,11 @@ impl Engine {
         let was_initiator = conn.initiator;
         if let Some(h) = conn.handle {
             tokio::spawn(h.close());
+        }
+        // A bootstrap whose handshake was under way on this connection is over: its
+        // messages are not repeated on another one.
+        if self.pairings.get(peer).is_some_and(|slot| slot.started) {
+            self.abort_pairing(peer, "the connection was lost during pairing");
         }
         tracing::info!(peer = %crate::short_id(peer), ?reason, was_open, "connection ended");
         let st = self.peer_mut(peer);
@@ -2204,9 +2139,9 @@ impl Engine {
 
     fn on_tick(&mut self) {
         if self.pairing_until.is_some_and(|t| Instant::now() >= t) {
-            self.pairing_until = None;
-            self.pending_bootstrap = None;
+            self.close_pairing_code();
         }
+        self.tick_pairings();
         self.expire_transfers();
         if !self.registered {
             return;
@@ -2267,7 +2202,6 @@ impl Engine {
                 Err(e) => tracing::debug!(peer = %crate::short_id(peer), %e, "decrypt failed"),
             }
         }
-        let mut bootstrapped_ik = None;
         if decoded.is_none()
             && self.pairing_open()
             && let Some(pb) = self.pending_bootstrap.as_ref()
@@ -2281,31 +2215,39 @@ impl Engine {
                 &pb.seed,
                 &pb.ratchet_secret,
             ) {
-                Ok(d) => {
-                    decoded = Some(d);
-                    bootstrapped_ik = Some(ik);
-                    self.pending_bootstrap = None;
-                }
+                // PNP-001 §5.3.1: the session is materialized; its first message is the
+                // scanner's BootstrapHandshake (PNP-003 §5.4).
+                Ok(d) => self.on_bootstrap_envelope(peer, ik, &d),
                 Err(e) => tracing::info!(peer = %crate::short_id(peer), %e, "bootstrap failed"),
             }
+            self.persist_sessions();
+            return;
         }
         let Some(d) = decoded else {
             return;
         };
+        // The responder of a PNP-002 handshake: this is the session's first message.
+        if self
+            .pairings
+            .get(peer)
+            .is_some_and(|slot| slot.pairing.state() == PairingState::Accepted)
+        {
+            self.on_first_session_message(peer);
+        }
         // We may hold a session only now (the presenter, on the scanner's bootstrap
         // envelope): our binding can go out.
         if d.msg_type != msg_type::CHANNEL_BINDING {
             self.send_binding(peer);
         }
-        if let Some(ik) = bootstrapped_ik {
-            let (contact, new) = self.upsert_contact(peer, Some(hex::encode(ik)));
-            tracing::info!(peer = %crate::short_id(peer), "paired (presenter side)");
-            self.emit(if new {
-                AppEvent::ContactAdded(contact)
-            } else {
-                AppEvent::ContactUpdated(contact)
-            });
-            self.send_watch();
+        if self.pairings.contains_key(peer)
+            && !matches!(
+                d.msg_type,
+                msg_type::HANDSHAKE | msg_type::CHANNEL_BINDING | msg_type::SYSTEM
+            )
+        {
+            tracing::debug!(peer = %crate::short_id(peer), "content before the pairing completed");
+            self.persist_sessions();
+            return;
         }
         match d.msg_type {
             msg_type::CHAT => {
@@ -2328,6 +2270,7 @@ impl Engine {
                 self.emit(AppEvent::Message(msg));
             }
             msg_type::SYSTEM => {}
+            msg_type::HANDSHAKE => self.on_handshake(peer, &d.plaintext),
             msg_type::CHANNEL_BINDING => self.on_binding(peer, &d.plaintext),
             parolnet_transfer::MSG_TYPE_FILE_TRANSFER => {
                 self.on_transfer_control(peer, &d.plaintext)
@@ -2444,7 +2387,11 @@ impl Engine {
         if !self.is_contact(peer) {
             return Err(AppError::UnknownContact(peer.to_owned()));
         }
-        // PNP-001-MUST-081: call signals only on a verified channel.
+        // PNP-001-MUST-081: call signals only on a verified channel (and not before the
+        // pairing's session is the final one).
+        if self.pairings.contains_key(peer) {
+            return Err(AppError::NotConnected(peer.to_owned()));
+        }
         if !self
             .peers
             .get(peer)

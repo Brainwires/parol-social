@@ -8,6 +8,9 @@ import { ConversationRow, initial } from "../../src/components/ConversationRow.t
 import { Line } from "../../src/components/Line.tsx";
 import { Panel } from "../../src/components/Panel.tsx";
 import { QrCode } from "../../src/components/QrCode.tsx";
+import { SasPanel, sasSpaced } from "../../src/screens/SasCheck.tsx";
+import { StoreProvider } from "../../src/state/context.ts";
+import { createFakeStore } from "../../src/state/fake.ts";
 import type { ContactView, LineState, PathState } from "../../src/state/model.ts";
 
 Deno.test("Line: a polite status with the words of each state", async () => {
@@ -217,6 +220,64 @@ Deno.test("codes: pairing code in fours, safety number as 12 groups of 5", async
   const safety = [...screen.getByTestId("safety").children].map((c) => c.textContent ?? "");
   assertEquals(safety.length, 12);
   assertEquals(safety.every((g) => /^\d{5}$/.test(g)), true);
+});
+
+Deno.test("SasPanel: the code as digits and pictures, and the two answers", async () => {
+  assertEquals(sasSpaced("042917"), "042 917");
+  assertEquals(sasSpaced("12345"), "12345");
+  const store = createFakeStore({ empty: true });
+  const sas = {
+    peerId: "5a".repeat(32),
+    digits: "042917",
+    emoji: "\u{1F400}\u{1F340}\u{1F3A0}\u{1F680}\u{1F41F}",
+    confirmed: false,
+  };
+  store.setSas(sas);
+  const Shown = () => {
+    const current = store.sas.value;
+    return current ? <SasPanel sas={current} /> : <p data-testid="gone">gone</p>;
+  };
+  const screen = await render(
+    <StoreProvider value={store}>
+      <Shown />
+    </StoreProvider>,
+  );
+  const digits = screen.getByTestId("sas-digits");
+  assertEquals(digits.textContent, "042 917");
+  assertEquals(digits.getAttribute("dir"), "ltr");
+  assertEquals(digits.getAttribute("aria-label"), "Verification code");
+  // PNP-003-MUST-027: the same value as five pictures, one each.
+  assertEquals(
+    [...screen.getByTestId("sas-emoji").children].map((c) => c.textContent),
+    [...sas.emoji],
+  );
+  assertEquals(screen.getByTestId("sas-match").textContent, "They match");
+  assertEquals(screen.getByTestId("sas-no-match").textContent, "They don't match");
+  assertEquals(screen.getByTestId("sas").getAttribute("data-confirmed"), "false");
+
+  // "They match": the buttons go, and the panel says what it waits for.
+  await userEvent.click(screen.getByTestId("sas-match"));
+  assertEquals(store.sas.value?.confirmed, true);
+  assertEquals(screen.getByTestId("sas").getAttribute("data-confirmed"), "true");
+  assertEquals(screen.queryByTestId("sas-match"), null);
+  assertEquals(
+    screen.getByTestId("sas-waiting").textContent,
+    "Waiting for your contact to confirm the code on their device.",
+  );
+
+  await screen.unmount();
+
+  // "They don't match" drops it.
+  store.setSas(sas);
+  const again = await render(
+    <StoreProvider value={store}>
+      <Shown />
+    </StoreProvider>,
+  );
+  await userEvent.click(again.getByTestId("sas-no-match"));
+  assertEquals(store.sas.value, null);
+  assertEquals(again.getByTestId("gone").textContent, "gone");
+  await again.unmount();
 });
 
 Deno.test("helpers: initials and file sizes", () => {

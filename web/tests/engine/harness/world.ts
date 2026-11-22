@@ -15,7 +15,7 @@ import type {
   WasmApi,
 } from "../../../src/engine/platform.ts";
 import { MemoryStorage } from "../../../src/engine/storage.ts";
-import type { AppEvent, PathState } from "../../../src/engine/types.ts";
+import type { AppEvent, PathState, SasCheck } from "../../../src/engine/types.ts";
 import { wasmApi } from "../../../src/engine/browser.ts";
 import {
   FakeClock,
@@ -106,6 +106,24 @@ export class Device {
     const id = typeof peer === "string" ? peer : peer.id;
     return this.engine.snapshot().contacts.find((c) => c.contact.peerId === id)
       ?.path ?? "Unknown";
+  }
+
+  /** The verification code this device shows for its pairing with `peer`, if any. */
+  sas(peer: Device | string): SasCheck | null {
+    const id = typeof peer === "string" ? peer : peer.id;
+    return this.eventsOf("Sas").findLast((e) => e.sas.peerId === id && this.pairingWith(id))
+      ?.sas ?? null;
+  }
+
+  /** A pairing with `peer` is under way on this device. */
+  pairingWith(peer: Device | string): boolean {
+    const id = typeof peer === "string" ? peer : peer.id;
+    return this.wasm.pairing_state(id) !== undefined;
+  }
+
+  contact(peer: Device | string) {
+    const id = typeof peer === "string" ? peer : peer.id;
+    return this.engine.snapshot().contacts.find((c) => c.contact.peerId === id)?.contact;
   }
 
   /** Break every live connection of this device (both ends notice). */
@@ -225,20 +243,46 @@ export class World {
     });
   }
 
-  /** `a` shows a code, `b` pairs with it, and both end with a verified direct channel. */
+  /**
+   * `a` shows a code, `b` pairs with it, both people confirm the verification code, and both
+   * end with the contact and a verified direct channel. A scan reads the code itself, a paste
+   * gets its text form.
+   */
   async pair(
     a: Device,
     b: Device,
     via: "scan" | "paste" = "paste",
   ): Promise<void> {
-    const { code } = await a.engine.createPairingCode();
-    await b.engine.pairWithCode(code, { via });
+    const { code, text } = await a.engine.createPairingCode();
+    await b.engine.pairWithCode(via === "scan" ? code : text, { via });
     await this.settle();
+    await this.confirmSas(a, b);
+    for (let i = 0; i < 5 && !(a.path(b) === "Direct" && b.path(a) === "Direct"); i++) {
+      await this.settle();
+    }
     if (a.path(b) !== "Direct" || b.path(a) !== "Direct") {
       throw new Error(
         `pairing did not reach Direct: ${a.name}=${a.path(b)} ${b.name}=${b.path(a)}`,
       );
     }
+  }
+
+  /**
+   * The two people compare the verification code and both say it matches. Throws when the
+   * two devices do not show the same one. Nothing to do when neither device asked for it.
+   */
+  async confirmSas(a: Device, b: Device): Promise<void> {
+    for (let i = 0; i < 5 && !(a.sas(b) && b.sas(a)); i++) await this.settle();
+    const [shownA, shownB] = [a.sas(b), b.sas(a)];
+    if (!shownA && !shownB) return;
+    if (
+      !shownA || !shownB || shownA.digits !== shownB.digits || shownA.emoji !== shownB.emoji
+    ) {
+      throw new Error("the two devices do not show the same verification code");
+    }
+    await a.engine.confirmSas(b.id);
+    await b.engine.confirmSas(a.id);
+    await this.settle();
   }
 
   async shutdown(): Promise<void> {

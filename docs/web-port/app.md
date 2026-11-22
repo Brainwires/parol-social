@@ -2,7 +2,8 @@
 
 `web/` is the web client: the screens of [docs/ux/web-app.md](../ux/web-app.md) on the engine
 of [engine.md](engine.md). This document says how the two are joined, what is tested, and what
-is still owed before `web/` replaces `pwa/` in production.
+is still owed. (`web/` has replaced the legacy vanilla-JS PWA, which has been removed from the
+repository; "the old PWA" below is that client.)
 
 ## How it is joined
 
@@ -101,7 +102,7 @@ open, behind the link that saves them. Nothing about either is logged.
 | The engine: 112 tests over real wasm, fake socket / peer connection / clock. Among them the sealed form of a row, the migration of a plaintext database (and its failure and a race of two tabs), lock / unlock / wrong passphrase / backoff / change / remove, the backup file's round trip, wrong passphrase, tampering and version, and a restored device at work | `tests/engine` (`denext task test:engine`, part of `test`) | `denext task build-wasm` |
 | The platform (CSP, service worker, offline start, update flow, takeover from the previous PWA) on the production export; the design, on the lab build | `tests/e2e/*.spec.ts` | both builds |
 | Real flows between two or three pages through a real relay, on the production export: first run, pairing by paste and by camera, chat, the queue with edit and take-back, unread counts and order, a video call, a second tab, settings, delete all data; nothing readable in the database; the passphrase lock (wrong tries, the wait, lock now, change, remove, forgotten); back up, delete all data, restore, still paired and chatting; a plaintext database of the earlier version sealed at start | `tests/e2e/real.flows.ts` (`--project=flows-<browser>`) | both builds and the relay binary |
-| The seven desktop ↔ browser cases against the web app | `apps/desktop/interop/pwa-interop.mjs` with `INTEROP_APP=web` | the test build, the relay and the bot |
+| The seven desktop ↔ browser cases against the web app | `apps/desktop/interop/pwa-interop.mjs` | the test build, the relay and the bot |
 | The engine alone in a browser (no UI) against the relay and the bot | `tests/engine/e2e` (`denext task engine:e2e:build`, `engine:e2e`) | as above; not run in CI: the two rows above cover its scenarios through the app |
 
 Every page in the real flows is watched: no Content-Security-Policy violation, no console
@@ -197,7 +198,7 @@ Where the old PWA's words came from, for the record:
 | `toast.codeCopied`, `toast.turnSaved` | the same keys |
 | `toast.renamed`, `toast.turnRemoved` | `toast.contactRenamed`, `toast.turnCleared` |
 
-## Owed before this replaces the old PWA
+## Still owed
 
 - **Review of the translations** by native speakers (above, "Languages").
 - **The lock.** No automatic lock after inactivity. The derivation runs on the main thread

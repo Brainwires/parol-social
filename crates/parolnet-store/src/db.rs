@@ -230,7 +230,8 @@ impl Database {
 
     pub fn contacts(&self) -> Result<Vec<ContactRecord>, StoreError> {
         let mut stmt = self.conn.prepare(
-            "SELECT peer_id, name, identity_key, added_ms FROM contacts ORDER BY added_ms, peer_id",
+            "SELECT peer_id, name, identity_key, added_ms, sas_verified, pairing
+             FROM contacts ORDER BY added_ms, peer_id",
         )?;
         let rows = stmt.query_map([], |r| {
             Ok(ContactRecord {
@@ -238,6 +239,8 @@ impl Database {
                 name: r.get(1)?,
                 identity_key: r.get(2)?,
                 added_ms: from_db(r.get(3)?),
+                sas_verified: r.get(4)?,
+                pairing: r.get(5)?,
             })
         })?;
         Ok(rows.collect::<Result<_, _>>()?)
@@ -535,14 +538,17 @@ pub(crate) fn apply_ops(tx: &Transaction<'_>, ops: &[Op]) -> Result<(), StoreErr
         match op {
             Op::PutContact(c) => {
                 tx.prepare_cached(
-                    "INSERT OR REPLACE INTO contacts (peer_id, name, identity_key, added_ms)
-                     VALUES (?1, ?2, ?3, ?4)",
+                    "INSERT OR REPLACE INTO contacts
+                         (peer_id, name, identity_key, added_ms, sas_verified, pairing)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
                 )?
                 .execute(params![
                     c.peer_id,
                     c.name,
                     c.identity_key,
-                    to_db(c.added_ms)
+                    to_db(c.added_ms),
+                    c.sas_verified,
+                    c.pairing
                 ])?;
             }
             Op::DeleteContact { peer_id } => {

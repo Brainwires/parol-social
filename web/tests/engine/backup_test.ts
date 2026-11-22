@@ -374,9 +374,7 @@ Deno.test(
     assertEquals(typeof restored.engine.snapshot().contacts[0].contact.restoredMs, "number");
 
     // Adding each other again makes a new session: the line opens and the mark is gone.
-    const { code } = await restored.engine.createPairingCode();
-    await b.engine.pairWithCode(code, { via: "paste" });
-    await w.advance(30_000);
+    await w.pair(restored, b);
     assertEquals(restored.path(b), "Direct");
     assertEquals(restored.engine.snapshot().contacts[0].contact.restoredMs, undefined);
     await b.engine.sendText(id, "after adding again");

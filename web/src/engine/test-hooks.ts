@@ -23,8 +23,22 @@ export interface ParolnetTestHooks {
   version: 1;
   ready(): Promise<{ peerId: string }>;
   relayRegistered(): boolean;
+  /** The code in its form for copying as text (the picture holds the same code). */
   showPairingCode(): Promise<string>;
+  /**
+   * Starts adding the contact whose code this is. The contact is added once both devices'
+   * verification codes were confirmed (`sas`, `confirmSas`).
+   */
   pairWithCode(code: string): Promise<void>;
+  /**
+   * Not in §11.4: the verification code this device shows for a pairing that waits for it
+   * (PNP-003 §5.5), or null. Both devices must show the same one.
+   */
+  sas(): { peerId: string; digits: string; emoji: string; confirmed: boolean } | null;
+  /** Not in §11.4: the person says the code shown is the one on the contact's device. */
+  confirmSas(): Promise<void>;
+  /** Not in §11.4: the person says the codes differ; the contact is not added. */
+  rejectSas(): Promise<void>;
   contacts(): Promise<string[]>;
   messages(
     peerId: string,
@@ -94,7 +108,8 @@ interface HookTarget {
 /**
  * Install `__parolnetTest` on `target` (default `globalThis`) and announce state changes as
  * `parolnet:test` events (`detail: {kind:'relay', state}`, `{kind:'path', peerId, state}`,
- * `{kind:'message', peerId}`, `{kind:'call', state}`).
+ * `{kind:'message', peerId}`, `{kind:'call', state}`, `{kind:'sas', peerId}`,
+ * `{kind:'paired', peerId, sasVerified}`, `{kind:'pairing-failed', peerId, reason}`).
  */
 export function installTestHooks(
   engine: Engine,
@@ -130,6 +145,15 @@ export function installTestHooks(
       case "Message":
         announce({ kind: "message", peerId: ev.message.peerId });
         break;
+      case "Sas":
+        announce({ kind: "sas", peerId: ev.sas.peerId });
+        break;
+      case "PairingComplete":
+        announce({ kind: "paired", peerId: ev.peerId, sasVerified: ev.sasVerified });
+        break;
+      case "PairingFailed":
+        announce({ kind: "pairing-failed", peerId: ev.peerId, reason: ev.reason });
+        break;
       case "Call":
         announce({
           kind: "call",
@@ -156,9 +180,21 @@ export function installTestHooks(
     version: 1,
     ready: () => Promise.resolve({ peerId: engine.peerId }),
     relayRegistered: () => engine.snapshot().relay.kind === "Registered",
-    showPairingCode: async () => (await engine.createPairingCode()).code,
+    showPairingCode: async () => (await engine.createPairingCode()).text,
     pairWithCode: async (code) => {
       await engine.pairWithCode(code, { via: "paste" });
+    },
+    sas: () => {
+      const sas = engine.snapshot().sas;
+      return sas ? { ...sas } : null;
+    },
+    confirmSas: async () => {
+      const sas = engine.snapshot().sas;
+      if (sas) await engine.confirmSas(sas.peerId);
+    },
+    rejectSas: async () => {
+      const sas = engine.snapshot().sas;
+      if (sas) await engine.rejectSas(sas.peerId);
     },
     contacts: () => Promise.resolve(engine.snapshot().contacts.map((c) => c.contact.peerId)),
     messages: async (peerId) =>

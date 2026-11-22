@@ -37,7 +37,7 @@ docker run -d -p 1411:80 parolnet
 
 The image builds the relay and the web app from source (multi-stage `Dockerfile`: no host-side build step) and runs them on `nginx:alpine`: the distribution landing page at `/`, the web app's static export (`web/out`) at `/pwa/`, the relay behind nginx at the same origin (`/ws`, `/turn-credentials`, ...). Deploy or update with `git pull && docker compose up -d --build`; check a running container with `scripts/image-smoke.sh http://127.0.0.1:1411`.
 
-The legacy PWA in `pwa/` is no longer part of the image. The new app's service worker at `/pwa/sw.js` takes over from the old one at the same scope and deletes its caches.
+The legacy PWA that was in `pwa/` has been removed from the repository. The new app's service worker at `/pwa/sw.js` takes over from the old one at the same scope and deletes its caches.
 
 ## Alternative Hosting Options
 

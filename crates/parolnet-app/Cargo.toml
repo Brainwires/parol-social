@@ -38,6 +38,8 @@ tracing.workspace = true
 ed25519-dalek.workspace = true
 rand.workspace = true
 zeroize.workspace = true
+# The pairing code as a QR code (level M, PNP-003-MUST-008). No image or SVG back ends.
+qrcode = { version = "0.14", default-features = false }
 
 [dev-dependencies]
 # The in-process TURN server that stands in for the user's own.

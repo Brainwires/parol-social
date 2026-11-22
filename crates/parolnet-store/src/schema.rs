@@ -45,6 +45,14 @@ const MIGRATIONS: &[&str] = &[
     );
     CREATE INDEX queue_by_peer ON queue (peer_id, seq);
     ",
+    // 1 → 2: what a pairing (PNP-003) leaves on a contact. `sas_verified`: both users
+    // confirmed the verification code. `pairing`: a pairing is under way (1: it added the
+    // contact, 2: the contact was there before); such a contact is cleaned up at the next
+    // start, see `ContactRecord::pairing`.
+    "
+    ALTER TABLE contacts ADD COLUMN sas_verified INTEGER NOT NULL DEFAULT 0;
+    ALTER TABLE contacts ADD COLUMN pairing INTEGER NOT NULL DEFAULT 0;
+    ",
 ];
 
 /// The schema version this build reads and writes.

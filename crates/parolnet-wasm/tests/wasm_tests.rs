@@ -162,66 +162,6 @@ fn test_wasm_decoy_not_enabled_by_default() {
     );
 }
 
-// ── Bootstrap tests (kept from original) ────────────────────
-
-/// QR payload round-trip: generate then parse should both succeed.
-///
-/// Gated to wasm32 only because `parse_qr_payload` returns `JsValue`.
-#[test]
-#[serial]
-#[cfg(target_arch = "wasm32")]
-fn test_wasm_qr_payload_roundtrip() {
-    let key_hex = "aa".repeat(32);
-    let encoded = parolnet_wasm::generate_qr_payload(&key_hex, None)
-        .expect("generate_qr_payload should succeed");
-
-    let parsed = parolnet_wasm::parse_qr_payload(&encoded);
-    assert!(
-        parsed.is_ok(),
-        "parse_qr_payload should succeed: {:?}",
-        parsed.err()
-    );
-}
-
-/// compute_sas with valid 64-char hex strings should return Ok with a 6-char string.
-#[test]
-#[serial]
-fn test_wasm_decode_32_valid() {
-    let hex_a = "aa".repeat(32);
-    let hex_b = "bb".repeat(32);
-    let hex_c = "cc".repeat(32);
-    let hex_d = "dd".repeat(32);
-    let hex_e = "ee".repeat(32);
-
-    let result = parolnet_wasm::compute_sas(&hex_a, &hex_b, &hex_c, &hex_d, &hex_e);
-    assert!(
-        result.is_ok(),
-        "compute_sas should succeed: {:?}",
-        result.err()
-    );
-    let sas = result.unwrap();
-    assert_eq!(sas.len(), 6, "SAS should be 6 chars, got {}", sas.len());
-    assert!(
-        sas.chars().all(|c| c.is_ascii_digit()),
-        "SAS should be all digits, got: {}",
-        sas
-    );
-}
-
-/// compute_sas with a short hex string should return Err.
-///
-/// Gated to wasm32 because the error path constructs JsError.
-#[test]
-#[serial]
-#[cfg(target_arch = "wasm32")]
-fn test_wasm_decode_32_invalid_length() {
-    let valid = "aa".repeat(32);
-    let short = "abcd";
-
-    let result = parolnet_wasm::compute_sas(short, &valid, &valid, &valid, &valid);
-    assert!(result.is_err(), "compute_sas should fail with short input");
-}
-
 // ── Sequential operation / mutex recovery regression tests ──
 
 /// Calling initialize() twice should produce distinct peer IDs and reset sessions.
