@@ -1,8 +1,11 @@
 //! Relay peer presence + lookup (PNP-008 §Presence / §Peer Lookup, v0.3).
 //!
-//! Each relay exposes its currently-connected peers over `GET /peers/presence`
-//! so that client libraries (and federation peers) can discover where a given
-//! `PeerId` lives. Presence entries are Ed25519-signed by the home relay's
+//! A relay-profile relay exposes its currently-connected peers over
+//! `GET /peers/presence` to its federation peers, and answers
+//! `GET /peers/lookup` to them and to its own registered peers, so that they
+//! can discover where a given `PeerId` lives. Neither is answered to an
+//! anonymous caller, and a signaling-only relay serves neither (PNP-008
+//! §10.8; the checks are in `parolnet-relay-server`). Presence entries are Ed25519-signed by the home relay's
 //! identity key over the canonical hash
 //! `SHA-256(relay_peer_id || peer_id || last_seen_be_u64)`, allowing clients
 //! to verify authenticity against the authority-endorsed relay directory.

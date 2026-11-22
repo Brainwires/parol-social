@@ -9,7 +9,9 @@
 //! serves loopback names: clients sign their register answer for
 //! `127.0.0.1:<port>`, the name they dialed (PNP-001 §10.7).
 
-use parolnet_protocol::relay_auth::{RelayName, register_signable};
+use parolnet_protocol::relay_auth::{
+    PeersAuthorization, PeersRequest, RelayName, register_signable,
+};
 
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{Value, json};
@@ -902,4 +904,215 @@ async fn a_pinned_relay_key_has_to_be_the_relays_own() {
     send(&mut ws, swapped).await;
     let r = register_reply(&mut ws).await;
     assert_eq!(r["code"], "register_failed", "{r}");
+}
+
+// ---- who may ask who is online (PNP-001-MUST-071, PNP-008 §10.8) ----------
+
+/// An `Authorization` header for a `/peers/*` request, signed by `key` for
+/// the relay named `relay_name` at `timestamp`.
+fn peers_authorization(
+    key: &ed25519_dalek::SigningKey,
+    request: PeersRequest,
+    relay_name: &str,
+    timestamp: u64,
+) -> String {
+    use ed25519_dalek::Signer;
+    PeersAuthorization::sign(
+        request,
+        key.verifying_key().to_bytes(),
+        timestamp,
+        RelayName::parse(relay_name).unwrap(),
+        |m| key.sign(m).to_bytes(),
+    )
+    .to_header()
+}
+
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+}
+
+fn peer_id_of(id: &Identity) -> parolnet_protocol::address::PeerId {
+    parolnet_protocol::address::PeerId(hex::decode(&id.peer_id).unwrap().try_into().unwrap())
+}
+
+async fn get_peers(relay: &Relay, path: &str, authorization: Option<&str>) -> (u16, Vec<u8>) {
+    // The relay allows one address 10 presence / lookup requests a second
+    // (PNP-008-MUST-066); stay below it.
+    tokio::time::sleep(Duration::from_millis(125)).await;
+    let mut req = http_client().get(relay.http(path));
+    if let Some(a) = authorization {
+        req = req.header("Authorization", a);
+    }
+    let resp = req.send().await.unwrap();
+    let status = resp.status().as_u16();
+    (status, resp.bytes().await.unwrap().to_vec())
+}
+
+#[tokio::test]
+async fn a_signaling_only_relay_tells_no_http_caller_who_is_online() {
+    let relay = Relay::start(&[]).await;
+    let (_a, ida) = registered_peer(&relay).await;
+    let offline = Identity::new();
+
+    // Anonymous: the answer is 404 for an online peer and for one that is
+    // not, with the same (empty) body.
+    let (online_status, online_body) =
+        get_peers(&relay, &format!("/peers/lookup?id={}", ida.peer_id), None).await;
+    let (offline_status, offline_body) = get_peers(
+        &relay,
+        &format!("/peers/lookup?id={}", offline.peer_id),
+        None,
+    )
+    .await;
+    assert_eq!(online_status, 404);
+    assert_eq!(
+        (online_status, &online_body),
+        (offline_status, &offline_body)
+    );
+    assert_eq!(get_peers(&relay, "/peers/presence", None).await.0, 404);
+
+    // Signed by a registered peer, for this relay, now: still not served.
+    let now = unix_now();
+    let lookup = PeersRequest::Lookup(peer_id_of(&ida));
+    let auth = peers_authorization(&ida.key, lookup, &relay.name(), now);
+    let path = format!("/peers/lookup?id={}", ida.peer_id);
+    assert_eq!(get_peers(&relay, &path, Some(&auth)).await.0, 404);
+    let auth = peers_authorization(&ida.key, PeersRequest::Presence, &relay.name(), now);
+    assert_eq!(
+        get_peers(&relay, "/peers/presence", Some(&auth)).await.0,
+        404
+    );
+
+    // The other HTTP surfaces name no peer either.
+    let (status, body) = get_peers(&relay, "/bootstrap", None).await;
+    assert_eq!((status, body.as_slice()), (200, b"[]".as_slice()));
+    assert_eq!(get_peers(&relay, "/peers", None).await.0, 404);
+
+    // Over the registered socket the peer still learns what it needs: an
+    // offer to an offline peer is answered `peer_offline`.
+    let (mut b, _) = registered_peer(&relay).await;
+    send(
+        &mut b,
+        json!({"type": "rtc_offer", "to": offline.peer_id, "payload": "x"}),
+    )
+    .await;
+    let e = recv_type(&mut b, "error", 3000).await.unwrap();
+    assert_eq!(e["code"], "peer_offline");
+}
+
+#[tokio::test]
+async fn a_relay_profile_relay_answers_presence_and_lookup_only_to_signed_requests() {
+    let federation_key = ed25519_dalek::SigningKey::from_bytes(&[0x55; 32]);
+    let federation_pub = hex::encode(federation_key.verifying_key().to_bytes());
+    let relay = Relay::start(&[
+        ("SIGNALING_ONLY", "0"),
+        ("RELAY_PUBLIC_NAMES", "127.0.0.1:{port}"),
+        ("FEDERATION_PEER_KEYS", &federation_pub),
+    ])
+    .await;
+    let (_a, ida) = registered_peer(&relay).await;
+    let (_b, idb) = registered_peer(&relay).await;
+    let stranger = Identity::new();
+    let offline = Identity::new();
+    let now = unix_now();
+    let name = relay.name();
+    let lookup_path = |id: &Identity| format!("/peers/lookup?id={}", id.peer_id);
+    let lookup_of = |id: &Identity| PeersRequest::Lookup(peer_id_of(id));
+
+    // No credentials: refused the same way whether or not the peer is online.
+    let online = get_peers(&relay, &lookup_path(&idb), None).await;
+    let absent = get_peers(&relay, &lookup_path(&offline), None).await;
+    assert_eq!(online.0, 401);
+    assert_eq!(online, absent);
+    assert_eq!(get_peers(&relay, "/peers/presence", None).await.0, 401);
+
+    // A registered peer may look a peer up ...
+    let auth = peers_authorization(&ida.key, lookup_of(&idb), &name, now);
+    let (status, body) = get_peers(&relay, &lookup_path(&idb), Some(&auth)).await;
+    assert_eq!(status, 200);
+    assert!(!body.is_empty());
+    let auth = peers_authorization(&ida.key, lookup_of(&offline), &name, now);
+    assert_eq!(
+        get_peers(&relay, &lookup_path(&offline), Some(&auth))
+            .await
+            .0,
+        404
+    );
+    // ... but not list everyone.
+    let auth = peers_authorization(&ida.key, PeersRequest::Presence, &name, now);
+    assert_eq!(
+        get_peers(&relay, "/peers/presence", Some(&auth)).await.0,
+        403
+    );
+
+    // A key that is not registered here: a valid signature, and no answer,
+    // the same for an online and an offline target.
+    let auth = peers_authorization(&stranger.key, lookup_of(&idb), &name, now);
+    let online = get_peers(&relay, &lookup_path(&idb), Some(&auth)).await;
+    let auth = peers_authorization(&stranger.key, lookup_of(&offline), &name, now);
+    let absent = get_peers(&relay, &lookup_path(&offline), Some(&auth)).await;
+    assert_eq!(online.0, 403);
+    assert_eq!(online, absent);
+
+    // A registered peer's credentials do not stretch: another target, an old
+    // timestamp, another relay's name.
+    let for_b = peers_authorization(&ida.key, lookup_of(&idb), &name, now);
+    assert_eq!(
+        get_peers(&relay, &lookup_path(&offline), Some(&for_b))
+            .await
+            .0,
+        401
+    );
+    let stale = peers_authorization(&ida.key, lookup_of(&idb), &name, now - 3600);
+    assert_eq!(
+        get_peers(&relay, &lookup_path(&idb), Some(&stale)).await.0,
+        401
+    );
+    let elsewhere = peers_authorization(&ida.key, lookup_of(&idb), "relay-e.example:443", now);
+    assert_eq!(
+        get_peers(&relay, &lookup_path(&idb), Some(&elsewhere))
+            .await
+            .0,
+        401
+    );
+    assert_eq!(
+        get_peers(&relay, &lookup_path(&idb), Some("Bearer token"))
+            .await
+            .0,
+        401
+    );
+
+    // No other HTTP endpoint lists who is connected, in this profile either.
+    let (status, body) = get_peers(&relay, "/bootstrap?exclude=x", None).await;
+    assert_eq!((status, body.as_slice()), (200, b"[]".as_slice()));
+    assert_eq!(get_peers(&relay, "/peers", None).await.0, 404);
+
+    // The configured federation peer reads presence and may look up.
+    let auth = peers_authorization(&federation_key, PeersRequest::Presence, &name, now);
+    let (status, body) = get_peers(&relay, "/peers/presence", Some(&auth)).await;
+    assert_eq!(status, 200);
+    #[derive(serde::Deserialize)]
+    struct Entry {
+        peer_id: parolnet_protocol::address::PeerId,
+    }
+    let entries: Vec<Entry> = ciborium::from_reader(body.as_slice()).unwrap();
+    let listed: Vec<String> = entries.iter().map(|e| hex::encode(e.peer_id.0)).collect();
+    assert!(listed.contains(&ida.peer_id) && listed.contains(&idb.peer_id));
+    let auth = peers_authorization(&federation_key, lookup_of(&idb), &name, now);
+    assert_eq!(
+        get_peers(&relay, &lookup_path(&idb), Some(&auth)).await.0,
+        200
+    );
+
+    // A peer that has left is no longer allowed to ask.
+    drop(_a);
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    let auth = peers_authorization(&ida.key, lookup_of(&idb), &name, unix_now());
+    assert_eq!(
+        get_peers(&relay, &lookup_path(&idb), Some(&auth)).await.0,
+        403
+    );
 }

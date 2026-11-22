@@ -373,6 +373,38 @@ pub fn sign_relay_register(nonce_hex: &str, relay_name: &str) -> Result<String, 
     Ok(hex::encode(signature))
 }
 
+/// The `Authorization` header value for `GET /peers/lookup?id=<target>` at
+/// the relay named `relay_name` (PNP-008 §10.8), signed with the identity
+/// key. `now_secs` is the current Unix time.
+#[wasm_bindgen]
+pub fn peers_lookup_authorization(
+    relay_name: &str,
+    target_peer_id_hex: &str,
+    now_secs: u64,
+) -> Result<String, JsError> {
+    use parolnet_protocol::relay_auth::{
+        PeersAuthorization, PeersRequest, RelayName, peers_request_signable,
+    };
+    let relay = RelayName::parse(relay_name).map_err(|e| JsError::new(&e.to_string()))?;
+    let target: [u8; 32] = hex::decode(target_peer_id_hex)
+        .map_err(|e| JsError::new(&format!("invalid peer id hex: {e}")))?
+        .try_into()
+        .map_err(|_| JsError::new("a peer id must be 32 bytes"))?;
+    let request = PeersRequest::Lookup(parolnet_protocol::address::PeerId(target));
+    let key: [u8; 32] = hex::decode(get_public_key())
+        .ok()
+        .and_then(|k| k.try_into().ok())
+        .ok_or_else(|| JsError::new("not initialized"))?;
+    let signature = sign_with_identity(&peers_request_signable(request, now_secs, &relay))?;
+    Ok(PeersAuthorization {
+        key,
+        timestamp: now_secs,
+        relay,
+        signature,
+    }
+    .to_header())
+}
+
 // ── Session Management ──────────────────────────────────────
 
 /// Establish a Double Ratchet session with a peer.

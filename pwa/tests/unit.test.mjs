@@ -1595,6 +1595,30 @@ describe('H12 Phase 2 cross-relay', () => {
         assert.equal(fetchCalls, 1, 'second call hit the cache');
     });
 
+    test('lookupHomeRelay signs its request for the home relay (PNP-008 §10.8)', async () => {
+        const mod = await freshCache();
+        const { lookupHomeRelay, _clearCache, _inject, _resetInject } = mod;
+        _clearCache();
+        const seen = [];
+        const asked = [];
+        const body = encodeLookup('https://home.example', 1_700_000_000, new Uint8Array(64));
+        _inject({
+            fetchFn: async (url, init) => { seen.push({ url, headers: init.headers }); return fakeResp(body); },
+            authorizeFn: (httpBase, peerIdHex) => { asked.push([httpBase, peerIdHex]); return 'PNP-Ed25519 test'; },
+            verifyFn: () => true,
+            homeRelayUrl: () => 'wss://home.example/ws',
+            verifiedDirectory: () => [
+                { url: 'https://home.example', identityKey: RELAY_PUB_HEX, peerIdHex: RELAY_PID_HEX, verified: true },
+            ],
+        });
+        await lookupHomeRelay(PEER_HEX);
+        _resetInject();
+        assert.equal(seen.length, 1);
+        assert.equal(seen[0].headers['Authorization'], 'PNP-Ed25519 test');
+        // Signed for the relay that is asked and for the PeerId that is looked up.
+        assert.deepEqual(asked, [['https://home.example', PEER_HEX]]);
+    });
+
     test('lookupHomeRelay rejects a signature that does not verify', async () => {
         const mod = await freshCache();
         const { lookupHomeRelay, _clearCache, _inject, _resetInject } = mod;

@@ -85,6 +85,35 @@ fn signaling_only_accepts_only_signaling_frames() {
     assert_eq!(p.stun_uris, vec!["stun:a:3478".to_string()]);
 }
 
+/// MUST-071 (v0.15): a signaling-only relay serves none of the relay-profile
+/// HTTP endpoints, the two that say who is online among them.
+#[clause("PNP-001-MUST-071", "PNP-008-MUST-099")]
+#[test]
+fn signaling_only_serves_no_relay_profile_endpoint_and_no_presence_over_http() {
+    use parolnet_relay_server::policy::{
+        PEERS_LOOKUP_PATH, PEERS_PRESENCE_PATH, RELAY_PROFILE_ENDPOINTS,
+    };
+    assert_eq!(PEERS_PRESENCE_PATH, "/peers/presence");
+    assert_eq!(PEERS_LOOKUP_PATH, "/peers/lookup");
+    for path in [
+        "/tokens/issue",
+        "/telemetry",
+        "/endorse",
+        "/directory/push",
+        "/federation/v1",
+        "/peers/presence",
+        "/peers/lookup",
+    ] {
+        assert!(RELAY_PROFILE_ENDPOINTS.contains(&path), "{path}");
+        assert!(!signaling().serves_endpoint(path), "{path}");
+        assert!(relay().serves_endpoint(path), "{path}");
+    }
+    // What stays: the socket, health, STUN URIs, the directory.
+    for path in ["/ws", "/health", "/turn-credentials", "/directory"] {
+        assert!(signaling().serves_endpoint(path), "{path}");
+    }
+}
+
 #[clause("PNP-001-MUST-072")]
 #[test]
 fn signaling_payload_caps() {
