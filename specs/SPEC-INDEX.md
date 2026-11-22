@@ -20,7 +20,7 @@ This index is the authoritative registry of ParolNet Protocol (PNP) specificatio
 | PNP-011 | 1:1 Calls | 0.1 | CANDIDATE | 34 | 8 | 1 | 43 | M 34/34 · S 8/8 · MAY 1/1 |
 | **Totals** | — | — | — | **629** | **117** | **32** | **778** | **M 626/629 · S 115/117 · MAY 3/32** |
 
-The CI gate (`cargo xtask clauses --check`) requires a test for every MUST and every SHOULD clause, and that every `#[clause]` id is one a spec publishes. MAY clauses are reported and not required: an implementation need not take an option, and an option it does not take has nothing to test.
+The gate (`cargo xtask clauses --check`) requires a test for every MUST and every SHOULD clause, and that every `#[clause]` id is one a spec publishes. CI runs the report without `--check` for now: many of the tests the column counts do not exercise the implementation (`docs/conformance-audit/`), and the gate goes back on when the coverage is real. MAY clauses are reported and not required: an implementation need not take an option, and an option it does not take has nothing to test.
 
 The tool counts a clause as covered when a test names it. It cannot tell whether that test would fail if the implementation broke the clause; that is a matter for review.
 
@@ -53,5 +53,5 @@ Clause IDs are stable. Once a clause ID is published in a CANDIDATE or ADOPTED s
 
 ## Changelog
 
-- **2026-11-21** — The registry table is generated in full (versions, statuses, clause counts, coverage per level, totals) and checked in CI. The gate is 100% MUST and 100% SHOULD; MAY is reported. `[DEPRECATED]` is recognized by the tooling.
+- **2026-11-21** — The registry table is generated in full (versions, statuses, clause counts, coverage per level, totals) and checked in CI. The gate (`--check`, not yet run in CI) is 100% MUST and 100% SHOULD; MAY is reported. `[DEPRECATED]` is recognized by the tooling.
 - **2026-04-17** — Initial SPEC-INDEX. All 9 specs harmonized to v0.2 CANDIDATE with numbered clause IDs. Cross-spec inconsistencies resolved (nonce construction catalog in PNP-001 §9, AEAD layering in PNP-001 §6.6, replay-window consolidation, TTL scope table in PNP-005 §3.6, BLE UUID assignment in PNP-003, onion ChaCha-only clarification in PNP-004, IBLT parameter pinning in PNP-005, MediaSource naming note in PNP-007, PNP-008 rewritten from roadmap to normative spec).
