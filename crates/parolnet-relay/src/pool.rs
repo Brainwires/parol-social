@@ -4,12 +4,20 @@
 //! Circuits are built proactively so that sending a message does not
 //! incur the latency of circuit construction.
 
-use crate::circuit::EstablishedCircuit;
+use crate::circuit::{CircuitFactory, EstablishedCircuit};
 use std::sync::Arc;
-use tokio::sync::Mutex;
+use std::time::Duration;
+use tokio::sync::{Mutex, Notify};
+use tokio::task::JoinHandle;
 
 /// Default target pool size.
 pub const DEFAULT_POOL_SIZE: usize = 4;
+/// Smallest pool kept ready (PNP-004-SHOULD-001: "a pool of 3-5 ready circuits").
+pub const MIN_POOL_SIZE: usize = 3;
+/// Largest pool kept ready.
+pub const MAX_POOL_SIZE: usize = 5;
+/// Pause after a failed build before the pool tries again.
+const REBUILD_BACKOFF: Duration = Duration::from_secs(5);
 
 /// A pool of pre-built onion circuits.
 pub struct CircuitPool {
@@ -17,15 +25,52 @@ pub struct CircuitPool {
     circuits: Mutex<Vec<Arc<EstablishedCircuit>>>,
     /// Target number of circuits to maintain.
     target_size: usize,
+    /// Wakes the maintainer when a circuit left the pool.
+    refill: Notify,
+}
+
+impl Default for CircuitPool {
+    fn default() -> Self {
+        Self::new(DEFAULT_POOL_SIZE)
+    }
 }
 
 impl CircuitPool {
-    /// Create a new circuit pool with the given target size.
+    /// Create a new circuit pool. The target is kept within 3 to 5 circuits.
     pub fn new(target_size: usize) -> Self {
+        let target_size = target_size.clamp(MIN_POOL_SIZE, MAX_POOL_SIZE);
         Self {
             circuits: Mutex::new(Vec::with_capacity(target_size)),
             target_size,
+            refill: Notify::new(),
         }
+    }
+
+    /// Keep the pool full: build circuits ahead of need until the target is reached,
+    /// and again whenever one is taken or removed (PNP-004-SHOULD-001).
+    pub fn spawn_maintainer(self: &Arc<Self>, factory: Arc<dyn CircuitFactory>) -> JoinHandle<()> {
+        let pool = Arc::downgrade(self);
+        tokio::spawn(async move {
+            loop {
+                let Some(pool) = pool.upgrade() else { return };
+                let mut failed = false;
+                while pool.needs_circuits().await {
+                    match factory.build().await {
+                        Ok(circuit) => pool.add_circuit(Arc::new(circuit)).await,
+                        Err(e) => {
+                            tracing::debug!(error = %e, "pool circuit build failed");
+                            failed = true;
+                            break;
+                        }
+                    }
+                }
+                if failed {
+                    tokio::time::sleep(REBUILD_BACKOFF).await;
+                } else {
+                    pool.refill.notified().await;
+                }
+            }
+        })
     }
 
     /// Get an available circuit, if any.
@@ -46,6 +91,7 @@ impl CircuitPool {
         if circuits.is_empty() {
             None
         } else {
+            self.refill.notify_one();
             Some(circuits.remove(0))
         }
     }
@@ -60,6 +106,7 @@ impl CircuitPool {
     pub async fn remove_circuit(&self, circuit_id: u32) {
         let mut circuits = self.circuits.lock().await;
         circuits.retain(|c| c.id() != circuit_id);
+        self.refill.notify_one();
     }
 
     /// Get current pool size.
@@ -103,6 +150,8 @@ mod tests {
     #[tokio::test]
     async fn test_pool_new_empty() {
         let pool = CircuitPool::new(4);
+        assert_eq!(CircuitPool::new(1).target_size(), MIN_POOL_SIZE);
+        assert_eq!(CircuitPool::new(99).target_size(), MAX_POOL_SIZE);
         assert_eq!(pool.size().await, 0);
         assert!(pool.needs_circuits().await);
         assert_eq!(pool.deficit().await, 4);
@@ -151,13 +200,14 @@ mod tests {
 
     #[tokio::test]
     async fn test_pool_needs_circuits() {
-        let pool = CircuitPool::new(2);
+        let pool = CircuitPool::new(3);
         assert!(pool.needs_circuits().await);
 
         pool.add_circuit(make_circuit(1)).await;
+        pool.add_circuit(make_circuit(2)).await;
         assert!(pool.needs_circuits().await);
 
-        pool.add_circuit(make_circuit(2)).await;
+        pool.add_circuit(make_circuit(3)).await;
         assert!(!pool.needs_circuits().await);
     }
 

@@ -186,9 +186,13 @@ pub fn onion_wrap(
 ) -> Result<Vec<u8>, String> {
     let cipher = ChaCha20Poly1305Cipher::new(key).map_err(|e| format!("cipher init: {e}"))?;
     let nonce = make_nonce(nonce_seed, counter);
-    cipher
+    // The cipher returns ciphertext || tag; on the wire the 16-byte tag comes first
+    // (PNP-004-MUST-024), as in `parolnet_relay::onion`.
+    let mut sealed = cipher
         .encrypt(&nonce, payload, &[])
-        .map_err(|e| format!("encrypt: {e}"))
+        .map_err(|e| format!("encrypt: {e}"))?;
+    sealed.rotate_right(16);
+    Ok(sealed)
 }
 
 /// Decrypt (peel) one onion layer.
@@ -198,10 +202,15 @@ pub fn onion_peel(
     nonce_seed: &[u8; 12],
     counter: u32,
 ) -> Result<Vec<u8>, String> {
+    if ciphertext.len() < 16 {
+        return Err("decrypt: layer shorter than its tag".into());
+    }
     let cipher = ChaCha20Poly1305Cipher::new(key).map_err(|e| format!("cipher init: {e}"))?;
     let nonce = make_nonce(nonce_seed, counter);
+    let mut sealed = ciphertext.to_vec();
+    sealed.rotate_left(16);
     cipher
-        .decrypt(&nonce, ciphertext, &[])
+        .decrypt(&nonce, &sealed, &[])
         .map_err(|e| format!("decrypt: {e}"))
 }
 
