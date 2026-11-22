@@ -391,6 +391,81 @@ async fn a_transfer_survives_a_killed_connection_and_a_restart_of_each_app() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Wait until the contact's connection has completed `want` ICE restarts.
+async fn ice_restarts(app: &parolnet_app::AppHandle, want: u32) {
+    let mut seen = 0;
+    for _ in 0..800 {
+        seen = app.snapshot().await.unwrap().contacts[0].ice_restarts;
+        if seen >= want {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    panic!("{seen} ICE restarts, expected {want}");
+}
+
+/// A network change while a file flows: the data connection restarts ICE in place
+/// (PNP-011 section 8) and the transfer goes on, on the channel it had: the receiver
+/// never falls back to waiting for a new one. (What happens when the old path is really
+/// gone is `parolnet-simnet`'s `tests/transfer.rs`; on loopback the path stays.)
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_transfer_goes_on_through_an_ice_restart() {
+    init_tracing();
+    let size: u64 = 32 * 1024 * 1024 + 99;
+    let relay = start_relay().await;
+    let dir = unique_dir("ice-restart");
+    let ((alice, mut alice_rx), (bob, mut bob_rx)) = paired_pair(&relay, &dir, |_, _| {}).await;
+    let source = dir.join("film.bin");
+    let sha = write_file(&source, size);
+    let offered = alice.offer_file(bob.peer_id(), &source).await.unwrap();
+    let id = offered.id.clone();
+    transfer(&mut bob_rx, "the offer", 30, |t| t.id == id).await;
+    bob.accept_transfer(&id).await.unwrap();
+    progress_to(&mut bob_rx, &id, size / 8, 120).await;
+
+    // The sender's interfaces changed, then (once that restart is through) the receiver's.
+    alice.network_changed();
+    ice_restarts(&alice, 1).await;
+    ice_restarts(&bob, 1).await;
+    bob.network_changed();
+
+    // From its first record to its last the transfer is never without its channel.
+    let mut done = None;
+    while done.is_none() {
+        let t = transfer(&mut bob_rx, "the whole file", 180, |t| t.id == id).await;
+        assert_ne!(
+            t.state,
+            TransferState::Waiting,
+            "the attempt ended at {} of {size} bytes",
+            t.bytes_done
+        );
+        if t.state == TransferState::Complete {
+            done = Some(t);
+        } else {
+            assert_eq!(t.state, TransferState::Active);
+        }
+    }
+    let received = done.unwrap().path.expect("the received file");
+    assert_eq!(hash_of(&received), sha);
+    transfer(&mut alice_rx, "complete on the sender", 60, |t| {
+        t.id == id && t.state == TransferState::Complete
+    })
+    .await;
+
+    // Both restarts happened on the connection the transfer ran on.
+    for app in [&alice, &bob] {
+        ice_restarts(app, 2).await;
+        assert_eq!(
+            app.snapshot().await.unwrap().contacts[0].path,
+            PathState::Direct
+        );
+    }
+
+    alice.shutdown().await;
+    bob.shutdown().await;
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_file_that_changed_after_the_offer_is_not_sent() {
     init_tracing();
