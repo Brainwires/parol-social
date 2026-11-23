@@ -431,7 +431,18 @@ async fn the_estimate_follows_a_cap_that_comes_and_goes() {
     let opened = call.elapsed();
     call.run_for(secs(20)).await;
     let after = call.caller.metrics().target_at(call.elapsed()).unwrap();
-    assert!(after > 800_000, "{after} twenty seconds after the cap went");
+    // Since engine v0.22.0+brainwires.6 GCC climbs back as draft-ietf-rmcat-gcc-02 section
+    // 5.5 has it: the delay-based estimate stays below 1.5 times the received rate, and
+    // increases additively while that rate is "close to convergence" (engine CHANGELOG,
+    // "gcc: the delay-based estimate stays below 1.5 times the received rate"). A sender
+    // that follows its target therefore reopens over tens of seconds, not the 20 s this
+    // asserted before (it measured about 530 kbit/s here, from about 300). The engine's
+    // remedy, bandwidth probing (RFC 8836 requirement 4), is not adopted yet. What is
+    // asserted is that the estimate climbs well clear of the cap.
+    assert!(
+        after as f64 > under as f64 * 1.5,
+        "{after} twenty seconds after the cap went (capped median {under})"
+    );
     let m = call.callee.snapshot();
     assert_video_does_not_freeze("callee", &m, secs(2), call.elapsed());
     let _ = opened;
