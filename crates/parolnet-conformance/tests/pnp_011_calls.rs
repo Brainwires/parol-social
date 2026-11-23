@@ -507,7 +507,13 @@ async fn media_sections_are_bundled_and_rtcp_is_multiplexed() {
                 group[0]
             );
         }
-        assert_eq!(lines(sdp, "a=rtcp-mux").len(), 2, "{sdp}");
+        // `a=rtcp-mux` itself, not the `a=rtcp-mux-only` (RFC 8858) the engine also writes
+        // in new sections of an offer under the `require` policy since v0.22.0+brainwires.6.
+        let mux = lines(sdp, "a=rtcp-mux")
+            .into_iter()
+            .filter(|l| l.trim_end() == "a=rtcp-mux")
+            .count();
+        assert_eq!(mux, 2, "{sdp}");
     }
 }
 

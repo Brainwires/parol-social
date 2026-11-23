@@ -2016,7 +2016,7 @@ impl Driver {
                         return Ok(());
                     }
                 }
-                self.make_answer(first || restart).await
+                self.make_answer(first || restart, restart).await
             }
             other => {
                 tracing::debug!(?other, "remote description type not handled");
@@ -2025,13 +2025,22 @@ impl Driver {
         }
     }
 
-    async fn make_answer(&mut self, with_candidates: bool) -> Result<(), RtcError> {
+    /// Answer the peer's offer. `restart`: the offer restarts ICE.
+    async fn make_answer(&mut self, with_candidates: bool, restart: bool) -> Result<(), RtcError> {
         let now = now();
-        if with_candidates {
+        if with_candidates && !restart {
             self.add_local_candidates()?;
         }
         let answer = self.pc.create_answer(None)?;
         self.pc.set_local_description(now, answer)?;
+        if with_candidates && restart {
+            // The answer applies the restart the offer staged, and with
+            // `with_discard_local_candidates_during_ice_restart` the candidates held until
+            // then are dropped with the old generation (engine v0.22.0+brainwires.6): the new
+            // generation's are added once it is applied, as the restart's offer does, and
+            // the answer emitted below lists them.
+            self.add_local_candidates()?;
+        }
         self.negotiation.answering = false;
         self.negotiation.established = true;
         self.emit_local_description().await;
@@ -2147,7 +2156,7 @@ impl Driver {
         gather.apply(&mut self.socks);
         match gather.then {
             Some(AfterGather::Offer) => self.make_offer().await,
-            Some(AfterGather::Answer) => self.make_answer(true).await,
+            Some(AfterGather::Answer) => self.make_answer(true, true).await,
             None => Ok(()),
         }
     }
