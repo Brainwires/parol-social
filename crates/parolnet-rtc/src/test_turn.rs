@@ -458,7 +458,11 @@ impl Server {
                 number: ChannelNumber(*number),
                 ..Default::default()
             };
-            channel.encode();
+            // Refused only for data longer than a ChannelData message carries (a UDP
+            // datagram never is); drop it as the Data-indication path below does.
+            if channel.encode().is_err() {
+                return;
+            }
             channel.raw
         } else {
             let mut msg = Message::new();

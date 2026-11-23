@@ -140,7 +140,8 @@ See [docs/m1-desktop.md](docs/m1-desktop.md) for what runs end to end, the tests
   OpenSSL, key rotation, and a UI for "delete all data" / a lost key.
 - **`parolnet-rtc`**: server-reflexive candidates from STUN (binding request on the connection's
   socket before its loop starts), text data-channel messages, the channel label on open,
-  `default_local_ip`. Engine pin `v0.22.0+brainwires.5` (was `.3`; `.5` follows ICE renomination).
+  `default_local_ip`. Engine pin `v0.22.0+brainwires.6` (was `.5`; `.5` follows ICE renomination, `.6` is the engine's
+  conformance release, see CHANGELOG).
 - **TURN, user-supplied only** (PNP-001-MUST-082): `parolnet-rtc` gathers a relay candidate from
   the TURN server the user configured (UDP, long-term credentials, `rtc-turn` driven on the
   connection's socket) and has a relay-only ICE policy; `parolnet-app` stores `TurnSettings` and

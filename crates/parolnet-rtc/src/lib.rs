@@ -44,6 +44,7 @@ use std::task::Poll;
 use std::time::{Duration, Instant};
 
 use bytes::BytesMut;
+use rtc::ice::NominationAcceptance;
 use rtc::ice::mdns::MulticastDnsMode;
 use rtc::interceptor::{
     GccHandle, GccInterceptorBuilder, Interceptor as _, PassThroughInterceptor, Registry, Slot,
@@ -63,11 +64,13 @@ use rtc::peer_connection::configuration::{RTCConfigurationBuilder, RTCIceTranspo
 use rtc::peer_connection::event::{RTCDataChannelEvent, RTCPeerConnectionEvent, RTCTrackEvent};
 use rtc::peer_connection::message::{RTCMessage, TaggedRTCMessage};
 use rtc::peer_connection::sdp::{RTCSdpType, RTCSessionDescription};
+use rtc::peer_connection::srflx::ReflexiveGathering;
 use rtc::peer_connection::state::{RTCIceConnectionState, RTCPeerConnectionState};
 use rtc::peer_connection::transport::{
     CandidateConfig, CandidateHostConfig, CandidateRelayConfig, CandidateServerReflexiveConfig,
     RTCDtlsRole, RTCIceCandidate, RTCIceCandidateInit, RTCIceCandidateType, RTCIceServer,
 };
+use rtc::peer_connection::turn_streams::RelayGathering;
 use rtc::peer_connection::{RTCPeerConnection, RTCPeerConnectionBuilder};
 use rtc::rtcp::payload_feedbacks::full_intra_request::FullIntraRequest;
 use rtc::rtcp::payload_feedbacks::picture_loss_indication::PictureLossIndication;
@@ -1125,7 +1128,34 @@ fn build_peer_connection(config: &RtcConfig) -> Result<Built, RtcError> {
             MulticastDnsMode::Disabled
         })
         // A restart announces the sockets bound then, not those of the network left behind.
-        .with_discard_local_candidates_during_ice_restart(true);
+        .with_discard_local_candidates_during_ice_restart(true)
+        // This driver gathers every candidate itself (host sockets, STUN, its own TURN
+        // client). The engine's own gathering, on by default since v0.22.0+brainwires.6, is
+        // kept off so nothing changes behind it: no TCP candidates or ICE-TCP listeners
+        // (`with_tcp_candidate_gathering`), no TURN over TCP / TLS
+        // (`with_turn_over_streams`, `with_turn_tcp_relay`), no Binding requests or TURN
+        // allocations from our sockets to the configuration's servers
+        // (`with_server_reflexive_gathering`, `with_relay_gathering`).
+        .with_tcp_candidate_gathering(false)
+        .with_turn_over_streams(false)
+        .with_turn_tcp_relay(false)
+        .with_server_reflexive_gathering(ReflexiveGathering::Application)
+        .with_relay_gathering(RelayGathering::Application)
+        // Data-channel messages keep their size: PNP-010 records are up to 64 KiB and a chat
+        // frame carries a hex envelope of up to 16 KiB (about 32 KiB of text), so the RFC
+        // 8831 section 6.6 limit of 16 KB without interleaving, on by default since
+        // v0.22.0+brainwires.6, would refuse them towards every browser
+        // (`with_sctp_message_size_limit_without_interleaving(false)`: what browsers do).
+        // Interleaving (RFC 8260) is not announced, so two ParolNet peers keep sending DATA
+        // chunks as before (`with_sctp_message_interleaving(false)`).
+        .with_sctp_message_size_limit_without_interleaving(false)
+        .with_sctp_message_interleaving(false)
+        // As controlled agent, follow the latest nomination (libwebrtc's rule) as the engine
+        // did since v0.22.0+brainwires.5: Chromium moves to another pair a moment after
+        // connecting and stops answering on the one it left, which under the RFC 8445
+        // section 8.1.1 default (the highest-priority nominated pair) stopped the PWA's calls
+        // (`with_ice_nomination_acceptance`).
+        .with_ice_nomination_acceptance(NominationAcceptance::Latest);
     if let Some(role) = config.answering_dtls_role {
         settings = settings.with_answering_dtls_role(role);
     }
@@ -2127,7 +2157,7 @@ impl Driver {
             if let Some(mut transceiver) = self.pc.rtp_transceiver(id) {
                 let receive = transceiver.direction().has_recv();
                 transceiver
-                    .set_direction(RTCRtpTransceiverDirection::from_send_recv(enabled, receive));
+                    .set_direction(RTCRtpTransceiverDirection::from_send_recv(enabled, receive))?;
             }
             return Ok(true);
         }
@@ -2140,13 +2170,22 @@ impl Driver {
         let ids: Vec<RTCRtpTransceiverId> = self.pc.get_transceivers().collect();
         let mut reusable = None;
         for id in ids {
-            let Some(transceiver) = self.pc.rtp_transceiver(id) else {
+            let Some((stopped, sender_id, receiver_id)) = self
+                .pc
+                .rtp_transceiver(id)
+                .map(|t| (t.stopped(), t.sender(), t.receiver()))
+            else {
                 continue;
             };
-            if transceiver.stopped() || transceiver.sender().is_some() {
+            // Every transceiver has a sender now (W3C webrtc-pc 5.4): the one we can give our
+            // track to is a transceiver whose sender has no track.
+            let has_track = sender_id
+                .and_then(|sender| self.pc.rtp_sender(sender))
+                .is_some_and(|sender| sender.track().is_some());
+            if stopped || has_track {
                 continue;
             }
-            let Some(receiver_id) = transceiver.receiver() else {
+            let Some(receiver_id) = receiver_id else {
                 continue;
             };
             if self
@@ -2185,11 +2224,18 @@ impl Driver {
             let Some(mut transceiver) = self.pc.rtp_transceiver(id) else {
                 continue;
             };
-            let negotiated = transceiver.current_direction().has_send();
+            // `None` before any exchange negotiated the transceiver: not negotiated to send.
+            let negotiated = transceiver
+                .current_direction()
+                .is_some_and(|d| d.has_send());
             let receive = transceiver.direction().has_recv();
-            transceiver.set_direction(RTCRtpTransceiverDirection::from_send_recv(
+            // Refused only for a stopping transceiver (or a closed connection), whose
+            // direction no longer matters.
+            if let Err(err) = transceiver.set_direction(RTCRtpTransceiverDirection::from_send_recv(
                 negotiated, receive,
-            ));
+            )) {
+                tracing::debug!(%err, "transceiver direction left as it is");
+            }
             if let Some(sender) = self.senders.get_mut(&kind) {
                 sender.enabled = negotiated;
             }
@@ -2216,7 +2262,7 @@ impl Driver {
             let negotiated = self
                 .pc
                 .rtp_transceiver(id)
-                .is_some_and(|t| t.current_direction().has_send());
+                .is_some_and(|t| t.current_direction().is_some_and(|d| d.has_send()));
             let sending = enabled && negotiated;
             if self.local_sending.insert(kind, sending) != Some(sending) {
                 self.emit(RtcEvent::LocalMedia { kind, sending }).await;
@@ -2244,7 +2290,7 @@ impl Driver {
         if !self
             .pc
             .rtp_transceiver(id)
-            .is_some_and(|t| t.current_direction().has_send())
+            .is_some_and(|t| t.current_direction().is_some_and(|d| d.has_send()))
         {
             return Ok(());
         }
@@ -2254,7 +2300,7 @@ impl Driver {
         if local.packetizer.is_none() {
             // Negotiated once the remote description is applied: the payload type is the
             // answer's (or the offer's, when we answer).
-            let Some(ssrc) = sender.track().ssrcs().last() else {
+            let Some(ssrc) = sender.ssrcs().last() else {
                 return Ok(());
             };
             // The media codec, not its retransmission format.

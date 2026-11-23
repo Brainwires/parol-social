@@ -165,6 +165,10 @@ pub(crate) async fn allocate(
             username: server.username.clone(),
             password: server.password.clone(),
             allocation_refresh_interval_cap: Some(keepalive),
+            // No SOFTWARE attribute (`ClientConfig::software` empty): the engine's default
+            // names `rtc-turn` and its version, an implementation fingerprint on the path
+            // that THREAT_MODEL.md does not want on the wire.
+            software: String::new(),
             ..Default::default()
         },
         provider,
