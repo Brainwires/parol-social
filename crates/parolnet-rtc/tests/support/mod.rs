@@ -119,6 +119,7 @@ impl Peer {
             RtcEvent::KeyframeRequested => self.seen.keyframe_requests += 1,
             RtcEvent::Closed { error } => panic!("connection closed: {error:?}"),
             RtcEvent::IceConnectionState(_)
+            | RtcEvent::SelectedCandidatePairChanged
             | RtcEvent::DataChannelClose { .. }
             | RtcEvent::DataChannelBufferedLow { .. } => {}
         }

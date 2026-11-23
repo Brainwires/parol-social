@@ -802,6 +802,7 @@ impl PeerTask {
                         | RtcEvent::DataChannelBufferedLow { .. }
                         | RtcEvent::DataChannelMessage { .. }
                         | RtcEvent::IceConnectionState(_)
+                        | RtcEvent::SelectedCandidatePairChanged
                         | RtcEvent::RemoteOfferIgnored => {}
                     }
                 }

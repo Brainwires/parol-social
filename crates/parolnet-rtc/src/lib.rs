@@ -393,6 +393,10 @@ pub enum RtcEvent {
     ConnectionState(RTCPeerConnectionState),
     /// The ICE connection state changed.
     IceConnectionState(RTCIceConnectionState),
+    /// ICE selected another candidate pair (W3C `selectedcandidatepairchange`). This is how
+    /// an ICE restart begun while connected completes: the connection state stays connected
+    /// through it (W3C webrtc-pc 5.6.4), and the new generation's pair is selected.
+    SelectedCandidatePairChanged,
     /// The first RTP packet of a track arrived; names its kind and negotiated codec.
     Track {
         track_id: MediaStreamTrackId,
@@ -1657,6 +1661,9 @@ impl Driver {
                 }
                 RTCPeerConnectionEvent::OnIceConnectionStateChangeEvent(state) => {
                     self.emit(RtcEvent::IceConnectionState(state)).await;
+                }
+                RTCPeerConnectionEvent::OnSelectedCandidatePairChange(_) => {
+                    self.emit(RtcEvent::SelectedCandidatePairChanged).await;
                 }
                 RTCPeerConnectionEvent::OnTrack(RTCTrackEvent::OnOpen(init)) => {
                     self.tracks.insert(init.track_id, (init.receiver_id, false));

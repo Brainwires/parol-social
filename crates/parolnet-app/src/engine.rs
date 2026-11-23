@@ -295,6 +295,19 @@ struct Restart {
 }
 
 impl Conn {
+    /// An ICE restart, ours once answered or the peer's once applied, found its path: the
+    /// connection came back to connected, or (begun while connected) its new generation
+    /// selected a pair.
+    fn complete_restart(&mut self, peer: &str) {
+        if self.restart.as_ref().is_some_and(|r| r.answered) {
+            tracing::info!(peer = %crate::short_id(peer), "ICE restart complete");
+            self.restart = None;
+            self.restarts_done += 1;
+        } else if std::mem::take(&mut self.peer_restarting) {
+            self.restarts_done += 1;
+        }
+    }
+
     fn is_open(&self) -> bool {
         self.dc.is_some()
     }
@@ -1956,13 +1969,7 @@ impl Engine {
                         }
                     }
                     RTCPeerConnectionState::Connected => {
-                        if conn.restart.as_ref().is_some_and(|r| r.answered) {
-                            tracing::info!(peer = %crate::short_id(peer), "ICE restart complete");
-                            conn.restart = None;
-                            conn.restarts_done += 1;
-                        } else if std::mem::take(&mut conn.peer_restarting) {
-                            conn.restarts_done += 1;
-                        }
+                        conn.complete_restart(peer);
                         if verified {
                             self.set_path(peer, PathState::Direct);
                             self.flush_call_signals(peer);
@@ -2010,6 +2017,9 @@ impl Engine {
                 };
                 self.conn_failed(peer, reason);
             }
+            // A restart begun while connected stays connected (W3C webrtc-pc 5.6.4, engine
+            // v0.22.0+brainwires.6): it completes when the new generation selects a pair.
+            RtcEvent::SelectedCandidatePairChanged => conn.complete_restart(peer),
             RtcEvent::IceConnectionState(_)
             | RtcEvent::Track { .. }
             | RtcEvent::Rtp { .. }
