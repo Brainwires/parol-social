@@ -105,6 +105,9 @@ pub struct LinkStats {
     /// Datagrams the host sent.
     pub sent: u64,
     pub sent_bytes: u64,
+    /// Of those, datagrams whose first byte is in RFC 7983's RTP / RTCP range (128 to 191):
+    /// (S)RTP or (S)RTCP, which a data-only connection sends none of.
+    pub sent_rtp_or_rtcp: u64,
     /// Lost at random.
     pub lost: u64,
     /// Dropped by the capped link's full queue.
@@ -365,6 +368,9 @@ impl SimHost {
             let stats = &mut world.hosts[self.id].stats;
             stats.sent += 1;
             stats.sent_bytes += size;
+            if data.first().is_some_and(|b| (128..=191).contains(b)) {
+                stats.sent_rtp_or_rtcp += 1;
+            }
         }
         // An address the machine lost, a destination of the other family, or one that is not
         // a host's address any more: nowhere to go.

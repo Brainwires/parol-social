@@ -317,6 +317,15 @@ async fn a_transfer_goes_on_through_an_ice_restart_on_the_same_channel() {
         to_b.buffered_amount(on_a).await.expect("the channel lives"),
         0
     );
+    // A data-only connection has no RTP session, so it sends no RTCP (and no RTP) at all:
+    // the engine starts an RTCP session only for a negotiated RTP section with SRTP keys
+    // (webrtc-rs-rtc v0.22.0+brainwires.6; before it each end sent an SRTCP report about
+    // every 0.4 s).
+    for (who, end) in [("sender", &pair.a), ("receiver", &pair.b)] {
+        let stats = end.host.stats();
+        assert!(stats.sent > 0, "{who}: {stats:?}");
+        assert_eq!(stats.sent_rtp_or_rtcp, 0, "{who}: {stats:?}");
+    }
 
     pair.a.handle.close().await;
     pair.b.handle.close().await;
