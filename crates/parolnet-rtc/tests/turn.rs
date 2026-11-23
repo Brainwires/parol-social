@@ -146,7 +146,9 @@ async fn relay_only_on_both_sides_goes_through_the_turn_server() {
             !sdp.contains(&format!(" {} ", handle.local_addr().port())),
             "the socket's port is in the description: {sdp}"
         );
-        assert!(sdp.contains("raddr 0.0.0.0 rport 0"), "{sdp}");
+        // The related address is hidden: since engine v0.22.0+brainwires.6 the relay policy
+        // signals it as `raddr 0.0.0.0 rport 9` (RFC 8827 section 6.4), where it was rport 0.
+        assert!(sdp.contains("raddr 0.0.0.0 rport 9"), "{sdp}");
     }
     assert!(
         server.relayed_datagrams() > 20,
