@@ -1874,6 +1874,7 @@ impl Driver {
                     }
                 }
                 RTCMessage::DataChannelMessage(id, message) => {
+                    tracing::trace!(id, len = message.data.len(), "data channel message");
                     self.emit(RtcEvent::DataChannelMessage {
                         id,
                         payload: message.data,

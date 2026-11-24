@@ -692,6 +692,7 @@ async fn send_attempt(
     });
     // Everything is on its way. The transfer is complete when the receiver says so
     // (PNP-010-MUST-023); until then the channel stays open for the tail to be delivered.
+    let mut tick = tokio::time::interval(Duration::from_secs(1));
     loop {
         tokio::select! {
             ev = ch.rx.recv() => match ev {
@@ -699,6 +700,11 @@ async fn send_attempt(
                 Some(ChannelEvent::Message(_)) | None => return Outcome::Ended { progressed },
             },
             cmd = ctl.recv() => return stop_or_shutdown(cmd),
+            _ = tick.tick() => {
+                if let Ok(outstanding) = ch.data.buffered_amount(ch.dc).await {
+                    tracing::debug!(dc = ch.dc, outstanding, "sender: waiting for the receiver; bytes not yet acknowledged");
+                }
+            }
         }
     }
 }
