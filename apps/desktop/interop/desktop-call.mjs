@@ -12,11 +12,11 @@
 
 import { spawn } from "node:child_process";
 import { existsSync, mkdtempSync, rmSync } from "node:fs";
-import { connect, createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { createInterface } from "node:readline";
 import { fileURLToPath } from "node:url";
+import { spawnRelay } from "../../../web/tests/e2e/relay-process.mjs";
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "../../..");
 const exe = process.platform === "win32" ? ".exe" : "";
@@ -31,25 +31,14 @@ const children = [];
 const log = (...a) => console.log(`[${new Date().toISOString().slice(11, 23)}]`, ...a);
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-function freePort() {
-  return new Promise((res) => {
-    const s = createServer();
-    s.listen(0, "127.0.0.1", () => {
-      const { port } = s.address();
-      s.close(() => res(port));
-    });
-  });
-}
-
 async function main() {
   for (const b of [relayBin, botBin, desktopBin]) {
     if (!b || !existsSync(b)) throw new Error(`missing binary: ${b}`);
   }
-  const port = await freePort();
-  const relay = spawn(relayBin, [], {
+  // Port 0: the relay picks its own and reports it (web/tests/e2e/relay-process.mjs).
+  const { child: relay, port } = await spawnRelay(relayBin, {
     env: {
       PATH: process.env.PATH,
-      RELAY_PORT: String(port),
       RELAY_KEY_FILE: join(work, "relay.key"),
       RELAY_AUTHORITY_KEY_FILE: join(work, "relay-authority.cbor"),
       RUST_LOG: "warn",
@@ -57,18 +46,9 @@ async function main() {
       RELAY_MAX_PEERS_PER_IP: "16",
       RELAY_MAX_CONNS_PER_IP: "32",
     },
-    stdio: "ignore",
+    echo: verbose,
   });
   children.push(relay);
-  for (let i = 0; ; i++) {
-    const up = await new Promise((r) => {
-      const s = connect(port, "127.0.0.1", () => (s.end(), r(true)));
-      s.on("error", () => r(false));
-    });
-    if (up) break;
-    if (i > 200) throw new Error("relay did not start");
-    await sleep(50);
-  }
   const url = `ws://127.0.0.1:${port}/ws`;
 
   const bot = spawn(botBin, ["--relay", url, "--data-dir", join(work, "bot"), "--host-only", "--bind", "127.0.0.1", "--show-code"], {
