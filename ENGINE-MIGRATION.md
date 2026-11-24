@@ -230,3 +230,36 @@ ParolNet re-keying on the engine's negotiation-needed. Three runs of each test, 
 - `srtp_re_keying_by_one_side_keeps_the_call`: renewals at 39.97 s and 66.9 s, same figures.
 
 On df82663c the crossing test still fails (the engine fix is not on master yet).
+
+### 3.6 `file_tamper` timeouts: an engine data-channel delivery stall
+
+Probe PR #57, runs 45316993809, 45318163107 and 45319549406. `parolnet-app`'s `file_tamper`
+was run 30 times per job, three at a time. Failure rate:
+
+- df82663c, debug logging: 3 / 30.
+- daa6c684, debug logging: 5 / 30.
+- daa6c684, trace logging (more load): 11 / 30 and 8 / 30.
+- Earlier, one timeout on gcc-2 77185407, which is based on master 81e2253e, so the stall may predate train 13.
+
+What hangs: the second attempt of the first transfer.
+
+1. One record was corrupted on purpose, so the receiver ended the attempt and closed channel 1.
+2. It opened channel 2 and sent its resume (next record 7). The sender started at that record
+   and handed every record (to 1,310,457 bytes) to the channel.
+3. The sender's SCTP reported all of them acknowledged within a second (`buffered_amount` 0).
+
+The receiving side, in all 8 failed runs of the last job:
+
+- The driver got 10 or 11 messages on channel 2 from the engine's `poll_read`. The attempt
+  needed about 15 (the start message and records 7 to 20).
+- Every message the driver got was forwarded to the worker (none dropped), and the worker
+  stored each record.
+- The receiver's SCTP SACKs show its advertised receive window shrinking to about 705 KB and
+  staying there. About 320 KB, roughly five 64 KiB messages, was acknowledged and buffered in
+  the engine and never delivered.
+
+`parolnet-rtc` drains `poll_read` on every pass of its loop and drives `poll_timeout` /
+`handle_timeout`. Nothing more arrives after the last DATA chunk, and the messages never come
+out. Engine finding: complete messages that SCTP acknowledged stay undelivered on a data
+channel opened right after another channel of the connection was closed (stream reset). The
+full per-run logs are in the run's `tamper-logs` artifact.
