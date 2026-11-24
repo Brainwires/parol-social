@@ -16,10 +16,15 @@ let reloadOnTakeover = false;
 
 function watch(reg: ServiceWorkerRegistration): void {
   const offer = (worker: ServiceWorker | null) => {
-    // A waiting worker next to a controller is an update; without a controller it is the
-    // first install, which activates by itself.
+    // A waiting worker next to a controller that is another worker is an update. Without a
+    // controller it is the first install, which activates by itself; and the controller can
+    // already be that first install: it claims the page when it activates, and WebKit may
+    // apply the claim before it delivers the worker's "installed" state change (CI run
+    // 45388216463: "A new version is ready" on a first visit). A worker object is the same
+    // object wherever this page meets it, so identity tells the two apart.
     waiting = worker;
-    ready.value = worker !== null && navigator.serviceWorker.controller !== null;
+    const controller = navigator.serviceWorker.controller;
+    ready.value = worker !== null && controller !== null && controller !== worker;
   };
   offer(reg.waiting);
   reg.addEventListener("updatefound", () => {
