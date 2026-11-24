@@ -172,8 +172,8 @@ See [docs/m1-desktop.md](docs/m1-desktop.md) for what runs end to end, the tests
   events out (local description, states, tracks, RTP, data-channel messages). Host candidates on
   the bound socket only; srflx / TURN gathering, multiple sockets and the virtual-time mode are M1.
   A loopback test connects two drivers and exchanges data-channel messages.
-- **Engine pin.** `rtci` 0.1.0 (formerly `rtc`, repository `Brainwires/webrtc-rs-rtc`, being renamed
-  `Brainwires/rtci`), pinned by `rev` to its release commit 3bbd6cc1 until it is on crates.io.
+- **Engine pin.** `rtci` 0.1.0 from crates.io (formerly `rtc`, repository `Brainwires/rtci`, formerly
+  `Brainwires/webrtc-rs-rtc`), the exact version pinned in `Cargo.lock`.
 - **Desktop spike** (`apps/desktop`). A GPUI window shows a VP8 stream that headless Chromium sends
   through `webrtc-rs-rtc`; libvpx decodes it; macOS draws an IOSurface-backed NV12 `CVPixelBuffer`
   with `gpui::surface()`, other platforms a BGRA `RenderImage`. Verified on macOS arm64 (headless

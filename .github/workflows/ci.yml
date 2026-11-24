@@ -56,13 +56,7 @@ jobs:
           key: ${{ runner.os }}-cargo-test-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
             ${{ runner.os }}-cargo-test-
-      # NOT MERGEABLE (pre-release engine testing): `--no-fail-fast` so that one failing
-      # package does not hide the others, and the m1 figures step below. Both go back to
-      # `cargo test --workspace` at release (ENGINE-MIGRATION.md).
-      - run: cargo test --workspace --no-fail-fast
-      - name: m1 figures (what each simulated call measured on this engine)
-        if: ${{ !cancelled() }}
-        run: cargo test -p parolnet-simnet --test m1 -- --nocapture --test-threads=1
+      - run: cargo test --workspace
 
   clippy:
     name: Clippy

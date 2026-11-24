@@ -635,11 +635,13 @@ async fn cap_length(hold: Duration) {
     call.caller.host.set_profile(LinkProfile::default());
     call.run_for(secs(20)).await;
     let m = call.callee.snapshot();
-    let caller = call.caller.metrics();
-    let series: Vec<Option<u32>> = [5, 10, 15, 20]
-        .into_iter()
-        .map(|at| caller.target_at(opened + secs(at)))
-        .collect();
+    let series: Vec<Option<u32>> = {
+        let caller = call.caller.metrics();
+        [5, 10, 15, 20]
+            .into_iter()
+            .map(|at| caller.target_at(opened + secs(at)))
+            .collect()
+    };
     let who = format!("hold {} s", hold.as_secs());
     figure(
         "cap_length",
@@ -652,7 +654,6 @@ async fn cap_length(hold: Duration) {
             m.video.longest_gap(secs(2), call.elapsed()),
         ),
     );
-    drop(caller);
     call.close().await;
 }
 

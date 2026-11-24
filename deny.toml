@@ -60,11 +60,7 @@ wildcards = "allow"
 [sources]
 unknown-registry = "deny"
 unknown-git = "deny"
-allow-git = [
-    # The realtime engine `rtci`, pinned by rev to its 0.1.0 release commit until it is on
-    # crates.io (the repository is being renamed to Brainwires/rtci; this entry then goes).
-    "https://github.com/Brainwires/webrtc-rs-rtc",
-]
+allow-git = []
 
 [advisories]
 version = 2

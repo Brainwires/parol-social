@@ -44,7 +44,7 @@ These are non-negotiable and must be maintained in every change:
 - Use latest stable versions of all dependencies
 - No C dependencies for end-to-end cryptography (see invariant 6 for the engine's transport crypto)
 - Licences: permissive only (MIT, Apache-2.0, BSD, ISC, Zlib, ...). No GPL / LGPL / AGPL, ever; MPL-2.0 only for the crates `deny.toml` names. `cargo-deny` enforces it in CI
-- The realtime engine is `rtci` (formerly `rtc`; repository `Brainwires/rtci`, formerly `Brainwires/webrtc-rs-rtc`), pinned in the root `Cargo.toml` to a released version (crates.io) or a git **tag**, never a branch. ParolNet never carries engine patches: fixes land in the engine with a release first
+- The realtime engine is `rtci` from crates.io (formerly `rtc`; repository `Brainwires/rtci`, formerly `Brainwires/webrtc-rs-rtc`), a released version in the root `Cargo.toml`, pinned by exact version in `Cargo.lock` (both workspaces); never a git branch. ParolNet never carries engine patches: fixes land in the engine with a release first
 - GPUI is pinned exactly (`gpui-pre`, `gpui-component`) in `apps/desktop/Cargo.toml` with `Cargo.lock` committed; upgrades are their own change
 - `parolnet-crypto`, `parolnet-protocol` and `parolnet-transfer` must remain WASM-compatible (no tokio dependency)
 - Prefer audited, well-maintained crates from established projects (dalek-cryptography, RustCrypto)
