@@ -108,6 +108,12 @@ pub struct LinkStats {
     /// Of those, datagrams whose first byte is in RFC 7983's RTP / RTCP range (128 to 191):
     /// (S)RTP or (S)RTCP, which a data-only connection sends none of.
     pub sent_rtp_or_rtcp: u64,
+    /// Of those, STUN messages (RFC 7983's 0 to 3, the RFC 8489 magic cookie): ICE checks
+    /// and their responses, consent checks, Binding requests to a STUN server.
+    pub sent_stun: u64,
+    /// Of the STUN messages, those carrying a SOFTWARE attribute (RFC 8489 section 14.14),
+    /// an implementation fingerprint a ParolNet peer never puts on the wire.
+    pub sent_stun_with_software: u64,
     /// Lost at random.
     pub lost: u64,
     /// Dropped by the capped link's full queue.
@@ -117,6 +123,29 @@ pub struct LinkStats {
     /// Handed to the destination socket.
     pub delivered: u64,
     pub delivered_bytes: u64,
+}
+
+/// `None` when `data` is not a STUN message; otherwise whether one of its attributes is
+/// SOFTWARE (type 0x8022). Read from the wire format (RFC 8489 sections 5 and 14), not with
+/// the engine's parser, so the check does not depend on the code it checks.
+fn stun_has_software(data: &[u8]) -> Option<bool> {
+    const MAGIC_COOKIE: [u8; 4] = [0x21, 0x12, 0xa4, 0x42];
+    const SOFTWARE: u16 = 0x8022;
+    if data.len() < 20 || data[0] > 3 || data[4..8] != MAGIC_COOKIE {
+        return None;
+    }
+    let length = usize::from(u16::from_be_bytes([data[2], data[3]]));
+    let body = data.get(20..20 + length)?;
+    let mut at = 0;
+    while at + 4 <= body.len() {
+        let typ = u16::from_be_bytes([body[at], body[at + 1]]);
+        if typ == SOFTWARE {
+            return Some(true);
+        }
+        let len = usize::from(u16::from_be_bytes([body[at + 2], body[at + 3]]));
+        at += 4 + len.div_ceil(4) * 4;
+    }
+    Some(false)
 }
 
 struct Host {
@@ -370,6 +399,12 @@ impl SimHost {
             stats.sent_bytes += size;
             if data.first().is_some_and(|b| (128..=191).contains(b)) {
                 stats.sent_rtp_or_rtcp += 1;
+            }
+            if let Some(software) = stun_has_software(data) {
+                stats.sent_stun += 1;
+                if software {
+                    stats.sent_stun_with_software += 1;
+                }
             }
         }
         // An address the machine lost, a destination of the other family, or one that is not

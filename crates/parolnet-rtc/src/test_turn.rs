@@ -15,7 +15,8 @@ use std::time::Duration;
 
 use rtc::crypto::RTCCryptoProvider;
 use rtc::stun::attributes::{
-    ATTR_MESSAGE_INTEGRITY, ATTR_NONCE, ATTR_REALM, ATTR_USERNAME, ATTR_XOR_PEER_ADDRESS,
+    ATTR_MESSAGE_INTEGRITY, ATTR_NONCE, ATTR_REALM, ATTR_SOFTWARE, ATTR_USERNAME,
+    ATTR_XOR_PEER_ADDRESS,
 };
 use rtc::stun::error_code::{
     CODE_ALLOC_MISMATCH, CODE_BAD_REQUEST, CODE_UNAUTHORIZED, ErrorCode, ErrorCodeAttribute,
@@ -51,6 +52,7 @@ struct Stats {
     relayed: AtomicU64,
     refused: AtomicU64,
     refreshes: AtomicU64,
+    software: AtomicU64,
 }
 
 /// The server; it stops when dropped.
@@ -128,6 +130,23 @@ impl TestTurnServer {
     pub fn refused_requests(&self) -> u64 {
         self.stats.refused.load(Ordering::Relaxed)
     }
+
+    /// STUN messages carrying a SOFTWARE attribute (RFC 8489 section 14.14): the client's own
+    /// requests and indications, and the STUN messages it relays to peers (ICE checks and
+    /// their responses inside Send indications and ChannelData).
+    pub fn stun_with_software(&self) -> u64 {
+        self.stats.software.load(Ordering::Relaxed)
+    }
+}
+
+/// Whether `data` is a STUN message with a SOFTWARE attribute.
+fn carries_software(data: &[u8]) -> bool {
+    if !is_stun_message(data) {
+        return false;
+    }
+    let mut msg = Message::new();
+    msg.raw = data.to_vec();
+    msg.decode().is_ok() && msg.contains(ATTR_SOFTWARE)
 }
 
 struct Allocation {
@@ -258,6 +277,9 @@ impl Server {
         msg.raw = data.to_vec();
         if msg.decode().is_err() {
             return;
+        }
+        if msg.contains(ATTR_SOFTWARE) {
+            self.stats.software.fetch_add(1, Ordering::Relaxed);
         }
         if msg.typ.class == CLASS_INDICATION {
             if msg.typ.method == METHOD_SEND {
@@ -420,6 +442,9 @@ impl Server {
             return;
         }
         let to = SocketAddr::new(peer.ip, peer.port);
+        if carries_software(&data.0) {
+            self.stats.software.fetch_add(1, Ordering::Relaxed);
+        }
         if allocation.relay.send_to(&data.0, to).await.is_ok() {
             self.stats.relayed.fetch_add(1, Ordering::Relaxed);
         }
@@ -439,6 +464,9 @@ impl Server {
         let Some(peer) = allocation.peer_of.get(&channel.number.0) else {
             return;
         };
+        if carries_software(&channel.data) {
+            self.stats.software.fetch_add(1, Ordering::Relaxed);
+        }
         if allocation.relay.send_to(&channel.data, peer).await.is_ok() {
             self.stats.relayed.fetch_add(1, Ordering::Relaxed);
         }

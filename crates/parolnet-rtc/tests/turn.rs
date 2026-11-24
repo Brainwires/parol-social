@@ -154,6 +154,9 @@ async fn relay_only_on_both_sides_goes_through_the_turn_server() {
         server.relayed_datagrams() > 20,
         "ICE, DTLS and SCTP went through the relay"
     );
+    // No implementation fingerprint (THREAT_MODEL.md): neither our TURN client's requests
+    // nor the engine's ICE checks and responses relayed through it carry SOFTWARE.
+    assert_eq!(server.stun_with_software(), 0);
 
     // Closing releases the allocations on the server.
     a.close().await;
