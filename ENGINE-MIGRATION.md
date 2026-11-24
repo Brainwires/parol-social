@@ -113,7 +113,7 @@ runs on `v0.22.0+brainwires.6` (recovery relaxed there).
 | the_estimate_climbs_on_an_open_link | pass | pass: 1 Mbit/s at 16.1 s, then 2.5 Mbit/s, no downward step | pass | pass | pass |
 | the_estimate_settles_under_a_cap | pass | pass: median 189 / 190 kbit/s, high 382 k, carried 224 k, drops 123 / 6216 | pass | pass | pass: median 189 / 192 k, drops 144 / 6216 |
 | the_estimate_follows_a_cap_that_comes_and_goes (> 800 kbit/s 20 s after; freeze <= 2 s) | **fail: froze 6.86 s**; about 530 kbit/s at +20 s | **pass**: 436 / 641 / 942 / 1384 kbit/s at +5/10/15/20 s; freeze 1.22 s (while capped) | pass: 437 / 643 / 944 / 1388 k; freeze 1.22 s | **fail**: 145 / 213 / 313 / 460 k; freeze 1.69 / 2.08 s | **fail**: 183 / 269 / 395 / 581 k (second run 149 / 219 / 321 / 472 k); freeze 1.66 / 1.96 s |
-| profile_300_kbps_cap (freeze <= 2 s; audio >= 92 %) | pass | pass: freeze <= 1.50 s, audio 93.4 to 94.5 % | **fail: seed 3 caller audio 89.1 %** (freeze 1.58 s) | **fail: seed 1 callee audio 91.6 %** | pass: freeze <= 1.04 s, audio 92.8 to 94.2 % |
+| profile_300_kbps_cap (freeze <= 2 s; audio >= 92 %) | pass | pass: freeze <= 1.50 s, audio 93.4 to 94.5 % | fail once: seed 3 caller audio 89.1 % (freeze 1.58 s). **Not a regression**: run-to-run variation, see 3.1 | **fail: seed 1 callee audio 91.6 %** | pass: freeze <= 1.04 s, audio 92.8 to 94.2 % |
 | profile_two_percent_loss | pass | pass: freeze <= 627 ms, audio >= 97.9 % | pass | pass | pass |
 | profile_100_ms_jitter | pass | pass: freeze <= 131 ms, audio 100 % | pass | pass | pass |
 | renegotiation / restart that cannot be signalled / without a restart | pass | pass | pass | pass | pass |
@@ -123,3 +123,99 @@ runs on `v0.22.0+brainwires.6` (recovery relaxed there).
 Two runs of the same seed differ slightly on the gcc-2 branch (the test step, with tests in
 parallel, against the figures step with one thread): the simulated time is the same, but
 the order of tokio tasks is not.
+
+### 3.1 `profile_300_kbps_cap` across engine train 13 (no regression)
+
+Probe PR #54, run 45305849593: the measure-only sweep (`sweep_profile_300_kbps_cap`, seeds 1 to
+8, caller and callee, each run twice in separate processes) on every first-parent revision of
+train 13 between master 81e2253e and df82663c. Audio good %, `caller/callee` per seed:
+
+```
+audio good % per seed (caller/callee), run1 | run2 ; min over 16 = worst
+81e2253e: min 92.1 mean 93.72 below92 0/32 run1==run2 False
+   r1: 94.4/93.1 94.1/93.9 94.9/94.1 93.8/93.7 94.2/93.5 94.0/94.4 94.7/92.9 94.3/93.4
+   r2: 93.1/92.7 94.1/94.2 94.3/93.9 93.9/93.2 93.7/92.1 92.8/92.9 93.5/93.2 94.4/93.8
+cd69d504: min 91.6 mean 93.74 below92 2/32 run1==run2 False
+   r1: 92.8/93.0 94.1/93.0 93.7/92.7 93.6/92.4 94.4/94.4 95.9/95.8 93.1/93.6 96.1/95.9
+   r2: 93.4/93.4 93.4/91.9 93.9/93.9 93.5/91.6 94.8/94.3 94.2/93.6 94.1/93.6 92.4/93.2
+95fb09a4: min 91.5 mean 94.06 below92 1/32 run1==run2 False
+   r1: 94.1/92.9 94.2/94.4 95.2/96.1 93.9/93.6 96.4/96.1 94.7/93.3 93.4/93.3 93.4/93.9
+   r2: 94.6/94.4 95.6/95.7 93.6/91.5 94.7/94.5 93.1/92.6 93.1/93.1 94.1/93.4 94.1/92.9
+dfc9561f: min 91.7 mean 93.57 below92 3/32 run1==run2 False
+   r1: 92.9/92.8 94.1/92.6 93.9/92.9 93.1/93.8 91.8/91.8 94.1/93.1 94.3/93.2 93.7/94.1
+   r2: 94.1/93.1 94.9/93.9 93.4/91.7 93.9/92.8 94.7/93.7 96.5/95.1 94.1/92.2 94.6/93.3
+2dcf2689: min 91.9 mean 93.45 below92 1/32 run1==run2 False
+   r1: 94.3/93.9 94.3/93.7 93.4/94.6 92.3/93.1 94.1/93.4 93.9/94.2 92.6/91.9 93.3/92.5
+   r2: 94.0/92.8 92.7/92.6 93.4/94.4 93.9/93.6 94.0/93.0 93.9/94.0 93.1/93.1 93.1/93.2
+   asserting step: ['300 kbit/s cap, seed 2, caller: 91.7% of the played audio is the tone']
+fd0943cc: min 93.1 mean 93.98 below92 0/32 run1==run2 False
+   r1: 94.0/94.4 95.4/95.5 93.2/93.4 95.3/94.2 94.1/93.9 94.0/93.1 93.1/93.6 94.2/93.5
+   r2: 93.6/94.1 95.1/93.6 94.2/93.7 94.2/93.9 94.1/93.2 93.4/93.9 94.3/94.4 93.5/93.4
+   asserting step: ['300 kbit/s cap, seed 2, caller: 91.4% of the played audio is the tone']
+0391c4c8: min 90.4 mean 93.74 below92 1/32 run1==run2 False
+   r1: 93.6/93.5 92.9/90.4 93.4/93.7 93.6/93.7 94.1/92.6 94.4/93.8 94.5/93.4 93.9/92.3
+   r2: 93.9/94.0 92.7/92.7 94.4/93.9 95.8/95.9 94.3/93.1 94.3/93.5 92.9/94.5 95.0/95.1
+3829ab36: min 92.3 mean 93.91 below92 0/32 run1==run2 False
+   r1: 94.6/93.9 94.1/93.2 94.1/93.4 92.3/93.5 95.5/96.1 93.1/93.3 93.6/93.4 93.3/93.9
+   r2: 94.5/93.4 94.2/92.6 93.3/92.4 94.2/94.1 96.1/96.4 93.3/94.1 94.2/93.6 93.6/93.7
+ae773045: min 92.6 mean 93.78 below92 0/32 run1==run2 False
+   r1: 94.9/93.7 93.9/93.8 93.6/94.0 94.1/92.9 93.5/93.8 93.5/93.7 94.9/93.4 93.7/93.1
+   r2: 93.8/93.9 94.0/93.6 94.4/93.6 93.8/93.9 94.0/92.6 93.6/94.1 94.1/93.9 93.5/93.6
+5ea96f81: min 89.9 mean 93.53 below92 3/32 run1==run2 False
+   r1: 94.4/93.5 94.1/93.9 94.1/93.7 91.4/89.9 93.6/93.1 92.5/93.8 94.4/93.3 93.0/93.2
+   r2: 93.3/93.1 97.0/95.6 92.8/93.3 93.6/93.3 93.6/91.9 93.6/94.2 93.6/94.5 94.1/93.4
+   asserting step: ['300 kbit/s cap, seed 1, caller: 91.1% of the played audio is the tone']
+5c209231: min 92.6 mean 93.89 below92 0/32 run1==run2 False
+   r1: 93.6/93.9 93.9/93.6 94.7/93.9 94.1/94.4 92.6/92.6 93.9/92.8 93.6/94.3 94.4/94.4
+   r2: 93.8/93.4 93.3/92.7 93.9/93.4 93.4/93.5 96.1/94.0 94.9/93.6 95.6/95.1 93.8/93.2
+737507c9: min 92.6 mean 93.92 below92 0/32 run1==run2 False
+   r1: 92.6/93.1 93.7/94.8 94.9/94.4 94.9/93.8 93.8/93.5 94.3/93.9 94.3/94.1 94.4/93.6
+   r2: 93.1/93.3 93.4/94.1 94.9/94.0 93.6/92.7 94.2/93.9 94.0/94.2 94.1/93.5 94.1/94.4
+df82663c: min 90.7 mean 93.76 below92 2/32 run1==run2 False
+   r1: 94.6/94.6 93.6/93.1 93.3/94.1 94.5/94.4 93.9/94.1 93.9/93.5 93.2/94.0 93.7/93.6
+   r2: 94.1/93.7 91.3/93.2 93.7/93.1 95.6/96.2 92.1/90.7 95.0/94.3 93.7/94.2 93.9/93.5
+```
+
+Means stay between 93.45 and 94.06 % on every revision (81e2253e 93.72, df82663c 93.76); no
+revision is worse than another beyond the spread of one seed between two runs (up to 3.4
+points). The 92 % bar sits about 1.7 points under the mean, so the asserting test fails
+now and then on any revision (in this run: 2dcf2689, fd0943cc, 5ea96f81; not df82663c).
+
+### 3.2 Reproducible runs (engine `conf/det-1-wall-clock`)
+
+Two runs of one seed never gave the same figures, even one after the other in fresh processes.
+The engine maps instants to NTP times from a process-wide anchor taken at its first use, so
+report timestamps, the round trip they give, and with it the NACK and congestion timing,
+depend on real time elapsed. With `conf/det-1-wall-clock` (c26acab4) the simnet can make runs
+identical once that branch is on master:
+
+- a per-connection wall-clock anchor (`with_wall_clock`) on the RTCP session ParolNet installs
+  (`configure_rtcp_reports`; a `RtcConfig` field, set by the simnet at the call's start);
+- the setting engine's seeded crypto provider and `rtcp_random`, seeded from
+  `CallConfig::seed` (ICE credentials, DTLS randoms, RTCP intervals, CNAME);
+- ParolNet's own randomness made injectable in the same way: `rand_ssrc` (time and counter
+  hash), the RTP sequence start (`new_random_sequencer`), and STUN transaction ids.
+
+The SRTP and DTLS ephemeral keys stay unseeded (no seed reaches them), but they don't change
+timing or sizes. Not done yet: the branch is not on engine master.
+
+### 3.3 gcc-2 recovery series (for the congestion owner)
+
+Probe PR #55: `the_estimate_follows_a_cap_that_comes_and_goes` alone twice, then in the full
+suite. Median under the cap | target at +5/+10/+15/+20 s (kbit/s) | longest freeze; ICE restart
+freeze (caller / callee).
+
+| Engine | NACK limit | Under cap | +5 / +10 / +15 / +20 | Freeze | Restart freeze |
+|---|---|---|---|---|---|
+| master df82663c | default | 183 | 437 / 643 / 944 / 1388 (all runs) | 1.22 s | 479 / 400 ms |
+| gcc-2 53a17d35 | default | 197 | 152-171 / 224-250 / 329-368 / 484-541 | 1.45-1.66 s | 700 / 700 ms |
+| gcc-2 53a17d35 | UpToTarget | 198 | 151-178 / 221-260 / 326-383 / 478-562 | 1.45-2.01 s | 306 / 350 ms |
+| 4983efcc (master's twcc_gcc) | default | 159 | 380 / 558 / 820 / 1203 | **3.22-3.26 s** | 600 ms / **6.29 s** |
+| gcc-2 dabddd92 | default | 199 | 143-152 / 210-224 / 308-329 / 453-484 | 1.48-1.52 s | 700 / 700 ms |
+| gcc-2 dabddd92 | UpToTarget | 199 | 222-309 / 326-454 / 480-668 / 705-981 | 1.49-1.66 s | 306 / 350 ms |
+
+### 3.4 Relay candidates' hidden related address
+
+`raddr 0.0.0.0 rport 9` (RFC 8827 section 6.4, the engine's released `0.22.0+brainwires.6`
+entry) stands on master df82663c: `turn::relay_only_on_both_sides_goes_through_the_turn_server`
+asserts it and passes there.

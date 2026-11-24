@@ -612,6 +612,63 @@ async fn the_estimate_settles_under_a_cap() {
     call.close().await;
 }
 
+/// Measure only: the cap of `the_estimate_follows_a_cap_that_comes_and_goes`, held `hold`
+/// after the estimate went under 400 kbit/s, then lifted; the recovery series. Prints, as
+/// `figure cap_length | hold <n> s | ...`: the estimate when the cap lifts, the target 5, 10,
+/// 15 and 20 s later, the median under the cap and the callee's longest freeze.
+async fn cap_length(hold: Duration) {
+    let (call, _) = call_on(LinkProfile::default(), CallConfig::default()).await;
+    call.run_for(secs(20)).await;
+    call.caller.host.set_profile(LinkProfile::capped_300k());
+    let capped = call.elapsed();
+    call.until("the estimate to come down", secs(5), |c| {
+        c.caller
+            .metrics()
+            .target_at(c.elapsed())
+            .is_some_and(|t| t < 400_000)
+    })
+    .await;
+    call.run_for(hold).await;
+    let opened = call.elapsed();
+    let at_lift = call.caller.metrics().target_at(opened);
+    let under = median_target(&call.caller.snapshot(), capped + secs(8), opened);
+    call.caller.host.set_profile(LinkProfile::default());
+    call.run_for(secs(20)).await;
+    let m = call.callee.snapshot();
+    let caller = call.caller.metrics();
+    let series: Vec<Option<u32>> = [5, 10, 15, 20]
+        .into_iter()
+        .map(|at| caller.target_at(opened + secs(at)))
+        .collect();
+    let who = format!("hold {} s", hold.as_secs());
+    figure(
+        "cap_length",
+        &who,
+        "at lift | +5/+10/+15/+20 | median under the cap | longest freeze",
+        (
+            at_lift,
+            series,
+            under,
+            m.video.longest_gap(secs(2), call.elapsed()),
+        ),
+    );
+    drop(caller);
+    call.close().await;
+}
+
+/// The cap lengths of `M1_CAP_HOLDS` (seconds, comma-separated; default 14,17,20,23,26).
+#[tokio::test(start_paused = true)]
+#[ignore = "a measurement sweep for engine comparisons, not a check"]
+async fn sweep_cap_length() {
+    let holds = std::env::var("M1_CAP_HOLDS").unwrap_or_else(|_| "14,17,20,23,26".into());
+    for hold in holds
+        .split(',')
+        .filter_map(|h| h.trim().parse::<u64>().ok())
+    {
+        cap_length(secs(hold)).await;
+    }
+}
+
 #[tokio::test(start_paused = true)]
 async fn the_estimate_follows_a_cap_that_comes_and_goes() {
     let (call, _) = call_on(LinkProfile::default(), CallConfig::default()).await;
