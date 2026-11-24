@@ -888,6 +888,21 @@ async function pwaDecodes(pwa, what) {
   }
 }
 
+/// PROBE (webkit-case6): the old criterion. Wait up to 30 s from now for the browser's own
+/// connectionState to say "connected"; print one PROBE line either way.
+async function probeOldCriterion(pwa, tag, s) {
+  const t0 = Date.now();
+  let cur = s;
+  while (Date.now() - t0 < 30_000) {
+    if (cur.state === "connected") break;
+    await sleep(200);
+    cur = await pwa.callStats();
+  }
+  const verdict = cur.state === "connected" ? `connected after ${Date.now() - t0} ms` : "STUCK";
+  log(`PROBE ${tag}: decoded (frames ${s.videoFrames}, key frames ${s.keyFrames}, audio packets ${s.audioPackets}) with connectionState "${s.state}" transports ${JSON.stringify(s.transports)}; old criterion: ${verdict}`);
+  if (verdict === "STUCK") console.log(`PROBE ${tag}: diag ${JSON.stringify(await pwa.diag())}`);
+}
+
 async function caseCalls(ctx) {
   const profile = mkdtempSync(join(work, `${browserName}-5-`));
   const browser = await launchBrowser(profile, { media: true });
@@ -913,6 +928,7 @@ async function caseCalls(ctx) {
   await bot.wait("active", (e) => e.event === "call" && e.call_id === out.call_id && e.state === "Active", 30_000, mark);
   const m6 = await botMedia(bot, out.call_id, 50, `${tag}: the desktop receives ${Browser}'s VP8 and Opus`);
   const s6 = await pwaDecodes(pwa, `${tag}: ${Browser} decodes the desktop's VP8 and Opus`);
+  await probeOldCriterion(pwa, tag, s6);
   log(`${tag}: desktop got audio ${m6.audio_rx} / video ${m6.video_rx} packets; PWA decoded ${s6.videoFrames} frames, ${s6.audioSamples} audio samples`);
   // The browser side does not renegotiate: the call is not renegotiable, "camera off" leaves
   // the stream as it was set up, a network change sends no reoffer, and media goes on.
@@ -942,6 +958,7 @@ async function caseCalls(ctx) {
     await bot.wait("active", (e) => e.event === "call" && e.call_id === ring.call_id && e.state === "Active", 30_000);
     const m5 = await botMedia(bot, ring.call_id, 50, `${tag}: the desktop receives ${Browser}'s VP8 and Opus`);
     const s5 = await pwaDecodes(pwa, `${tag}: ${Browser} decodes the desktop's VP8 and Opus`);
+    await probeOldCriterion(pwa, tag, s5);
     log(`${tag}: desktop got audio ${m5.audio_rx} / video ${m5.video_rx} packets; PWA decoded ${s5.videoFrames} frames, ${s5.audioSamples} audio samples`);
     if (s5.state !== "connected") {
       log(`${tag}: ${Browser}'s connectionState is "${s5.state}" with its transports ${JSON.stringify(s5.transports)}: the call is up by the web app's rule (calls.ts, watchTransports)`);
@@ -1117,6 +1134,11 @@ async function main() {
 
   const bots = [];
   const filesOnly = process.env.INTEROP_ONLY === "files";
+  if (process.env.INTEROP_ONLY === "calls") {
+    bots.push(await caseCalls(ctx));
+    log(`PASS: desktop <-> web app interop, ${Browser}, ${mode} candidates (calls only)`);
+    return;
+  }
   if (!filesOnly) {
     bots.push(await caseDesktopEntersPwaCode(ctx));
     bots.push(await casePwaPastesDesktopCode(ctx));
