@@ -17,14 +17,10 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - rev: 53a17d35d07c9ea77582026a0c4e4e70076f3ee9
+          - rev: dabddd9250a5f29c57252fd511fab6cfcc5b25a0
             upto: false
-          - rev: 53a17d35d07c9ea77582026a0c4e4e70076f3ee9
+          - rev: dabddd9250a5f29c57252fd511fab6cfcc5b25a0
             upto: true
-          - rev: 4983efcc641bfd4db25a38c576e16525b5a18176
-            upto: false
-          - rev: df82663c6ca0a346e485b6ea79025c793a43f9a8
-            upto: false
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
