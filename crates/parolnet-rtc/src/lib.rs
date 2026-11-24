@@ -777,7 +777,15 @@ struct Sock {
     srflx: Vec<SocketAddr>,
     /// Consecutive failed receives.
     errors: u32,
+    /// A socket of the previous DTLS association (RFC 8842 section 5.1): kept reading and
+    /// sending for the pair that still carries the session until the new generation selects
+    /// a pair, then closed after [`RETIRED_SOCKET_LINGER`]. It gives no candidate.
+    retired: bool,
 }
+
+/// How long a retired socket stays open after the new generation selected a pair: the peer
+/// selects on its own and may still send to the previous address for a moment.
+const RETIRED_SOCKET_LINGER: Duration = Duration::from_secs(5);
 
 fn bind_all(
     network: &dyn Network,
@@ -788,7 +796,7 @@ fn bind_all(
     let mut last_error = None;
     for (index, ip) in addrs.iter().enumerate() {
         let preference = net::local_preference(index);
-        if let Some(existing) = socks.iter_mut().find(|s| s.local.ip() == *ip) {
+        if let Some(existing) = socks.iter_mut().find(|s| s.local.ip() == *ip && !s.retired) {
             existing.preference = preference;
             continue;
         }
@@ -802,6 +810,7 @@ fn bind_all(
                 preference,
                 srflx: Vec::new(),
                 errors: 0,
+                retired: false,
             }),
             Err(err) => {
                 tracing::debug!(%ip, %err, "cannot bind a local address");
@@ -960,6 +969,7 @@ pub async fn spawn(config: RtcConfig) -> Result<(RtcHandle, mpsc::Receiver<RtcEv
         quality_interval: config.quality_interval,
         next_quality: None,
         quality_base: QualityBase::default(),
+        retire_at: None,
     };
     let task = tokio::spawn(driver.run(cmd_rx));
     Ok((
@@ -1353,6 +1363,8 @@ struct Driver {
     quality_interval: Option<Duration>,
     next_quality: Option<Instant>,
     quality_base: QualityBase,
+    /// When the retired sockets of the previous DTLS association close.
+    retire_at: Option<Instant>,
 }
 
 /// The longest the loop sleeps when the engine names no deadline.
@@ -1409,6 +1421,10 @@ impl Driver {
                 continue;
             }
             self.release_audio(now);
+            if self.retire_at.is_some_and(|t| t <= now) {
+                self.close_retired_sockets();
+                continue;
+            }
             if self.next_estimate.is_some_and(|t| t <= now) {
                 self.report_estimate(now).await;
                 continue;
@@ -1430,6 +1446,7 @@ impl Driver {
                 self.next_estimate,
                 self.next_quality,
                 self.next_audio_release(),
+                self.retire_at,
             ]
             .into_iter()
             .flatten()
@@ -1689,7 +1706,36 @@ impl Driver {
                     self.emit(RtcEvent::IceConnectionState(state)).await;
                 }
                 RTCPeerConnectionEvent::OnSelectedCandidatePairChange(_) => {
+                    if self.retire_at.is_none() && self.socks.iter().any(|s| s.retired) {
+                        self.retire_at = Some(now() + RETIRED_SOCKET_LINGER);
+                    }
                     self.emit(RtcEvent::SelectedCandidatePairChanged).await;
+                }
+                // RFC 8842 section 5.1: a new DTLS association on a new 3-tuple. This driver
+                // binds the new sockets itself before it makes or answers the description
+                // that starts one (`renew_sockets`), so the candidates it adds are on new
+                // ports; the event is the engine's account of it.
+                RTCPeerConnectionEvent::OnLocalCandidatesNeeded(needed) => {
+                    let active: Vec<SocketAddr> = self
+                        .socks
+                        .iter()
+                        .filter(|s| !s.retired)
+                        .map(|s| s.local)
+                        .collect();
+                    let stale = needed
+                        .refused_addresses
+                        .iter()
+                        .filter(|a| active.contains(a))
+                        .count();
+                    if stale > 0 {
+                        tracing::warn!(
+                            reason = ?needed.reason,
+                            stale,
+                            "the engine refuses addresses this driver still gathers on"
+                        );
+                    } else {
+                        tracing::debug!(reason = ?needed.reason, "new local candidates needed");
+                    }
                 }
                 // SRTP re-keying (RFC 3711 section 9.2, RFC 5764 section 4.4). A key has a
                 // sixteenth of its lifetime left and the engine asked for a new DTLS
@@ -2053,7 +2099,9 @@ impl Driver {
                         .pc
                         .remote_description()
                         .is_some_and(|current| tls_id(&current.sdp) != tls_id(&desc.sdp));
-                if restart {
+                if new_association {
+                    self.renew_sockets()?;
+                } else if restart {
                     self.rebind()?;
                 }
                 let sdp = desc.sdp.clone();
@@ -2123,12 +2171,16 @@ impl Driver {
     }
 
     async fn begin_offer(&mut self) -> Result<(), RtcError> {
-        if self.negotiation.wanted.restarts() {
+        if self.negotiation.wanted.rekey {
+            self.renew_sockets()?;
+        } else if self.negotiation.wanted.restart {
             self.rebind()?;
-            if let Some(gather) = self.start_gather(AfterGather::Offer) {
-                self.gather = Some(gather);
-                return Ok(());
-            }
+        }
+        if self.negotiation.wanted.restarts()
+            && let Some(gather) = self.start_gather(AfterGather::Offer)
+        {
+            self.gather = Some(gather);
+            return Ok(());
         }
         self.make_offer().await
     }
@@ -2181,13 +2233,55 @@ impl Driver {
         Ok(())
     }
 
+    /// For a new DTLS association (RFC 8842 section 5.1: "a new 3-tuple ... MUST be
+    /// allocated"): new sockets, on new ports, for the addresses the machine has now; the
+    /// sockets they replace are retired (they keep reading and sending for the pair in use
+    /// until the new generation selects one). The engine refuses the previous addresses for
+    /// the new generation's candidates.
+    fn renew_sockets(&mut self) -> Result<(), RtcError> {
+        self.rebind()?;
+        let mut addrs: Vec<(u16, IpAddr)> = self
+            .socks
+            .iter()
+            .filter(|s| !s.retired)
+            .map(|s| (s.preference, s.local.ip()))
+            .collect();
+        addrs.sort_by(|a, b| b.0.cmp(&a.0));
+        let addrs: Vec<IpAddr> = addrs.into_iter().map(|(_, ip)| ip).collect();
+        for sock in &mut self.socks {
+            sock.retired = true;
+        }
+        // Port 0: a port the previous association did not use.
+        bind_all(self.network.as_ref(), &addrs, 0, &mut self.socks)?;
+        self.next_sock = 0;
+        self.retire_at = None;
+        tracing::debug!(
+            addrs = ?self.socks.iter().filter(|s| !s.retired).map(|s| s.local).collect::<Vec<_>>(),
+            "new sockets for a new DTLS association"
+        );
+        Ok(())
+    }
+
+    /// Close the retired sockets, except the one that holds the TURN allocation.
+    fn close_retired_sockets(&mut self) {
+        self.retire_at = None;
+        let relay_local = self.relay.as_ref().map(turn::Relay::local);
+        self.socks
+            .retain(|s| !s.retired || Some(s.local) == relay_local);
+        self.next_sock = 0;
+    }
+
     /// Ask the STUN servers again from the sockets that have no server-reflexive address
     /// yet. `None` when there is nothing to ask.
     fn start_gather(&mut self, then: AfterGather) -> Option<StunGather> {
         if self.relay_only {
             return None;
         }
-        let fresh: Vec<&Sock> = self.socks.iter().filter(|s| s.srflx.is_empty()).collect();
+        let fresh: Vec<&Sock> = self
+            .socks
+            .iter()
+            .filter(|s| s.srflx.is_empty() && !s.retired)
+            .collect();
         StunGather::for_socks(&fresh, &self.stun_targets, self.stun_timeout, Some(then))
     }
 
@@ -2445,17 +2539,18 @@ impl Driver {
             }
             .new_candidate_relay()?;
             let init = RTCIceCandidate::from(&candidate).to_json()?;
-            self.pc.add_local_candidate(init)?;
+            self.add_candidate(init)?;
         }
         if self.relay_only {
             return Ok(());
         }
         // With one socket the engine's own priorities (RFC 8445's single-address values) are
         // kept; with several each address gets its own local preference.
-        let several = self.socks.len() > 1;
+        let several = self.socks.iter().filter(|s| !s.retired).count() > 1;
         let locals: Vec<(SocketAddr, u16, Vec<SocketAddr>)> = self
             .socks
             .iter()
+            .filter(|s| !s.retired)
             .map(|s| (s.local, s.preference, s.srflx.clone()))
             .collect();
         for (local, preference, srflx) in locals {
@@ -2479,7 +2574,7 @@ impl Driver {
             }
             .new_candidate_host()?;
             let init = RTCIceCandidate::from(&candidate).to_json()?;
-            self.pc.add_local_candidate(init)?;
+            self.add_candidate(init)?;
             for addr in srflx {
                 let candidate = CandidateServerReflexiveConfig {
                     base_config: CandidateConfig {
@@ -2496,10 +2591,25 @@ impl Driver {
                 }
                 .new_candidate_server_reflexive()?;
                 let init = RTCIceCandidate::from(&candidate).to_json()?;
-                self.pc.add_local_candidate(init)?;
+                self.add_candidate(init)?;
             }
         }
         Ok(())
+    }
+
+    /// Add one local candidate. One on an address of the previous DTLS association is refused
+    /// by the engine (RFC 8842 section 5.1) and left out: the relay candidate, whose
+    /// allocation is not renewed (a gap for relay-only re-keying, see ENGINE-MIGRATION.md).
+    fn add_candidate(&mut self, init: RTCIceCandidateInit) -> Result<(), RtcError> {
+        match self.pc.add_local_candidate(init) {
+            Err(rtc::shared::error::Error::ErrICECandidateAddressOfPreviousDtlsAssociation(
+                addr,
+            )) => {
+                tracing::warn!(%addr, "candidate of the previous DTLS association left out");
+                Ok(())
+            }
+            other => Ok(other?),
+        }
     }
 
     async fn emit_local_description(&mut self) {
