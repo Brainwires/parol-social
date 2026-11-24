@@ -78,10 +78,13 @@ async fn a_relay_only_call_re_keys_on_new_allocations() {
         .with_test_writer()
         .try_init();
     let server = TestTurnServer::start(USER, PASS).await.unwrap();
-    // About 150 packets a second from `a`: its key nears its end (15/16 of 1600) after
-    // about 10 s, and the last 100 packets leave about 0.7 s for the re-keying.
+    // About 180 packets a second from `a`: its key nears its end (15/16 of 9600) after about
+    // 50 s, and the last 600 packets leave about 3 s for the re-keying. Through the TURN
+    // server a new ICE generation takes about 2 s to select a pair (the first exchange did
+    // too: the peer's first checks reach an allocation before it has a permission for the
+    // sender); with 1600 packets the old key ran out after 0.55 s, first.
     let lifetime = KeyLifetime {
-        srtp_packets: 1_600,
+        srtp_packets: 9_600,
         ..KeyLifetime::MAX
     };
     let mut pair = Pair::new(
@@ -106,7 +109,7 @@ async fn a_relay_only_call_re_keys_on_new_allocations() {
                 .collect();
         ids.windows(2).any(|w| w[0] != w[1])
     };
-    for _ in 0..60 {
+    for _ in 0..180 {
         feed(&mut pair, 500).await;
         if renewed(&pair) {
             break;
