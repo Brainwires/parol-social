@@ -18,10 +18,10 @@ use parolnet_protocol::ProtocolCodec as _;
 use parolnet_protocol::channel_binding::{BindingError, ChannelBinding};
 use parolnet_protocol::codec::CborCodec;
 use parolnet_protocol::shaping::{BandwidthMode, SendChoice, SendScheduler};
-use parolnet_rtc::rtc::peer_connection::sdp::{RTCSdpType, RTCSessionDescription};
-use parolnet_rtc::rtc::peer_connection::state::RTCPeerConnectionState;
-use parolnet_rtc::rtc::peer_connection::transport::RTCIceCandidateInit;
-use parolnet_rtc::rtc::rtp_transceiver::rtp_sender::RtpCodecKind;
+use parolnet_rtc::rtci::peer_connection::sdp::{RTCSdpType, RTCSessionDescription};
+use parolnet_rtc::rtci::peer_connection::state::RTCPeerConnectionState;
+use parolnet_rtc::rtci::peer_connection::transport::RTCIceCandidateInit;
+use parolnet_rtc::rtci::rtp_transceiver::rtp_sender::RtpCodecKind;
 use parolnet_rtc::{
     Gather, IcePolicy, MediaKind, NetworkMonitor, RtcConfig, RtcError, RtcEvent, RtcHandle,
     SystemNetwork, TurnServer,

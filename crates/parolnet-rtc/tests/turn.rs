@@ -10,7 +10,7 @@
 use std::net::{IpAddr, SocketAddr};
 use std::time::Duration;
 
-use parolnet_rtc::rtc::peer_connection::sdp::RTCSessionDescription;
+use parolnet_rtc::rtci::peer_connection::sdp::RTCSessionDescription;
 use parolnet_rtc::test_turn::TestTurnServer;
 use parolnet_rtc::{IcePolicy, RtcConfig, RtcError, RtcEvent, RtcHandle, TurnServer, spawn};
 use tokio::sync::mpsc::Receiver;

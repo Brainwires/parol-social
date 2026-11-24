@@ -12,8 +12,8 @@ use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Mutex};
 
 use parolnet_rtc::net::{DatagramSocket, LocalAddress, Network, SystemNetwork};
-use parolnet_rtc::rtc::stun::message::{BINDING_SUCCESS, Message, TransactionId};
-use parolnet_rtc::rtc::stun::xoraddr::XorMappedAddress;
+use parolnet_rtc::rtci::stun::message::{BINDING_SUCCESS, Message, TransactionId};
+use parolnet_rtc::rtci::stun::xoraddr::XorMappedAddress;
 use parolnet_rtc::{Gather, RtcConfig};
 use support::{Pair, host_addresses, ufrag};
 use tokio::net::UdpSocket;

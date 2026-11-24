@@ -25,8 +25,8 @@ use parolnet_rtc::jitter::AudioJitterBuffer;
 use parolnet_rtc::net::{
     ChangeDetector, LocalAddress, candidate_priority, local_preference, select_addresses,
 };
-use parolnet_rtc::rtc::peer_connection::sdp::{RTCSdpType, RTCSessionDescription};
-use parolnet_rtc::rtc::peer_connection::state::RTCPeerConnectionState;
+use parolnet_rtc::rtci::peer_connection::sdp::{RTCSdpType, RTCSessionDescription};
+use parolnet_rtc::rtci::peer_connection::state::RTCPeerConnectionState;
 use parolnet_rtc::{
     ConnectionQuality, MediaKind, RtcConfig, RtcEvent, RtcHandle, ice_ufrag, media_directions,
 };
@@ -1245,7 +1245,7 @@ fn received_audio_is_delivered_in_order_at_the_pace_it_was_sent() {
     for ms in 0..7_000u64 {
         let now = start + Duration::from_millis(ms);
         while next < arrivals.len() && arrivals[next].0 == ms {
-            let mut packet = parolnet_rtc::rtc::rtp::Packet::default();
+            let mut packet = parolnet_rtc::rtci::rtp::Packet::default();
             packet.header.sequence_number = arrivals[next].1;
             packet.header.timestamp = u32::from(arrivals[next].1) * 960;
             buffer.push(now, packet);
@@ -1271,7 +1271,7 @@ fn received_audio_is_delivered_in_order_at_the_pace_it_was_sent() {
     );
     // A packet that comes after its successors were delivered is given up.
     let late = buffer.late_drops();
-    let mut packet = parolnet_rtc::rtc::rtp::Packet::default();
+    let mut packet = parolnet_rtc::rtci::rtp::Packet::default();
     packet.header.sequence_number = 100;
     packet.header.timestamp = 100 * 960;
     buffer.push(start + Duration::from_secs(8), packet);

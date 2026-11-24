@@ -1,51 +1,65 @@
 # Engine migration: `rtc` 0.22.0+brainwires.6 to `rtci` 0.1.0
 
-Release-day checklist for the draft PR "Engine: next release (pre-release testing, not
-mergeable)". This file is deleted when the PR merges.
+Checklist for the draft PR "Engine: rtci 0.1.0 (release candidate 3bbd6cc1)". This file is
+deleted when the PR merges.
 
-The PR is prepared against the engine's development line, pinned to a git `rev`. Until the
-engine releases `v0.1.0` (repository `Brainwires/rtci`, crates `rtci` / `rtci-*`; see the
-engine's `docs/rename.md`) it must not merge.
+The engine's release commit (fork master 3bbd6cc1, `chore(release): 0.1.0`, after the rename
+commit c6f4611a) is pinned by `rev`. The rename (see the engine's `docs/rename.md`) is done here;
+what is left is the switch to crates.io once 0.1.0 is published.
 
-## 1. Release-day steps
+## 1. State of each step
 
-1. **Pin** (root `Cargo.toml`): replace
-
-   ```toml
-   rtc = { git = "https://github.com/Brainwires/webrtc-rs-rtc", rev = "<sha>" }
-   ```
-
-   with
+1. **Pin** (root `Cargo.toml`), done for the release candidate:
 
    ```toml
-   rtci = { git = "https://github.com/Brainwires/rtci", tag = "v0.1.0" }
+   rtci = { git = "https://github.com/Brainwires/webrtc-rs-rtc", rev = "3bbd6cc1d005678d391bcb336b43e437d2c6913b" }
    ```
 
-   and drop the "NOT MERGEABLE" comment above it. A tag, never a branch or a rev
-   (CLAUDE.md, dependency policy).
-2. **Dependency names**: `crates/parolnet-rtc/Cargo.toml` has `rtc.workspace = true`; it becomes
-   `rtci.workspace = true`. No other crate names the engine directly (`parolnet-simnet`,
-   `parolnet-app`, `parolnet-conformance` and `apps/desktop` reach it through `parolnet-rtc`).
-   ParolNet uses no `rtc-*` sub-crate directly.
-3. **`use` paths**: every `rtc::` path in `crates/parolnet-rtc/src` (lib.rs, net.rs, turn.rs,
-   test_turn.rs, jitter.rs) becomes `rtci::`. `parolnet-rtc` re-exports the engine as
-   `pub use rtc;`; make it `pub use rtci;` and rename the callers' `parolnet_rtc::rtc::` paths
-   (`parolnet-simnet`, `parolnet-app`, `parolnet-conformance`, `apps/desktop`). A grep for
-   `parolnet_rtc::rtc::` and `\brtc::` finds them all. (A one-line alternative is
-   `rtc = { package = "rtci", ... }`; not recommended, it keeps the old name alive.)
+   **After publishing** (the two-minute follow-up), replace that line with
+
+   ```toml
+   rtci = "0.1.0"
+   ```
+
+   and the "RELEASE CANDIDATE" comment above it with a plain one; then run `cargo update -p rtci`
+   in the root and in `apps/desktop` (each lock file's 18 `rtci` / `rtci-*` entries change their
+   `source` from `git+https://github.com/Brainwires/webrtc-rs-rtc?rev=...` to the crates.io
+   registry and gain a `checksum`; check that no other package moves). The
+   `"https://github.com/Brainwires/webrtc-rs-rtc"` entries in `allow-git` (`deny.toml`,
+   `apps/desktop/deny.toml`) are then unused and go.
+2. **Dependency names**, done: `crates/parolnet-rtc/Cargo.toml` has `rtci.workspace = true`. No
+   other crate names the engine directly (`parolnet-simnet`, `parolnet-app`,
+   `parolnet-conformance` and `apps/desktop` reach it through `parolnet-rtc`). ParolNet uses no
+   `rtci-*` sub-crate directly. No `package =` alias.
+3. **`use` paths**, done: every `rtc::` path is `rtci::`; `parolnet-rtc` re-exports
+   `pub use rtci;` and callers use `parolnet_rtc::rtci::`.
 4. **Feature names**: ParolNet enables no engine feature (default features only); none to
    rename. Do not enable `chrome-defaults` / `performance-defaults` or
    `turn-tls-webpki-roots` (CDLA licence).
-5. **Lock files**: `cargo update -p rtci` in the root and in `apps/desktop` (its own workspace).
-   Check that no other package moved.
-6. **CI workflow**: `.github/workflows/ci.yml` goes back to `cargo test --workspace` (drop
-   `--no-fail-fast`) and the "m1 figures" step is removed.
-7. **Licence gates**: `cargo deny check licenses sources bans` for both workspaces
-   (`deny.toml` allows the git source; update it if it names `webrtc-rs-rtc`).
-8. **Docs**: CHANGELOG.md (the "pre-release testing" entry becomes the engine bump entry, with
-   the release's name), IMPLEMENTATION_STATUS.md (engine pin line), README.md if it names the
-   engine crate; delete this file.
+5. **Lock files**, done: `cargo update -p rtc` in the root and in `apps/desktop`; only the 18
+   engine packages changed (version and source; their dependency lists are identical).
+6. **CI workflow**, at merge: `.github/workflows/ci.yml` goes back to `cargo test --workspace`
+   (drop `--no-fail-fast`) and the "m1 figures" step is removed. Kept for the release-candidate
+   run, which reports the figures.
+7. **Licence gates**, done: `cargo deny check licenses sources bans` passes for both workspaces.
+8. **Docs**, done: CHANGELOG.md, IMPLEMENTATION_STATUS.md, README.md, CLAUDE.md (dependency
+   policy, crate order), `apps/desktop` README and doc comment.
 9. **CI green on the exact merge SHA**, including `parolnet-simnet` m1 and the PWA interop job.
+
+### Adaptations beyond the rename
+
+None between the last probed engine commit (dcb85949, probe PR #58, run 45351949603) and the
+release commit. Between dcb85949 and the pre-rename merge 52676079 the engine's library code is
+unchanged except one doc comment (`rtc-interceptor`'s pacer); the range otherwise touched a
+capacity-cap test, the stream-driver example crate (a self-connection check), the rename script
+and docs. The rename commit c6f4611a changes names only: with `rtci` mapped back to `rtc`, every
+library source file (`src/`, `rtci-*/src/`) is byte-identical to 52676079's. The release commit
+f6f14375 touches CHANGELOG.md and docs only. The adaptations to the engine's API since
+`v0.22.0+brainwires.5` are those of PR #52 (CHANGELOG, "Engine pin `rtc` `v0.22.0+brainwires.6`"
+and the release-candidate entry): the W3C transceiver model, `set_direction` returning a
+`Result`, the ICE restart answer's candidates, selected-pair changes completing a restart,
+`with_ice_software(None)`, SRTP re-keying on the engine's negotiation-needed, and new ports for a
+new DTLS association (`OnLocalCandidatesNeeded` semantics, section 2).
 
 ## 2. Settings ParolNet sets on the engine, and why
 

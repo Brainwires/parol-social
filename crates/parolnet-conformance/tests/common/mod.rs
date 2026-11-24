@@ -35,7 +35,7 @@ use parolnet_core::envelope::{DecryptedEnvelope, decrypt_from_envelope, encrypt_
 use parolnet_crypto::IdentityKeyPair;
 use parolnet_crypto::double_ratchet::DoubleRatchetSession;
 use parolnet_protocol::address::PeerId;
-use parolnet_rtc::rtc::peer_connection::sdp::RTCSessionDescription;
+use parolnet_rtc::rtci::peer_connection::sdp::RTCSessionDescription;
 use parolnet_rtc::{RtcConfig, RtcEvent, RtcHandle};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};

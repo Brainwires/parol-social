@@ -128,7 +128,7 @@ impl Drop for Vp8Encoder {
 mod tests {
     use super::*;
 
-    /// An IVF file (the container libvpx's tools and `rtc::media::io::ivf_reader` read).
+    /// An IVF file (the container libvpx's tools and `rtci::media::io::ivf_reader` read).
     pub fn ivf(width: u16, height: u16, fps: u32, frames: &[Vec<u8>]) -> Vec<u8> {
         let mut out = Vec::new();
         out.extend_from_slice(b"DKIF");

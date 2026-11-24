@@ -45,11 +45,11 @@ parolnet-store = { path = "crates/parolnet-store" }
 parolnet-media = { path = "crates/parolnet-media", default-features = false }
 parolnet-transfer = { path = "crates/parolnet-transfer" }
 
-# Realtime engine: Brainwires' fork of webrtc-rs/rtc (sans-I/O), pinned by tag, never a branch.
+# Realtime engine: `rtci`, Brainwires' fork of webrtc-rs/rtc (sans-I/O), renamed from `rtc`.
 # Its DTLS / SRTP provider is ring (C and assembly); the E2EE layer stays pure Rust.
-# NOT MERGEABLE: pinned to an engine `rev` (master df82663c, train 13 merged) for pre-release testing of the
-# next engine release; at release this becomes `rtci = { ..., tag = "v0.1.0" }` (ENGINE-MIGRATION.md).
-rtc = { git = "https://github.com/Brainwires/webrtc-rs-rtc", rev = "df82663c6ca0a346e485b6ea79025c793a43f9a8" }
+# RELEASE CANDIDATE: pinned to the `rtci 0.1.0` release commit by `rev` until 0.1.0 is on
+# crates.io; then this becomes `rtci = "0.1.0"` (ENGINE-MIGRATION.md).
+rtci = { git = "https://github.com/Brainwires/webrtc-rs-rtc", rev = "3bbd6cc1d005678d391bcb336b43e437d2c6913b" }
 
 # Crypto
 x25519-dalek = { version = "2", features = ["static_secrets"] }

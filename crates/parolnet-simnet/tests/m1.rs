@@ -17,7 +17,7 @@
 
 use std::time::Duration;
 
-use parolnet_rtc::rtc::peer_connection::state::RTCPeerConnectionState;
+use parolnet_rtc::rtci::peer_connection::state::RTCPeerConnectionState;
 use parolnet_rtc::{CandidateKind, MediaKind, NetworkMonitor};
 use parolnet_simnet::call::{CallConfig, Metrics, SimCall, VideoSourceKind, video_bitrate_for};
 use parolnet_simnet::{LinkProfile, SimNet};
@@ -404,7 +404,7 @@ fn host_ports(sdp: &str) -> Vec<u16> {
 /// 8842 section 5.1). The call goes on through every one of them: no failure, no freeze over
 /// 2 s, intelligible audio.
 async fn re_keying(test: &str, sides: [bool; 2]) {
-    use parolnet_rtc::rtc::srtp::keying::KeyLifetime;
+    use parolnet_rtc::rtci::srtp::keying::KeyLifetime;
     let lifetime = KeyLifetime {
         srtp_packets: 8_000,
         ..KeyLifetime::MAX

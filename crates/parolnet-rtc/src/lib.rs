@@ -1,4 +1,4 @@
-//! Async driver for the sans-I/O [`rtc`] peer connection (`Brainwires/webrtc-rs-rtc`).
+//! Async driver for the sans-I/O [`rtci`] peer connection (`Brainwires/rtci`, formerly `webrtc-rs-rtc`).
 //!
 //! The engine does no I/O of its own: it is fed datagrams and timeouts and hands back
 //! datagrams to send, events and decrypted messages. This crate owns that loop. Each
@@ -44,54 +44,54 @@ use std::task::Poll;
 use std::time::{Duration, Instant};
 
 use bytes::BytesMut;
-use rtc::ice::NominationAcceptance;
-use rtc::ice::mdns::MulticastDnsMode;
-use rtc::interceptor::{
+use rtci::ice::NominationAcceptance;
+use rtci::ice::mdns::MulticastDnsMode;
+use rtci::interceptor::{
     GccHandle, GccInterceptorBuilder, Interceptor as _, PassThroughInterceptor, Registry, Slot,
 };
-use rtc::mdns::{MDNS_PORT, MulticastSocket};
-use rtc::media_stream::{MediaStreamTrack, MediaStreamTrackId};
-use rtc::peer_connection::configuration::interceptor_registry::{
+use rtci::mdns::{MDNS_PORT, MulticastSocket};
+use rtci::media_stream::{MediaStreamTrack, MediaStreamTrackId};
+use rtci::peer_connection::configuration::interceptor_registry::{
     configure_key_frame_requests, configure_nack, configure_receiver_reference_time,
     configure_rtcp_reports, configure_simulcast_extension_headers, configure_twcc,
     configure_twcc_receiver_only,
 };
-use rtc::peer_connection::configuration::media_engine::{
+use rtci::peer_connection::configuration::media_engine::{
     MIME_TYPE_OPUS, MIME_TYPE_RTX, MIME_TYPE_VP8, MediaEngine,
 };
-use rtc::peer_connection::configuration::setting_engine::SettingEngineBuilder;
-use rtc::peer_connection::configuration::{RTCConfigurationBuilder, RTCIceTransportPolicy};
-use rtc::peer_connection::event::{RTCDataChannelEvent, RTCPeerConnectionEvent, RTCTrackEvent};
-use rtc::peer_connection::message::{RTCMessage, TaggedRTCMessage};
-use rtc::peer_connection::sdp::{RTCSdpType, RTCSessionDescription};
-use rtc::peer_connection::srflx::ReflexiveGathering;
-use rtc::peer_connection::state::{RTCIceConnectionState, RTCPeerConnectionState};
-use rtc::peer_connection::transport::{
+use rtci::peer_connection::configuration::setting_engine::SettingEngineBuilder;
+use rtci::peer_connection::configuration::{RTCConfigurationBuilder, RTCIceTransportPolicy};
+use rtci::peer_connection::event::{RTCDataChannelEvent, RTCPeerConnectionEvent, RTCTrackEvent};
+use rtci::peer_connection::message::{RTCMessage, TaggedRTCMessage};
+use rtci::peer_connection::sdp::{RTCSdpType, RTCSessionDescription};
+use rtci::peer_connection::srflx::ReflexiveGathering;
+use rtci::peer_connection::state::{RTCIceConnectionState, RTCPeerConnectionState};
+use rtci::peer_connection::transport::{
     CandidateConfig, CandidateHostConfig, CandidateRelayConfig, CandidateServerReflexiveConfig,
     RTCDtlsRole, RTCIceCandidate, RTCIceCandidateInit, RTCIceCandidateType, RTCIceServer,
 };
-use rtc::peer_connection::turn_streams::RelayGathering;
-use rtc::peer_connection::{RTCPeerConnection, RTCPeerConnectionBuilder};
-use rtc::rtcp::payload_feedbacks::full_intra_request::FullIntraRequest;
-use rtc::rtcp::payload_feedbacks::picture_loss_indication::PictureLossIndication;
-use rtc::rtp::packetizer::Packetizer;
-use rtc::rtp_transceiver::rtp_sender::{
+use rtci::peer_connection::turn_streams::RelayGathering;
+use rtci::peer_connection::{RTCPeerConnection, RTCPeerConnectionBuilder};
+use rtci::rtcp::payload_feedbacks::full_intra_request::FullIntraRequest;
+use rtci::rtcp::payload_feedbacks::picture_loss_indication::PictureLossIndication;
+use rtci::rtp::packetizer::Packetizer;
+use rtci::rtp_transceiver::rtp_sender::{
     RTCPFeedback, RTCRtpCodec, RTCRtpCodecParameters, RTCRtpCodingParameters,
     RTCRtpEncodingParameters, RTCRtpRtxParameters, RtpCodecKind,
 };
-use rtc::rtp_transceiver::{
+use rtci::rtp_transceiver::{
     RTCRtpReceiverId, RTCRtpSenderId, RTCRtpTransceiverDirection, RTCRtpTransceiverId,
     RTCRtpTransceiverInit,
 };
-use rtc::sansio::Protocol;
-use rtc::shared::{TaggedBytesMut, TransportContext, TransportProtocol};
-use rtc::statistics::StatsSelector;
-use rtc::statistics::report::{RTCStatsReport, RTCStatsReportEntry};
+use rtci::sansio::Protocol;
+use rtci::shared::{TaggedBytesMut, TransportContext, TransportProtocol};
+use rtci::statistics::StatsSelector;
+use rtci::statistics::report::{RTCStatsReport, RTCStatsReportEntry};
 use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 
-pub use rtc;
+pub use rtci;
 
 pub mod jitter;
 pub mod net;
@@ -115,7 +115,7 @@ pub enum RtcError {
     #[error("socket: {0}")]
     Io(#[from] std::io::Error),
     #[error("engine: {0}")]
-    Engine(#[from] rtc::shared::error::Error),
+    Engine(#[from] rtci::shared::error::Error),
     #[error("the bind address must name an interface, not {0}")]
     UnspecifiedBind(SocketAddr),
     #[error("the connection task has stopped")]
@@ -299,7 +299,7 @@ pub struct RtcConfig {
     /// outbound key nears its end re-offers with an ICE restart and a new DTLS association
     /// (RFC 5764 section 4.4, RFC 8842; PNP-011 section 7.6). Tests set a short one to run
     /// re-keying in a call.
-    pub srtp_key_lifetime: Option<rtc::srtp::keying::KeyLifetime>,
+    pub srtp_key_lifetime: Option<rtci::srtp::keying::KeyLifetime>,
 }
 
 impl Default for RtcConfig {
@@ -413,7 +413,7 @@ pub enum RtcEvent {
     /// An RTP packet of a track (after SRTP and the interceptors).
     Rtp {
         track_id: MediaStreamTrackId,
-        packet: rtc::rtp::Packet,
+        packet: rtci::rtp::Packet,
     },
     /// A data channel opened.
     DataChannelOpen { id: usize, label: String },
@@ -1184,7 +1184,7 @@ fn build_peer_connection(config: &RtcConfig) -> Result<Built, RtcError> {
         .with_ice_nomination_acceptance(NominationAcceptance::Latest)
         // No SOFTWARE attribute in any STUN message the engine sends: ICE connectivity
         // checks (nominations and consent checks included) and their success responses
-        // (RFC 8489 section 14.14; engine default `rtc-ice <version>`). An implementation
+        // (RFC 8489 section 14.14; engine default `rtci-ice <version>`). An implementation
         // fingerprint on the path is what THREAT_MODEL.md does not want; our own STUN
         // Binding requests and our TURN client send none either.
         .with_ice_software(None)
@@ -2595,13 +2595,13 @@ impl Driver {
             else {
                 return Ok(());
             };
-            local.packetizer = Some(Box::new(rtc::rtp::packetizer::new_packetizer(
+            local.packetizer = Some(Box::new(rtci::rtp::packetizer::new_packetizer(
                 now,
                 RTP_OUTBOUND_MTU,
                 codec.payload_type,
                 ssrc,
                 codec.rtp_codec.payloader()?,
-                Box::new(rtc::rtp::sequence::new_random_sequencer()),
+                Box::new(rtci::rtp::sequence::new_random_sequencer()),
                 codec.rtp_codec.clock_rate,
             )));
         }
@@ -2719,7 +2719,7 @@ impl Driver {
     /// allocation could be made (`renew_relay`).
     fn add_candidate(&mut self, init: RTCIceCandidateInit) -> Result<(), RtcError> {
         match self.pc.add_local_candidate(init) {
-            Err(rtc::shared::error::Error::ErrICECandidateAddressOfPreviousDtlsAssociation(
+            Err(rtci::shared::error::Error::ErrICECandidateAddressOfPreviousDtlsAssociation(
                 addr,
             )) => {
                 tracing::warn!(%addr, "candidate of the previous DTLS association left out");
@@ -2843,7 +2843,7 @@ impl Driver {
 /// The candidate pair the transport runs on.
 fn selected_pair(
     report: &RTCStatsReport,
-) -> Option<&rtc::statistics::stats::ice_candidate_pair::RTCIceCandidatePairStats> {
+) -> Option<&rtci::statistics::stats::ice_candidate_pair::RTCIceCandidatePairStats> {
     let id = &report.transport()?.selected_candidate_pair_id;
     match report.get(id) {
         Some(RTCStatsReportEntry::IceCandidatePair(pair)) => Some(pair),
@@ -3061,7 +3061,7 @@ impl StunGather {
         timeout: Duration,
         then: Option<AfterGather>,
     ) -> Option<StunGather> {
-        use rtc::stun::message::{BINDING_REQUEST, Message, TransactionId};
+        use rtci::stun::message::{BINDING_REQUEST, Message, TransactionId};
 
         let mut requests = Vec::new();
         let mut pending = HashMap::new();
@@ -3151,8 +3151,8 @@ impl StunGather {
     /// answer to one of this round's requests (it is consumed); anything else is the
     /// connection's.
     fn handle(&mut self, local: SocketAddr, from: SocketAddr, data: &[u8]) -> bool {
-        use rtc::stun::message::{Getter as _, Message};
-        use rtc::stun::xoraddr::XorMappedAddress;
+        use rtci::stun::message::{Getter as _, Message};
+        use rtci::stun::xoraddr::XorMappedAddress;
 
         if !self.requests.iter().any(|(_, target, _)| *target == from) {
             return false;

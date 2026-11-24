@@ -7,7 +7,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use parolnet_core::envelope::encrypt_for_peer;
-use parolnet_rtc::rtc::peer_connection::state::RTCPeerConnectionState;
+use parolnet_rtc::rtci::peer_connection::state::RTCPeerConnectionState;
 use parolnet_transfer::{
     CancelReason, ChannelAdmission, Control, FileKey, MAX_CONCURRENT_PER_CONNECTION,
     MSG_TYPE_FILE_TRANSFER, Offer, OfferLimiter, Phase, Role, TRANSFER_MAX_AGE_MS, TransferId,

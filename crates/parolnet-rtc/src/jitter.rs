@@ -14,7 +14,7 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::time::{Duration, Instant};
 
-use rtc::rtp::Packet;
+use rtci::rtp::Packet;
 
 /// Added on top of the measured lateness.
 const MARGIN: Duration = Duration::from_millis(5);

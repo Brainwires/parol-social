@@ -4,9 +4,9 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
-use parolnet_rtc::rtc::peer_connection::sdp::{RTCSdpType, RTCSessionDescription};
-use parolnet_rtc::rtc::peer_connection::state::RTCPeerConnectionState;
-use parolnet_rtc::rtc::rtp_transceiver::rtp_sender::RtpCodecKind;
+use parolnet_rtc::rtci::peer_connection::sdp::{RTCSdpType, RTCSessionDescription};
+use parolnet_rtc::rtci::peer_connection::state::RTCPeerConnectionState;
+use parolnet_rtc::rtci::rtp_transceiver::rtp_sender::RtpCodecKind;
 use parolnet_rtc::{MediaConfig, MediaKind, RtcConfig, RtcEvent, RtcHandle};
 use tokio::sync::mpsc::Receiver;
 

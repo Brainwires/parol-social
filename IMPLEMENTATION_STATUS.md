@@ -34,7 +34,7 @@ The root Cargo workspace has 15 members; the desktop app is a separate workspace
 | `parolnet-authority-cli` | Authority key and relay endorsement CLI |
 | `parolnet-cli` | Headless test client (QR bootstrap, messaging over the relay) |
 | `parolnet-clause`, `parolnet-conformance` | Spec-clause attribute and the conformance suite |
-| `parolnet-rtc` | **New (M0, extended in M1).** Async driver for the sans-I/O `webrtc-rs-rtc` engine |
+| `parolnet-rtc` | **New (M0, extended in M1).** Async driver for the sans-I/O `rtci` engine |
 | `parolnet-store` | **New (M1).** Encrypted native persistence: SQLite with SQLCipher, key in the OS keychain or a key file; identity, contacts, sessions, messages, queue, settings |
 | `parolnet-app` | **New (M1).** Headless client core: identity, pairing, signaling, direct data channels, 1:1 chat, calls, file transfer |
 | `parolnet-transfer` | **New (M1).** PNP-010 file transfer without I/O (native and wasm): control messages, the sealed record stream, sender and receiver, limits |
@@ -140,8 +140,8 @@ See [docs/m1-desktop.md](docs/m1-desktop.md) for what runs end to end, the tests
   OpenSSL, key rotation, and a UI for "delete all data" / a lost key.
 - **`parolnet-rtc`**: server-reflexive candidates from STUN (binding request on the connection's
   socket before its loop starts), text data-channel messages, the channel label on open,
-  `default_local_ip`. Engine pin `v0.22.0+brainwires.6` (was `.5`; `.5` follows ICE renomination, `.6` is the engine's
-  conformance release, see CHANGELOG).
+  `default_local_ip`. Engine `rtci` 0.1.0 (was `rtc` `v0.22.0+brainwires.6`; `.5` follows ICE renomination, `.6` is the
+  engine's conformance release, 0.1.0 the renamed first crates.io release; see CHANGELOG).
 - **TURN, user-supplied only** (PNP-001-MUST-082): `parolnet-rtc` gathers a relay candidate from
   the TURN server the user configured (UDP, long-term credentials, `rtc-turn` driven on the
   connection's socket) and has a relay-only ICE policy; `parolnet-app` stores `TurnSettings` and
@@ -172,7 +172,8 @@ See [docs/m1-desktop.md](docs/m1-desktop.md) for what runs end to end, the tests
   events out (local description, states, tracks, RTP, data-channel messages). Host candidates on
   the bound socket only; srflx / TURN gathering, multiple sockets and the virtual-time mode are M1.
   A loopback test connects two drivers and exchanges data-channel messages.
-- **Engine pin.** `rtc` from `Brainwires/webrtc-rs-rtc` tag `v0.22.0+brainwires.1` (git dependency).
+- **Engine pin.** `rtci` 0.1.0 (formerly `rtc`, repository `Brainwires/webrtc-rs-rtc`, being renamed
+  `Brainwires/rtci`), pinned by `rev` to its release commit 3bbd6cc1 until it is on crates.io.
 - **Desktop spike** (`apps/desktop`). A GPUI window shows a VP8 stream that headless Chromium sends
   through `webrtc-rs-rtc`; libvpx decodes it; macOS draws an IOSurface-backed NV12 `CVPixelBuffer`
   with `gpui::surface()`, other platforms a BGRA `RenderImage`. Verified on macOS arm64 (headless

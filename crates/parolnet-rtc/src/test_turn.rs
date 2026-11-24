@@ -13,30 +13,30 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 
-use rtc::crypto::RTCCryptoProvider;
-use rtc::stun::attributes::{
+use rtci::crypto::RTCCryptoProvider;
+use rtci::stun::attributes::{
     ATTR_MESSAGE_INTEGRITY, ATTR_NONCE, ATTR_REALM, ATTR_SOFTWARE, ATTR_USERNAME,
     ATTR_XOR_PEER_ADDRESS,
 };
-use rtc::stun::error_code::{
+use rtci::stun::error_code::{
     CODE_ALLOC_MISMATCH, CODE_BAD_REQUEST, CODE_UNAUTHORIZED, ErrorCode, ErrorCodeAttribute,
 };
-use rtc::stun::fingerprint::FINGERPRINT;
-use rtc::stun::integrity::MessageIntegrity;
-use rtc::stun::message::{
+use rtci::stun::fingerprint::FINGERPRINT;
+use rtci::stun::integrity::MessageIntegrity;
+use rtci::stun::message::{
     CLASS_ERROR_RESPONSE, CLASS_INDICATION, CLASS_REQUEST, CLASS_SUCCESS_RESPONSE, Getter as _,
     MAGIC_COOKIE, METHOD_ALLOCATE, METHOD_BINDING, METHOD_CHANNEL_BIND, METHOD_CREATE_PERMISSION,
     METHOD_DATA, METHOD_REFRESH, METHOD_SEND, Message, MessageType, Setter, TransactionId,
     is_stun_message,
 };
-use rtc::stun::textattrs::TextAttribute;
-use rtc::stun::xoraddr::XorMappedAddress;
-use rtc::turn::proto::chandata::ChannelData;
-use rtc::turn::proto::channum::ChannelNumber;
-use rtc::turn::proto::data::Data;
-use rtc::turn::proto::lifetime::Lifetime;
-use rtc::turn::proto::peeraddr::PeerAddress;
-use rtc::turn::proto::relayaddr::RelayedAddress;
+use rtci::stun::textattrs::TextAttribute;
+use rtci::stun::xoraddr::XorMappedAddress;
+use rtci::turn::proto::chandata::ChannelData;
+use rtci::turn::proto::channum::ChannelNumber;
+use rtci::turn::proto::data::Data;
+use rtci::turn::proto::lifetime::Lifetime;
+use rtci::turn::proto::peeraddr::PeerAddress;
+use rtci::turn::proto::relayaddr::RelayedAddress;
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
@@ -73,7 +73,7 @@ impl TestTurnServer {
     pub async fn start(username: &str, password: &str) -> std::io::Result<TestTurnServer> {
         let socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await?;
         let addr = socket.local_addr()?;
-        let provider = rtc::crypto::default_provider().map_err(std::io::Error::other)?;
+        let provider = rtci::crypto::default_provider().map_err(std::io::Error::other)?;
         let key = MessageIntegrity::long_term_integrity_key(
             username.to_owned(),
             REALM.to_owned(),
@@ -201,7 +201,7 @@ impl Server {
     fn reply(
         &self,
         request: &Message,
-        class: rtc::stun::message::MessageClass,
+        class: rtci::stun::message::MessageClass,
         attrs: Vec<Box<dyn Setter>>,
         signed: bool,
     ) -> Vec<u8> {
@@ -230,7 +230,7 @@ impl Server {
         &self,
         to: SocketAddr,
         request: &Message,
-        class: rtc::stun::message::MessageClass,
+        class: rtci::stun::message::MessageClass,
         attrs: impl FnOnce() -> Vec<Box<dyn Setter>>,
         signed: bool,
     ) {

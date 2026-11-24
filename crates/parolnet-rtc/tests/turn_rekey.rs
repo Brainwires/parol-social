@@ -6,7 +6,7 @@ mod support;
 
 use std::time::Duration;
 
-use parolnet_rtc::rtc::srtp::keying::KeyLifetime;
+use parolnet_rtc::rtci::srtp::keying::KeyLifetime;
 use parolnet_rtc::test_turn::TestTurnServer;
 use parolnet_rtc::{IcePolicy, MediaConfig, MediaKind, RtcConfig, TurnServer, tls_id};
 use support::Pair;
