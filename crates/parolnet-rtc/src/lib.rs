@@ -1115,6 +1115,18 @@ fn build_peer_connection(config: &RtcConfig) -> Result<Built, RtcError> {
     // transport-wide feedback half can be the receiver alone or, with congestion control,
     // both halves under the congestion controller.
     let registry = configure_nack(Registry::new(), &mut media_engine);
+    // PROBE BRANCH ONLY (never merged): a build with PAROLNET_PROBE_NACK_UP_TO_TARGET set
+    // replaces the engine's default NACK responder by one limited `UpToTarget`.
+    let registry = if option_env!("PAROLNET_PROBE_NACK_UP_TO_TARGET").is_some() {
+        registry.with(
+            Slot::NackResponder,
+            rtc::interceptor::NackResponderBuilder::new()
+                .with_rate_limit(rtc::interceptor::RetransmissionRateLimit::UpToTarget)
+                .build(),
+        )
+    } else {
+        registry
+    };
     configure_simulcast_extension_headers(&mut media_engine)?;
     let registry = configure_rtcp_reports(registry);
     configure_receiver_reference_time(&mut media_engine);

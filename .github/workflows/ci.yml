@@ -1,17 +1,30 @@
 name: CI
 
+# PROBE BRANCH (never merged): the m1 cap-recovery figures on engine commits of the
+# congestion owner's bisect. ParolNet code unchanged; `upto` builds it with the NACK
+# responder limited UpToTarget instead of the engine default. Only this job runs here.
 on:
-  push:
-    branches: [main, master]
   pull_request:
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  check:
-    name: Cargo Check
+  recovery:
+    name: m1 recovery @ ${{ matrix.rev }} ${{ matrix.upto && 'UpToTarget' || 'default' }}
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - rev: 53a17d35d07c9ea77582026a0c4e4e70076f3ee9
+            upto: false
+          - rev: 53a17d35d07c9ea77582026a0c4e4e70076f3ee9
+            upto: true
+          - rev: 4983efcc641bfd4db25a38c576e16525b5a18176
+            upto: false
+          - rev: df82663c6ca0a346e485b6ea79025c793a43f9a8
+            upto: false
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
@@ -21,408 +34,22 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-cargo-check-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-check-
-      - run: cargo check --workspace
-
-  deny:
-    name: Licence gate (cargo-deny)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v7
-      - uses: taiki-e/install-action@v2
-        with:
-          tool: cargo-deny
-      # No GPL / LGPL / AGPL anywhere; MPL-2.0 only for the crates deny.toml names. Advisories are
-      # not gated here yet (the existing tree carries known ones: see IMPLEMENTATION_STATUS.md).
-      - name: Workspace
-        run: cargo deny check licenses sources bans
-      - name: Desktop app (its own workspace)
-        run: cargo deny --manifest-path apps/desktop/Cargo.toml --config apps/desktop/deny.toml check licenses sources bans
-
-  test:
-    name: Tests
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: actions/cache@v6
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-test-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-probe-recovery-${{ matrix.rev }}-${{ matrix.upto }}
           restore-keys: |
             ${{ runner.os }}-cargo-test-
-      # NOT MERGEABLE (pre-release engine testing): `--no-fail-fast` so that one failing
-      # package does not hide the others, and the m1 figures step below. Both go back to
-      # `cargo test --workspace` at release (ENGINE-MIGRATION.md).
-      - run: cargo test --workspace --no-fail-fast
-      - name: m1 figures (what each simulated call measured on this engine)
+      - name: Pin the engine to ${{ matrix.rev }}
+        run: |
+          sed -i -E 's|^rtc = \{ git = "([^"]+)", rev = "[0-9a-f]+" \}|rtc = { git = "\1", rev = "${{ matrix.rev }}" }|' Cargo.toml
+          grep -q '${{ matrix.rev }}' Cargo.toml
+          cargo update -p rtc
+      - name: UpToTarget build switch
+        if: ${{ matrix.upto }}
+        run: echo "PAROLNET_PROBE_NACK_UP_TO_TARGET=1" >> "$GITHUB_ENV"
+      - name: Cap comes and goes, run 1
+        run: cargo test -p parolnet-simnet --test m1 -- --nocapture --exact the_estimate_follows_a_cap_that_comes_and_goes
+      - name: Cap comes and goes, run 2
+        if: ${{ !cancelled() }}
+        run: cargo test -p parolnet-simnet --test m1 -- --nocapture --exact the_estimate_follows_a_cap_that_comes_and_goes
+      - name: All m1 tests (figures)
         if: ${{ !cancelled() }}
         run: cargo test -p parolnet-simnet --test m1 -- --nocapture --test-threads=1
-
-  clippy:
-    name: Clippy
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy
-      - uses: actions/cache@v6
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-clippy-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-clippy-
-      - run: cargo clippy --workspace -- -D warnings
-
-  fmt:
-    name: Rustfmt
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt
-      - run: cargo fmt --all -- --check
-
-  wasm:
-    name: WASM Build
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: actions/cache@v6
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-wasm-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-wasm-
-      - name: Install wasm-pack
-        run: curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
-      - run: wasm-pack build crates/parolnet-wasm --target web
-
-  conformance:
-    name: Spec Conformance (clauses + vectors)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: actions/cache@v6
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-conformance-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-conformance-
-      - name: Conformance test suite
-        run: cargo test -p parolnet-conformance
-      - name: Spec-clause coverage report
-        # The gate (`--check`: every MUST and every SHOULD clause has a test) is
-        # added once the clauses it lists are implemented or the specs change.
-        run: cargo xtask clauses
-      - name: SPEC-INDEX.md is up to date
-        # Regenerate with `cargo xtask clauses --report`.
-        if: ${{ !cancelled() }}
-        run: cargo xtask clauses --check-index
-      - name: Test-vector validity
-        run: cargo xtask vectors --validate
-
-  pwa-interop:
-    name: Desktop <-> web app interop (Chromium, Firefox, WebKit)
-    # The headless desktop core (parolnet-app's bot) against the web app (web/, its test build)
-    # in headless Chromium, Firefox and WebKit (Playwright) through the relay binary in its
-    # signaling-only profile: pairing both ways, chat both ways, the sender queue, the channel
-    # binding, calls both ways, files. Then the web app's own real flows between pages through
-    # the relay (web/tests/e2e/real.flows.ts). They are steps of this job because they need the
-    # same relay and bot.
-    # Chromium and Firefox twice each: as shipped (mDNS host candidates the desktop resolves) and
-    # with loopback candidates. WebKit once (Playwright's Linux build gathers plain host
-    # addresses). One job, browsers in sequence: the Rust build dominates and a browser run takes
-    # about a minute, so a matrix would rebuild (or ship ~100 MB of artifacts) three times for
-    # nothing. Every browser step runs even when an earlier one failed.
-    runs-on: ubuntu-latest
-    timeout-minutes: 75
-    env:
-      # The interop uses Playwright's browsers; puppeteer's Chrome is not needed here.
-      PUPPETEER_SKIP_DOWNLOAD: "1"
-    steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: wasm32-unknown-unknown
-      - uses: actions/cache@v6
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-interop-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-interop-
-      - uses: actions/setup-node@v6
-        with:
-          node-version: 22
-      - name: Playwright
-        run: npm ci
-      - uses: actions/cache@v6
-        with:
-          path: ~/.cache/ms-playwright
-          key: ${{ runner.os }}-playwright-${{ hashFiles('package-lock.json') }}
-      - name: Chromium, Firefox, WebKit (Playwright) and their system libraries
-        # With the cache restored only the system libraries are installed.
-        run: npx playwright install --with-deps chromium firefox webkit
-      - name: Allow Chrome's sandbox
-        # Ubuntu 24.04 restricts unprivileged user namespaces through AppArmor.
-        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
-      - name: Install wasm-pack
-        run: curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
-      - name: Build the relay and the desktop bot
-        run: cargo build -p parolnet-relay-server --bin parolnet-relay -p parolnet-app --example bot
-      # The web app (web/): its test build for the interop (it has the test hooks), its
-      # production export for its own real flows.
-      - name: Install Denext
-        run: |
-          curl -fsSL https://denext.dev/install.sh | sh
-          echo "$HOME/.denext/bin" >> "$GITHUB_PATH"
-      - name: Build the web app (wasm core, test build, production export)
-        working-directory: web
-        run: |
-          denext runtime install
-          denext task build-wasm
-          denext task build:test
-          denext task build
-          (cd tests/e2e && npm ci)
-      - name: Web app, Chromium (mDNS host candidates)
-        id: first
-        run: INTEROP_BROWSER=chromium INTEROP_ICE=mdns node apps/desktop/interop/pwa-interop.mjs
-      # The remaining configurations run whatever the earlier ones did, unless the first was
-      # skipped (a build failed).
-      - name: Web app, Chromium (loopback host candidates)
-        if: ${{ !cancelled() && steps.first.conclusion != 'skipped' }}
-        run: INTEROP_BROWSER=chromium INTEROP_ICE=loopback node apps/desktop/interop/pwa-interop.mjs
-      - name: Web app, Firefox (mDNS host candidates)
-        if: ${{ !cancelled() && steps.first.conclusion != 'skipped' }}
-        run: INTEROP_BROWSER=firefox INTEROP_ICE=mdns node apps/desktop/interop/pwa-interop.mjs
-      - name: Web app, Firefox (loopback host candidates)
-        if: ${{ !cancelled() && steps.first.conclusion != 'skipped' }}
-        run: INTEROP_BROWSER=firefox INTEROP_ICE=loopback node apps/desktop/interop/pwa-interop.mjs
-      - name: Web app, WebKit (host candidates)
-        if: ${{ !cancelled() && steps.first.conclusion != 'skipped' }}
-        run: INTEROP_BROWSER=webkit INTEROP_ICE=host node apps/desktop/interop/pwa-interop.mjs
-      - name: Web app, real flows between pages through the relay (three browsers)
-        if: ${{ !cancelled() && steps.first.conclusion != 'skipped' }}
-        working-directory: web/tests/e2e
-        env:
-          PAROLNET_RELAY_BIN: ${{ github.workspace }}/target/debug/parolnet-relay
-        run: npx playwright test --project=flows-chromium --project=flows-firefox --project=flows-webkit
-      - name: Upload the web app's report
-        if: always()
-        uses: actions/upload-artifact@v7
-        with:
-          name: web-flows
-          path: web/tests/e2e/playwright-report/
-          if-no-files-found: ignore
-
-  turn-coturn:
-    name: User-supplied TURN (coturn)
-    # parolnet-rtc's relay-only path against a real TURN server. coturn stands in for the server
-    # a user would run: ParolNet operates none and the relay never offers one. The in-process
-    # test server covers the same exchange in the Test job; this job catches a disagreement
-    # with a real implementation (authentication, permissions, channel data, release).
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: actions/cache@v6
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-turn-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-turn-
-      - name: Install coturn
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y coturn
-          sudo systemctl stop coturn || true
-      - name: Start coturn with a static test user
-        run: |
-          # The runner's own address, not loopback: coturn refuses loopback peers by default,
-          # and both test peers' relayed addresses are on this address.
-          ip=$(hostname -I | awk '{print $1}')
-          echo "TURN_IP=$ip" >> "$GITHUB_ENV"
-          turnserver --listening-ip "$ip" --relay-ip "$ip" --listening-port 3478 \
-            --min-port 49160 --max-port 49260 \
-            --lt-cred-mech --user parolnet-ci:parolnet-ci-password --realm parolnet.test \
-            --fingerprint --no-tls --no-dtls --no-cli --no-multicast-peers \
-            --log-file stdout --simple-log > coturn.log 2>&1 &
-          for _ in $(seq 1 50); do
-            if ss -lun | grep -q "$ip:3478"; then exit 0; fi
-            sleep 0.2
-          done
-          cat coturn.log
-          exit 1
-      - name: Relay-only through coturn
-        env:
-          PAROLNET_TEST_TURN_REQUIRED: "1"
-          PAROLNET_TEST_TURN_USER: parolnet-ci
-          PAROLNET_TEST_TURN_PASS: parolnet-ci-password
-        run: |
-          export PAROLNET_TEST_TURN_URI="turn:$TURN_IP:3478?transport=udp"
-          export PAROLNET_TEST_BIND_IP="$TURN_IP"
-          cargo test -p parolnet-rtc --test turn relay_only_through_an_external_turn_server -- --nocapture
-      - name: coturn log
-        if: always()
-        run: cat coturn.log || true
-
-  web:
-    name: Web app (Denext; unit tests, export, Chromium / Firefox / WebKit)
-    # web/: the Denext rewrite of the PWA. Builds the wasm core, lints, type-checks, runs the
-    # unit tests (the app's and the engine's), exports the static site (the production export,
-    # and the test build that has the state lab) and drives both in three browsers under /pwa/
-    # with the production Content-Security-Policy. What needs a relay or the desktop bot (real
-    # flows, the interop) runs in the `pwa-interop` job, which builds them.
-    runs-on: ubuntu-latest
-    timeout-minutes: 45
-    defaults:
-      run:
-        working-directory: web
-    steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: wasm32-unknown-unknown
-      - uses: actions/cache@v6
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-web-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-web-
-      - name: Install wasm-pack
-        run: curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
-      - name: Install Denext
-        run: |
-          curl -fsSL https://denext.dev/install.sh | sh
-          echo "$HOME/.denext/bin" >> "$GITHUB_PATH"
-      - name: Install Denext's runtime
-        run: denext runtime install
-      - name: Build the wasm core
-        run: denext task build-wasm
-      - name: Lint, format, type-check
-        run: denext task lint && denext task fmt:check && denext task check
-      - name: Unit tests (the app and the engine)
-        run: denext task test
-      - name: Export the static site (the test build, then the production export)
-        run: denext task build:test && denext task build
-      - uses: actions/setup-node@v6
-        with:
-          node-version: 22
-      - name: Playwright and its browsers
-        working-directory: web/tests/e2e
-        run: npm ci && npx playwright install --with-deps chromium firefox webkit
-      - name: Browser tests (the platform and the design)
-        working-directory: web/tests/e2e
-        run: npx playwright test --project=chromium --project=firefox --project=webkit
-      - name: Upload screenshots and the report
-        if: always()
-        uses: actions/upload-artifact@v7
-        with:
-          name: web-e2e
-          path: |
-            web/tests/e2e/artifacts/
-            web/tests/e2e/playwright-report/
-          if-no-files-found: ignore
-
-  msrv:
-    name: MSRV (1.91.0)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: "1.91.0"
-      - uses: actions/cache@v6
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-msrv-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-msrv-
-      - run: cargo check --workspace
-
-  reproducible:
-    name: Reproducible Build Check
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v7
-      - name: Build artifacts
-        run: |
-          mkdir -p dist
-          docker build -f Dockerfile.release -t parolnet-build --no-cache .
-          docker run --rm -v $(pwd)/dist:/out parolnet-build
-      - name: Display checksums
-        run: cat dist/SHA256SUMS
-      - name: Upload artifacts
-        uses: actions/upload-artifact@v7
-        with:
-          name: release-artifacts
-          path: dist/
-
-  image:
-    name: Relay image (build + smoke checks)
-    # The image builds the relay and the web app from source (Dockerfile). Build it with BuildKit
-    # (layers cached in the GitHub Actions cache), run it signaling-only on a throwaway volume and
-    # check what nginx serves: the landing page, the web app under /pwa/ with its CSP and cache
-    # rules, application/wasm, and the relay behind it (scripts/image-smoke.sh).
-    runs-on: ubuntu-latest
-    timeout-minutes: 60
-    steps:
-      - uses: actions/checkout@v7
-      - uses: docker/setup-buildx-action@v4
-      - name: Build the image
-        uses: docker/build-push-action@v7
-        with:
-          context: .
-          load: true
-          tags: parolnet-relay:ci
-          cache-from: type=gha,scope=relay-image
-          cache-to: type=gha,scope=relay-image,mode=max
-          build-args: |
-            BUILD_COMMIT=${{ github.sha }}
-      - name: Run it (signaling-only, no STUN)
-        run: |
-          docker run -d --name parolnet-ci -p 127.0.0.1:8080:80 \
-            -e SIGNALING_ONLY=1 -e STUN_URIS= -e PAROLNET_ANALYTICS=0 \
-            -v parolnet-ci-data:/data parolnet-relay:ci
-          for _ in $(seq 1 60); do
-            curl -fsS -o /dev/null http://127.0.0.1:8080/health && exit 0
-            sleep 1
-          done
-          docker logs parolnet-ci
-          exit 1
-      - name: Smoke checks
-        run: scripts/image-smoke.sh http://127.0.0.1:8080
-      - name: Container log
-        if: always()
-        run: docker logs parolnet-ci || true
