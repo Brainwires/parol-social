@@ -49,7 +49,7 @@ parolnet-transfer = { path = "crates/parolnet-transfer" }
 # Its DTLS / SRTP provider is ring (C and assembly); the E2EE layer stays pure Rust.
 # NOT MERGEABLE: pinned to an engine `rev` (master df82663c, train 13 merged) for pre-release testing of the
 # next engine release; at release this becomes `rtci = { ..., tag = "v0.1.0" }` (ENGINE-MIGRATION.md).
-rtc = { git = "https://github.com/Brainwires/webrtc-rs-rtc", rev = "df82663c6ca0a346e485b6ea79025c793a43f9a8" }
+rtc = { git = "https://github.com/Brainwires/webrtc-rs-rtc", rev = "4431dda0dc88dfb5ccefd079e256bbf5d238a0d0" }
 
 # Crypto
 x25519-dalek = { version = "2", features = ["static_secrets"] }
