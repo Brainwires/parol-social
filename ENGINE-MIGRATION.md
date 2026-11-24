@@ -56,7 +56,8 @@ All in `parolnet-rtc` `build_peer_connection`. Everything else is the engine's d
 |---|---|---|
 | `with_ice_software` | `None` | No STUN SOFTWARE attribute (implementation fingerprint) in ICE checks, responses or consent checks (THREAT_MODEL.md). Our own STUN requests and TURN client (`ClientConfig::software = ""`) send none either. Asserted by `m1::call_setup`, `m1::an_ice_restart_follows_a_machine_to_another_network` (simnet counts every STUN message) and `turn::relay_only_on_both_sides_goes_through_the_turn_server` (the test TURN server checks requests and relayed STUN). |
 | `with_srtp_key_lifetime` | `RtcConfig::srtp_key_lifetime` (`None` = profile default) | Tests re-key a call every few seconds. |
-| `with_srtp_automatic_rekeying` | default (on) | Re-keying is handled: the side whose outbound key nears its end re-offers with an ICE restart (PNP-011 v0.2 section 7.6). `m1::srtp_re_keying_keeps_the_call`. |
+| `with_srtp_automatic_rekeying` | default (on) | Re-keying is handled: the side whose outbound key nears its end re-offers with an ICE restart (PNP-011 v0.2 section 7.6). `m1::srtp_re_keying_by_one_side_keeps_the_call`, `m1::srtp_re_keying_keeps_the_call`. |
+| `with_dtls_new_association_on_previous_addresses` | default (`false`: RFC 8842 section 5.1) | A new association runs on new ports: the driver binds them itself (`renew_sockets`) before it offers a re-keying or answers a peer's new `a=tls-id`; the previous sockets close 5 s after the new pair is selected. |
 | `with_discard_local_candidates_during_ice_restart` | `true` | A restart announces the sockets bound then, not the network left behind. |
 | `with_tcp_candidate_gathering` | `false` | No ICE-TCP; the driver gathers its own UDP candidates. |
 | `with_turn_over_streams`, `with_turn_tcp_relay` | `false` | No engine-run TURN over TCP/TLS. |
@@ -81,9 +82,11 @@ NACK responder rate limit (engine default: `UpToTarget` on master, `WithinTarget
   ephemeral (port 0 in every product configuration), an ICE restart already rebinds and runs a
   STUN round for sockets without a server-reflexive address, and the only trigger in ParolNet is
   re-keying, which it now initiates and answers itself. So: when ParolNet offers or answers a new
-  association, it binds new sockets on the addresses it has, gathers on them, keeps the old
-  ones until the new pair is selected, and in relay-only mode allocates again. To be implemented
-  and tested against `conf/train-13` (not on engine master yet).
+  association, it binds new sockets on the addresses it has, gathers on them (STUN included),
+  keeps the old ones until the new pair is selected plus 5 s. Implemented against engine master
+  df82663c (train 13 merged). **Gap:** the TURN allocation is not renewed, so the relay
+  candidate is left out of a new association (the engine refuses its address): a relay-only
+  call cannot re-key and ends at the key's limit (never reached at the default lifetimes).
 - **Re-keying**: handled, not turned off (see the table). A peer that does not renegotiate gets
   no re-offer (PNP-011-MUST-020); such a call ends at the key's limit, as with a browser, which
   ignores a new `a=tls-id`. The default lifetimes are not reached by a call.
@@ -97,9 +100,24 @@ NACK responder rate limit (engine default: `UpToTarget` on master, `WithinTarget
 
 ## 3. What each ParolNet test measured, old engine vs new
 
-Filled in from CI (the "m1 figures" step prints `figure <test> | <side> | <what> = <value>`).
-See the PR description for the run ids.
+From CI (the "m1 figures" step prints `figure <test> | <side> | <what> = <value>`). Runs on the
+draft PRs (#52 for master, #53 for the gcc-2 branch). The tag column is from PR #52's earlier
+runs on `v0.22.0+brainwires.6` (recovery relaxed there).
 
-| Test | brainwires.6 tag (PR #52 earlier runs) | engine master 81e2253e | `conf/gcc-2-rfc-retransmission` 77185407 |
-|---|---|---|---|
-| (pending CI) | | | |
+| Test (assertion) | tag brainwires.6 | master 81e2253e | master df82663c | gcc-2 77185407 | gcc-2 e3bfc7e0 |
+|---|---|---|---|---|---|
+| call_setup | pass | pass (connected 230 ms, first frame 277 ms, gap 34 ms, STUN with SOFTWARE 0 of 4 per side) | pass | pass | pass |
+| an_ice_restart_follows_a_machine (freeze <= 2 s after restore) | pass | pass: freeze 500 / 400 ms (caller / callee); target after the move 242 / 274 kbit/s | pass: 500 / 394 ms | **fail: callee froze 7 s**; target after the move 121 kbit/s | pass: 700 / 700 ms; target restarts at 300 k, then 151 k |
+| the_estimate_climbs_on_an_open_link | pass | pass: 1 Mbit/s at 16.1 s, then 2.5 Mbit/s, no downward step | pass | pass | pass |
+| the_estimate_settles_under_a_cap | pass | pass: median 189 / 190 kbit/s, high 382 k, carried 224 k, drops 123 / 6216 | pass | pass | pass: median 189 / 192 k, drops 144 / 6216 |
+| the_estimate_follows_a_cap_that_comes_and_goes (> 800 kbit/s 20 s after; freeze <= 2 s) | **fail: froze 6.86 s**; about 530 kbit/s at +20 s | **pass**: 436 / 641 / 942 / 1384 kbit/s at +5/10/15/20 s; freeze 1.22 s (while capped) | pass: 437 / 643 / 944 / 1388 k; freeze 1.22 s | **fail**: 145 / 213 / 313 / 460 k; freeze 1.69 / 2.08 s | **fail**: 183 / 269 / 395 / 581 k (second run 149 / 219 / 321 / 472 k); freeze 1.66 / 1.96 s |
+| profile_300_kbps_cap (freeze <= 2 s; audio >= 92 %) | pass | pass: freeze <= 1.50 s, audio 93.4 to 94.5 % | **fail: seed 3 caller audio 89.1 %** (freeze 1.58 s) | **fail: seed 1 callee audio 91.6 %** | pass: freeze <= 1.04 s, audio 92.8 to 94.2 % |
+| profile_two_percent_loss | pass | pass: freeze <= 627 ms, audio >= 97.9 % | pass | pass | pass |
+| profile_100_ms_jitter | pass | pass: freeze <= 131 ms, audio 100 % | pass | pass | pass |
+| renegotiation / restart that cannot be signalled / without a restart | pass | pass | pass | pass | pass |
+| srtp_re_keying_by_one_side_keeps_the_call (new) | n/a | n/a | **pass**: re-keys at 39 s and 65 s, new ports each time (49152, 49153, 49154), freeze 34 ms | n/a | pass: re-keys at 39 s and 77.8 s, freeze 34 / 121 ms |
+| srtp_re_keying_keeps_the_call (both sides; the offers cross) | n/a | fail | **fail**: both offer at 39 s, the polite side rolls back and answers at 39.05 s, no DTLS association completes, both Failed at 40.73 s (key exhausted) | fail | fail (Failed at 44.1 / 44.4 s) |
+
+Two runs of the same seed differ slightly on the gcc-2 branch (the test step, with tests in
+parallel, against the figures step with one thread): the simulated time is the same, but
+the order of tokio tasks is not.
