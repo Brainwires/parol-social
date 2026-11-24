@@ -678,6 +678,56 @@ async fn the_estimate_follows_a_cap_that_comes_and_goes() {
     call.close().await;
 }
 
+/// Measure only: one M1 profile on `seeds`, every figure of the exit bar printed and nothing
+/// asserted, so that a sweep runs to its end. For engine comparisons (several seeds, several
+/// engine revisions): `cargo test -p parolnet-simnet --test m1 -- --ignored --nocapture sweep`.
+async fn sweep(name: &str, link: LinkProfile, seeds: std::ops::RangeInclusive<u64>) {
+    for seed in seeds {
+        let config = CallConfig {
+            seed,
+            ..Default::default()
+        };
+        let (call, connected) = call_on(link, config).await;
+        call.run_for(secs(30)).await;
+        let end = call.elapsed();
+        let from = connected + secs(2);
+        for (side, peer) in [("caller", &call.caller), ("callee", &call.callee)] {
+            let who = format!("{name}, seed {seed}, {side}");
+            let m = peer.snapshot();
+            let good = m.audio.good_ratio(from, end);
+            let dropout = m.audio.longest_dropout(from, end);
+            let freeze = m.video.longest_gap(from, end);
+            figure(
+                "sweep",
+                &who,
+                "audio good % / longest dropout / longest freeze / failed",
+                (
+                    format!("{:.1}", good * 100.0),
+                    dropout,
+                    freeze,
+                    m.closed.is_some()
+                        || m.states
+                            .iter()
+                            .any(|s| s.1 == RTCPeerConnectionState::Failed),
+                ),
+            );
+            figure(
+                "sweep",
+                &who,
+                "meets the bar (audio >= 92 %, dropout <= 0.4 s, freeze <= 2 s)",
+                good >= 0.92 && dropout <= ms(400) && freeze <= secs(2),
+            );
+        }
+        call.close().await;
+    }
+}
+
+#[tokio::test(start_paused = true)]
+#[ignore = "a measurement sweep for engine comparisons, not a check"]
+async fn sweep_profile_300_kbps_cap() {
+    sweep("300 kbit/s cap", LinkProfile::capped_300k(), 1..=8).await;
+}
+
 /// One M1 profile, on three seeds: the exit bar's two assertions.
 async fn profile(name: &str, link: LinkProfile, source: VideoSourceKind) {
     for seed in [1, 2, 3] {
