@@ -75,7 +75,7 @@ jobs:
           (cd tests/e2e && npm ci)
       - name: WebKit, calls only, repeated (measurement)
         env:
-          RUNS: "30"
+          RUNS: "60"
         run: |
           pass=0; fail=0
           for i in $(seq 1 "$RUNS"); do
