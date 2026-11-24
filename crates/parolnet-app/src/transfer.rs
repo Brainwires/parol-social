@@ -391,6 +391,12 @@ pub(crate) async fn forward_events(
                 }
             }
             RtcEvent::DataChannelMessage { id, payload } if queues.contains_key(&id) => {
+                tracing::trace!(
+                    dc = id,
+                    len = payload.len(),
+                    room = queues[&id].capacity(),
+                    "file channel message to its queue"
+                );
                 if queues[&id]
                     .send(ChannelEvent::Message(payload))
                     .await
@@ -401,7 +407,10 @@ pub(crate) async fn forward_events(
                 }
                 continue;
             }
-            RtcEvent::DataChannelMessage { id, .. } if dead.contains(&id) => continue,
+            RtcEvent::DataChannelMessage { id, .. } if dead.contains(&id) => {
+                tracing::debug!(dc = id, "message of a channel nobody reads dropped");
+                continue;
+            }
             RtcEvent::DataChannelBufferedLow { id } => {
                 if let Some(tx) = queues.get(&id) {
                     let _ = tx.try_send(ChannelEvent::BufferedLow);
@@ -959,6 +968,12 @@ async fn receive_attempt(
             );
         }
         progressed = true;
+        tracing::trace!(
+            dc = ch.dc,
+            next = receiver.next_record(),
+            last,
+            "receiver: record stored"
+        );
         since_checkpoint += CHUNK_SIZE as u64;
         if last {
             return Outcome::AllStored;

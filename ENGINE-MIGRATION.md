@@ -56,7 +56,7 @@ All in `parolnet-rtc` `build_peer_connection`. Everything else is the engine's d
 |---|---|---|
 | `with_ice_software` | `None` | No STUN SOFTWARE attribute (implementation fingerprint) in ICE checks, responses or consent checks (THREAT_MODEL.md). Our own STUN requests and TURN client (`ClientConfig::software = ""`) send none either. Asserted by `m1::call_setup`, `m1::an_ice_restart_follows_a_machine_to_another_network` (simnet counts every STUN message) and `turn::relay_only_on_both_sides_goes_through_the_turn_server` (the test TURN server checks requests and relayed STUN). |
 | `with_srtp_key_lifetime` | `RtcConfig::srtp_key_lifetime` (`None` = profile default) | Tests re-key a call every few seconds. |
-| `with_srtp_automatic_rekeying` | default (on) | Re-keying is handled: the side whose outbound key nears its end re-offers with an ICE restart (PNP-011 v0.2 section 7.6). `m1::srtp_re_keying_by_one_side_keeps_the_call`, `m1::srtp_re_keying_keeps_the_call`. |
+| `with_srtp_automatic_rekeying` | default (on) | Re-keying is handled: after a lifetime warning, the offer follows the engine's own negotiation-needed (engine tie-break from `conf/rekey-1-glare`: the DTLS client asks at 1/16 of the lifetime left, the server at 1/32, one renewal at a time), with an ICE restart on new ports (PNP-011 v0.2 section 7.6). `m1::srtp_re_keying_by_one_side_keeps_the_call`, `m1::srtp_re_keying_keeps_the_call`. |
 | `with_dtls_new_association_on_previous_addresses` | default (`false`: RFC 8842 section 5.1) | A new association runs on new ports: the driver binds them itself (`renew_sockets`) before it offers a re-keying or answers a peer's new `a=tls-id`; the previous sockets close 5 s after the new pair is selected. |
 | `with_discard_local_candidates_during_ice_restart` | `true` | A restart announces the sockets bound then, not the network left behind. |
 | `with_tcp_candidate_gathering` | `false` | No ICE-TCP; the driver gathers its own UDP candidates. |
@@ -219,3 +219,14 @@ freeze (caller / callee).
 `raddr 0.0.0.0 rport 9` (RFC 8827 section 6.4, the engine's released `0.22.0+brainwires.6`
 entry) stands on master df82663c: `turn::relay_only_on_both_sides_goes_through_the_turn_server`
 asserts it and passes there.
+
+### 3.5 Re-keying with crossing offers (finding 1): closed by engine `conf/rekey-1-glare`
+
+Probe PR #57, run 45316993809, engine daa6c684 (rekey-1-glare merged with master 4431dda0),
+ParolNet re-keying on the engine's negotiation-needed. Three runs of each test, all pass:
+
+- `srtp_re_keying_keeps_the_call` (both sides' keys have the short lifetime): renewals at
+  39.05 s and 65.08 s, connected again 120 ms after each, longest freeze 34 ms, audio 100 %.
+- `srtp_re_keying_by_one_side_keeps_the_call`: renewals at 39.97 s and 66.9 s, same figures.
+
+On df82663c the crossing test still fails (the engine fix is not on master yet).
