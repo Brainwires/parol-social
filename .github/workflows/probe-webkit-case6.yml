@@ -1,4 +1,4 @@
-# PROBE (draft PR only, not for merge): measures PR #60's WebKit interop case 6.
+# PROBE (draft PR only, not for merge): measures WebKit interop case 6 on master's engine (brainwires.5).
 name: Probe webkit-case6
 
 on:
@@ -75,7 +75,7 @@ jobs:
           (cd tests/e2e && npm ci)
       - name: WebKit, calls only, repeated (measurement)
         env:
-          RUNS: "30"
+          RUNS: "60"
         run: |
           pass=0; fail=0
           for i in $(seq 1 "$RUNS"); do
