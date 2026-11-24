@@ -3,7 +3,9 @@ name: CI
 on:
   push:
     branches: [main, master]
+  # PROBE branch: CI off for this draft PR (the probe workflow runs instead).
   pull_request:
+    branches: [probe-disabled]
 
 env:
   CARGO_TERM_COLOR: always

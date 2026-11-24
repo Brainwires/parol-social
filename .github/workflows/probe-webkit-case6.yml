@@ -1,0 +1,86 @@
+# PROBE (draft PR only, not for merge): measures PR #60's WebKit interop case 6.
+name: Probe webkit-case6
+
+on:
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  webkit-case6:
+    name: PROBE WebKit interop calls, repeated
+    # The headless desktop core (parolnet-app's bot) against the web app (web/, its test build)
+    # in headless Chromium, Firefox and WebKit (Playwright) through the relay binary in its
+    # signaling-only profile: pairing both ways, chat both ways, the sender queue, the channel
+    # binding, calls both ways, files. Then the web app's own real flows between pages through
+    # the relay (web/tests/e2e/real.flows.ts). They are steps of this job because they need the
+    # same relay and bot.
+    # Chromium and Firefox twice each: as shipped (mDNS host candidates the desktop resolves) and
+    # with loopback candidates. WebKit once (Playwright's Linux build gathers plain host
+    # addresses). One job, browsers in sequence: the Rust build dominates and a browser run takes
+    # about a minute, so a matrix would rebuild (or ship ~100 MB of artifacts) three times for
+    # nothing. Every browser step runs even when an earlier one failed.
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+    env:
+      # The interop uses Playwright's browsers; puppeteer's Chrome is not needed here.
+      PUPPETEER_SKIP_DOWNLOAD: "1"
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-interop-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-interop-
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+      - name: Playwright
+        run: npm ci
+      - uses: actions/cache@v6
+        with:
+          path: ~/.cache/ms-playwright
+          key: ${{ runner.os }}-playwright-${{ hashFiles('package-lock.json') }}
+      - name: Chromium, Firefox, WebKit (Playwright) and their system libraries
+        # With the cache restored only the system libraries are installed.
+        run: npx playwright install --with-deps chromium firefox webkit
+      - name: Allow Chrome's sandbox
+        # Ubuntu 24.04 restricts unprivileged user namespaces through AppArmor.
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+      - name: Install wasm-pack
+        run: curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
+      - name: Build the relay and the desktop bot
+        run: cargo build -p parolnet-relay-server --bin parolnet-relay -p parolnet-app --example bot
+      # The web app (web/): its test build for the interop (it has the test hooks), its
+      # production export for its own real flows.
+      - name: Install Denext
+        run: |
+          curl -fsSL https://denext.dev/install.sh | sh
+          echo "$HOME/.denext/bin" >> "$GITHUB_PATH"
+      - name: Build the web app (wasm core, test build, production export)
+        working-directory: web
+        run: |
+          denext runtime install
+          denext task build-wasm
+          denext task build:test
+          denext task build
+          (cd tests/e2e && npm ci)
+      - name: WebKit, calls only, repeated (measurement)
+        env:
+          RUNS: "30"
+        run: |
+          pass=0; fail=0
+          for i in $(seq 1 "$RUNS"); do
+            echo "=== run $i of $RUNS ==="
+            if INTEROP_ONLY=calls INTEROP_BROWSER=webkit INTEROP_ICE=host node apps/desktop/interop/pwa-interop.mjs; then pass=$((pass+1)); else fail=$((fail+1)); fi
+          done
+          echo "PROBE SUMMARY: $pass passed, $fail failed of $RUNS"
+          [ "$fail" = 0 ]
