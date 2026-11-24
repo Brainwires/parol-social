@@ -388,32 +388,40 @@ async fn a_restart_that_cannot_be_signalled_leaves_the_old_path_in_use() {
     call.close().await;
 }
 
+/// The host candidate ports of a description.
+fn host_ports(sdp: &str) -> Vec<u16> {
+    sdp.lines()
+        .filter(|l| l.contains("typ host"))
+        .filter_map(|l| l.split_whitespace().nth(5)?.parse().ok())
+        .collect()
+}
+
 /// SRTP re-keying in a call (RFC 3711 section 9.2, RFC 5764 section 4.4; PNP-011 section
-/// 7.6): with a key lifetime of 8000 packets each side's outbound key nears its end about
-/// every half minute, and each time the call re-offers with an ICE restart and a new DTLS
-/// association. The call goes on through every one of them: no failure, no freeze over 2 s,
-/// intelligible audio. The engine asks for the new association when a sixteenth of the
-/// lifetime is left: 500 packets, about 2 s at the 2.5 Mbit/s the estimate reaches, ample
-/// for an offer, an answer, ICE checks and a DTLS handshake. (With 2000 packets the margin
-/// was 125 packets, about 0.6 s, and the key ran out before the new handshake ended.)
-#[tokio::test(start_paused = true)]
-async fn srtp_re_keying_keeps_the_call() {
+/// 7.6) with a key lifetime of 8000 packets on `sides`, for 90 s. The engine asks for the
+/// new association when a sixteenth of the lifetime is left: 500 packets, about 2 s at the
+/// 2.5 Mbit/s the estimate reaches, ample for an offer, an answer, ICE checks and a DTLS
+/// handshake. Each re-keying is an ICE restart with a new DTLS association on new ports (RFC
+/// 8842 section 5.1). The call goes on through every one of them: no failure, no freeze over
+/// 2 s, intelligible audio.
+async fn re_keying(test: &str, sides: [bool; 2]) {
     use parolnet_rtc::rtc::srtp::keying::KeyLifetime;
+    let lifetime = KeyLifetime {
+        srtp_packets: 8_000,
+        ..KeyLifetime::MAX
+    };
     let config = CallConfig {
-        srtp_key_lifetime: Some(KeyLifetime {
-            srtp_packets: 8_000,
-            ..KeyLifetime::MAX
-        }),
+        srtp_key_lifetime: sides.map(|on| on.then_some(lifetime)),
         ..Default::default()
     };
     let (call, connected) = call_on(LinkProfile::default(), config).await;
     call.run_for(secs(90)).await;
     let end = call.elapsed();
-    const REKEY: &str = "srtp_re_keying_keeps_the_call";
     let mut renewals = 0;
+    let mut same_ports = Vec::new();
     for (who, peer) in [("caller", &call.caller), ("callee", &call.callee)] {
         let m = peer.snapshot();
-        // Each new association is a new `a=tls-id` in this side's descriptions.
+        // Each new association is a new `a=tls-id` in this side's descriptions, and its
+        // candidates are on new ports.
         let ids: Vec<&str> = m
             .descriptions
             .iter()
@@ -421,17 +429,42 @@ async fn srtp_re_keying_keeps_the_call() {
             .collect();
         let changes = ids.windows(2).filter(|w| w[0] != w[1]).count();
         renewals += changes;
-        figure(REKEY, who, "descriptions", m.descriptions.len());
-        figure(REKEY, who, "tls-id changes", changes);
-        figure(REKEY, who, "states", &m.states);
+        for w in m.descriptions.windows(2) {
+            let (before, after) = (&w[0].2, &w[1].2);
+            if parolnet_rtc::tls_id(before) != parolnet_rtc::tls_id(after)
+                && host_ports(after)
+                    .iter()
+                    .any(|p| host_ports(before).contains(p))
+            {
+                same_ports.push((who, w[1].0));
+            }
+        }
+        figure(test, who, "tls-id changes", changes);
+        figure(test, who, "states", &m.states);
         figure(
-            REKEY,
+            test,
+            who,
+            "descriptions (at, type, tls-id, host ports)",
+            m.descriptions
+                .iter()
+                .map(|d| {
+                    (
+                        d.0,
+                        d.1,
+                        parolnet_rtc::tls_id(&d.2).map(|t| t[..8].to_owned()),
+                        host_ports(&d.2),
+                    )
+                })
+                .collect::<Vec<_>>(),
+        );
+        figure(
+            test,
             who,
             "longest freeze",
             m.video.longest_gap(connected + secs(1), end),
         );
         figure(
-            REKEY,
+            test,
             who,
             "audio good / longest dropout",
             (
@@ -439,16 +472,7 @@ async fn srtp_re_keying_keeps_the_call() {
                 m.audio.longest_dropout(connected + secs(1), end),
             ),
         );
-        figure(
-            REKEY,
-            who,
-            "description times",
-            m.descriptions
-                .iter()
-                .map(|d| (d.0, d.1, parolnet_rtc::tls_id(&d.2).map(str::to_owned)))
-                .collect::<Vec<_>>(),
-        );
-        figure(REKEY, who, "closed", &m.closed);
+        figure(test, who, "closed", &m.closed);
     }
     for (who, peer) in [("caller", &call.caller), ("callee", &call.callee)] {
         let m = peer.snapshot();
@@ -464,7 +488,24 @@ async fn srtp_re_keying_keeps_the_call() {
         assert_audio_intelligible(who, &m, connected + secs(1), end);
     }
     assert!(renewals >= 2, "{renewals} new DTLS associations in 90 s");
+    assert!(
+        same_ports.is_empty(),
+        "a new association on a previous port: {same_ports:?}"
+    );
     call.close().await;
+}
+
+/// Only the caller's keys have the short lifetime: the caller re-keys, the callee answers.
+#[tokio::test(start_paused = true)]
+async fn srtp_re_keying_by_one_side_keeps_the_call() {
+    re_keying("srtp_re_keying_by_one_side_keeps_the_call", [true, false]).await;
+}
+
+/// Both sides' keys have it: their re-keying offers cross (PNP-011-MUST-022) and one new
+/// association serves both.
+#[tokio::test(start_paused = true)]
+async fn srtp_re_keying_keeps_the_call() {
+    re_keying("srtp_re_keying_keeps_the_call", [true, true]).await;
 }
 
 /// The median of the estimates in force between `from` and `to`, sampled every 100 ms.
