@@ -957,6 +957,10 @@ pub async fn spawn(config: RtcConfig) -> Result<(RtcHandle, mpsc::Receiver<RtcEv
         mdns: None,
         mdns_answers: 0,
         relay,
+        retired_relay: None,
+        turn: config.turn.clone(),
+        turn_timeout: config.turn_timeout,
+        turn_keepalive: config.turn_keepalive,
         relay_only,
         polite: config.polite,
         negotiation: Negotiation::default(),
@@ -1347,6 +1351,13 @@ struct Driver {
     mdns_answers: u64,
     /// The allocation on the user's TURN server, when there is one.
     relay: Option<turn::Relay>,
+    /// The allocation of the previous DTLS association (RFC 8842 section 5.1), carrying the
+    /// session until the new generation selects a pair; released with the retired sockets.
+    retired_relay: Option<turn::Relay>,
+    /// The user's TURN server, to allocate again for a new DTLS association.
+    turn: Option<TurnServer>,
+    turn_timeout: Duration,
+    turn_keepalive: Duration,
     /// [`IcePolicy::Relay`]: nothing is sent to, or accepted from, anyone but the TURN server.
     relay_only: bool,
     polite: bool,
@@ -1386,10 +1397,13 @@ impl Driver {
             .err()
             .map(|e| e.to_string());
         let _ = self.pc.close();
-        if let Some(relay) = self.relay.take()
-            && let Some(sock) = self.socks.iter().find(|s| s.local == relay.local())
+        for relay in [self.relay.take(), self.retired_relay.take()]
+            .into_iter()
+            .flatten()
         {
-            relay.release(sock.socket.as_ref()).await;
+            if let Some(sock) = self.socks.iter().find(|s| s.local == relay.local()) {
+                relay.release(sock.socket.as_ref()).await;
+            }
         }
         let _ = self.events.send(RtcEvent::Closed { error }).await;
     }
@@ -1409,11 +1423,17 @@ impl Driver {
             self.release_acks();
 
             let now = now();
-            let relay_deadline = self.relay.as_mut().and_then(turn::Relay::poll_timeout);
-            if let Some(relay) = self.relay.as_mut()
-                && relay_deadline.is_some_and(|t| t <= now)
-            {
-                relay.handle_timeout(now);
+            let mut relay_deadline = None;
+            let mut relay_due = false;
+            for relay in self.relay.iter_mut().chain(self.retired_relay.iter_mut()) {
+                let deadline = relay.poll_timeout();
+                if deadline.is_some_and(|t| t <= now) {
+                    relay.handle_timeout(now);
+                    relay_due = true;
+                }
+                relay_deadline = [relay_deadline, deadline].into_iter().flatten().min();
+            }
+            if relay_due {
                 continue;
             }
             if self.gather.as_ref().is_some_and(|g| g.wake() <= now) {
@@ -1422,7 +1442,7 @@ impl Driver {
             }
             self.release_audio(now);
             if self.retire_at.is_some_and(|t| t <= now) {
-                self.close_retired_sockets();
+                self.close_retired_sockets().await;
                 continue;
             }
             if self.next_estimate.is_some_and(|t| t <= now) {
@@ -1510,9 +1530,11 @@ impl Driver {
     /// round, or the peer's.
     fn on_datagram(&mut self, index: usize, peer_addr: SocketAddr, data: &[u8]) {
         let local_addr = self.socks[index].local;
-        if let Some(relay) = self.relay.as_mut()
-            && relay.server() == peer_addr
-            && relay.local() == local_addr
+        if let Some(relay) = self
+            .relay
+            .iter_mut()
+            .chain(self.retired_relay.iter_mut())
+            .find(|r| r.server() == peer_addr && r.local() == local_addr)
         {
             relay.handle_datagram(data);
             return;
@@ -1556,6 +1578,13 @@ impl Driver {
         }
         let gone = self.socks.remove(index);
         if self
+            .retired_relay
+            .as_ref()
+            .is_some_and(|relay| relay.local() == gone.local)
+        {
+            self.retired_relay = None;
+        }
+        if self
             .relay
             .as_ref()
             .is_some_and(|relay| relay.local() == gone.local)
@@ -1577,8 +1606,11 @@ impl Driver {
     async fn flush_writes(&mut self) {
         self.deliver_relayed();
         while let Some(msg) = self.pc.poll_write() {
-            if let Some(relay) = self.relay.as_mut()
-                && msg.transport.local_addr == relay.relayed()
+            if let Some(relay) = self
+                .relay
+                .iter_mut()
+                .chain(self.retired_relay.iter_mut())
+                .find(|r| msg.transport.local_addr == r.relayed())
             {
                 relay.send(now(), msg.message, msg.transport.peer_addr);
                 continue;
@@ -1608,12 +1640,16 @@ impl Driver {
                 tracing::debug!(peer = %msg.transport.peer_addr, %err, "send failed");
             }
         }
-        if let Some(relay) = self.relay.as_mut() {
+        let mut outgoing = Vec::new();
+        for relay in self.relay.iter_mut().chain(self.retired_relay.iter_mut()) {
             let local = relay.local();
             let mut out = Vec::new();
             while let Some(datagram) = relay.poll_write() {
                 out.push(datagram);
             }
+            outgoing.push((local, out));
+        }
+        for (local, out) in outgoing {
             if let Some(sock) = self.socks.iter().find(|s| s.local == local) {
                 for (data, to) in out {
                     if let Err(err) = net::send_to(sock.socket.as_ref(), &data, to).await {
@@ -1627,12 +1663,18 @@ impl Driver {
     /// Hand the engine what peers sent to the relayed address (it arrives there as if on a
     /// socket bound to that address).
     fn deliver_relayed(&mut self) {
-        let Some(relay) = self.relay.as_mut() else {
-            return;
-        };
         let now = now();
-        let local_addr = relay.relayed();
-        for (peer_addr, message) in relay.poll_inbound(now) {
+        let mut inbound = Vec::new();
+        for relay in self.relay.iter_mut().chain(self.retired_relay.iter_mut()) {
+            let local_addr = relay.relayed();
+            inbound.extend(
+                relay
+                    .poll_inbound(now)
+                    .into_iter()
+                    .map(|(peer, message)| (local_addr, peer, message)),
+            );
+        }
+        for (local_addr, peer_addr, message) in inbound {
             if let Err(err) = self.pc.handle_read(TaggedBytesMut {
                 now,
                 transport: TransportContext {
@@ -2101,6 +2143,7 @@ impl Driver {
                         .is_some_and(|current| tls_id(&current.sdp) != tls_id(&desc.sdp));
                 if new_association {
                     self.renew_sockets()?;
+                    self.renew_relay().await?;
                 } else if restart {
                     self.rebind()?;
                 }
@@ -2173,6 +2216,7 @@ impl Driver {
     async fn begin_offer(&mut self) -> Result<(), RtcError> {
         if self.negotiation.wanted.rekey {
             self.renew_sockets()?;
+            self.renew_relay().await?;
         } else if self.negotiation.wanted.restart {
             self.rebind()?;
         }
@@ -2262,9 +2306,57 @@ impl Driver {
         Ok(())
     }
 
-    /// Close the retired sockets, except the one that holds the TURN allocation.
-    fn close_retired_sockets(&mut self) {
+    /// For a new DTLS association with a TURN allocation: a new allocation from a new socket
+    /// (the engine refuses the previous relayed address with the previous association's
+    /// candidates). The previous one carries the session until the new generation selects a
+    /// pair and is released with the retired sockets. The loop waits for the allocation (an
+    /// exchange or two with the server, at most [`RtcConfig::turn_timeout`]), as the
+    /// description it goes into does. Without it a relay-only connection cannot go on; any
+    /// other goes on without a relay candidate.
+    async fn renew_relay(&mut self) -> Result<(), RtcError> {
+        let (Some(server), Some(previous)) = (self.turn.clone(), self.relay.as_ref()) else {
+            return Ok(());
+        };
+        let v4 = previous.local().is_ipv4();
+        let Some(sock) = self
+            .socks
+            .iter()
+            .find(|s| !s.retired && s.local.is_ipv4() == v4)
+        else {
+            return Ok(());
+        };
+        let allocated = turn::allocate(
+            sock.socket.as_ref(),
+            &server,
+            self.turn_timeout,
+            self.turn_keepalive,
+        )
+        .await;
+        match allocated {
+            Ok(relay) => {
+                tracing::debug!(relayed = %relay.relayed(), "new TURN allocation for a new DTLS association");
+                // A third association before the second's sockets closed: the oldest
+                // allocation expires on the server by its lifetime.
+                self.retired_relay = self.relay.replace(relay);
+                Ok(())
+            }
+            Err(err) if self.relay_only => Err(err),
+            Err(err) => {
+                tracing::warn!(%err, "no new relay candidate for the new DTLS association");
+                Ok(())
+            }
+        }
+    }
+
+    /// Close the retired sockets, except the one that holds the TURN allocation, and release
+    /// the previous association's allocation.
+    async fn close_retired_sockets(&mut self) {
         self.retire_at = None;
+        if let Some(relay) = self.retired_relay.take()
+            && let Some(sock) = self.socks.iter().find(|s| s.local == relay.local())
+        {
+            relay.release(sock.socket.as_ref()).await;
+        }
         let relay_local = self.relay.as_ref().map(turn::Relay::local);
         self.socks
             .retain(|s| !s.retired || Some(s.local) == relay_local);
@@ -2598,8 +2690,8 @@ impl Driver {
     }
 
     /// Add one local candidate. One on an address of the previous DTLS association is refused
-    /// by the engine (RFC 8842 section 5.1) and left out: the relay candidate, whose
-    /// allocation is not renewed (a gap for relay-only re-keying, see ENGINE-MIGRATION.md).
+    /// by the engine (RFC 8842 section 5.1) and left out: the relay candidate when no new
+    /// allocation could be made (`renew_relay`).
     fn add_candidate(&mut self, init: RTCIceCandidateInit) -> Result<(), RtcError> {
         match self.pc.add_local_candidate(init) {
             Err(rtc::shared::error::Error::ErrICECandidateAddressOfPreviousDtlsAssociation(

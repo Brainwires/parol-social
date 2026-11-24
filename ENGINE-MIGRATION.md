@@ -84,9 +84,11 @@ NACK responder rate limit (engine default: `UpToTarget` on master, `WithinTarget
   re-keying, which it now initiates and answers itself. So: when ParolNet offers or answers a new
   association, it binds new sockets on the addresses it has, gathers on them (STUN included),
   keeps the old ones until the new pair is selected plus 5 s. Implemented against engine master
-  df82663c (train 13 merged). **Gap:** the TURN allocation is not renewed, so the relay
-  candidate is left out of a new association (the engine refuses its address): a relay-only
-  call cannot re-key and ends at the key's limit (never reached at the default lifetimes).
+  df82663c (train 13 merged). The TURN allocation is renewed too: a new allocation from a new
+  socket, the previous one released with the retired sockets
+  (`turn_rekey::a_relay_only_call_re_keys_on_new_allocations`). The loop waits for the new
+  allocation (one or two exchanges with the server, at most `RtcConfig::turn_timeout`).
+  `RtcHandle::relayed_addr` keeps naming the first allocation.
 - **Re-keying**: handled, not turned off (see the table). A peer that does not renegotiate gets
   no re-offer (PNP-011-MUST-020); such a call ends at the key's limit, as with a browser, which
   ignores a new `a=tls-id`. The default lifetimes are not reached by a call.
