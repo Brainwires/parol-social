@@ -562,7 +562,17 @@ async fn send_attempt(
         match first {
             Ok(Some(ChannelEvent::Message(m))) => break m,
             Ok(Some(ChannelEvent::BufferedLow)) => {}
-            Ok(None) | Err(_) => return Outcome::Ended { progressed: false },
+            Ok(None) => {
+                tracing::debug!(
+                    dc = ch.dc,
+                    "sender: the channel closed before the receiver's resume"
+                );
+                return Outcome::Ended { progressed: false };
+            }
+            Err(_) => {
+                tracing::debug!(dc = ch.dc, "sender: no resume from the receiver in time");
+                return Outcome::Ended { progressed: false };
+            }
         }
     };
     let Ok(start) = sender.begin(&resume, parolnet_transfer::random_bytes()) else {
@@ -582,6 +592,7 @@ async fn send_attempt(
     if ch.data.send(ch.dc, start).await.is_err() {
         return Outcome::Ended { progressed: false };
     }
+    tracing::debug!(dc = ch.dc, offset, "sender: attempt started");
     // Where the receiver is: what it has stored, not what an earlier attempt had sent.
     report(WorkerEvent::Progress {
         bytes: sender.sent_bytes(),
@@ -598,6 +609,11 @@ async fn send_attempt(
             match ch.rx.try_recv() {
                 Ok(ChannelEvent::BufferedLow) => {}
                 Ok(ChannelEvent::Message(_)) | Err(mpsc::error::TryRecvError::Disconnected) => {
+                    tracing::debug!(
+                        dc = ch.dc,
+                        sent = sender.sent_bytes(),
+                        "sender: the receiver ended the attempt"
+                    );
                     return Outcome::Ended { progressed };
                 }
                 Err(mpsc::error::TryRecvError::Empty) => break,
@@ -652,13 +668,24 @@ async fn send_attempt(
                 }
                 match ch.data.buffered_amount(ch.dc).await {
                     Ok(amount) if amount <= BUFFER_LOW => break,
-                    Ok(_) => {}
+                    Ok(amount) => {
+                        tracing::trace!(
+                            dc = ch.dc,
+                            amount,
+                            "sender: waiting for the buffer to drain"
+                        );
+                    }
                     Err(_) => return Outcome::Ended { progressed },
                 }
             }
         }
     }
     chunk.zeroize();
+    tracing::debug!(
+        dc = ch.dc,
+        sent = sender.sent_bytes(),
+        "sender: every record handed to the channel"
+    );
     report(WorkerEvent::Progress {
         bytes: sender.sent_bytes(),
         checkpoint: None,
@@ -877,8 +904,14 @@ async fn receive_attempt(
         return Outcome::Ended { progressed: false };
     };
     if ch.data.send(ch.dc, resume).await.is_err() {
+        tracing::debug!(dc = ch.dc, "receiver: the resume could not be sent");
         return Outcome::Ended { progressed: false };
     }
+    tracing::debug!(
+        dc = ch.dc,
+        next = receiver.next_record(),
+        "receiver: resume sent"
+    );
     let mut progressed = false;
     let mut last_report = Instant::now();
     let mut last_checkpoint = Instant::now();
@@ -891,14 +924,24 @@ async fn receive_attempt(
         let message = match event {
             Some(ChannelEvent::Message(m)) => m,
             Some(ChannelEvent::BufferedLow) => continue,
-            None => return Outcome::Ended { progressed },
+            None => {
+                tracing::debug!(
+                    dc = ch.dc,
+                    next = receiver.next_record(),
+                    "receiver: the channel closed"
+                );
+                return Outcome::Ended { progressed };
+            }
         };
         let (mut data, last) = match receiver.on_message(&message) {
             Ok(Received::Started) => continue,
             Ok(Received::Chunk { data, last, .. }) => (data, last),
             // A record that does not verify, or anything out of place: nothing of it is
             // stored and the attempt is over (PNP-010-MUST-013, -019, -020).
-            Err(_) => return Outcome::Ended { progressed },
+            Err(err) => {
+                tracing::debug!(dc = ch.dc, next = receiver.next_record(), %err, "receiver: a message refused; the attempt is over");
+                return Outcome::Ended { progressed };
+            }
         };
         // Records arrive in order and the file is only ever appended to.
         let written = file.write_all(&data).await;

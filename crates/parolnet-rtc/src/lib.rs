@@ -974,6 +974,7 @@ pub async fn spawn(config: RtcConfig) -> Result<(RtcHandle, mpsc::Receiver<RtcEv
         next_quality: None,
         quality_base: QualityBase::default(),
         retire_at: None,
+        rekey_warned: false,
     };
     let task = tokio::spawn(driver.run(cmd_rx));
     Ok((
@@ -1376,6 +1377,9 @@ struct Driver {
     quality_base: QualityBase,
     /// When the retired sockets of the previous DTLS association close.
     retire_at: Option<Instant>,
+    /// An SRTP key of the current association neared its lifetime: the next negotiation-needed
+    /// is the engine asking for a new association.
+    rekey_warned: bool,
 }
 
 /// The longest the loop sleeps when the engine names no deadline.
@@ -1791,7 +1795,21 @@ impl Driver {
                     remaining,
                 } => {
                     tracing::info!(outbound, rtcp, remaining, "SRTP key near its lifetime");
-                    if outbound {
+                    // Which side asks, and when, is the engine's (its tie-break: the DTLS
+                    // client at a sixteenth of the lifetime left, the server at a
+                    // thirty-second, one renewal at a time): the re-offer follows the
+                    // negotiation-needed it then raises.
+                    self.rekey_warned = true;
+                }
+                RTCPeerConnectionEvent::OnNegotiationNeededEvent => {
+                    let n = &self.negotiation;
+                    if self.rekey_warned
+                        && n.established
+                        && n.in_flight.is_none()
+                        && !n.answering
+                        && self.gather.is_none()
+                    {
+                        tracing::debug!("the engine asks for a new DTLS association");
                         self.negotiation.wanted.rekey = true;
                         self.negotiate_if_ready().await?;
                     }
@@ -1808,9 +1826,11 @@ impl Driver {
                         .data_channel(id)
                         .map(|dc| dc.label().to_owned())
                         .unwrap_or_default();
+                    tracing::debug!(id, %label, "data channel open");
                     self.emit(RtcEvent::DataChannelOpen { id, label }).await;
                 }
                 RTCPeerConnectionEvent::OnDataChannel(RTCDataChannelEvent::OnClose(id)) => {
+                    tracing::debug!(id, "data channel closed");
                     self.emit(RtcEvent::DataChannelClose { id }).await;
                 }
                 RTCPeerConnectionEvent::OnDataChannel(
@@ -2153,6 +2173,7 @@ impl Driver {
                 self.report_remote_media(&sdp).await;
                 if new_association {
                     self.negotiation.wanted.rekey = false;
+                    self.rekey_warned = false;
                 }
                 if restart {
                     self.negotiation.wanted.restart = false;
@@ -2232,6 +2253,9 @@ impl Driver {
     async fn make_offer(&mut self) -> Result<(), RtcError> {
         let now = now();
         let wanted = std::mem::take(&mut self.negotiation.wanted);
+        if wanted.rekey {
+            self.rekey_warned = false;
+        }
         if wanted.restarts() {
             self.pc.restart_ice();
         }
