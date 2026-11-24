@@ -389,22 +389,25 @@ async fn a_restart_that_cannot_be_signalled_leaves_the_old_path_in_use() {
 }
 
 /// SRTP re-keying in a call (RFC 3711 section 9.2, RFC 5764 section 4.4; PNP-011 section
-/// 7.6): with a key lifetime of 2000 packets each side's outbound key nears its end every
-/// few seconds, and each time the call re-offers with an ICE restart and a new DTLS
+/// 7.6): with a key lifetime of 8000 packets each side's outbound key nears its end about
+/// every half minute, and each time the call re-offers with an ICE restart and a new DTLS
 /// association. The call goes on through every one of them: no failure, no freeze over 2 s,
-/// intelligible audio.
+/// intelligible audio. The engine asks for the new association when a sixteenth of the
+/// lifetime is left: 500 packets, about 2 s at the 2.5 Mbit/s the estimate reaches, ample
+/// for an offer, an answer, ICE checks and a DTLS handshake. (With 2000 packets the margin
+/// was 125 packets, about 0.6 s, and the key ran out before the new handshake ended.)
 #[tokio::test(start_paused = true)]
 async fn srtp_re_keying_keeps_the_call() {
     use parolnet_rtc::rtc::srtp::keying::KeyLifetime;
     let config = CallConfig {
         srtp_key_lifetime: Some(KeyLifetime {
-            srtp_packets: 2_000,
+            srtp_packets: 8_000,
             ..KeyLifetime::MAX
         }),
         ..Default::default()
     };
     let (call, connected) = call_on(LinkProfile::default(), config).await;
-    call.run_for(secs(45)).await;
+    call.run_for(secs(90)).await;
     let end = call.elapsed();
     const REKEY: &str = "srtp_re_keying_keeps_the_call";
     let mut renewals = 0;
@@ -436,6 +439,19 @@ async fn srtp_re_keying_keeps_the_call() {
                 m.audio.longest_dropout(connected + secs(1), end),
             ),
         );
+        figure(
+            REKEY,
+            who,
+            "description times",
+            m.descriptions
+                .iter()
+                .map(|d| (d.0, d.1, parolnet_rtc::tls_id(&d.2).map(str::to_owned)))
+                .collect::<Vec<_>>(),
+        );
+        figure(REKEY, who, "closed", &m.closed);
+    }
+    for (who, peer) in [("caller", &call.caller), ("callee", &call.callee)] {
+        let m = peer.snapshot();
         assert_eq!(m.closed, None, "{who}");
         assert!(
             m.states
@@ -447,7 +463,7 @@ async fn srtp_re_keying_keeps_the_call() {
         assert_video_does_not_freeze(who, &m, connected + secs(1), end);
         assert_audio_intelligible(who, &m, connected + secs(1), end);
     }
-    assert!(renewals >= 2, "{renewals} new DTLS associations in 45 s");
+    assert!(renewals >= 2, "{renewals} new DTLS associations in 90 s");
     call.close().await;
 }
 
