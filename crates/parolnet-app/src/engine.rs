@@ -2902,6 +2902,16 @@ impl Engine {
                 let first = !c.described;
                 let incoming = c.info.incoming;
                 let is_offer = desc.sdp_type == RTCSdpType::Offer;
+                if !first && is_offer && !c.info.renegotiable {
+                    // An offer the connection made by itself (SRTP re-keying, PNP-011 section
+                    // 7.6) to a peer that does not renegotiate: never sent (PNP-011-MUST-020).
+                    // The call goes on as it was set up.
+                    tracing::info!(call = %call_id, "re-offer to a peer that does not renegotiate taken back");
+                    if let Some(h) = c.handle.as_ref() {
+                        let _ = h.rollback();
+                    }
+                    return;
+                }
                 let sig = match (first, is_offer) {
                     (true, false) => CallSignal::Answer {
                         call_id: call_id.to_owned(),

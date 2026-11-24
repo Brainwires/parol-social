@@ -30,6 +30,13 @@ fn ms(n: u64) -> Duration {
     Duration::from_millis(n)
 }
 
+/// One measurement, printed before it is asserted on: `cargo test --test m1 -- --nocapture`
+/// lists what each test measured, so a run against another engine can be compared figure by
+/// figure, passing or not.
+fn figure(test: &str, who: &str, what: &str, value: impl std::fmt::Debug) {
+    eprintln!("figure {test} | {who} | {what} = {value:?}");
+}
+
 /// A call on `profile` (both directions), connected.
 async fn call_on(profile: LinkProfile, config: CallConfig) -> (SimCall, Duration) {
     let net = SimNet::new(config.seed);
@@ -74,12 +81,20 @@ fn assert_video_does_not_freeze(who: &str, m: &Metrics, from: Duration, to: Dura
     );
 }
 
+/// No STUN message a peer sent (ICE checks and responses, nominations, consent checks)
+/// carries SOFTWARE: no implementation fingerprint on the path (THREAT_MODEL.md).
+fn assert_no_stun_software(who: &str, stats: &parolnet_simnet::LinkStats) {
+    assert!(stats.sent_stun > 0, "{who}: no STUN at all: {stats:?}");
+    assert_eq!(stats.sent_stun_with_software, 0, "{who}: {stats:?}");
+}
+
 #[tokio::test(start_paused = true)]
 async fn call_setup() {
     let real = std::time::Instant::now();
     let (call, connected) = call_on(LinkProfile::default(), CallConfig::default()).await;
     // Offer and answer cross the signaling channel (50 ms each), then ICE and DTLS over a
     // 10 ms link: well under a second.
+    figure("call_setup", "-", "connected", connected);
     assert!(connected < secs(1), "connected after {connected:?}");
     call.run_for(secs(5)).await;
     let end = call.elapsed();
@@ -100,6 +115,14 @@ async fn call_setup() {
         // Media both ways from the start: the first usable frame within half a second of
         // the connection, then 30 a second with no gap over 100 ms.
         let first = m.video.usable_at.first().copied().expect("video");
+        figure("call_setup", who, "first frame", first);
+        figure(
+            "call_setup",
+            who,
+            "longest gap",
+            m.video.longest_gap(first, end),
+        );
+        figure("call_setup", who, "stun", peer.host.stats());
         assert!(
             first < connected + ms(500),
             "{who}: first frame at {first:?}"
@@ -129,6 +152,7 @@ async fn call_setup() {
             quality.rtt_ms.is_some_and(|rtt| (15..=40).contains(&rtt)),
             "{who}: {quality:?}"
         );
+        assert_no_stun_software(who, &peer.host.stats());
     }
     // Six virtual seconds, a fraction of that in real time.
     assert!(call.elapsed() >= secs(5));
@@ -241,6 +265,9 @@ async fn an_ice_restart_follows_a_machine_to_another_network() {
     })
     .await;
     let restored = call.elapsed();
+    const RESTART: &str = "an_ice_restart_follows_a_machine_to_another_network";
+    figure(RESTART, "-", "noticed after move", noticed - moved);
+    figure(RESTART, "-", "restored after notice", restored - noticed);
     assert!(restored - noticed < secs(2), "{:?}", restored - noticed);
     call.run_for(secs(8)).await;
     let end = call.elapsed();
@@ -263,6 +290,37 @@ async fn an_ice_restart_follows_a_machine_to_another_network() {
         // The outage is the time it took to notice, plus the restart: video is back within
         // two seconds of the restart, and runs without a freeze afterwards.
         let after = m.video.usable_at.iter().find(|t| **t > noticed).copied();
+        figure(
+            RESTART,
+            who,
+            "video back after notice",
+            after.map(|t| t - noticed),
+        );
+        figure(
+            RESTART,
+            who,
+            "longest freeze after restore+1s",
+            m.video.longest_gap(restored + secs(1), end),
+        );
+        figure(
+            RESTART,
+            who,
+            "audio good / longest dropout after restore+1s",
+            (
+                m.audio.good_ratio(restored + secs(1), end),
+                m.audio.longest_dropout(restored + secs(1), end),
+            ),
+        );
+        figure(
+            RESTART,
+            who,
+            "targets after the move",
+            m.targets
+                .iter()
+                .filter(|t| t.0 >= moved)
+                .map(|t| (t.0.as_millis(), t.1))
+                .collect::<Vec<_>>(),
+        );
         assert!(
             after.is_some_and(|t| t - noticed < secs(2)),
             "{who}: video back at {after:?}, restart at {noticed:?}"
@@ -271,6 +329,9 @@ async fn an_ice_restart_follows_a_machine_to_another_network() {
         assert_audio_intelligible(who, m, restored + secs(1), end);
         assert_audio_intelligible(who, m, connected + secs(1), moved);
     }
+    // The restart's checks and the consent checks on both networks.
+    assert_no_stun_software("caller", &call.caller.host.stats());
+    assert_no_stun_software("callee", &call.callee.host.stats());
     call.close().await;
 }
 
@@ -327,6 +388,69 @@ async fn a_restart_that_cannot_be_signalled_leaves_the_old_path_in_use() {
     call.close().await;
 }
 
+/// SRTP re-keying in a call (RFC 3711 section 9.2, RFC 5764 section 4.4; PNP-011 section
+/// 7.6): with a key lifetime of 2000 packets each side's outbound key nears its end every
+/// few seconds, and each time the call re-offers with an ICE restart and a new DTLS
+/// association. The call goes on through every one of them: no failure, no freeze over 2 s,
+/// intelligible audio.
+#[tokio::test(start_paused = true)]
+async fn srtp_re_keying_keeps_the_call() {
+    use parolnet_rtc::rtc::srtp::keying::KeyLifetime;
+    let config = CallConfig {
+        srtp_key_lifetime: Some(KeyLifetime {
+            srtp_packets: 2_000,
+            ..KeyLifetime::MAX
+        }),
+        ..Default::default()
+    };
+    let (call, connected) = call_on(LinkProfile::default(), config).await;
+    call.run_for(secs(45)).await;
+    let end = call.elapsed();
+    const REKEY: &str = "srtp_re_keying_keeps_the_call";
+    let mut renewals = 0;
+    for (who, peer) in [("caller", &call.caller), ("callee", &call.callee)] {
+        let m = peer.snapshot();
+        // Each new association is a new `a=tls-id` in this side's descriptions.
+        let ids: Vec<&str> = m
+            .descriptions
+            .iter()
+            .filter_map(|d| parolnet_rtc::tls_id(&d.2))
+            .collect();
+        let changes = ids.windows(2).filter(|w| w[0] != w[1]).count();
+        renewals += changes;
+        figure(REKEY, who, "descriptions", m.descriptions.len());
+        figure(REKEY, who, "tls-id changes", changes);
+        figure(REKEY, who, "states", &m.states);
+        figure(
+            REKEY,
+            who,
+            "longest freeze",
+            m.video.longest_gap(connected + secs(1), end),
+        );
+        figure(
+            REKEY,
+            who,
+            "audio good / longest dropout",
+            (
+                m.audio.good_ratio(connected + secs(1), end),
+                m.audio.longest_dropout(connected + secs(1), end),
+            ),
+        );
+        assert_eq!(m.closed, None, "{who}");
+        assert!(
+            m.states
+                .iter()
+                .all(|s| s.1 != RTCPeerConnectionState::Failed),
+            "{who}: {:?}",
+            m.states
+        );
+        assert_video_does_not_freeze(who, &m, connected + secs(1), end);
+        assert_audio_intelligible(who, &m, connected + secs(1), end);
+    }
+    assert!(renewals >= 2, "{renewals} new DTLS associations in 45 s");
+    call.close().await;
+}
+
 /// The median of the estimates in force between `from` and `to`, sampled every 100 ms.
 fn median_target(m: &Metrics, from: Duration, to: Duration) -> u32 {
     let mut samples = Vec::new();
@@ -345,6 +469,22 @@ async fn the_estimate_climbs_on_an_open_link() {
     call.run_for(secs(35)).await;
     for (who, peer) in [("caller", &call.caller), ("callee", &call.callee)] {
         let m = peer.snapshot();
+        const CLIMBS: &str = "the_estimate_climbs_on_an_open_link";
+        figure(CLIMBS, who, "first target", m.targets[0].1);
+        figure(CLIMBS, who, "last target", m.targets.last().map(|t| t.1));
+        figure(
+            CLIMBS,
+            who,
+            "reached 1 Mbit/s at",
+            m.targets.iter().find(|t| t.1 >= 1_000_000).map(|t| t.0),
+        );
+        figure(
+            CLIMBS,
+            who,
+            "downward steps",
+            m.targets.windows(2).filter(|w| w[1].1 < w[0].1).count(),
+        );
+        figure(CLIMBS, who, "video bits", m.video.bytes_sent * 8);
         assert_eq!(
             m.targets[0].1, 300_000,
             "{who}: starts at the initial estimate"
@@ -377,6 +517,21 @@ async fn the_estimate_settles_under_a_cap() {
         let m = peer.snapshot();
         let (low, high) = m.target_range(connected + secs(10), end).unwrap();
         let median = median_target(&m, connected + secs(10), end);
+        let stats = peer.host.stats();
+        const SETTLES: &str = "the_estimate_settles_under_a_cap";
+        figure(SETTLES, who, "low / median / high", (low, median, high));
+        figure(
+            SETTLES,
+            who,
+            "carried bit/s",
+            (stats.delivered_bytes as f64 * 8.0 / end.as_secs_f64()) as u64,
+        );
+        figure(
+            SETTLES,
+            who,
+            "queue drops / sent",
+            (stats.queue_drops, stats.sent),
+        );
         // It probes above the cap, is pushed back under it, and spends its time around it.
         assert!(high <= 450_000, "{who}: the estimate reached {high}");
         assert!(low >= 100_000, "{who}: {low}");
@@ -385,7 +540,6 @@ async fn the_estimate_settles_under_a_cap() {
             "{who}: a median estimate of {median} on a 300 kbit/s link"
         );
         // What the link carried: most of its capacity, and little of it was dropped.
-        let stats = peer.host.stats();
         let carried = stats.delivered_bytes as f64 * 8.0 / end.as_secs_f64();
         assert!(
             (150_000.0..=300_000.0).contains(&carried),
@@ -406,6 +560,8 @@ async fn the_estimate_follows_a_cap_that_comes_and_goes() {
     let (call, _) = call_on(LinkProfile::default(), CallConfig::default()).await;
     call.run_for(secs(20)).await;
     let before = call.caller.metrics().target_at(call.elapsed()).unwrap();
+    const CAP: &str = "the_estimate_follows_a_cap_that_comes_and_goes";
+    figure(CAP, "caller", "target before the cap", before);
     assert!(before > 900_000, "{before}");
 
     // The path drops to 300 kbit/s.
@@ -419,9 +575,11 @@ async fn the_estimate_follows_a_cap_that_comes_and_goes() {
     })
     .await;
     let reacted = call.elapsed() - capped;
+    figure(CAP, "caller", "below 400 kbit/s after", reacted);
     assert!(reacted < secs(4), "{reacted:?}");
     call.run_for(secs(20)).await;
     let under = median_target(&call.caller.snapshot(), capped + secs(8), call.elapsed());
+    figure(CAP, "caller", "median under the cap", under);
     assert!((150_000..=330_000).contains(&under), "{under}");
     // The other direction never had a cap.
     assert!(call.callee.metrics().target_at(call.elapsed()).unwrap() > 1_500_000);
@@ -431,21 +589,35 @@ async fn the_estimate_follows_a_cap_that_comes_and_goes() {
     let opened = call.elapsed();
     call.run_for(secs(20)).await;
     let after = call.caller.metrics().target_at(call.elapsed()).unwrap();
-    // Since engine v0.22.0+brainwires.6 GCC climbs back as draft-ietf-rmcat-gcc-02 section
-    // 5.5 has it: the delay-based estimate stays below 1.5 times the received rate, and
-    // increases additively while that rate is "close to convergence" (engine CHANGELOG,
-    // "gcc: the delay-based estimate stays below 1.5 times the received rate"). A sender
-    // that follows its target therefore reopens over tens of seconds, not the 20 s this
-    // asserted before (it measured about 530 kbit/s here, from about 300). The engine's
-    // remedy, bandwidth probing (RFC 8836 requirement 4), is not adopted yet. What is
-    // asserted is that the estimate climbs well clear of the cap.
-    assert!(
-        after as f64 > under as f64 * 1.5,
-        "{after} twenty seconds after the cap went (capped median {under})"
-    );
     let m = call.callee.snapshot();
+    for at in [5, 10, 15, 20] {
+        figure(
+            CAP,
+            "caller",
+            &format!("target {at} s after the cap went"),
+            call.caller.metrics().target_at(opened + secs(at)),
+        );
+    }
+    figure(
+        CAP,
+        "callee",
+        "longest freeze (whole call)",
+        m.video.longest_gap(secs(2), call.elapsed()),
+    );
+    figure(
+        CAP,
+        "callee",
+        "longest freeze while capped",
+        m.video.longest_gap(capped, opened),
+    );
+    figure(
+        CAP,
+        "callee",
+        "longest freeze after the cap went",
+        m.video.longest_gap(opened, call.elapsed()),
+    );
+    assert!(after > 800_000, "{after} twenty seconds after the cap went");
     assert_video_does_not_freeze("callee", &m, secs(2), call.elapsed());
-    let _ = opened;
     call.close().await;
 }
 
@@ -464,6 +636,37 @@ async fn profile(name: &str, link: LinkProfile, source: VideoSourceKind) {
         for (side, peer) in [("caller", &call.caller), ("callee", &call.callee)] {
             let who = format!("{name}, seed {seed}, {side}");
             let m = peer.snapshot();
+            {
+                let (_, highest) = m.target_range(Duration::ZERO, end).unwrap_or_default();
+                let rate = m.video.bytes_sent as f64 * 8.0 / (end - connected).as_secs_f64();
+                figure(
+                    "profile",
+                    &who,
+                    "longest freeze",
+                    m.video.longest_gap(from, end),
+                );
+                figure(
+                    "profile",
+                    &who,
+                    "video bit/s / allowed by highest estimate",
+                    (rate as u64, video_bitrate_for(highest)),
+                );
+                figure(
+                    "profile",
+                    &who,
+                    "usable frames",
+                    m.video.usable_between(from, end),
+                );
+                figure(
+                    "profile",
+                    &who,
+                    "audio good / longest dropout",
+                    (
+                        m.audio.good_ratio(from, end),
+                        m.audio.longest_dropout(from, end),
+                    ),
+                );
+            }
             assert_eq!(m.closed, None, "{who}");
             assert!(
                 m.states

@@ -294,6 +294,12 @@ pub struct RtcConfig {
     pub mdns: bool,
     /// Report [`RtcEvent::Quality`] this often once connected (`None`: never).
     pub quality_interval: Option<Duration>,
+    /// How many packets an SRTP master key protects before the connection re-keys (`None`:
+    /// the profile's, 2^31 packets and more, which a call never reaches). The side whose
+    /// outbound key nears its end re-offers with an ICE restart and a new DTLS association
+    /// (RFC 5764 section 4.4, RFC 8842; PNP-011 section 7.6). Tests set a short one to run
+    /// re-keying in a call.
+    pub srtp_key_lifetime: Option<rtc::srtp::keying::KeyLifetime>,
 }
 
 impl Default for RtcConfig {
@@ -318,6 +324,7 @@ impl Default for RtcConfig {
             event_capacity: 4096,
             mdns: true,
             quality_interval: None,
+            srtp_key_lifetime: None,
         }
     }
 }
@@ -1159,7 +1166,18 @@ fn build_peer_connection(config: &RtcConfig) -> Result<Built, RtcError> {
         // connecting and stops answering on the one it left, which under the RFC 8445
         // section 8.1.1 default (the highest-priority nominated pair) stopped the PWA's calls
         // (`with_ice_nomination_acceptance`).
-        .with_ice_nomination_acceptance(NominationAcceptance::Latest);
+        .with_ice_nomination_acceptance(NominationAcceptance::Latest)
+        // No SOFTWARE attribute in any STUN message the engine sends: ICE connectivity
+        // checks (nominations and consent checks included) and their success responses
+        // (RFC 8489 section 14.14; engine default `rtc-ice <version>`). An implementation
+        // fingerprint on the path is what THREAT_MODEL.md does not want; our own STUN
+        // Binding requests and our TURN client send none either.
+        .with_ice_software(None)
+        // Re-keying stays on (the engine's default, `with_srtp_automatic_rekeying`): when a
+        // master key has a sixteenth of its lifetime left the engine raises negotiation-needed
+        // and its next offer carries a new `a=tls-id` and new ICE credentials. The re-offer is
+        // made here, on `OnSrtpKeyLifetimeExpiring` (`Driver::drain_events`).
+        .with_srtp_key_lifetime(config.srtp_key_lifetime);
     if let Some(role) = config.answering_dtls_role {
         settings = settings.with_answering_dtls_role(role);
     }
@@ -1223,11 +1241,19 @@ struct Wanted {
     restart: bool,
     /// A track or direction changed.
     media: bool,
+    /// A new DTLS association for new SRTP keys (re-keying), which the engine puts in the
+    /// next offer with an ICE restart. Done as well by a peer's offer that starts one.
+    rekey: bool,
 }
 
 impl Wanted {
     fn any(self) -> bool {
-        self.restart || self.media
+        self.restart || self.media || self.rekey
+    }
+
+    /// The offer restarts ICE: new credentials, and candidates gathered for them.
+    fn restarts(self) -> bool {
+        self.restart || self.rekey
     }
 }
 
@@ -1665,6 +1691,23 @@ impl Driver {
                 RTCPeerConnectionEvent::OnSelectedCandidatePairChange(_) => {
                     self.emit(RtcEvent::SelectedCandidatePairChanged).await;
                 }
+                // SRTP re-keying (RFC 3711 section 9.2, RFC 5764 section 4.4). A key has a
+                // sixteenth of its lifetime left and the engine asked for a new DTLS
+                // association, which the next offer carries with an ICE restart. The side
+                // whose outbound key it is makes that offer (as an ICE restart: new sockets'
+                // candidates are gathered as for one); the peer sees the same key as inbound
+                // and answers. Both directions get new keys from the new association.
+                RTCPeerConnectionEvent::OnSrtpKeyLifetimeExpiring {
+                    outbound,
+                    rtcp,
+                    remaining,
+                } => {
+                    tracing::info!(outbound, rtcp, remaining, "SRTP key near its lifetime");
+                    if outbound {
+                        self.negotiation.wanted.rekey = true;
+                        self.negotiate_if_ready().await?;
+                    }
+                }
                 RTCPeerConnectionEvent::OnTrack(RTCTrackEvent::OnOpen(init)) => {
                     self.tracks.insert(init.track_id, (init.receiver_id, false));
                 }
@@ -1990,6 +2033,7 @@ impl Driver {
                     self.negotiation.in_flight = None;
                     self.negotiation.wanted.restart |= ours.restart;
                     self.negotiation.wanted.media |= ours.media;
+                    self.negotiation.wanted.rekey |= ours.rekey;
                 }
                 // Our own restart was still gathering: the peer's restart does its job.
                 self.gather = None;
@@ -2002,6 +2046,13 @@ impl Driver {
                         .pc
                         .remote_description()
                         .is_some_and(|current| ice_ufrag(&current.sdp) != ice_ufrag(&desc.sdp));
+                // The peer's offer starts a new DTLS association: new SRTP keys both ways, so
+                // a re-keying of ours is not needed any more.
+                let new_association = !first
+                    && self
+                        .pc
+                        .remote_description()
+                        .is_some_and(|current| tls_id(&current.sdp) != tls_id(&desc.sdp));
                 if restart {
                     self.rebind()?;
                 }
@@ -2009,6 +2060,9 @@ impl Driver {
                 self.pc.set_remote_description(now, desc)?;
                 self.negotiation.answering = true;
                 self.report_remote_media(&sdp).await;
+                if new_association {
+                    self.negotiation.wanted.rekey = false;
+                }
                 if restart {
                     self.negotiation.wanted.restart = false;
                     if let Some(gather) = self.start_gather(AfterGather::Answer) {
@@ -2069,7 +2123,7 @@ impl Driver {
     }
 
     async fn begin_offer(&mut self) -> Result<(), RtcError> {
-        if self.negotiation.wanted.restart {
+        if self.negotiation.wanted.restarts() {
             self.rebind()?;
             if let Some(gather) = self.start_gather(AfterGather::Offer) {
                 self.gather = Some(gather);
@@ -2082,12 +2136,12 @@ impl Driver {
     async fn make_offer(&mut self) -> Result<(), RtcError> {
         let now = now();
         let wanted = std::mem::take(&mut self.negotiation.wanted);
-        if wanted.restart {
+        if wanted.restarts() {
             self.pc.restart_ice();
         }
         let offer = self.pc.create_offer(None)?;
         self.pc.set_local_description(now, offer)?;
-        if wanted.restart {
+        if wanted.restarts() {
             self.add_local_candidates()?;
         }
         self.negotiation.in_flight = Some(wanted);
@@ -2575,6 +2629,14 @@ fn selected_pair(
 pub fn ice_ufrag(sdp: &str) -> Option<&str> {
     sdp.lines()
         .find_map(|line| line.trim().strip_prefix("a=ice-ufrag:"))
+        .map(str::trim)
+}
+
+/// The first `a=tls-id` of a description (RFC 8842 section 5.5): it changes when the
+/// description starts a new DTLS association.
+pub fn tls_id(sdp: &str) -> Option<&str> {
+    sdp.lines()
+        .find_map(|line| line.trim().strip_prefix("a=tls-id:"))
         .map(str::trim)
 }
 
