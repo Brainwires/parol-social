@@ -60,10 +60,7 @@ wildcards = "allow"
 [sources]
 unknown-registry = "deny"
 unknown-git = "deny"
-allow-git = [
-    # The realtime engine, pinned by tag (plan section 2.3).
-    "https://github.com/Brainwires/webrtc-rs-rtc",
-]
+allow-git = []
 
 [advisories]
 version = 2

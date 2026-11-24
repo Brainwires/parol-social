@@ -35,8 +35,8 @@ use parolnet_media::{
     AudioSink, AudioSource, DeviceInfo, FRAME_20MS, I420Frame, MediaError, SAMPLE_RATE,
     VideoFormat, VideoSource, audio_io, camera,
 };
-use parolnet_rtc::rtc::media::io::sample_builder::SampleBuilder;
-use parolnet_rtc::rtc::rtp::codec::vp8::Vp8Packet;
+use parolnet_rtc::rtci::media::io::sample_builder::SampleBuilder;
+use parolnet_rtc::rtci::rtp::codec::vp8::Vp8Packet;
 
 use crate::frame::{FrameSlot, Presentable};
 use crate::receiver::{Stats, decode_loop};

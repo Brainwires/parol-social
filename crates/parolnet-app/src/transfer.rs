@@ -391,6 +391,12 @@ pub(crate) async fn forward_events(
                 }
             }
             RtcEvent::DataChannelMessage { id, payload } if queues.contains_key(&id) => {
+                tracing::trace!(
+                    dc = id,
+                    len = payload.len(),
+                    room = queues[&id].capacity(),
+                    "file channel message to its queue"
+                );
                 if queues[&id]
                     .send(ChannelEvent::Message(payload))
                     .await
@@ -401,7 +407,10 @@ pub(crate) async fn forward_events(
                 }
                 continue;
             }
-            RtcEvent::DataChannelMessage { id, .. } if dead.contains(&id) => continue,
+            RtcEvent::DataChannelMessage { id, .. } if dead.contains(&id) => {
+                tracing::debug!(dc = id, "message of a channel nobody reads dropped");
+                continue;
+            }
             RtcEvent::DataChannelBufferedLow { id } => {
                 if let Some(tx) = queues.get(&id) {
                     let _ = tx.try_send(ChannelEvent::BufferedLow);
@@ -562,7 +571,17 @@ async fn send_attempt(
         match first {
             Ok(Some(ChannelEvent::Message(m))) => break m,
             Ok(Some(ChannelEvent::BufferedLow)) => {}
-            Ok(None) | Err(_) => return Outcome::Ended { progressed: false },
+            Ok(None) => {
+                tracing::debug!(
+                    dc = ch.dc,
+                    "sender: the channel closed before the receiver's resume"
+                );
+                return Outcome::Ended { progressed: false };
+            }
+            Err(_) => {
+                tracing::debug!(dc = ch.dc, "sender: no resume from the receiver in time");
+                return Outcome::Ended { progressed: false };
+            }
         }
     };
     let Ok(start) = sender.begin(&resume, parolnet_transfer::random_bytes()) else {
@@ -582,6 +601,7 @@ async fn send_attempt(
     if ch.data.send(ch.dc, start).await.is_err() {
         return Outcome::Ended { progressed: false };
     }
+    tracing::debug!(dc = ch.dc, offset, "sender: attempt started");
     // Where the receiver is: what it has stored, not what an earlier attempt had sent.
     report(WorkerEvent::Progress {
         bytes: sender.sent_bytes(),
@@ -598,6 +618,11 @@ async fn send_attempt(
             match ch.rx.try_recv() {
                 Ok(ChannelEvent::BufferedLow) => {}
                 Ok(ChannelEvent::Message(_)) | Err(mpsc::error::TryRecvError::Disconnected) => {
+                    tracing::debug!(
+                        dc = ch.dc,
+                        sent = sender.sent_bytes(),
+                        "sender: the receiver ended the attempt"
+                    );
                     return Outcome::Ended { progressed };
                 }
                 Err(mpsc::error::TryRecvError::Empty) => break,
@@ -652,19 +677,31 @@ async fn send_attempt(
                 }
                 match ch.data.buffered_amount(ch.dc).await {
                     Ok(amount) if amount <= BUFFER_LOW => break,
-                    Ok(_) => {}
+                    Ok(amount) => {
+                        tracing::trace!(
+                            dc = ch.dc,
+                            amount,
+                            "sender: waiting for the buffer to drain"
+                        );
+                    }
                     Err(_) => return Outcome::Ended { progressed },
                 }
             }
         }
     }
     chunk.zeroize();
+    tracing::debug!(
+        dc = ch.dc,
+        sent = sender.sent_bytes(),
+        "sender: every record handed to the channel"
+    );
     report(WorkerEvent::Progress {
         bytes: sender.sent_bytes(),
         checkpoint: None,
     });
     // Everything is on its way. The transfer is complete when the receiver says so
     // (PNP-010-MUST-023); until then the channel stays open for the tail to be delivered.
+    let mut tick = tokio::time::interval(Duration::from_secs(1));
     loop {
         tokio::select! {
             ev = ch.rx.recv() => match ev {
@@ -672,6 +709,11 @@ async fn send_attempt(
                 Some(ChannelEvent::Message(_)) | None => return Outcome::Ended { progressed },
             },
             cmd = ctl.recv() => return stop_or_shutdown(cmd),
+            _ = tick.tick() => {
+                if let Ok(outstanding) = ch.data.buffered_amount(ch.dc).await {
+                    tracing::debug!(dc = ch.dc, outstanding, "sender: waiting for the receiver; bytes not yet acknowledged");
+                }
+            }
         }
     }
 }
@@ -877,8 +919,14 @@ async fn receive_attempt(
         return Outcome::Ended { progressed: false };
     };
     if ch.data.send(ch.dc, resume).await.is_err() {
+        tracing::debug!(dc = ch.dc, "receiver: the resume could not be sent");
         return Outcome::Ended { progressed: false };
     }
+    tracing::debug!(
+        dc = ch.dc,
+        next = receiver.next_record(),
+        "receiver: resume sent"
+    );
     let mut progressed = false;
     let mut last_report = Instant::now();
     let mut last_checkpoint = Instant::now();
@@ -891,14 +939,24 @@ async fn receive_attempt(
         let message = match event {
             Some(ChannelEvent::Message(m)) => m,
             Some(ChannelEvent::BufferedLow) => continue,
-            None => return Outcome::Ended { progressed },
+            None => {
+                tracing::debug!(
+                    dc = ch.dc,
+                    next = receiver.next_record(),
+                    "receiver: the channel closed"
+                );
+                return Outcome::Ended { progressed };
+            }
         };
         let (mut data, last) = match receiver.on_message(&message) {
             Ok(Received::Started) => continue,
             Ok(Received::Chunk { data, last, .. }) => (data, last),
             // A record that does not verify, or anything out of place: nothing of it is
             // stored and the attempt is over (PNP-010-MUST-013, -019, -020).
-            Err(_) => return Outcome::Ended { progressed },
+            Err(err) => {
+                tracing::debug!(dc = ch.dc, next = receiver.next_record(), %err, "receiver: a message refused; the attempt is over");
+                return Outcome::Ended { progressed };
+            }
         };
         // Records arrive in order and the file is only ever appended to.
         let written = file.write_all(&data).await;
@@ -910,6 +968,12 @@ async fn receive_attempt(
             );
         }
         progressed = true;
+        tracing::trace!(
+            dc = ch.dc,
+            next = receiver.next_record(),
+            last,
+            "receiver: record stored"
+        );
         since_checkpoint += CHUNK_SIZE as u64;
         if last {
             return Outcome::AllStored;

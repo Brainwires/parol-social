@@ -3,7 +3,7 @@ name: Desktop spike (M0)
 # The GPUI video spike on the five desktop targets: build, the media crate's tests with its
 # device backends compiled in (libvpx, cpal, nokhwa), the media check (echo cancellation ERLE,
 # a synthetic camera through libvpx), a headless decode check (VP8 + an Opus tone from headless
-# Chromium through webrtc-rs-rtc), the desktop's call media against the headless bot
+# Chromium through rtci), the desktop's call media against the headless bot
 # (desktop-call.mjs), then a real window that shows the stream and a screenshot. Heavy, so it runs only by hand: dispatched, or once on a pull
 # request by adding the `desktop-spike` label (a workflow file can be dispatched only once it is on
 # the default branch).

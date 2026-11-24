@@ -18,10 +18,10 @@ use parolnet_protocol::ProtocolCodec as _;
 use parolnet_protocol::channel_binding::{BindingError, ChannelBinding};
 use parolnet_protocol::codec::CborCodec;
 use parolnet_protocol::shaping::{BandwidthMode, SendChoice, SendScheduler};
-use parolnet_rtc::rtc::peer_connection::sdp::{RTCSdpType, RTCSessionDescription};
-use parolnet_rtc::rtc::peer_connection::state::RTCPeerConnectionState;
-use parolnet_rtc::rtc::peer_connection::transport::RTCIceCandidateInit;
-use parolnet_rtc::rtc::rtp_transceiver::rtp_sender::RtpCodecKind;
+use parolnet_rtc::rtci::peer_connection::sdp::{RTCSdpType, RTCSessionDescription};
+use parolnet_rtc::rtci::peer_connection::state::RTCPeerConnectionState;
+use parolnet_rtc::rtci::peer_connection::transport::RTCIceCandidateInit;
+use parolnet_rtc::rtci::rtp_transceiver::rtp_sender::RtpCodecKind;
 use parolnet_rtc::{
     Gather, IcePolicy, MediaKind, NetworkMonitor, RtcConfig, RtcError, RtcEvent, RtcHandle,
     SystemNetwork, TurnServer,
@@ -295,6 +295,19 @@ struct Restart {
 }
 
 impl Conn {
+    /// An ICE restart, ours once answered or the peer's once applied, found its path: the
+    /// connection came back to connected, or (begun while connected) its new generation
+    /// selected a pair.
+    fn complete_restart(&mut self, peer: &str) {
+        if self.restart.as_ref().is_some_and(|r| r.answered) {
+            tracing::info!(peer = %crate::short_id(peer), "ICE restart complete");
+            self.restart = None;
+            self.restarts_done += 1;
+        } else if std::mem::take(&mut self.peer_restarting) {
+            self.restarts_done += 1;
+        }
+    }
+
     fn is_open(&self) -> bool {
         self.dc.is_some()
     }
@@ -1956,13 +1969,7 @@ impl Engine {
                         }
                     }
                     RTCPeerConnectionState::Connected => {
-                        if conn.restart.as_ref().is_some_and(|r| r.answered) {
-                            tracing::info!(peer = %crate::short_id(peer), "ICE restart complete");
-                            conn.restart = None;
-                            conn.restarts_done += 1;
-                        } else if std::mem::take(&mut conn.peer_restarting) {
-                            conn.restarts_done += 1;
-                        }
+                        conn.complete_restart(peer);
                         if verified {
                             self.set_path(peer, PathState::Direct);
                             self.flush_call_signals(peer);
@@ -2010,6 +2017,9 @@ impl Engine {
                 };
                 self.conn_failed(peer, reason);
             }
+            // A restart begun while connected stays connected (W3C webrtc-pc 5.6.4, engine
+            // v0.22.0+brainwires.6): it completes when the new generation selects a pair.
+            RtcEvent::SelectedCandidatePairChanged => conn.complete_restart(peer),
             RtcEvent::IceConnectionState(_)
             | RtcEvent::Track { .. }
             | RtcEvent::Rtp { .. }
@@ -2892,6 +2902,16 @@ impl Engine {
                 let first = !c.described;
                 let incoming = c.info.incoming;
                 let is_offer = desc.sdp_type == RTCSdpType::Offer;
+                if !first && is_offer && !c.info.renegotiable {
+                    // An offer the connection made by itself (SRTP re-keying, PNP-011 section
+                    // 7.6) to a peer that does not renegotiate: never sent (PNP-011-MUST-020).
+                    // The call goes on as it was set up.
+                    tracing::info!(call = %call_id, "re-offer to a peer that does not renegotiate taken back");
+                    if let Some(h) = c.handle.as_ref() {
+                        let _ = h.rollback();
+                    }
+                    return;
+                }
                 let sig = match (first, is_offer) {
                     (true, false) => CallSignal::Answer {
                         call_id: call_id.to_owned(),

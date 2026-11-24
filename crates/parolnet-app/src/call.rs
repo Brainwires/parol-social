@@ -15,7 +15,7 @@
 
 use std::time::Duration;
 
-use parolnet_rtc::rtc::peer_connection::transport::RTCIceCandidateInit;
+use parolnet_rtc::rtci::peer_connection::transport::RTCIceCandidateInit;
 use parolnet_rtc::{
     CongestionConfig, ConnectionQuality, FrameSender, MediaConfig, MediaKind, RtcConfig,
 };
@@ -200,7 +200,7 @@ pub enum MediaEvent {
     /// One RTP packet of a remote track (after SRTP), to depacketize and decode.
     Rtp {
         kind: MediaKind,
-        packet: parolnet_rtc::rtc::rtp::Packet,
+        packet: parolnet_rtc::rtci::rtp::Packet,
     },
     /// The contact asked for a keyframe of our video.
     KeyframeRequested,

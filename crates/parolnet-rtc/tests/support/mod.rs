@@ -7,9 +7,9 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
-use parolnet_rtc::rtc::peer_connection::sdp::{RTCSdpType, RTCSessionDescription};
-use parolnet_rtc::rtc::peer_connection::state::RTCPeerConnectionState;
-use parolnet_rtc::rtc::rtp_transceiver::rtp_sender::RtpCodecKind;
+use parolnet_rtc::rtci::peer_connection::sdp::{RTCSdpType, RTCSessionDescription};
+use parolnet_rtc::rtci::peer_connection::state::RTCPeerConnectionState;
+use parolnet_rtc::rtci::rtp_transceiver::rtp_sender::RtpCodecKind;
 use parolnet_rtc::{ConnectionQuality, MediaKind, RtcConfig, RtcEvent, RtcHandle, spawn};
 use tokio::sync::mpsc::Receiver;
 
@@ -117,8 +117,17 @@ impl Peer {
             RtcEvent::Quality(q) => self.seen.quality.push(q),
             RtcEvent::RemoteOfferIgnored => self.seen.ignored_offers += 1,
             RtcEvent::KeyframeRequested => self.seen.keyframe_requests += 1,
-            RtcEvent::Closed { error } => panic!("connection closed: {error:?}"),
+            RtcEvent::Closed { error } => panic!(
+                "connection closed: {error:?}; states {:?}; descriptions {:?}",
+                self.seen.states,
+                self.seen
+                    .descriptions
+                    .iter()
+                    .map(|d| (d.sdp_type, parolnet_rtc::tls_id(&d.sdp).map(str::to_owned)))
+                    .collect::<Vec<_>>()
+            ),
             RtcEvent::IceConnectionState(_)
+            | RtcEvent::SelectedCandidatePairChanged
             | RtcEvent::DataChannelClose { .. }
             | RtcEvent::DataChannelBufferedLow { .. } => {}
         }

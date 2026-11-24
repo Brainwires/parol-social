@@ -3,7 +3,7 @@
 
 use std::time::{Duration, Instant};
 
-use parolnet_rtc::rtc::peer_connection::sdp::RTCSessionDescription;
+use parolnet_rtc::rtci::peer_connection::sdp::RTCSessionDescription;
 use parolnet_rtc::{RtcConfig, RtcEvent, RtcHandle, spawn};
 use tokio::sync::mpsc::Receiver;
 use tokio::time::timeout;

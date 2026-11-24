@@ -9,7 +9,7 @@
 //! encoder and decoder (`media_check.rs`).
 //!
 //! With `--spike` (or any of the spike's flags below) it is the M0 spike: a GPUI window that
-//! shows a VP8 stream received from a peer (Chromium in the tests) through `webrtc-rs-rtc`,
+//! shows a VP8 stream received from a peer (Chromium in the tests) through `rtci`,
 //! decoded with libvpx. The call view of M1 grows out of it.
 //!
 //! ```text

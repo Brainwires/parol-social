@@ -1,6 +1,6 @@
 //! Relay candidates from a TURN server the user configured (RFC 8656 over UDP).
 //!
-//! The engine's `rtc-turn` client is sans-I/O; this module owns its I/O on the connection's
+//! The engine's `rtci-turn` client is sans-I/O; this module owns its I/O on the connection's
 //! own socket: the allocation before the loop starts, then permissions, channel bindings,
 //! refreshes and the data path while the connection runs, and the release when it closes.
 //! Authentication is the long-term credential mechanism (username and password).
@@ -13,10 +13,10 @@ use std::net::{IpAddr, SocketAddr};
 use std::time::{Duration, Instant};
 
 use bytes::BytesMut;
-use rtc::sansio::Protocol;
-use rtc::shared::{TaggedBytesMut, TransportContext, TransportProtocol};
-use rtc::stun::message::TransactionId;
-use rtc::turn::client::{Client, ClientConfig, Event};
+use rtci::sansio::Protocol;
+use rtci::shared::{TaggedBytesMut, TransportContext, TransportProtocol};
+use rtci::stun::message::TransactionId;
+use rtci::turn::client::{Client, ClientConfig, Event};
 use zeroize::Zeroize;
 
 use crate::RtcError;
@@ -156,7 +156,7 @@ pub(crate) async fn allocate(
         Ok(Err(err)) => return Err(turn_error("resolving the TURN server", err)),
         Err(_) => return Err(RtcError::Turn("resolving the TURN server timed out".into())),
     };
-    let provider = rtc::crypto::default_provider().map_err(|e| turn_error("crypto", e))?;
+    let provider = rtci::crypto::default_provider().map_err(|e| turn_error("crypto", e))?;
     let mut client = Client::new(
         ClientConfig {
             turn_serv_addr: server_addr.to_string(),
@@ -165,6 +165,10 @@ pub(crate) async fn allocate(
             username: server.username.clone(),
             password: server.password.clone(),
             allocation_refresh_interval_cap: Some(keepalive),
+            // No SOFTWARE attribute (`ClientConfig::software` empty): the engine's default
+            // names `rtci-turn` and its version, an implementation fingerprint on the path
+            // that THREAT_MODEL.md does not want on the wire.
+            software: String::new(),
             ..Default::default()
         },
         provider,

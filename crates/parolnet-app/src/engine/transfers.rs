@@ -7,7 +7,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use parolnet_core::envelope::encrypt_for_peer;
-use parolnet_rtc::rtc::peer_connection::state::RTCPeerConnectionState;
+use parolnet_rtc::rtci::peer_connection::state::RTCPeerConnectionState;
 use parolnet_transfer::{
     CancelReason, ChannelAdmission, Control, FileKey, MAX_CONCURRENT_PER_CONNECTION,
     MSG_TYPE_FILE_TRANSFER, Offer, OfferLimiter, Phase, Role, TRANSFER_MAX_AGE_MS, TransferId,
@@ -643,6 +643,7 @@ impl Engine {
                 .and_then(|p| p.conn.as_ref())
                 .and_then(|c| c.handle.as_ref())
                 .is_some_and(|h| h.open_data_channel(label).is_ok());
+            tracing::debug!(transfer = %id, asked, "receiver asks for a transfer channel");
             if !asked {
                 continue;
             }
@@ -750,6 +751,7 @@ impl Engine {
             .find(|t| t.id == id && t.peer_id == peer)
             .map(|t| (t.role(), t.phase.phase()));
 
+        tracing::debug!(transfer = %id, dc, ?known, verified, "transfer channel opened");
         // The channel we asked for.
         let ours = known == Some((Role::Receiver, Phase::Accepted))
             && self.xfer.workers.get(&id).is_some_and(|w| {
@@ -820,6 +822,7 @@ impl Engine {
             .as_ref()
             .is_some_and(|c| c.epoch == epoch && c.dc.is_none())
         {
+            tracing::debug!(transfer = %id, "the transfer channel did not open in time");
             w.chan = None;
             w.idle_attempts += 1;
             if let Some(peer) = self.transfer(id).map(|t| t.peer_id.clone()) {
@@ -852,6 +855,7 @@ impl Engine {
                 self.emit_transfer(id);
             }
             WorkerEvent::AttemptEnded { progressed } => {
+                tracing::debug!(transfer = %id, incoming, progressed, "transfer attempt ended");
                 let mut wait = Duration::from_millis(100);
                 if let Some(w) = self.xfer.workers.get_mut(id) {
                     w.chan = None;

@@ -13,29 +13,30 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 
-use rtc::crypto::RTCCryptoProvider;
-use rtc::stun::attributes::{
-    ATTR_MESSAGE_INTEGRITY, ATTR_NONCE, ATTR_REALM, ATTR_USERNAME, ATTR_XOR_PEER_ADDRESS,
+use rtci::crypto::RTCCryptoProvider;
+use rtci::stun::attributes::{
+    ATTR_MESSAGE_INTEGRITY, ATTR_NONCE, ATTR_REALM, ATTR_SOFTWARE, ATTR_USERNAME,
+    ATTR_XOR_PEER_ADDRESS,
 };
-use rtc::stun::error_code::{
+use rtci::stun::error_code::{
     CODE_ALLOC_MISMATCH, CODE_BAD_REQUEST, CODE_UNAUTHORIZED, ErrorCode, ErrorCodeAttribute,
 };
-use rtc::stun::fingerprint::FINGERPRINT;
-use rtc::stun::integrity::MessageIntegrity;
-use rtc::stun::message::{
+use rtci::stun::fingerprint::FINGERPRINT;
+use rtci::stun::integrity::MessageIntegrity;
+use rtci::stun::message::{
     CLASS_ERROR_RESPONSE, CLASS_INDICATION, CLASS_REQUEST, CLASS_SUCCESS_RESPONSE, Getter as _,
     MAGIC_COOKIE, METHOD_ALLOCATE, METHOD_BINDING, METHOD_CHANNEL_BIND, METHOD_CREATE_PERMISSION,
     METHOD_DATA, METHOD_REFRESH, METHOD_SEND, Message, MessageType, Setter, TransactionId,
     is_stun_message,
 };
-use rtc::stun::textattrs::TextAttribute;
-use rtc::stun::xoraddr::XorMappedAddress;
-use rtc::turn::proto::chandata::ChannelData;
-use rtc::turn::proto::channum::ChannelNumber;
-use rtc::turn::proto::data::Data;
-use rtc::turn::proto::lifetime::Lifetime;
-use rtc::turn::proto::peeraddr::PeerAddress;
-use rtc::turn::proto::relayaddr::RelayedAddress;
+use rtci::stun::textattrs::TextAttribute;
+use rtci::stun::xoraddr::XorMappedAddress;
+use rtci::turn::proto::chandata::ChannelData;
+use rtci::turn::proto::channum::ChannelNumber;
+use rtci::turn::proto::data::Data;
+use rtci::turn::proto::lifetime::Lifetime;
+use rtci::turn::proto::peeraddr::PeerAddress;
+use rtci::turn::proto::relayaddr::RelayedAddress;
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
@@ -51,6 +52,7 @@ struct Stats {
     relayed: AtomicU64,
     refused: AtomicU64,
     refreshes: AtomicU64,
+    software: AtomicU64,
 }
 
 /// The server; it stops when dropped.
@@ -71,7 +73,7 @@ impl TestTurnServer {
     pub async fn start(username: &str, password: &str) -> std::io::Result<TestTurnServer> {
         let socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await?;
         let addr = socket.local_addr()?;
-        let provider = rtc::crypto::default_provider().map_err(std::io::Error::other)?;
+        let provider = rtci::crypto::default_provider().map_err(std::io::Error::other)?;
         let key = MessageIntegrity::long_term_integrity_key(
             username.to_owned(),
             REALM.to_owned(),
@@ -128,6 +130,23 @@ impl TestTurnServer {
     pub fn refused_requests(&self) -> u64 {
         self.stats.refused.load(Ordering::Relaxed)
     }
+
+    /// STUN messages carrying a SOFTWARE attribute (RFC 8489 section 14.14): the client's own
+    /// requests and indications, and the STUN messages it relays to peers (ICE checks and
+    /// their responses inside Send indications and ChannelData).
+    pub fn stun_with_software(&self) -> u64 {
+        self.stats.software.load(Ordering::Relaxed)
+    }
+}
+
+/// Whether `data` is a STUN message with a SOFTWARE attribute.
+fn carries_software(data: &[u8]) -> bool {
+    if !is_stun_message(data) {
+        return false;
+    }
+    let mut msg = Message::new();
+    msg.raw = data.to_vec();
+    msg.decode().is_ok() && msg.contains(ATTR_SOFTWARE)
 }
 
 struct Allocation {
@@ -182,7 +201,7 @@ impl Server {
     fn reply(
         &self,
         request: &Message,
-        class: rtc::stun::message::MessageClass,
+        class: rtci::stun::message::MessageClass,
         attrs: Vec<Box<dyn Setter>>,
         signed: bool,
     ) -> Vec<u8> {
@@ -211,7 +230,7 @@ impl Server {
         &self,
         to: SocketAddr,
         request: &Message,
-        class: rtc::stun::message::MessageClass,
+        class: rtci::stun::message::MessageClass,
         attrs: impl FnOnce() -> Vec<Box<dyn Setter>>,
         signed: bool,
     ) {
@@ -258,6 +277,9 @@ impl Server {
         msg.raw = data.to_vec();
         if msg.decode().is_err() {
             return;
+        }
+        if msg.contains(ATTR_SOFTWARE) {
+            self.stats.software.fetch_add(1, Ordering::Relaxed);
         }
         if msg.typ.class == CLASS_INDICATION {
             if msg.typ.method == METHOD_SEND {
@@ -420,6 +442,9 @@ impl Server {
             return;
         }
         let to = SocketAddr::new(peer.ip, peer.port);
+        if carries_software(&data.0) {
+            self.stats.software.fetch_add(1, Ordering::Relaxed);
+        }
         if allocation.relay.send_to(&data.0, to).await.is_ok() {
             self.stats.relayed.fetch_add(1, Ordering::Relaxed);
         }
@@ -439,6 +464,9 @@ impl Server {
         let Some(peer) = allocation.peer_of.get(&channel.number.0) else {
             return;
         };
+        if carries_software(&channel.data) {
+            self.stats.software.fetch_add(1, Ordering::Relaxed);
+        }
         if allocation.relay.send_to(&channel.data, peer).await.is_ok() {
             self.stats.relayed.fetch_add(1, Ordering::Relaxed);
         }
@@ -458,7 +486,11 @@ impl Server {
                 number: ChannelNumber(*number),
                 ..Default::default()
             };
-            channel.encode();
+            // Refused only for data longer than a ChannelData message carries (a UDP
+            // datagram never is); drop it as the Data-indication path below does.
+            if channel.encode().is_err() {
+                return;
+            }
             channel.raw
         } else {
             let mut msg = Message::new();

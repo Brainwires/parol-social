@@ -11,7 +11,7 @@ in the timeline; files travel only over the direct connection and received ones 
 [docs/m1-desktop.md](../../docs/m1-desktop.md).
 
 With `--spike` (or any spike flag) it is the M0 spike: a window that shows a VP8 stream received
-through `webrtc-rs-rtc` (via `parolnet-rtc`) and decoded with libvpx. Findings:
+through the `rtci` engine (via `parolnet-rtc`) and decoded with libvpx. Findings:
 [docs/m0-spike.md](../../docs/m0-spike.md).
 
 This directory is its own Cargo workspace: it pins a newer toolchain (`rust-toolchain.toml`) and

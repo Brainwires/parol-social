@@ -61,7 +61,7 @@ apps/desktop (GPUI)      web/ (TS + wasm)        later: iOS / Android shells (Un
             |        |          |            |            |
    parolnet-core  parolnet-call  parolnet-transfer  parolnet-mls  parolnet-store
                   |        \
-              parolnet-media  parolnet-rtc ── webrtc-rs-rtc (sans-I/O) ── rtc-turn / rtc-stun / rtc-ice
+              parolnet-media  parolnet-rtc ── rtci (sans-I/O) ── rtci-turn / rtci-stun / rtci-ice
                                    |
    relay-server (+ feature sfu → parolnet-sfu)      coturn (until a Rust TURN server)
 ```
@@ -74,7 +74,7 @@ apps/desktop (GPUI)      web/ (TS + wasm)        later: iOS / Android shells (Un
 | `parolnet-core` | Client library: bootstrap, sessions, groups, files | exists |
 | `parolnet-wasm` | Browser bindings for the PWA | exists |
 | `parolnet-relay-server` | Axum relay: signaling-only by default (register, SDP / ICE, presence, STUN URIs); opt-in relay profile with store-and-forward, federation, TURN credentials | exists |
-| `parolnet-rtc` | Async driver for the sans-I/O [`webrtc-rs-rtc`](https://github.com/Brainwires/webrtc-rs-rtc) engine (native): sockets on every interface (IPv4 and IPv6), STUN and the user's TURN server, data channels, RTP with RTX, ICE restart, track renegotiation, the congestion controller's estimate, a statistics digest; runs on real sockets or, in virtual time, on `parolnet-simnet` | M1 |
+| `parolnet-rtc` | Async driver for the sans-I/O [`rtci`](https://crates.io/crates/rtci) ([source](https://github.com/Brainwires/rtci)) engine (native): sockets on every interface (IPv4 and IPv6), STUN and the user's TURN server, data channels, RTP with RTX, ICE restart, track renegotiation, the congestion controller's estimate, a statistics digest; runs on real sockets or, in virtual time, on `parolnet-simnet` | M1 |
 | `parolnet-store` | Encrypted native persistence: SQLite with SQLCipher (bundled), database key in the OS keychain (`keyring`) or an owner-only key file on machines without one; identity, contacts, sessions, messages, sender queue, settings; schema migrations, incremental transactional writes, import of the earlier plaintext data directory, wipe | M1 |
 | `parolnet-app` | Headless client core: identity, PNP-003 pairing (code or QR, verification code, the same exchange as the web app), signaling-only relay client, a direct data channel per contact bound to the E2EE session (DTLS fingerprints, PNP-001 §10.5.1), 1:1 encrypted chat paced by the PNP-006 bandwidth mode, sender-side queue, 1:1 voice / video calls, file transfer that survives a lost connection and a restart (PNP-010) | M1 |
 | `apps/desktop` | GPUI desktop client: contacts, pairing, chat (UI v0), 1:1 calls with camera, echo cancellation and device menus; the M0 video spike behind `--spike` | M1 |

@@ -4,8 +4,8 @@
 
 use std::time::Duration;
 
-use parolnet_rtc::rtc::stun::message::{BINDING_SUCCESS, Message, TransactionId};
-use parolnet_rtc::rtc::stun::xoraddr::XorMappedAddress;
+use parolnet_rtc::rtci::stun::message::{BINDING_SUCCESS, Message, TransactionId};
+use parolnet_rtc::rtci::stun::xoraddr::XorMappedAddress;
 use parolnet_rtc::{RtcConfig, RtcEvent, spawn};
 use tokio::net::UdpSocket;
 

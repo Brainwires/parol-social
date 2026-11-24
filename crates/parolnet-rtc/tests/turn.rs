@@ -10,7 +10,7 @@
 use std::net::{IpAddr, SocketAddr};
 use std::time::Duration;
 
-use parolnet_rtc::rtc::peer_connection::sdp::RTCSessionDescription;
+use parolnet_rtc::rtci::peer_connection::sdp::RTCSessionDescription;
 use parolnet_rtc::test_turn::TestTurnServer;
 use parolnet_rtc::{IcePolicy, RtcConfig, RtcError, RtcEvent, RtcHandle, TurnServer, spawn};
 use tokio::sync::mpsc::Receiver;
@@ -146,12 +146,17 @@ async fn relay_only_on_both_sides_goes_through_the_turn_server() {
             !sdp.contains(&format!(" {} ", handle.local_addr().port())),
             "the socket's port is in the description: {sdp}"
         );
-        assert!(sdp.contains("raddr 0.0.0.0 rport 0"), "{sdp}");
+        // The related address is hidden: since engine v0.22.0+brainwires.6 the relay policy
+        // signals it as `raddr 0.0.0.0 rport 9` (RFC 8827 section 6.4), where it was rport 0.
+        assert!(sdp.contains("raddr 0.0.0.0 rport 9"), "{sdp}");
     }
     assert!(
         server.relayed_datagrams() > 20,
         "ICE, DTLS and SCTP went through the relay"
     );
+    // No implementation fingerprint (THREAT_MODEL.md): neither our TURN client's requests
+    // nor the engine's ICE checks and responses relayed through it carry SOFTWARE.
+    assert_eq!(server.stun_with_software(), 0);
 
     // Closing releases the allocations on the server.
     a.close().await;

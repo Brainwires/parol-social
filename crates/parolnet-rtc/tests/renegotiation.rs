@@ -6,7 +6,7 @@ mod support;
 
 use std::time::Duration;
 
-use parolnet_rtc::rtc::peer_connection::sdp::RTCSdpType;
+use parolnet_rtc::rtci::peer_connection::sdp::RTCSdpType;
 use parolnet_rtc::{CongestionConfig, MediaConfig, MediaKind, RtcConfig};
 use support::{Pair, ufrag};
 

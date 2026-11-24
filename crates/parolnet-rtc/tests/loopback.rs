@@ -9,7 +9,7 @@ use tokio::time::timeout;
 
 async fn next_description(
     events: &mut Receiver<RtcEvent>,
-) -> parolnet_rtc::rtc::peer_connection::sdp::RTCSessionDescription {
+) -> parolnet_rtc::rtci::peer_connection::sdp::RTCSessionDescription {
     loop {
         match events.recv().await.expect("events") {
             RtcEvent::LocalDescription(desc) => return *desc,

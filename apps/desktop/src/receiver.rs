@@ -11,10 +11,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, bail};
-use parolnet_rtc::rtc::media::io::sample_builder::SampleBuilder;
-use parolnet_rtc::rtc::peer_connection::sdp::RTCSessionDescription;
-use parolnet_rtc::rtc::rtp::codec::vp8::Vp8Packet;
-use parolnet_rtc::rtc::rtp_transceiver::rtp_sender::RtpCodecKind;
+use parolnet_rtc::rtci::media::io::sample_builder::SampleBuilder;
+use parolnet_rtc::rtci::peer_connection::sdp::RTCSessionDescription;
+use parolnet_rtc::rtci::rtp::codec::vp8::Vp8Packet;
+use parolnet_rtc::rtci::rtp_transceiver::rtp_sender::RtpCodecKind;
 use parolnet_rtc::{MediaConfig, RtcConfig, RtcEvent};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -197,7 +197,7 @@ async fn run_session(
 
     let mut video_track = None;
     let mut audio: Option<(
-        parolnet_rtc::rtc::media_stream::MediaStreamTrackId,
+        parolnet_rtc::rtci::media_stream::MediaStreamTrackId,
         OpusDecoder,
     )> = None;
     let mut builder = SampleBuilder::new(256, Vp8Packet::default(), 90_000);
