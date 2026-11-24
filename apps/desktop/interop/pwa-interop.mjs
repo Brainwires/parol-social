@@ -434,6 +434,33 @@ class Client {
           };
           this.addEventListener("connectionstatechange", watch);
           this.addEventListener("iceconnectionstatechange", watch);
+          // PROBE (webkit-case6): a timeline of descriptions, states and transports.
+          this.__timeline = [];
+          const mark = (what) => this.__timeline.push(`${Math.round(performance.now() - t0)} ${what}`);
+          const tracked = new Set();
+          const trackTransports = () => {
+            this.getTransceivers().forEach((t) => {
+              const d = t.sender.transport;
+              if (!d || tracked.has(d)) return;
+              tracked.add(d);
+              const id = tracked.size;
+              mark(`mid ${t.mid} -> dtls#${id} (${d.state}, ice ${d.iceTransport?.state})`);
+              d.addEventListener("statechange", () => mark(`dtls#${id} ${d.state}`));
+              d.iceTransport?.addEventListener("statechange", () => mark(`ice#${id} ${d.iceTransport.state}`));
+            });
+          };
+          this.addEventListener("connectionstatechange", () => mark(`pc ${this.connectionState}`));
+          this.addEventListener("iceconnectionstatechange", () => mark(`pc-ice ${this.iceConnectionState}`));
+          this.addEventListener("signalingstatechange", () => { mark(`signaling ${this.signalingState}`); trackTransports(); });
+          for (const name of ["setLocalDescription", "setRemoteDescription"]) {
+            const orig = this[name].bind(this);
+            this[name] = async (...a) => {
+              const r = await orig(...a);
+              mark(`${name}(${a[0]?.type ?? "implicit"}) done; senders' dtls ${JSON.stringify(this.getSenders().map((x) => x.transport?.state))}`);
+              trackTransports();
+              return r;
+            };
+          }
         }
       };
     });
@@ -920,6 +947,8 @@ async function probeOldCriterion(pwa, tag, s) {
   }
   const verdict = cur.state === "connected" ? `connected after ${Date.now() - t0} ms` : "STUCK";
   log(`PROBE ${tag}: decoded (frames ${s.videoFrames}, key frames ${s.keyFrames}, audio packets ${s.audioPackets}) with connectionState "${s.state}" transports ${JSON.stringify(s.transports)}; old criterion: ${verdict}`);
+  const tl = await pwa.page.evaluate(() => (window.__pcs || []).filter((pc) => pc.connectionState !== "closed" && pc.getTransceivers().length > 0).map((pc) => ({ role: pc.localDescription?.type, pairs: pc.__pairChanges, timeline: pc.__timeline })));
+  log(`PROBE ${tag}: verdict ${verdict === "STUCK" ? "STUCK" : "OK"} timeline ${JSON.stringify(tl)}`);
   if (verdict === "STUCK") console.log(`PROBE ${tag}: diag ${JSON.stringify(await pwa.diag())}`);
 }
 
