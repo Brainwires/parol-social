@@ -117,7 +117,15 @@ impl Peer {
             RtcEvent::Quality(q) => self.seen.quality.push(q),
             RtcEvent::RemoteOfferIgnored => self.seen.ignored_offers += 1,
             RtcEvent::KeyframeRequested => self.seen.keyframe_requests += 1,
-            RtcEvent::Closed { error } => panic!("connection closed: {error:?}"),
+            RtcEvent::Closed { error } => panic!(
+                "connection closed: {error:?}; states {:?}; descriptions {:?}",
+                self.seen.states,
+                self.seen
+                    .descriptions
+                    .iter()
+                    .map(|d| (d.sdp_type, parolnet_rtc::tls_id(&d.sdp).map(str::to_owned)))
+                    .collect::<Vec<_>>()
+            ),
             RtcEvent::IceConnectionState(_)
             | RtcEvent::SelectedCandidatePairChanged
             | RtcEvent::DataChannelClose { .. }

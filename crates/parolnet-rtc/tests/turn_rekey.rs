@@ -72,6 +72,11 @@ async fn feed(pair: &mut Pair, millis: u64) {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_relay_only_call_re_keys_on_new_allocations() {
+    // The driver's own log (debug), shown when the test fails.
+    let _ = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::DEBUG)
+        .with_test_writer()
+        .try_init();
     let server = TestTurnServer::start(USER, PASS).await.unwrap();
     // About 150 packets a second from `a`: its key nears its end (15/16 of 1600) after
     // about 10 s, and the last 100 packets leave about 0.7 s for the re-keying.
