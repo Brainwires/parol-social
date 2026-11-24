@@ -78,7 +78,10 @@
 //      the ICE controlling side (it offers). Chromium, holding media permission, gathers on
 //      every interface and may move its nomination to another pair a moment after connecting;
 //      the desktop (controlled) must follow the later nomination (webrtc-rs-rtc
-//      v0.22.0+brainwires.5). INTEROP_PWA_CALLS=0 skips it.
+//      v0.22.0+brainwires.5). The call counts as up by the web app's own rule (every DTLS
+//      transport its senders still use is connected): Linux WebKit, the offerer here,
+//      sometimes leaves `connectionState` at "connecting" for good when its DTLS transport
+//      connects before the answer is applied (see `callStats`). INTEROP_PWA_CALLS=0 skips it.
 //   7. A data channel the PWA offers while it holds camera and microphone permission (a live
 //      getUserMedia stream): the same renomination as case 6 on a chat connection. The PWA
 //      pastes the desktop's code and must be the offerer; bindings verified, messages both
@@ -100,13 +103,13 @@
 import { chromium, firefox, webkit } from "playwright";
 import { spawn } from "node:child_process";
 import { createServer } from "node:http";
-import { connect as netConnect, createServer as netCreateServer } from "node:net";
 import { createHash, randomFillSync } from "node:crypto";
 import { closeSync, existsSync, mkdtempSync, openSync, rmSync, statSync, writeSync } from "node:fs";
 import { networkInterfaces, tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { createInterface } from "node:readline";
 import { fileURLToPath } from "node:url";
+import { spawnRelay } from "../../../web/tests/e2e/relay-process.mjs";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const root = resolve(here, "../../..");
@@ -162,17 +165,6 @@ async function until(what, ms, fn, every = 200) {
   throw new Error(`timed out after ${ms} ms waiting for ${what}${last ? ` (${last.message})` : ""}`);
 }
 
-function freePort() {
-  return new Promise((res, rej) => {
-    const s = netCreateServer();
-    s.listen(0, "127.0.0.1", () => {
-      const { port } = s.address();
-      s.close(() => res(port));
-    });
-    s.on("error", rej);
-  });
-}
-
 /// The address host candidates use in mdns and host mode: the default-route IPv4 interface.
 function lanIPv4() {
   for (const list of Object.values(networkInterfaces())) {
@@ -187,12 +179,11 @@ function lanIPv4() {
 
 async function startRelay() {
   if (!existsSync(relayBin)) throw new Error(`relay binary not found: ${relayBin} (cargo build -p parolnet-relay-server)`);
-  const port = await freePort();
   const dir = join(work, "relay");
-  const child = spawn(relayBin, [], {
+  // Port 0: the relay picks its own and reports it (web/tests/e2e/relay-process.mjs).
+  const { child, port } = await spawnRelay(relayBin, {
     env: {
       PATH: process.env.PATH,
-      RELAY_PORT: String(port),
       RELAY_KEY_FILE: join(dir, "relay.key"),
       RELAY_AUTHORITY_KEY_FILE: join(dir, "relay-authority.cbor"),
       RUST_LOG: "warn",
@@ -201,18 +192,10 @@ async function startRelay() {
       RELAY_MAX_PEERS_PER_IP: "16",
       RELAY_MAX_CONNS_PER_IP: "32",
     },
-    stdio: ["ignore", "ignore", verbose ? "inherit" : "ignore"],
+    stderr: verbose ? "inherit" : "ignore",
+    echo: verbose,
   });
   cleanups.push(() => child.kill());
-  await until("the relay to listen", 20_000, () =>
-    new Promise((res) => {
-      const s = netConnect(port, "127.0.0.1", () => {
-        s.end();
-        res(true);
-      });
-      s.on("error", () => res(false));
-    }),
-  );
   log(`relay on 127.0.0.1:${port}`);
   return port;
 }
@@ -468,11 +451,33 @@ class Client {
       .evaluate(async () => {
         const out = [];
         for (const pc of window.__pcs || []) {
-          const r = { state: pc.connectionState, ice: pc.iceConnectionState, role: pc.localDescription?.type, pairChanges: pc.__pairChanges, pairs: [], transports: [] };
+          const r = {
+            state: pc.connectionState,
+            ice: pc.iceConnectionState,
+            role: pc.localDescription?.type,
+            pairChanges: pc.__pairChanges,
+            // The transports the browser's own objects report (connectionState is built from
+            // these), and how the descriptions bundled the media lines.
+            transceivers: pc.getTransceivers().map((t) => ({
+              mid: t.mid,
+              direction: t.currentDirection,
+              dtls: t.sender.transport?.state,
+              ice: t.sender.transport?.iceTransport?.state,
+            })),
+            sctp: pc.sctp ? pc.sctp.transport?.state : undefined,
+            bundle: [pc.localDescription, pc.remoteDescription].map((d) => d?.sdp.match(/^a=group:BUNDLE.*$/m)?.[0] ?? null),
+            pairs: [],
+            transports: [],
+            inbound: [],
+          };
           const stats = await pc.getStats();
           const byId = new Map();
           stats.forEach((s) => byId.set(s.id, s));
           stats.forEach((s) => {
+            if (s.type === "inbound-rtp") {
+              const { kind, ssrc, packetsReceived, packetsLost, framesDecoded, keyFramesDecoded, pliCount, firCount, nackCount, totalSamplesReceived } = s;
+              r.inbound.push({ kind, ssrc, packetsReceived, packetsLost, framesDecoded, keyFramesDecoded, pliCount, firCount, nackCount, totalSamplesReceived });
+            }
             if (s.type === "transport") r.transports.push({ dtls: s.dtlsState, role: s.dtlsRole, selected: s.selectedCandidatePairId });
             if (s.type === "candidate-pair" && (s.nominated || s.state === "succeeded")) {
               const l = byId.get(s.localCandidateId), rc = byId.get(s.remoteCandidateId);
@@ -487,18 +492,36 @@ class Client {
   }
 
   /// What the PWA's call connection receives: decoded video frames and audio.
+  ///
+  /// `connected` is the web app's own rule for a call being up (web/src/engine/calls.ts,
+  /// `watchTransports`): `connectionState` is "connected", or every DTLS transport its senders
+  /// still use is. Playwright's Linux WebKit, as the offerer, sometimes never sets
+  /// `connectionState` to "connected": when its bundled DTLS transport reports "connected"
+  /// before the answer has been applied (before `signalingState` "stable" and
+  /// `iceConnectionState` "connected"), the state it computes then is "connecting" and the later
+  /// ICE change does not recompute it, although every transport is connected and media is
+  /// decoded (W3C webrtc-pc, RTCPeerConnectionState "connected"). A desktop whose DTLS
+  /// handshake completes within a few milliseconds of ICE (rtci 0.1.0) hits it in about one
+  /// call in twenty. `state` is the browser's own `connectionState`, `transports` the
+  /// senders' transport states, for the log.
   async callStats() {
     return this.page.evaluate(async () => {
-      const out = { videoFrames: 0, videoPackets: 0, audioPackets: 0, audioSamples: 0, connected: false };
+      const out = { videoFrames: 0, videoPackets: 0, keyFrames: 0, audioPackets: 0, audioSamples: 0, connected: false, state: null, transports: [] };
       for (const pc of window.__pcs || []) {
         if (pc.connectionState === "closed") continue;
         if (!pc.getReceivers().some((r) => r.track && r.track.kind === "video" || r.track && r.track.kind === "audio")) continue;
-        if (pc.connectionState === "connected") out.connected = true;
+        const transports = [...new Set(pc.getSenders().map((s) => s.transport).filter(Boolean))];
+        const live = transports.filter((t) => t.state !== "closed");
+        const transportsUp = live.length > 0 && live.every((t) => t.state === "connected");
+        if (pc.connectionState === "connected" || transportsUp) out.connected = true;
+        out.state = pc.connectionState;
+        out.transports = transports.map((t) => t.state);
         (await pc.getStats()).forEach((s) => {
           if (s.type !== "inbound-rtp") return;
           if (s.kind === "video") {
             out.videoFrames = Math.max(out.videoFrames, s.framesDecoded || 0);
             out.videoPackets = Math.max(out.videoPackets, s.packetsReceived || 0);
+            out.keyFrames = Math.max(out.keyFrames, s.keyFramesDecoded || 0);
           } else if (s.kind === "audio") {
             out.audioPackets = Math.max(out.audioPackets, s.packetsReceived || 0);
             out.audioSamples = Math.max(out.audioSamples, s.totalSamplesReceived || 0);
@@ -858,10 +881,15 @@ async function botMedia(bot, callId, n, what) {
 }
 
 async function pwaDecodes(pwa, what) {
-  return until(what, 30_000, async () => {
-    const s = await pwa.callStats();
-    return s.connected && s.videoFrames >= 20 && s.audioPackets >= 50 && s.audioSamples > 0 ? s : null;
-  });
+  let last = null;
+  try {
+    return await until(what, 30_000, async () => {
+      const s = (last = await pwa.callStats());
+      return s.connected && s.videoFrames >= 20 && s.audioPackets >= 50 && s.audioSamples > 0 ? s : null;
+    });
+  } catch (e) {
+    throw new Error(`${e.message}; last seen ${JSON.stringify(last)}`);
+  }
 }
 
 async function caseCalls(ctx) {
@@ -919,6 +947,9 @@ async function caseCalls(ctx) {
     const m5 = await botMedia(bot, ring.call_id, 50, `${tag}: the desktop receives ${Browser}'s VP8 and Opus`);
     const s5 = await pwaDecodes(pwa, `${tag}: ${Browser} decodes the desktop's VP8 and Opus`);
     log(`${tag}: desktop got audio ${m5.audio_rx} / video ${m5.video_rx} packets; PWA decoded ${s5.videoFrames} frames, ${s5.audioSamples} audio samples`);
+    if (s5.state !== "connected") {
+      log(`${tag}: ${Browser}'s connectionState is "${s5.state}" with its transports ${JSON.stringify(s5.transports)}: the call is up by the web app's rule (calls.ts, watchTransports)`);
+    }
     log(`${tag}: selected-pair changes on the PWA's connections: ${JSON.stringify(await pairChanges(pwa))}`);
     await pwa.hangupCall();
     await bot.wait("remote hang-up", (e) => e.event === "call" && e.call_id === ring.call_id && e.state === "Ended(RemoteHungUp)", 15_000);

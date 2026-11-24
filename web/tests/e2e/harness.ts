@@ -2,12 +2,11 @@
 // build without touching another), a recorder of everything the page must not do, and, for
 // the tests of real flows, a relay per test.
 import { expect, type Page, test as base } from "@playwright/test";
-import { spawn } from "node:child_process";
 import { existsSync, mkdtempSync, rmSync } from "node:fs";
-import { connect, createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { spawnRelay } from "./relay-process.mjs";
 import { startServer } from "./static-server.mjs";
 
 /** The production export (`denext task build`). */
@@ -121,17 +120,6 @@ export async function workerVersion(page: Page): Promise<string> {
   });
 }
 
-function freePort(): Promise<number> {
-  return new Promise((resolve, reject) => {
-    const probe = createServer();
-    probe.listen(0, "127.0.0.1", () => {
-      const { port } = probe.address() as { port: number };
-      probe.close(() => resolve(port));
-    });
-    probe.on("error", reject);
-  });
-}
-
 /** A relay in its default (signaling-only) profile, with its own state directory. */
 async function startRelay(): Promise<{ port: number; stop(): void }> {
   if (!existsSync(RELAY_BIN)) {
@@ -139,35 +127,28 @@ async function startRelay(): Promise<{ port: number; stop(): void }> {
       `relay binary not found: ${RELAY_BIN} (cargo build -p parolnet-relay-server --bin parolnet-relay, or set PAROLNET_RELAY_BIN)`,
     );
   }
-  const port = await freePort();
   const dir = mkdtempSync(join(tmpdir(), "parolnet-web-relay-"));
-  const child = spawn(RELAY_BIN, [], {
-    env: {
-      PATH: process.env.PATH,
-      RELAY_PORT: String(port),
-      RELAY_KEY_FILE: join(dir, "relay.key"),
-      RELAY_AUTHORITY_KEY_FILE: join(dir, "relay-authority.cbor"),
-      RUST_LOG: "warn",
-      // Every page shares one address here.
-      RELAY_CONN_PER_MINUTE: "1000",
-      RELAY_MAX_PEERS_PER_IP: "16",
-      RELAY_MAX_CONNS_PER_IP: "32",
-    },
-    stdio: ["ignore", "ignore", "inherit"],
-  });
-  const deadline = Date.now() + 20_000;
-  for (;;) {
-    const up = await new Promise<boolean>((resolve) => {
-      const socket = connect(port, "127.0.0.1", () => {
-        socket.end();
-        resolve(true);
-      });
-      socket.on("error", () => resolve(false));
+  // Port 0: the relay picks its own and reports it (relay-process.mjs).
+  let started;
+  try {
+    started = await spawnRelay(RELAY_BIN, {
+      env: {
+        PATH: process.env.PATH,
+        RELAY_KEY_FILE: join(dir, "relay.key"),
+        RELAY_AUTHORITY_KEY_FILE: join(dir, "relay-authority.cbor"),
+        RUST_LOG: "warn",
+        // Every page shares one address here.
+        RELAY_CONN_PER_MINUTE: "1000",
+        RELAY_MAX_PEERS_PER_IP: "16",
+        RELAY_MAX_CONNS_PER_IP: "32",
+      },
+      stderr: "inherit",
     });
-    if (up) break;
-    if (Date.now() > deadline) throw new Error("the relay did not start listening");
-    await new Promise((done) => setTimeout(done, 100));
+  } catch (err) {
+    rmSync(dir, { recursive: true, force: true });
+    throw err;
   }
+  const { child, port } = started;
   return {
     port,
     stop() {

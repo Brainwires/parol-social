@@ -22,12 +22,13 @@
 import { spawn } from "node:child_process";
 import { createReadStream, existsSync, mkdtempSync, rmSync, statSync } from "node:fs";
 import { createServer, request as httpRequest } from "node:http";
-import { connect as netConnect, createServer as netCreateServer } from "node:net";
+import { connect as netConnect } from "node:net";
 import { networkInterfaces, tmpdir } from "node:os";
 import { dirname, extname, join, normalize, resolve, sep } from "node:path";
 import { createInterface } from "node:readline";
 import { fileURLToPath } from "node:url";
 import { chromium, firefox, webkit } from "playwright";
+import { spawnRelay } from "../../e2e/relay-process.mjs";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const root = resolve(here, "../../../..");
@@ -125,17 +126,6 @@ async function confirmSasWithBot(web, bot) {
   assert(done.sas_verified === true, "the desktop recorded the confirmed code");
 }
 
-function freePort() {
-  return new Promise((res, rej) => {
-    const s = netCreateServer();
-    s.listen(0, "127.0.0.1", () => {
-      const { port } = s.address();
-      s.close(() => res(port));
-    });
-    s.on("error", rej);
-  });
-}
-
 function lanIPv4() {
   for (const list of Object.values(networkInterfaces())) {
     for (const a of list ?? []) if (a.family === "IPv4" && !a.internal) return a.address;
@@ -147,12 +137,11 @@ function lanIPv4() {
 
 async function startRelay() {
   if (!existsSync(relayBin)) throw new Error(`relay binary not found: ${relayBin}`);
-  const port = await freePort();
   const dir = join(work, "relay");
-  const child = spawn(relayBin, [], {
+  // Port 0: the relay picks its own and reports it (web/tests/e2e/relay-process.mjs).
+  const { child, port } = await spawnRelay(relayBin, {
     env: {
       PATH: process.env.PATH,
-      RELAY_PORT: String(port),
       RELAY_KEY_FILE: join(dir, "relay.key"),
       RELAY_AUTHORITY_KEY_FILE: join(dir, "relay-authority.cbor"),
       RUST_LOG: "warn",
@@ -161,17 +150,10 @@ async function startRelay() {
       RELAY_MAX_PEERS_PER_IP: "16",
       RELAY_MAX_CONNS_PER_IP: "32",
     },
-    stdio: ["ignore", "ignore", verbose ? "inherit" : "ignore"],
+    stderr: verbose ? "inherit" : "ignore",
+    echo: verbose,
   });
   cleanups.push(() => child.kill());
-  await until("the relay to listen", 20_000, () =>
-    new Promise((res) => {
-      const s = netConnect(port, "127.0.0.1", () => {
-        s.end();
-        res(true);
-      });
-      s.on("error", () => res(false));
-    }));
   return port;
 }
 
@@ -232,10 +214,9 @@ async function startServer(relayPort) {
     up.on("error", () => socket.destroy());
     socket.on("error", () => up.destroy());
   });
-  const port = await freePort();
-  await new Promise((r) => server.listen(port, "127.0.0.1", r));
+  await new Promise((r) => server.listen(0, "127.0.0.1", r));
   cleanups.push(() => server.close());
-  return port;
+  return server.address().port;
 }
 
 /** A proxy that refuses everything and remembers what it was asked for. */
