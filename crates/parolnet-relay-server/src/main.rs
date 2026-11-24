@@ -1334,10 +1334,17 @@ async fn main() {
         )
         .init();
 
-    let port: u16 = std::env::var("RELAY_PORT")
+    // `RELAY_PORT=0` lets the OS pick a free port. The socket is bound here, before
+    // anything else reads `port`, so everything below sees the port actually bound.
+    let requested_port: u16 = std::env::var("RELAY_PORT")
         .ok()
         .and_then(|p| p.parse().ok())
         .unwrap_or(9000);
+    let listener = tokio::net::TcpListener::bind(("0.0.0.0", requested_port))
+        .await
+        .unwrap();
+    let bound = listener.local_addr().unwrap();
+    let port = bound.port();
 
     // Operating profile. Signaling-only is the default; the relay profile
     // (mailbox, tokens, onion cells, gossip, TURN credentials, federation)
@@ -1959,10 +1966,17 @@ async fn main() {
         }
     }
 
-    let addr = format!("0.0.0.0:{port}");
-    info!("ParolNet relay listening on {addr}");
+    info!("ParolNet relay listening on {bound}");
+    // One machine-readable line on stdout, whatever the log level, once the relay is about
+    // to serve: whoever started the relay with `RELAY_PORT=0` learns the port from it and
+    // knows the relay is up (the test harnesses wait for this line).
+    {
+        use std::io::Write as _;
+        let mut out = std::io::stdout().lock();
+        let _ = writeln!(out, "PAROLNET_RELAY_LISTENING={bound}");
+        let _ = out.flush();
+    }
 
-    let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
     let app = app.into_make_service_with_connect_info::<std::net::SocketAddr>();
     axum::serve(listener, app).await.unwrap();
 }

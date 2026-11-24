@@ -1,13 +1,18 @@
 //! End-to-end tests of the relay binary's operating profiles.
 //!
-//! Each test starts its own `parolnet-relay` process on a free loopback port
-//! with an isolated key directory, talks to it over real WebSockets and HTTP,
-//! and kills it on drop. The default profile is signaling-only; tests that
+//! Each test starts its own `parolnet-relay` process with an isolated key
+//! directory, talks to it over real WebSockets and HTTP, and kills it on drop.
+//! The relay binds `RELAY_PORT=0` itself and the test reads the port from the
+//! `PAROLNET_RELAY_LISTENING=<addr>` line it prints once it serves: a port
+//! picked by the test and bound later by the relay could be taken in between
+//! by another test's relay. The default profile is signaling-only; tests that
 //! need the relay profile pass `SIGNALING_ONLY=0`.
 //!
 //! No `RELAY_PUBLIC_NAMES` is set unless a test sets it, so a relay here
 //! serves loopback names: clients sign their register answer for
-//! `127.0.0.1:<port>`, the name they dialed (PNP-001 §10.7).
+//! `127.0.0.1:<port>`, the name they dialed (PNP-001 §10.7). A test that sets
+//! it gives the relay a public name, as a relay behind a TLS proxy has, and
+//! its clients sign for that name ([`Relay::name`]).
 
 use parolnet_protocol::relay_auth::{
     PeersAuthorization, PeersRequest, RelayName, register_signable,
@@ -15,8 +20,9 @@ use parolnet_protocol::relay_auth::{
 
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{Value, json};
+use std::io::BufRead as _;
 use std::path::PathBuf;
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, ChildStdout, Command, Stdio};
 use std::time::Duration;
 use tokio::net::TcpStream;
 use tokio_tungstenite::tungstenite::Message;
@@ -28,6 +34,8 @@ struct Relay {
     child: Child,
     port: u16,
     dir: PathBuf,
+    /// The first `RELAY_PUBLIC_NAMES` entry, canonical, when the test set one.
+    public_name: Option<String>,
 }
 
 impl Drop for Relay {
@@ -44,16 +52,39 @@ fn http_client() -> reqwest::Client {
     reqwest::Client::new()
 }
 
-fn free_port() -> u16 {
-    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    l.local_addr().unwrap().port()
+/// The port a relay started with `RELAY_PORT=0` bound, from the
+/// `PAROLNET_RELAY_LISTENING=<addr>` line it prints on stdout once it serves.
+/// The rest of its stdout is read and dropped so the relay never blocks on a
+/// full pipe.
+async fn listening_port(stdout: ChildStdout) -> u16 {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    std::thread::spawn(move || {
+        let mut tx = Some(tx);
+        let mut out = std::io::BufReader::new(stdout);
+        let mut line = Vec::new();
+        while out.read_until(b'\n', &mut line).is_ok_and(|n| n > 0) {
+            let text = String::from_utf8_lossy(&line);
+            if let Some(addr) = text.trim_end().strip_prefix("PAROLNET_RELAY_LISTENING=")
+                && let Some(tx) = tx.take()
+            {
+                let _ = tx.send(addr.to_owned());
+            }
+            line.clear();
+        }
+    });
+    let addr = tokio::time::timeout(Duration::from_secs(30), rx)
+        .await
+        .expect("the relay did not report its listening address within 30 s")
+        .expect("the relay exited before it reported its listening address");
+    addr.parse::<std::net::SocketAddr>()
+        .unwrap_or_else(|e| panic!("listening address {addr:?}: {e}"))
+        .port()
 }
 
 impl Relay {
     /// Start a relay. Generous connection / identity budgets unless the
     /// test overrides them, since every client here shares 127.0.0.1.
     async fn start(envs: &[(&str, &str)]) -> Relay {
-        let port = free_port();
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
@@ -68,37 +99,46 @@ impl Relay {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_parolnet-relay"));
         cmd.env_clear()
             .env("PATH", std::env::var("PATH").unwrap_or_default())
-            .env("RELAY_PORT", port.to_string())
+            .env("RELAY_PORT", "0")
             .env("RELAY_KEY_FILE", dir.join("relay.key"))
             .env("RELAY_AUTHORITY_KEY_FILE", dir.join("relay-authority.cbor"))
             .env("RUST_LOG", "warn")
             .env("RELAY_CONN_PER_MINUTE", "1000")
             .env("RELAY_MAX_PEERS_PER_IP", "16")
             .env("RELAY_MAX_CONNS_PER_IP", "32")
-            .stdout(Stdio::null())
+            .stdout(Stdio::piped())
             .stderr(Stdio::null());
         for (k, v) in envs {
-            // `{port}` stands for the port this relay listens on.
-            cmd.env(k, v.replace("{port}", &port.to_string()));
+            cmd.env(k, v);
         }
-        let child = cmd.spawn().expect("spawn relay binary");
-        let relay = Relay { child, port, dir };
-        for _ in 0..200 {
-            if TcpStream::connect(("127.0.0.1", port)).await.is_ok() {
-                return relay;
-            }
-            tokio::time::sleep(Duration::from_millis(25)).await;
-        }
-        panic!("relay did not start listening on {port}");
+        let public_name = envs
+            .iter()
+            .find(|(k, _)| *k == "RELAY_PUBLIC_NAMES")
+            .and_then(|(_, v)| v.split(',').map(str::trim).find(|e| !e.is_empty()))
+            .map(|e| RelayName::from_config(e).unwrap().as_str().to_owned());
+        let mut child = cmd.spawn().expect("spawn relay binary");
+        let stdout = child.stdout.take().unwrap();
+        // Built before the wait so that a relay that never reports is killed.
+        let mut relay = Relay {
+            child,
+            port: 0,
+            dir,
+            public_name,
+        };
+        relay.port = listening_port(stdout).await;
+        relay
     }
 
     fn http(&self, path: &str) -> String {
         format!("http://127.0.0.1:{}{}", self.port, path)
     }
 
-    /// The canonical name clients here dial this relay under.
+    /// The canonical name clients here sign for: the relay's public name when
+    /// the test configured one, else the loopback address they dial.
     fn name(&self) -> String {
-        format!("127.0.0.1:{}", self.port)
+        self.public_name
+            .clone()
+            .unwrap_or_else(|| format!("127.0.0.1:{}", self.port))
     }
 
     async fn ws(&self) -> Ws {
@@ -168,12 +208,18 @@ async fn closed_within(ws: &mut Ws, timeout_ms: u64) -> bool {
     }
 }
 
-/// Run the challenge-response registration; returns the `registered` frame
-/// or the error frame.
+/// Run the challenge-response registration, signed for the address the
+/// socket dialed; returns the `registered` frame or the error frame.
 async fn register(ws: &mut Ws, id: &Identity) -> Value {
+    let name = dialed(ws);
+    register_for(ws, id, &name).await
+}
+
+/// [`register`], signed for `relay_name`.
+async fn register_for(ws: &mut Ws, id: &Identity, relay_name: &str) -> Value {
     send(ws, json!({"type": "register", "peer_id": id.peer_id})).await;
     let ch = recv_type(ws, "challenge", 3000).await.expect("challenge");
-    let answer = signed_register(id, ch["nonce"].as_str().unwrap(), &dialed(ws));
+    let answer = signed_register(id, ch["nonce"].as_str().unwrap(), relay_name);
     send(ws, answer).await;
     loop {
         let v = recv(ws, 3000).await.expect("register reply");
@@ -186,7 +232,7 @@ async fn register(ws: &mut Ws, id: &Identity) -> Value {
 async fn registered_peer(relay: &Relay) -> (Ws, Identity) {
     let id = Identity::new();
     let mut ws = relay.ws().await;
-    let r = register(&mut ws, &id).await;
+    let r = register_for(&mut ws, &id, &relay.name()).await;
     assert_eq!(r["type"], "registered", "{r}");
     (ws, id)
 }
@@ -740,7 +786,7 @@ async fn relay_profile_frame_cap() {
 #[tokio::test]
 async fn an_answer_signed_for_another_relay_does_not_register_here() {
     // R knows its own name; E is any other relay.
-    let r = Relay::start(&[("RELAY_PUBLIC_NAMES", "127.0.0.1:{port}")]).await;
+    let r = Relay::start(&[("RELAY_PUBLIC_NAMES", "relay-r.example")]).await;
     let e = Relay::start(&[]).await;
     let victim = Identity::new();
 
@@ -781,7 +827,10 @@ async fn an_answer_signed_for_another_relay_does_not_register_here() {
 
     // The victim itself, dialing R, registers.
     let mut own = r.ws().await;
-    assert_eq!(register(&mut own, &victim).await["type"], "registered");
+    assert_eq!(
+        register_for(&mut own, &victim, &r.name()).await["type"],
+        "registered"
+    );
 }
 
 #[tokio::test]
@@ -1009,7 +1058,7 @@ async fn a_relay_profile_relay_answers_presence_and_lookup_only_to_signed_reques
     let federation_pub = hex::encode(federation_key.verifying_key().to_bytes());
     let relay = Relay::start(&[
         ("SIGNALING_ONLY", "0"),
-        ("RELAY_PUBLIC_NAMES", "127.0.0.1:{port}"),
+        ("RELAY_PUBLIC_NAMES", "relay-r.example"),
         ("FEDERATION_PEER_KEYS", &federation_pub),
     ])
     .await;
