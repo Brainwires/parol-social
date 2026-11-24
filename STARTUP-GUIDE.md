@@ -140,7 +140,7 @@ docker run -d -p 9000:80 \
 
 | Variable | Required | Default | Description |
 |----------|----------|---------|-------------|
-| `RELAY_PORT` | No | `9000` | Port the relay listens on |
+| `RELAY_PORT` | No | `9000` | Port the relay listens on. `0` lets the OS pick a free port. Once it serves, the relay prints `PAROLNET_RELAY_LISTENING=<addr>` (the address and port it bound) on stdout, at any log level. |
 | `RELAY_PUBLIC_NAMES` | **Yes, on a public relay** | Loopback names only | Comma-separated `host` or `host:port` that clients dial this relay under; no port means 443. Example: `relay.example.com` for `wss://relay.example.com/ws`, `203.0.113.5:9000` for `ws://203.0.113.5:9000/ws`. A registration is signed for the dialed name and refused under any other (PNP-001 §10.7). Unset, only clients that dialed `localhost` / `127.0.0.1` / `[::1]` can register. A malformed entry stops the relay at startup. |
 | `SIGNALING_ONLY` | No | `1` | `0` selects the relay profile (store-and-forward, tokens, federation, TURN credentials). The default serves signaling only. |
 | `FEDERATION_PEER_KEYS` | No | Empty | Relay profile only. Comma-separated Ed25519 public keys (64 hex characters, the "Relay Ed25519 public key" a relay logs at startup) of the relays allowed to read this relay's `/peers/presence`. Empty means nobody is. |

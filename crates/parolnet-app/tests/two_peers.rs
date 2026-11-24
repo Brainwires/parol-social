@@ -5,10 +5,12 @@
 //! call relayed through the user's own TURN server (an in-process one here).
 //!
 //! The relay binary is `PAROLNET_RELAY_BIN` when set, else `parolnet-relay` next to this
-//! test's target directory (built with `cargo build -p parolnet-relay-server` on demand).
+//! test's target directory (brought up to date with `cargo build -p parolnet-relay-server`
+//! once per test binary). It binds a port of its own choosing and reports it on stdout.
 
+use std::io::BufRead as _;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, ChildStdout, Command, Stdio};
 use std::time::Duration;
 
 use futures_util::{SinkExt as _, StreamExt as _};
@@ -51,7 +53,12 @@ fn relay_binary() -> PathBuf {
     // target/<profile>/deps/two_peers-xxxx → target/<profile>/parolnet-relay
     let profile_dir = exe.parent().and_then(Path::parent).unwrap().to_owned();
     let bin = profile_dir.join(format!("parolnet-relay{}", std::env::consts::EXE_SUFFIX));
-    if !bin.exists() {
+    // Built once per test binary and always through cargo: a relay binary that is merely
+    // there may be older than the sources (one from before the listening line never
+    // reports), and cargo does nothing when it is current.
+    static BUILD: std::sync::Mutex<bool> = std::sync::Mutex::new(false);
+    let mut built = BUILD.lock().unwrap_or_else(|e| e.into_inner());
+    if !*built {
         let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".into());
         let mut cmd = Command::new(cargo);
         cmd.args([
@@ -66,22 +73,48 @@ fn relay_binary() -> PathBuf {
         }
         let status = cmd.status().expect("run cargo build for the relay");
         assert!(status.success(), "building parolnet-relay failed");
+        *built = true;
     }
     assert!(bin.exists(), "relay binary not found at {}", bin.display());
     bin
 }
 
+/// The port a relay started with `RELAY_PORT=0` bound, from the
+/// `PAROLNET_RELAY_LISTENING=<addr>` line it prints on stdout once it serves. The rest of its
+/// stdout is read and dropped so the relay never blocks on a full pipe.
+async fn listening_port(stdout: ChildStdout) -> u16 {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    std::thread::spawn(move || {
+        let mut tx = Some(tx);
+        let mut out = std::io::BufReader::new(stdout);
+        let mut line = Vec::new();
+        while out.read_until(b'\n', &mut line).is_ok_and(|n| n > 0) {
+            let text = String::from_utf8_lossy(&line);
+            if let Some(addr) = text.trim_end().strip_prefix("PAROLNET_RELAY_LISTENING=")
+                && let Some(tx) = tx.take()
+            {
+                let _ = tx.send(addr.to_owned());
+            }
+            line.clear();
+        }
+    });
+    let addr = tokio::time::timeout(Duration::from_secs(30), rx)
+        .await
+        .expect("the relay did not report its listening address within 30 s")
+        .expect("the relay exited before it reported its listening address");
+    addr.parse::<std::net::SocketAddr>()
+        .unwrap_or_else(|e| panic!("listening address {addr:?}: {e}"))
+        .port()
+}
+
+/// A relay on a port it bound itself (`RELAY_PORT=0`): a port picked here and bound later
+/// by the relay could be taken in between by another test's relay.
 async fn start_relay() -> Relay {
-    let port = std::net::TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port();
     let dir = unique_dir("relay");
-    let child = Command::new(relay_binary())
+    let mut child = Command::new(relay_binary())
         .env_clear()
         .env("PATH", std::env::var("PATH").unwrap_or_default())
-        .env("RELAY_PORT", port.to_string())
+        .env("RELAY_PORT", "0")
         .env("RELAY_KEY_FILE", dir.join("relay.key"))
         .env("RELAY_AUTHORITY_KEY_FILE", dir.join("relay-authority.cbor"))
         .env("RUST_LOG", "warn")
@@ -89,21 +122,19 @@ async fn start_relay() -> Relay {
         .env("RELAY_CONN_PER_MINUTE", "1000")
         .env("RELAY_MAX_PEERS_PER_IP", "16")
         .env("RELAY_MAX_CONNS_PER_IP", "32")
-        .stdout(Stdio::null())
+        .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()
         .expect("spawn relay");
-    let relay = Relay { child, port, dir };
-    for _ in 0..400 {
-        if tokio::net::TcpStream::connect(("127.0.0.1", port))
-            .await
-            .is_ok()
-        {
-            return relay;
-        }
-        tokio::time::sleep(Duration::from_millis(25)).await;
-    }
-    panic!("relay did not listen on {port}");
+    let stdout = child.stdout.take().unwrap();
+    // Built before the wait so that a relay that never reports is killed.
+    let mut relay = Relay {
+        child,
+        port: 0,
+        dir,
+    };
+    relay.port = listening_port(stdout).await;
+    relay
 }
 
 fn config(dir: &Path, relay: &Relay, name: &str) -> AppConfig {

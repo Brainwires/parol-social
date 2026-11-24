@@ -18,7 +18,7 @@
 
 #![allow(dead_code)]
 
-use std::io::Read as _;
+use std::io::{BufRead as _, Read as _};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
@@ -110,29 +110,17 @@ impl Drop for Relay {
 }
 
 impl Relay {
+    /// The relay binds `RELAY_PORT=0` itself and reports the port it got with a
+    /// `PAROLNET_RELAY_LISTENING=<addr>` line on stdout once it serves; this waits for that
+    /// line. (A port picked here and bound later by the relay could be taken in between by
+    /// another test's relay, and a readiness probe could then reach the wrong relay.)
     pub async fn start(envs: &[(&str, &str)]) -> Relay {
-        // The port is picked before the relay binds it, so another process can take it in
-        // between; a relay that exits or never listens is started again on another port.
-        for _ in 0..4 {
-            if let Some(relay) = Relay::try_start(envs).await {
-                return relay;
-            }
-        }
-        panic!("the relay did not start");
-    }
-
-    async fn try_start(envs: &[(&str, &str)]) -> Option<Relay> {
-        let port = std::net::TcpListener::bind("127.0.0.1:0")
-            .unwrap()
-            .local_addr()
-            .unwrap()
-            .port();
         let dir = unique_dir("relay");
         let mut cmd = Command::new(relay_binary());
         // No RUST_LOG: the relay logs at its default level.
         cmd.env_clear()
             .env("PATH", std::env::var("PATH").unwrap_or_default())
-            .env("RELAY_PORT", port.to_string())
+            .env("RELAY_PORT", "0")
             .env("RELAY_KEY_FILE", dir.join("relay.key"))
             .env("RELAY_AUTHORITY_KEY_FILE", dir.join("relay-authority.cbor"))
             // Every client shares 127.0.0.1 here.
@@ -146,41 +134,58 @@ impl Relay {
         }
         let mut child = cmd.spawn().expect("spawn relay");
         let log = Arc::new(Mutex::new(Vec::new()));
-        let pipes: [Box<dyn std::io::Read + Send>; 2] = [
-            Box::new(child.stdout.take().unwrap()),
-            Box::new(child.stderr.take().unwrap()),
-        ];
-        for mut pipe in pipes {
-            let log = log.clone();
-            std::thread::spawn(move || {
-                let mut buf = [0u8; 4096];
-                while let Ok(n) = pipe.read(&mut buf) {
-                    if n == 0 {
-                        break;
-                    }
-                    log.lock().unwrap().extend_from_slice(&buf[..n]);
+        let mut stderr = child.stderr.take().unwrap();
+        let err_log = log.clone();
+        std::thread::spawn(move || {
+            let mut buf = [0u8; 4096];
+            while let Ok(n) = stderr.read(&mut buf) {
+                if n == 0 {
+                    break;
                 }
-            });
-        }
+                err_log.lock().unwrap().extend_from_slice(&buf[..n]);
+            }
+        });
+        // Stdout line by line: into the log, and the listening line to `listening`.
+        let (listening_tx, listening) = tokio::sync::oneshot::channel::<String>();
+        let mut stdout = std::io::BufReader::new(child.stdout.take().unwrap());
+        let out_log = log.clone();
+        std::thread::spawn(move || {
+            let mut listening_tx = Some(listening_tx);
+            let mut line = Vec::new();
+            while stdout.read_until(b'\n', &mut line).is_ok_and(|n| n > 0) {
+                out_log.lock().unwrap().extend_from_slice(&line);
+                let text = String::from_utf8_lossy(&line);
+                if let Some(addr) = text.trim_end().strip_prefix("PAROLNET_RELAY_LISTENING=")
+                    && let Some(tx) = listening_tx.take()
+                {
+                    let _ = tx.send(addr.to_owned());
+                }
+                line.clear();
+            }
+        });
+        // Built before the wait so that a relay that never reports is killed.
         let mut relay = Relay {
             child,
-            port,
+            port: 0,
             dir,
             log,
         };
-        for _ in 0..800 {
-            if tokio::net::TcpStream::connect(("127.0.0.1", port))
-                .await
-                .is_ok()
-            {
-                return Some(relay);
-            }
-            if relay.child.try_wait().ok().flatten().is_some() {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(25)).await;
-        }
-        None
+        let addr = match tokio::time::timeout(Duration::from_secs(30), listening).await {
+            Ok(Ok(addr)) => addr,
+            Ok(Err(_)) => panic!(
+                "the relay exited before it reported its listening address:\n{}",
+                relay.log()
+            ),
+            Err(_) => panic!(
+                "the relay did not report its listening address within 30 s:\n{}",
+                relay.log()
+            ),
+        };
+        relay.port = addr
+            .parse::<std::net::SocketAddr>()
+            .unwrap_or_else(|e| panic!("listening address {addr:?}: {e}"))
+            .port();
+        relay
     }
 
     pub fn ws_url(&self) -> String {
