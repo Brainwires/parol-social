@@ -1,12 +1,16 @@
 # PNP-011: ParolNet 1:1 Calls
 
 ### Status: CANDIDATE
-### Version: 0.1
-### Date: 2026-11-21
+### Version: 0.2
+### Date: 2026-11-23
 
 ---
 
 ## Changelog
+
+**v0.2 (2026-11-23) — SRTP re-keying**
+
+- Section 7.6: a call whose SRTP master key nears its lifetime re-keys with a `reoffer` that restarts ICE and starts a new DTLS association under the same certificate. Section 7.3 says which renegotiation keeps the DTLS session. No new clauses; no change for a call that does not reach a key's lifetime (the default lifetimes are 2^31 packets and more).
 
 **v0.1 (2026-11-21) — Initial version**
 
@@ -171,7 +175,7 @@ Both peers can send a `reoffer` before either has seen the other's. The caller's
 
 ### 7.3 What a Renegotiation Keeps
 
-A `reoffer` and its `reanswer` MUST carry the DTLS fingerprint of the description they replace: the DTLS session, and the SRTP keys derived from it, continue. **PNP-011-MUST-023**
+A `reoffer` and its `reanswer` MUST carry the DTLS fingerprint of the description they replace: the DTLS session, and the SRTP keys derived from it, continue. **PNP-011-MUST-023** The one exception is re-keying (section 7.6): its descriptions keep the fingerprint (the same certificate) and start a new DTLS association, with new SRTP keys.
 
 A `reoffer` that only changes media (a section added, a direction changed) MUST keep the ICE username fragment and password of the description it replaces. **PNP-011-MUST-024** An offer with other ICE credentials is an ICE restart.
 
@@ -184,6 +188,10 @@ A `reoffer` that is not answered within 10 seconds MUST be taken back (a rollbac
 ### 7.5 Peers That Do Not Renegotiate
 
 With a peer that did not list `renegotiate` the call stays as it was set up. An implementation MUST NOT try to add video to an audio call with such a peer, and when its user turns the camera off in a video call it MUST keep the video stream as negotiated. **PNP-011-MUST-027** What is sent on a stream whose camera is off is then black frames (one a second is enough), which is what a browser sends for a disabled track.
+
+### 7.6 Re-keying
+
+An SRTP master key protects a limited number of packets (RFC 3711 section 9.2; 2^31 for the RFC 5764 profiles, 2^48 SRTP and 2^31 SRTCP packets for AEAD_AES_256_GCM, RFC 7714). When the key a peer sends with has a sixteenth of its lifetime left, that peer re-keys: it sends a `reoffer` that is an ICE restart (section 8.1) and carries a new `a=tls-id` (RFC 8842 section 5.5). When the exchange completes, a new DTLS handshake runs on the call's transport and both directions take new SRTP keys from it (RFC 5764 section 4.4); media goes on under the old keys until then. A peer that receives such a `reoffer` while it wants to re-key itself takes it as its own re-keying. With a peer that does not list `renegotiate` no such `reoffer` is sent (PNP-011-MUST-020), and a call that reaches a key's lifetime ends as failed. The default lifetimes are not reached by a call; an implementation may configure shorter ones.
 
 ## 8. ICE Restart
 

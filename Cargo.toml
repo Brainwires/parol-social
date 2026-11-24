@@ -47,7 +47,9 @@ parolnet-transfer = { path = "crates/parolnet-transfer" }
 
 # Realtime engine: Brainwires' fork of webrtc-rs/rtc (sans-I/O), pinned by tag, never a branch.
 # Its DTLS / SRTP provider is ring (C and assembly); the E2EE layer stays pure Rust.
-rtc = { git = "https://github.com/Brainwires/webrtc-rs-rtc", tag = "v0.22.0+brainwires.5" }
+# NOT MERGEABLE: pinned to an engine `rev` (master df82663c, train 13 merged) for pre-release testing of the
+# next engine release; at release this becomes `rtci = { ..., tag = "v0.1.0" }` (ENGINE-MIGRATION.md).
+rtc = { git = "https://github.com/Brainwires/webrtc-rs-rtc", rev = "df82663c6ca0a346e485b6ea79025c793a43f9a8" }
 
 # Crypto
 x25519-dalek = { version = "2", features = ["static_secrets"] }

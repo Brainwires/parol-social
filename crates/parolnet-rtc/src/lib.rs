@@ -44,6 +44,7 @@ use std::task::Poll;
 use std::time::{Duration, Instant};
 
 use bytes::BytesMut;
+use rtc::ice::NominationAcceptance;
 use rtc::ice::mdns::MulticastDnsMode;
 use rtc::interceptor::{
     GccHandle, GccInterceptorBuilder, Interceptor as _, PassThroughInterceptor, Registry, Slot,
@@ -63,11 +64,13 @@ use rtc::peer_connection::configuration::{RTCConfigurationBuilder, RTCIceTranspo
 use rtc::peer_connection::event::{RTCDataChannelEvent, RTCPeerConnectionEvent, RTCTrackEvent};
 use rtc::peer_connection::message::{RTCMessage, TaggedRTCMessage};
 use rtc::peer_connection::sdp::{RTCSdpType, RTCSessionDescription};
+use rtc::peer_connection::srflx::ReflexiveGathering;
 use rtc::peer_connection::state::{RTCIceConnectionState, RTCPeerConnectionState};
 use rtc::peer_connection::transport::{
     CandidateConfig, CandidateHostConfig, CandidateRelayConfig, CandidateServerReflexiveConfig,
     RTCDtlsRole, RTCIceCandidate, RTCIceCandidateInit, RTCIceCandidateType, RTCIceServer,
 };
+use rtc::peer_connection::turn_streams::RelayGathering;
 use rtc::peer_connection::{RTCPeerConnection, RTCPeerConnectionBuilder};
 use rtc::rtcp::payload_feedbacks::full_intra_request::FullIntraRequest;
 use rtc::rtcp::payload_feedbacks::picture_loss_indication::PictureLossIndication;
@@ -291,6 +294,12 @@ pub struct RtcConfig {
     pub mdns: bool,
     /// Report [`RtcEvent::Quality`] this often once connected (`None`: never).
     pub quality_interval: Option<Duration>,
+    /// How many packets an SRTP master key protects before the connection re-keys (`None`:
+    /// the profile's, 2^31 packets and more, which a call never reaches). The side whose
+    /// outbound key nears its end re-offers with an ICE restart and a new DTLS association
+    /// (RFC 5764 section 4.4, RFC 8842; PNP-011 section 7.6). Tests set a short one to run
+    /// re-keying in a call.
+    pub srtp_key_lifetime: Option<rtc::srtp::keying::KeyLifetime>,
 }
 
 impl Default for RtcConfig {
@@ -315,6 +324,7 @@ impl Default for RtcConfig {
             event_capacity: 4096,
             mdns: true,
             quality_interval: None,
+            srtp_key_lifetime: None,
         }
     }
 }
@@ -390,6 +400,10 @@ pub enum RtcEvent {
     ConnectionState(RTCPeerConnectionState),
     /// The ICE connection state changed.
     IceConnectionState(RTCIceConnectionState),
+    /// ICE selected another candidate pair (W3C `selectedcandidatepairchange`). This is how
+    /// an ICE restart begun while connected completes: the connection state stays connected
+    /// through it (W3C webrtc-pc 5.6.4), and the new generation's pair is selected.
+    SelectedCandidatePairChanged,
     /// The first RTP packet of a track arrived; names its kind and negotiated codec.
     Track {
         track_id: MediaStreamTrackId,
@@ -763,7 +777,15 @@ struct Sock {
     srflx: Vec<SocketAddr>,
     /// Consecutive failed receives.
     errors: u32,
+    /// A socket of the previous DTLS association (RFC 8842 section 5.1): kept reading and
+    /// sending for the pair that still carries the session until the new generation selects
+    /// a pair, then closed after [`RETIRED_SOCKET_LINGER`]. It gives no candidate.
+    retired: bool,
 }
+
+/// How long a retired socket stays open after the new generation selected a pair: the peer
+/// selects on its own and may still send to the previous address for a moment.
+const RETIRED_SOCKET_LINGER: Duration = Duration::from_secs(5);
 
 fn bind_all(
     network: &dyn Network,
@@ -774,7 +796,7 @@ fn bind_all(
     let mut last_error = None;
     for (index, ip) in addrs.iter().enumerate() {
         let preference = net::local_preference(index);
-        if let Some(existing) = socks.iter_mut().find(|s| s.local.ip() == *ip) {
+        if let Some(existing) = socks.iter_mut().find(|s| s.local.ip() == *ip && !s.retired) {
             existing.preference = preference;
             continue;
         }
@@ -788,6 +810,7 @@ fn bind_all(
                 preference,
                 srflx: Vec::new(),
                 errors: 0,
+                retired: false,
             }),
             Err(err) => {
                 tracing::debug!(%ip, %err, "cannot bind a local address");
@@ -934,6 +957,10 @@ pub async fn spawn(config: RtcConfig) -> Result<(RtcHandle, mpsc::Receiver<RtcEv
         mdns: None,
         mdns_answers: 0,
         relay,
+        retired_relay: None,
+        turn: config.turn.clone(),
+        turn_timeout: config.turn_timeout,
+        turn_keepalive: config.turn_keepalive,
         relay_only,
         polite: config.polite,
         negotiation: Negotiation::default(),
@@ -946,6 +973,8 @@ pub async fn spawn(config: RtcConfig) -> Result<(RtcHandle, mpsc::Receiver<RtcEv
         quality_interval: config.quality_interval,
         next_quality: None,
         quality_base: QualityBase::default(),
+        retire_at: None,
+        rekey_warned: false,
     };
     let task = tokio::spawn(driver.run(cmd_rx));
     Ok((
@@ -1125,7 +1154,45 @@ fn build_peer_connection(config: &RtcConfig) -> Result<Built, RtcError> {
             MulticastDnsMode::Disabled
         })
         // A restart announces the sockets bound then, not those of the network left behind.
-        .with_discard_local_candidates_during_ice_restart(true);
+        .with_discard_local_candidates_during_ice_restart(true)
+        // This driver gathers every candidate itself (host sockets, STUN, its own TURN
+        // client). The engine's own gathering, on by default since v0.22.0+brainwires.6, is
+        // kept off so nothing changes behind it: no TCP candidates or ICE-TCP listeners
+        // (`with_tcp_candidate_gathering`), no TURN over TCP / TLS
+        // (`with_turn_over_streams`, `with_turn_tcp_relay`), no Binding requests or TURN
+        // allocations from our sockets to the configuration's servers
+        // (`with_server_reflexive_gathering`, `with_relay_gathering`).
+        .with_tcp_candidate_gathering(false)
+        .with_turn_over_streams(false)
+        .with_turn_tcp_relay(false)
+        .with_server_reflexive_gathering(ReflexiveGathering::Application)
+        .with_relay_gathering(RelayGathering::Application)
+        // Data-channel messages keep their size: PNP-010 records are up to 64 KiB and a chat
+        // frame carries a hex envelope of up to 16 KiB (about 32 KiB of text), so the RFC
+        // 8831 section 6.6 limit of 16 KB without interleaving, on by default since
+        // v0.22.0+brainwires.6, would refuse them towards every browser
+        // (`with_sctp_message_size_limit_without_interleaving(false)`: what browsers do).
+        // Interleaving (RFC 8260) is not announced, so two ParolNet peers keep sending DATA
+        // chunks as before (`with_sctp_message_interleaving(false)`).
+        .with_sctp_message_size_limit_without_interleaving(false)
+        .with_sctp_message_interleaving(false)
+        // As controlled agent, follow the latest nomination (libwebrtc's rule) as the engine
+        // did since v0.22.0+brainwires.5: Chromium moves to another pair a moment after
+        // connecting and stops answering on the one it left, which under the RFC 8445
+        // section 8.1.1 default (the highest-priority nominated pair) stopped the PWA's calls
+        // (`with_ice_nomination_acceptance`).
+        .with_ice_nomination_acceptance(NominationAcceptance::Latest)
+        // No SOFTWARE attribute in any STUN message the engine sends: ICE connectivity
+        // checks (nominations and consent checks included) and their success responses
+        // (RFC 8489 section 14.14; engine default `rtc-ice <version>`). An implementation
+        // fingerprint on the path is what THREAT_MODEL.md does not want; our own STUN
+        // Binding requests and our TURN client send none either.
+        .with_ice_software(None)
+        // Re-keying stays on (the engine's default, `with_srtp_automatic_rekeying`): when a
+        // master key has a sixteenth of its lifetime left the engine raises negotiation-needed
+        // and its next offer carries a new `a=tls-id` and new ICE credentials. The re-offer is
+        // made here, on `OnSrtpKeyLifetimeExpiring` (`Driver::drain_events`).
+        .with_srtp_key_lifetime(config.srtp_key_lifetime);
     if let Some(role) = config.answering_dtls_role {
         settings = settings.with_answering_dtls_role(role);
     }
@@ -1189,11 +1256,19 @@ struct Wanted {
     restart: bool,
     /// A track or direction changed.
     media: bool,
+    /// A new DTLS association for new SRTP keys (re-keying), which the engine puts in the
+    /// next offer with an ICE restart. Done as well by a peer's offer that starts one.
+    rekey: bool,
 }
 
 impl Wanted {
     fn any(self) -> bool {
-        self.restart || self.media
+        self.restart || self.media || self.rekey
+    }
+
+    /// The offer restarts ICE: new credentials, and candidates gathered for them.
+    fn restarts(self) -> bool {
+        self.restart || self.rekey
     }
 }
 
@@ -1277,6 +1352,13 @@ struct Driver {
     mdns_answers: u64,
     /// The allocation on the user's TURN server, when there is one.
     relay: Option<turn::Relay>,
+    /// The allocation of the previous DTLS association (RFC 8842 section 5.1), carrying the
+    /// session until the new generation selects a pair; released with the retired sockets.
+    retired_relay: Option<turn::Relay>,
+    /// The user's TURN server, to allocate again for a new DTLS association.
+    turn: Option<TurnServer>,
+    turn_timeout: Duration,
+    turn_keepalive: Duration,
     /// [`IcePolicy::Relay`]: nothing is sent to, or accepted from, anyone but the TURN server.
     relay_only: bool,
     polite: bool,
@@ -1293,6 +1375,11 @@ struct Driver {
     quality_interval: Option<Duration>,
     next_quality: Option<Instant>,
     quality_base: QualityBase,
+    /// When the retired sockets of the previous DTLS association close.
+    retire_at: Option<Instant>,
+    /// An SRTP key of the current association neared its lifetime: the next negotiation-needed
+    /// is the engine asking for a new association.
+    rekey_warned: bool,
 }
 
 /// The longest the loop sleeps when the engine names no deadline.
@@ -1314,10 +1401,13 @@ impl Driver {
             .err()
             .map(|e| e.to_string());
         let _ = self.pc.close();
-        if let Some(relay) = self.relay.take()
-            && let Some(sock) = self.socks.iter().find(|s| s.local == relay.local())
+        for relay in [self.relay.take(), self.retired_relay.take()]
+            .into_iter()
+            .flatten()
         {
-            relay.release(sock.socket.as_ref()).await;
+            if let Some(sock) = self.socks.iter().find(|s| s.local == relay.local()) {
+                relay.release(sock.socket.as_ref()).await;
+            }
         }
         let _ = self.events.send(RtcEvent::Closed { error }).await;
     }
@@ -1337,11 +1427,17 @@ impl Driver {
             self.release_acks();
 
             let now = now();
-            let relay_deadline = self.relay.as_mut().and_then(turn::Relay::poll_timeout);
-            if let Some(relay) = self.relay.as_mut()
-                && relay_deadline.is_some_and(|t| t <= now)
-            {
-                relay.handle_timeout(now);
+            let mut relay_deadline = None;
+            let mut relay_due = false;
+            for relay in self.relay.iter_mut().chain(self.retired_relay.iter_mut()) {
+                let deadline = relay.poll_timeout();
+                if deadline.is_some_and(|t| t <= now) {
+                    relay.handle_timeout(now);
+                    relay_due = true;
+                }
+                relay_deadline = [relay_deadline, deadline].into_iter().flatten().min();
+            }
+            if relay_due {
                 continue;
             }
             if self.gather.as_ref().is_some_and(|g| g.wake() <= now) {
@@ -1349,6 +1445,10 @@ impl Driver {
                 continue;
             }
             self.release_audio(now);
+            if self.retire_at.is_some_and(|t| t <= now) {
+                self.close_retired_sockets().await;
+                continue;
+            }
             if self.next_estimate.is_some_and(|t| t <= now) {
                 self.report_estimate(now).await;
                 continue;
@@ -1370,6 +1470,7 @@ impl Driver {
                 self.next_estimate,
                 self.next_quality,
                 self.next_audio_release(),
+                self.retire_at,
             ]
             .into_iter()
             .flatten()
@@ -1433,9 +1534,11 @@ impl Driver {
     /// round, or the peer's.
     fn on_datagram(&mut self, index: usize, peer_addr: SocketAddr, data: &[u8]) {
         let local_addr = self.socks[index].local;
-        if let Some(relay) = self.relay.as_mut()
-            && relay.server() == peer_addr
-            && relay.local() == local_addr
+        if let Some(relay) = self
+            .relay
+            .iter_mut()
+            .chain(self.retired_relay.iter_mut())
+            .find(|r| r.server() == peer_addr && r.local() == local_addr)
         {
             relay.handle_datagram(data);
             return;
@@ -1479,6 +1582,13 @@ impl Driver {
         }
         let gone = self.socks.remove(index);
         if self
+            .retired_relay
+            .as_ref()
+            .is_some_and(|relay| relay.local() == gone.local)
+        {
+            self.retired_relay = None;
+        }
+        if self
             .relay
             .as_ref()
             .is_some_and(|relay| relay.local() == gone.local)
@@ -1500,8 +1610,11 @@ impl Driver {
     async fn flush_writes(&mut self) {
         self.deliver_relayed();
         while let Some(msg) = self.pc.poll_write() {
-            if let Some(relay) = self.relay.as_mut()
-                && msg.transport.local_addr == relay.relayed()
+            if let Some(relay) = self
+                .relay
+                .iter_mut()
+                .chain(self.retired_relay.iter_mut())
+                .find(|r| msg.transport.local_addr == r.relayed())
             {
                 relay.send(now(), msg.message, msg.transport.peer_addr);
                 continue;
@@ -1531,12 +1644,16 @@ impl Driver {
                 tracing::debug!(peer = %msg.transport.peer_addr, %err, "send failed");
             }
         }
-        if let Some(relay) = self.relay.as_mut() {
+        let mut outgoing = Vec::new();
+        for relay in self.relay.iter_mut().chain(self.retired_relay.iter_mut()) {
             let local = relay.local();
             let mut out = Vec::new();
             while let Some(datagram) = relay.poll_write() {
                 out.push(datagram);
             }
+            outgoing.push((local, out));
+        }
+        for (local, out) in outgoing {
             if let Some(sock) = self.socks.iter().find(|s| s.local == local) {
                 for (data, to) in out {
                     if let Err(err) = net::send_to(sock.socket.as_ref(), &data, to).await {
@@ -1550,12 +1667,18 @@ impl Driver {
     /// Hand the engine what peers sent to the relayed address (it arrives there as if on a
     /// socket bound to that address).
     fn deliver_relayed(&mut self) {
-        let Some(relay) = self.relay.as_mut() else {
-            return;
-        };
         let now = now();
-        let local_addr = relay.relayed();
-        for (peer_addr, message) in relay.poll_inbound(now) {
+        let mut inbound = Vec::new();
+        for relay in self.relay.iter_mut().chain(self.retired_relay.iter_mut()) {
+            let local_addr = relay.relayed();
+            inbound.extend(
+                relay
+                    .poll_inbound(now)
+                    .into_iter()
+                    .map(|(peer, message)| (local_addr, peer, message)),
+            );
+        }
+        for (local_addr, peer_addr, message) in inbound {
             if let Err(err) = self.pc.handle_read(TaggedBytesMut {
                 now,
                 transport: TransportContext {
@@ -1628,6 +1751,69 @@ impl Driver {
                 RTCPeerConnectionEvent::OnIceConnectionStateChangeEvent(state) => {
                     self.emit(RtcEvent::IceConnectionState(state)).await;
                 }
+                RTCPeerConnectionEvent::OnSelectedCandidatePairChange(_) => {
+                    if self.retire_at.is_none() && self.socks.iter().any(|s| s.retired) {
+                        self.retire_at = Some(now() + RETIRED_SOCKET_LINGER);
+                    }
+                    self.emit(RtcEvent::SelectedCandidatePairChanged).await;
+                }
+                // RFC 8842 section 5.1: a new DTLS association on a new 3-tuple. This driver
+                // binds the new sockets itself before it makes or answers the description
+                // that starts one (`renew_sockets`), so the candidates it adds are on new
+                // ports; the event is the engine's account of it.
+                RTCPeerConnectionEvent::OnLocalCandidatesNeeded(needed) => {
+                    let active: Vec<SocketAddr> = self
+                        .socks
+                        .iter()
+                        .filter(|s| !s.retired)
+                        .map(|s| s.local)
+                        .collect();
+                    let stale = needed
+                        .refused_addresses
+                        .iter()
+                        .filter(|a| active.contains(a))
+                        .count();
+                    if stale > 0 {
+                        tracing::warn!(
+                            reason = ?needed.reason,
+                            stale,
+                            "the engine refuses addresses this driver still gathers on"
+                        );
+                    } else {
+                        tracing::debug!(reason = ?needed.reason, "new local candidates needed");
+                    }
+                }
+                // SRTP re-keying (RFC 3711 section 9.2, RFC 5764 section 4.4). A key has a
+                // sixteenth of its lifetime left and the engine asked for a new DTLS
+                // association, which the next offer carries with an ICE restart. The side
+                // whose outbound key it is makes that offer (as an ICE restart: new sockets'
+                // candidates are gathered as for one); the peer sees the same key as inbound
+                // and answers. Both directions get new keys from the new association.
+                RTCPeerConnectionEvent::OnSrtpKeyLifetimeExpiring {
+                    outbound,
+                    rtcp,
+                    remaining,
+                } => {
+                    tracing::info!(outbound, rtcp, remaining, "SRTP key near its lifetime");
+                    // Which side asks, and when, is the engine's (its tie-break: the DTLS
+                    // client at a sixteenth of the lifetime left, the server at a
+                    // thirty-second, one renewal at a time): the re-offer follows the
+                    // negotiation-needed it then raises.
+                    self.rekey_warned = true;
+                }
+                RTCPeerConnectionEvent::OnNegotiationNeededEvent => {
+                    let n = &self.negotiation;
+                    if self.rekey_warned
+                        && n.established
+                        && n.in_flight.is_none()
+                        && !n.answering
+                        && self.gather.is_none()
+                    {
+                        tracing::debug!("the engine asks for a new DTLS association");
+                        self.negotiation.wanted.rekey = true;
+                        self.negotiate_if_ready().await?;
+                    }
+                }
                 RTCPeerConnectionEvent::OnTrack(RTCTrackEvent::OnOpen(init)) => {
                     self.tracks.insert(init.track_id, (init.receiver_id, false));
                 }
@@ -1640,9 +1826,11 @@ impl Driver {
                         .data_channel(id)
                         .map(|dc| dc.label().to_owned())
                         .unwrap_or_default();
+                    tracing::debug!(id, %label, "data channel open");
                     self.emit(RtcEvent::DataChannelOpen { id, label }).await;
                 }
                 RTCPeerConnectionEvent::OnDataChannel(RTCDataChannelEvent::OnClose(id)) => {
+                    tracing::debug!(id, "data channel closed");
                     self.emit(RtcEvent::DataChannelClose { id }).await;
                 }
                 RTCPeerConnectionEvent::OnDataChannel(
@@ -1686,6 +1874,7 @@ impl Driver {
                     }
                 }
                 RTCMessage::DataChannelMessage(id, message) => {
+                    tracing::trace!(id, len = message.data.len(), "data channel message");
                     self.emit(RtcEvent::DataChannelMessage {
                         id,
                         payload: message.data,
@@ -1953,6 +2142,7 @@ impl Driver {
                     self.negotiation.in_flight = None;
                     self.negotiation.wanted.restart |= ours.restart;
                     self.negotiation.wanted.media |= ours.media;
+                    self.negotiation.wanted.rekey |= ours.rekey;
                 }
                 // Our own restart was still gathering: the peer's restart does its job.
                 self.gather = None;
@@ -1965,13 +2155,27 @@ impl Driver {
                         .pc
                         .remote_description()
                         .is_some_and(|current| ice_ufrag(&current.sdp) != ice_ufrag(&desc.sdp));
-                if restart {
+                // The peer's offer starts a new DTLS association: new SRTP keys both ways, so
+                // a re-keying of ours is not needed any more.
+                let new_association = !first
+                    && self
+                        .pc
+                        .remote_description()
+                        .is_some_and(|current| tls_id(&current.sdp) != tls_id(&desc.sdp));
+                if new_association {
+                    self.renew_sockets()?;
+                    self.renew_relay().await?;
+                } else if restart {
                     self.rebind()?;
                 }
                 let sdp = desc.sdp.clone();
                 self.pc.set_remote_description(now, desc)?;
                 self.negotiation.answering = true;
                 self.report_remote_media(&sdp).await;
+                if new_association {
+                    self.negotiation.wanted.rekey = false;
+                    self.rekey_warned = false;
+                }
                 if restart {
                     self.negotiation.wanted.restart = false;
                     if let Some(gather) = self.start_gather(AfterGather::Answer) {
@@ -1979,7 +2183,7 @@ impl Driver {
                         return Ok(());
                     }
                 }
-                self.make_answer(first || restart).await
+                self.make_answer(first || restart, restart).await
             }
             other => {
                 tracing::debug!(?other, "remote description type not handled");
@@ -1988,13 +2192,22 @@ impl Driver {
         }
     }
 
-    async fn make_answer(&mut self, with_candidates: bool) -> Result<(), RtcError> {
+    /// Answer the peer's offer. `restart`: the offer restarts ICE.
+    async fn make_answer(&mut self, with_candidates: bool, restart: bool) -> Result<(), RtcError> {
         let now = now();
-        if with_candidates {
+        if with_candidates && !restart {
             self.add_local_candidates()?;
         }
         let answer = self.pc.create_answer(None)?;
         self.pc.set_local_description(now, answer)?;
+        if with_candidates && restart {
+            // The answer applies the restart the offer staged, and with
+            // `with_discard_local_candidates_during_ice_restart` the candidates held until
+            // then are dropped with the old generation (engine v0.22.0+brainwires.6): the new
+            // generation's are added once it is applied, as the restart's offer does, and
+            // the answer emitted below lists them.
+            self.add_local_candidates()?;
+        }
         self.negotiation.answering = false;
         self.negotiation.established = true;
         self.emit_local_description().await;
@@ -2023,12 +2236,17 @@ impl Driver {
     }
 
     async fn begin_offer(&mut self) -> Result<(), RtcError> {
-        if self.negotiation.wanted.restart {
+        if self.negotiation.wanted.rekey {
+            self.renew_sockets()?;
+            self.renew_relay().await?;
+        } else if self.negotiation.wanted.restart {
             self.rebind()?;
-            if let Some(gather) = self.start_gather(AfterGather::Offer) {
-                self.gather = Some(gather);
-                return Ok(());
-            }
+        }
+        if self.negotiation.wanted.restarts()
+            && let Some(gather) = self.start_gather(AfterGather::Offer)
+        {
+            self.gather = Some(gather);
+            return Ok(());
         }
         self.make_offer().await
     }
@@ -2036,12 +2254,15 @@ impl Driver {
     async fn make_offer(&mut self) -> Result<(), RtcError> {
         let now = now();
         let wanted = std::mem::take(&mut self.negotiation.wanted);
-        if wanted.restart {
+        if wanted.rekey {
+            self.rekey_warned = false;
+        }
+        if wanted.restarts() {
             self.pc.restart_ice();
         }
         let offer = self.pc.create_offer(None)?;
         self.pc.set_local_description(now, offer)?;
-        if wanted.restart {
+        if wanted.restarts() {
             self.add_local_candidates()?;
         }
         self.negotiation.in_flight = Some(wanted);
@@ -2081,13 +2302,103 @@ impl Driver {
         Ok(())
     }
 
+    /// For a new DTLS association (RFC 8842 section 5.1: "a new 3-tuple ... MUST be
+    /// allocated"): new sockets, on new ports, for the addresses the machine has now; the
+    /// sockets they replace are retired (they keep reading and sending for the pair in use
+    /// until the new generation selects one). The engine refuses the previous addresses for
+    /// the new generation's candidates.
+    fn renew_sockets(&mut self) -> Result<(), RtcError> {
+        self.rebind()?;
+        let mut addrs: Vec<(u16, IpAddr)> = self
+            .socks
+            .iter()
+            .filter(|s| !s.retired)
+            .map(|s| (s.preference, s.local.ip()))
+            .collect();
+        addrs.sort_by(|a, b| b.0.cmp(&a.0));
+        let addrs: Vec<IpAddr> = addrs.into_iter().map(|(_, ip)| ip).collect();
+        for sock in &mut self.socks {
+            sock.retired = true;
+        }
+        // Port 0: a port the previous association did not use.
+        bind_all(self.network.as_ref(), &addrs, 0, &mut self.socks)?;
+        self.next_sock = 0;
+        self.retire_at = None;
+        tracing::debug!(
+            addrs = ?self.socks.iter().filter(|s| !s.retired).map(|s| s.local).collect::<Vec<_>>(),
+            "new sockets for a new DTLS association"
+        );
+        Ok(())
+    }
+
+    /// For a new DTLS association with a TURN allocation: a new allocation from a new socket
+    /// (the engine refuses the previous relayed address with the previous association's
+    /// candidates). The previous one carries the session until the new generation selects a
+    /// pair and is released with the retired sockets. The loop waits for the allocation (an
+    /// exchange or two with the server, at most [`RtcConfig::turn_timeout`]), as the
+    /// description it goes into does. Without it a relay-only connection cannot go on; any
+    /// other goes on without a relay candidate.
+    async fn renew_relay(&mut self) -> Result<(), RtcError> {
+        let (Some(server), Some(previous)) = (self.turn.clone(), self.relay.as_ref()) else {
+            return Ok(());
+        };
+        let v4 = previous.local().is_ipv4();
+        let Some(sock) = self
+            .socks
+            .iter()
+            .find(|s| !s.retired && s.local.is_ipv4() == v4)
+        else {
+            return Ok(());
+        };
+        let allocated = turn::allocate(
+            sock.socket.as_ref(),
+            &server,
+            self.turn_timeout,
+            self.turn_keepalive,
+        )
+        .await;
+        match allocated {
+            Ok(relay) => {
+                tracing::debug!(relayed = %relay.relayed(), "new TURN allocation for a new DTLS association");
+                // A third association before the second's sockets closed: the oldest
+                // allocation expires on the server by its lifetime.
+                self.retired_relay = self.relay.replace(relay);
+                Ok(())
+            }
+            Err(err) if self.relay_only => Err(err),
+            Err(err) => {
+                tracing::warn!(%err, "no new relay candidate for the new DTLS association");
+                Ok(())
+            }
+        }
+    }
+
+    /// Close the retired sockets, except the one that holds the TURN allocation, and release
+    /// the previous association's allocation.
+    async fn close_retired_sockets(&mut self) {
+        self.retire_at = None;
+        if let Some(relay) = self.retired_relay.take()
+            && let Some(sock) = self.socks.iter().find(|s| s.local == relay.local())
+        {
+            relay.release(sock.socket.as_ref()).await;
+        }
+        let relay_local = self.relay.as_ref().map(turn::Relay::local);
+        self.socks
+            .retain(|s| !s.retired || Some(s.local) == relay_local);
+        self.next_sock = 0;
+    }
+
     /// Ask the STUN servers again from the sockets that have no server-reflexive address
     /// yet. `None` when there is nothing to ask.
     fn start_gather(&mut self, then: AfterGather) -> Option<StunGather> {
         if self.relay_only {
             return None;
         }
-        let fresh: Vec<&Sock> = self.socks.iter().filter(|s| s.srflx.is_empty()).collect();
+        let fresh: Vec<&Sock> = self
+            .socks
+            .iter()
+            .filter(|s| s.srflx.is_empty() && !s.retired)
+            .collect();
         StunGather::for_socks(&fresh, &self.stun_targets, self.stun_timeout, Some(then))
     }
 
@@ -2110,7 +2421,7 @@ impl Driver {
         gather.apply(&mut self.socks);
         match gather.then {
             Some(AfterGather::Offer) => self.make_offer().await,
-            Some(AfterGather::Answer) => self.make_answer(true).await,
+            Some(AfterGather::Answer) => self.make_answer(true, true).await,
             None => Ok(()),
         }
     }
@@ -2127,7 +2438,7 @@ impl Driver {
             if let Some(mut transceiver) = self.pc.rtp_transceiver(id) {
                 let receive = transceiver.direction().has_recv();
                 transceiver
-                    .set_direction(RTCRtpTransceiverDirection::from_send_recv(enabled, receive));
+                    .set_direction(RTCRtpTransceiverDirection::from_send_recv(enabled, receive))?;
             }
             return Ok(true);
         }
@@ -2140,13 +2451,22 @@ impl Driver {
         let ids: Vec<RTCRtpTransceiverId> = self.pc.get_transceivers().collect();
         let mut reusable = None;
         for id in ids {
-            let Some(transceiver) = self.pc.rtp_transceiver(id) else {
+            let Some((stopped, sender_id, receiver_id)) = self
+                .pc
+                .rtp_transceiver(id)
+                .map(|t| (t.stopped(), t.sender(), t.receiver()))
+            else {
                 continue;
             };
-            if transceiver.stopped() || transceiver.sender().is_some() {
+            // Every transceiver has a sender now (W3C webrtc-pc 5.4): the one we can give our
+            // track to is a transceiver whose sender has no track.
+            let has_track = sender_id
+                .and_then(|sender| self.pc.rtp_sender(sender))
+                .is_some_and(|sender| sender.track().is_some());
+            if stopped || has_track {
                 continue;
             }
-            let Some(receiver_id) = transceiver.receiver() else {
+            let Some(receiver_id) = receiver_id else {
                 continue;
             };
             if self
@@ -2185,11 +2505,18 @@ impl Driver {
             let Some(mut transceiver) = self.pc.rtp_transceiver(id) else {
                 continue;
             };
-            let negotiated = transceiver.current_direction().has_send();
+            // `None` before any exchange negotiated the transceiver: not negotiated to send.
+            let negotiated = transceiver
+                .current_direction()
+                .is_some_and(|d| d.has_send());
             let receive = transceiver.direction().has_recv();
-            transceiver.set_direction(RTCRtpTransceiverDirection::from_send_recv(
+            // Refused only for a stopping transceiver (or a closed connection), whose
+            // direction no longer matters.
+            if let Err(err) = transceiver.set_direction(RTCRtpTransceiverDirection::from_send_recv(
                 negotiated, receive,
-            ));
+            )) {
+                tracing::debug!(%err, "transceiver direction left as it is");
+            }
             if let Some(sender) = self.senders.get_mut(&kind) {
                 sender.enabled = negotiated;
             }
@@ -2216,7 +2543,7 @@ impl Driver {
             let negotiated = self
                 .pc
                 .rtp_transceiver(id)
-                .is_some_and(|t| t.current_direction().has_send());
+                .is_some_and(|t| t.current_direction().is_some_and(|d| d.has_send()));
             let sending = enabled && negotiated;
             if self.local_sending.insert(kind, sending) != Some(sending) {
                 self.emit(RtcEvent::LocalMedia { kind, sending }).await;
@@ -2244,7 +2571,7 @@ impl Driver {
         if !self
             .pc
             .rtp_transceiver(id)
-            .is_some_and(|t| t.current_direction().has_send())
+            .is_some_and(|t| t.current_direction().is_some_and(|d| d.has_send()))
         {
             return Ok(());
         }
@@ -2254,7 +2581,7 @@ impl Driver {
         if local.packetizer.is_none() {
             // Negotiated once the remote description is applied: the payload type is the
             // answer's (or the offer's, when we answer).
-            let Some(ssrc) = sender.track().ssrcs().last() else {
+            let Some(ssrc) = sender.ssrcs().last() else {
                 return Ok(());
             };
             // The media codec, not its retransmission format.
@@ -2329,17 +2656,18 @@ impl Driver {
             }
             .new_candidate_relay()?;
             let init = RTCIceCandidate::from(&candidate).to_json()?;
-            self.pc.add_local_candidate(init)?;
+            self.add_candidate(init)?;
         }
         if self.relay_only {
             return Ok(());
         }
         // With one socket the engine's own priorities (RFC 8445's single-address values) are
         // kept; with several each address gets its own local preference.
-        let several = self.socks.len() > 1;
+        let several = self.socks.iter().filter(|s| !s.retired).count() > 1;
         let locals: Vec<(SocketAddr, u16, Vec<SocketAddr>)> = self
             .socks
             .iter()
+            .filter(|s| !s.retired)
             .map(|s| (s.local, s.preference, s.srflx.clone()))
             .collect();
         for (local, preference, srflx) in locals {
@@ -2363,7 +2691,7 @@ impl Driver {
             }
             .new_candidate_host()?;
             let init = RTCIceCandidate::from(&candidate).to_json()?;
-            self.pc.add_local_candidate(init)?;
+            self.add_candidate(init)?;
             for addr in srflx {
                 let candidate = CandidateServerReflexiveConfig {
                     base_config: CandidateConfig {
@@ -2380,10 +2708,25 @@ impl Driver {
                 }
                 .new_candidate_server_reflexive()?;
                 let init = RTCIceCandidate::from(&candidate).to_json()?;
-                self.pc.add_local_candidate(init)?;
+                self.add_candidate(init)?;
             }
         }
         Ok(())
+    }
+
+    /// Add one local candidate. One on an address of the previous DTLS association is refused
+    /// by the engine (RFC 8842 section 5.1) and left out: the relay candidate when no new
+    /// allocation could be made (`renew_relay`).
+    fn add_candidate(&mut self, init: RTCIceCandidateInit) -> Result<(), RtcError> {
+        match self.pc.add_local_candidate(init) {
+            Err(rtc::shared::error::Error::ErrICECandidateAddressOfPreviousDtlsAssociation(
+                addr,
+            )) => {
+                tracing::warn!(%addr, "candidate of the previous DTLS association left out");
+                Ok(())
+            }
+            other => Ok(other?),
+        }
     }
 
     async fn emit_local_description(&mut self) {
@@ -2513,6 +2856,14 @@ fn selected_pair(
 pub fn ice_ufrag(sdp: &str) -> Option<&str> {
     sdp.lines()
         .find_map(|line| line.trim().strip_prefix("a=ice-ufrag:"))
+        .map(str::trim)
+}
+
+/// The first `a=tls-id` of a description (RFC 8842 section 5.5): it changes when the
+/// description starts a new DTLS association.
+pub fn tls_id(sdp: &str) -> Option<&str> {
+    sdp.lines()
+        .find_map(|line| line.trim().strip_prefix("a=tls-id:"))
         .map(str::trim)
 }
 

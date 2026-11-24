@@ -85,6 +85,9 @@ pub struct CallConfig {
     pub video_source: VideoSourceKind,
     /// The addresses of the two machines.
     pub addresses: [Vec<&'static str>; 2],
+    /// Packets an SRTP master key protects before the connection re-keys, per side
+    /// (`[caller, callee]`; `None`: the profile's, which a call never reaches).
+    pub srtp_key_lifetime: [Option<parolnet_rtc::rtc::srtp::keying::KeyLifetime>; 2],
 }
 
 impl Default for CallConfig {
@@ -97,6 +100,7 @@ impl Default for CallConfig {
             jitter_buffer: true,
             video_source: VideoSourceKind::Model,
             addresses: [vec!["10.0.0.1"], vec!["10.0.0.2"]],
+            srtp_key_lifetime: [None, None],
         }
     }
 }
@@ -540,6 +544,7 @@ async fn spawn_peer(
         polite: index == 1,
         mdns: false,
         quality_interval: Some(Duration::from_secs(1)),
+        srtp_key_lifetime: config.srtp_key_lifetime[index],
         ..Default::default()
     };
     let (handle, events) = parolnet_rtc::spawn(rtc_config).await.expect("spawn");
@@ -802,6 +807,7 @@ impl PeerTask {
                         | RtcEvent::DataChannelBufferedLow { .. }
                         | RtcEvent::DataChannelMessage { .. }
                         | RtcEvent::IceConnectionState(_)
+                        | RtcEvent::SelectedCandidatePairChanged
                         | RtcEvent::RemoteOfferIgnored => {}
                     }
                 }
