@@ -271,8 +271,8 @@ struct Stall {
     requests: (u64, u64),
     /// The caller's key frames sent, at the same two instants.
     keyframes_sent: (u64, u64),
-    /// The callee's video NACKs: when the stall began, before the gap's time bound ran out,
-    /// after it, and when the link healed.
+    /// The callee's video NACKs: before it could know of the gap, before the gap's time
+    /// bound ran out, after it, and when the link healed.
     nacks: [u32; 4],
 }
 
@@ -281,10 +281,10 @@ struct Stall {
 /// callee) and the callee's (its RTCP back):
 ///
 /// 1. `t0 .. t0+200 ms`: the caller's link drops everything (about six frames);
-/// 2. `t0+200 .. t0+250 ms`: it carries again (at least one frame, 30 a second), so the
-///    callee learns of the gap; the callee's link drops everything, so no NACK reaches the
-///    caller and nothing repairs the gap;
-/// 3. `t0+250 ms .. t0+1750 ms`: the caller's link drops everything again; the callee's
+/// 2. `t0+200 .. t0+300 ms`: it carries again (three frame intervals at 30 a second), so
+///    the callee learns of the gap; the callee's link drops everything, so no NACK reaches
+///    the caller and nothing repairs the gap;
+/// 3. `t0+300 ms .. t0+1750 ms`: the caller's link drops everything again; the callee's
 ///    carries (its PLI and NACKs reach the caller, whose answers are lost);
 /// 4. from `t0+1750 ms`: both carry.
 ///
@@ -299,19 +299,25 @@ async fn stall_after_a_gap() -> Stall {
     };
     call.caller.host.set_profile(dead);
     run_to(&call, t0 + ms(200)).await;
+    // Nothing after the gap has arrived yet: no NACK can name it.
+    let nacks_unknown = video_nacks_sent(&call.callee).await;
     call.caller.host.set_profile(LinkProfile::default());
     call.callee.host.set_profile(dead);
-    run_to(&call, t0 + ms(250)).await;
+    run_to(&call, t0 + ms(300)).await;
     call.caller.host.set_profile(dead);
     call.callee.host.set_profile(LinkProfile::default());
-    let nacks_at_stall = video_nacks_sent(&call.callee).await;
-    // The gap became known between t0+210 and t0+260 ms: its bound runs out between t0+510
-    // and t0+560 ms.
+    // The gap became known with the first frame after t0+200 ms (it arrives by t0+245 ms):
+    // its bound runs out between t0+510 and t0+545 ms. The last packet of phase 2 arrives by
+    // about t0+310 ms.
     run_to(&call, t0 + ms(400)).await;
     let requests_before = call.callee.metrics().video.keyframes_requested;
     let keyframes_before = call.caller.metrics().video.keyframes_sent;
+    // About 300 ms of asking for the gap (the generator runs every 100 ms), all before its
+    // bound.
+    run_to(&call, t0 + ms(500)).await;
     let nacks_before = video_nacks_sent(&call.callee).await;
-    run_to(&call, t0 + ms(700)).await;
+    // At least 250 ms after the bound.
+    run_to(&call, t0 + ms(800)).await;
     let nacks_after = video_nacks_sent(&call.callee).await;
     let heal = t0 + ms(1750);
     run_to(&call, heal).await;
@@ -325,7 +331,7 @@ async fn stall_after_a_gap() -> Stall {
         heal,
         requests: (requests_before, requests_at_heal),
         keyframes_sent: (keyframes_before, keyframes_at_heal),
-        nacks: [nacks_at_stall, nacks_before, nacks_after, nacks_at_heal],
+        nacks: [nacks_unknown, nacks_before, nacks_after, nacks_at_heal],
     }
 }
 
@@ -377,11 +383,11 @@ async fn a_stall_after_a_gap_asks_for_a_key_frame_and_video_resumes() {
 async fn a_gap_given_up_is_no_longer_asked_for() {
     let stall = stall_after_a_gap().await;
     let test = "a_gap_given_up_is_no_longer_asked_for";
-    let [at_stall, before, after, at_heal] = stall.nacks;
+    let [unknown, before, after, at_heal] = stall.nacks;
     figure(test, "callee", "video NACKs", stall.nacks);
     // The callee asked for the gap while it could still be used...
     assert!(
-        before > at_stall,
+        before > unknown,
         "no NACK for the gap before its bound: {:?}",
         stall.nacks
     );
