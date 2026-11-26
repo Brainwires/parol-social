@@ -759,6 +759,12 @@ async fn receive(
                         stats.video.samples.fetch_add(1, Ordering::Relaxed);
                         let _ = sample_tx.try_send(sample.data.to_vec());
                     }
+                    // The builder gave a gap up (a packet missing for its time bound): the
+                    // frames after it may refer to what was lost.
+                    if builder.take_key_frame_request() {
+                        last_request = Instant::now();
+                        let _ = frames.request_keyframe();
+                    }
                 }
                 Some(MediaEvent::Rtp { kind: MediaKind::Audio, packet }) => {
                     stats.audio_packets.fetch_add(1, Ordering::Relaxed);
