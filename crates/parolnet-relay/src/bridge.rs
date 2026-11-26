@@ -233,6 +233,6 @@ mod tests {
     #[test]
     fn scrubber_interval_meets_spec() {
         // MUST-090: scrubber runs at least once per hour, independent of traffic.
-        assert!(IP_LOG_SCRUBBER_INTERVAL_SECS <= 3_600);
+        const { assert!(IP_LOG_SCRUBBER_INTERVAL_SECS <= 3_600) };
     }
 }

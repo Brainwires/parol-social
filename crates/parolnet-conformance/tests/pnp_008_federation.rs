@@ -233,10 +233,7 @@ fn release_ships_with_at_least_three_authority_keys_and_threshold_two() {
         "release MUST ship ≥3 authority pubkeys, got {}",
         AUTHORITY_PUBKEYS.len()
     );
-    assert!(
-        AUTHORITY_THRESHOLD >= 2,
-        "threshold MUST be ≥2, got {AUTHORITY_THRESHOLD}"
-    );
+    const { assert!(AUTHORITY_THRESHOLD >= 2, "threshold MUST be ≥2") };
 }
 
 #[clause("PNP-008-MUST-057")]
@@ -408,7 +405,7 @@ fn iblt_wire_cell_count_over_cap_rejected() {
     let mut buf = Vec::new();
     buf.extend_from_slice(&((MAX_IBLT_CELLS + 1) as u16).to_be_bytes());
     buf.push(3);
-    buf.extend(std::iter::repeat(0u8).take((MAX_IBLT_CELLS + 1) * 68));
+    buf.extend(std::iter::repeat_n(0u8, (MAX_IBLT_CELLS + 1) * 68));
     assert!(Iblt::from_bytes(&buf).is_err());
 }
 
@@ -692,8 +689,8 @@ fn heartbeat_counter_must_strictly_increase_verified_via_sig() {
     // Monotonicity check: h2 > h1, h1 at ≥ h1.counter is a replay.
     let last_counter = 11u64;
     assert!(mk(12).counter > last_counter);
-    assert!(!(mk(11).counter > last_counter));
-    assert!(!(mk(0).counter > last_counter));
+    assert!(mk(11).counter <= last_counter);
+    assert!(mk(0).counter <= last_counter);
 }
 
 #[clause("PNP-008-MUST-011")]
@@ -702,7 +699,7 @@ fn heartbeat_cadence_constants_match_spec() {
     use parolnet_protocol::federation::{HEARTBEAT_MIN_INTERVAL_SECS, HEARTBEAT_UNREACHABLE_SECS};
     assert_eq!(HEARTBEAT_MIN_INTERVAL_SECS, 60);
     assert_eq!(HEARTBEAT_UNREACHABLE_SECS, 180);
-    assert!(HEARTBEAT_UNREACHABLE_SECS >= 3 * HEARTBEAT_MIN_INTERVAL_SECS);
+    const { assert!(HEARTBEAT_UNREACHABLE_SECS >= 3 * HEARTBEAT_MIN_INTERVAL_SECS) };
 }
 
 // -- §4.3 BridgeAnnouncement ------------------------------------------------
@@ -1330,7 +1327,7 @@ fn bridge_ip_log_scrubber_purges_at_24h() {
         "scrubber MUST run at least every 3600 s independent of traffic"
     );
     assert_eq!(IP_LOG_MAX_AGE_SECS, 86_400);
-    assert!(IP_LOG_SCRUBBER_INTERVAL_SECS <= 3_600);
+    const { assert!(IP_LOG_SCRUBBER_INTERVAL_SECS <= 3_600) };
     // Exercise the scrub path.
     let mut log = IpAuditLog::new();
     let ip: std::net::IpAddr = "198.51.100.7".parse().unwrap();
@@ -2139,7 +2136,7 @@ fn reputation_never_used_as_published_signal() {
 #[test]
 fn authority_key_rotation_at_most_annual() {
     const AUTHORITY_KEY_ROTATION_MAX_DAYS: u64 = 365;
-    assert!(AUTHORITY_KEY_ROTATION_MAX_DAYS <= 365);
+    const { assert!(AUTHORITY_KEY_ROTATION_MAX_DAYS <= 365) };
 }
 
 #[clause("PNP-008-SHOULD-002")]
@@ -2170,8 +2167,8 @@ fn expired_descriptor_digest_retention_is_24_hours() {
 fn stable_promotion_requires_7_days_active_score_0_8() {
     const STABLE_MIN_ACTIVE_DAYS: u64 = 7;
     const STABLE_MIN_SCORE: f64 = 0.8;
-    assert!(STABLE_MIN_ACTIVE_DAYS >= 7);
-    assert!(STABLE_MIN_SCORE >= 0.8);
+    const { assert!(STABLE_MIN_ACTIVE_DAYS >= 7) };
+    const { assert!(STABLE_MIN_SCORE >= 0.8) };
 }
 
 #[clause("PNP-008-SHOULD-006")]
@@ -2196,26 +2193,26 @@ fn release_ships_5_to_10_seed_addresses() {
 #[test]
 fn priority_tier_order_randomizable() {
     const RANDOMIZE_WITHIN_TIER: bool = true;
-    assert!(RANDOMIZE_WITHIN_TIER);
+    const { assert!(RANDOMIZE_WITHIN_TIER) };
 }
 
 #[clause("PNP-008-SHOULD-009")]
 #[test]
 fn bridge_descriptors_via_e2e_channel() {
     const BRIDGE_DELIVERY_E2E: bool = true;
-    assert!(BRIDGE_DELIVERY_E2E);
+    const { assert!(BRIDGE_DELIVERY_E2E) };
 }
 
 #[clause("PNP-008-SHOULD-010")]
 #[test]
 fn endorsement_transparency_log_architected() {
     const TRANSPARENCY_LOG_SUPPORTED: bool = true;
-    assert!(TRANSPARENCY_LOG_SUPPORTED);
+    const { assert!(TRANSPARENCY_LOG_SUPPORTED) };
 }
 
 #[clause("PNP-008-SHOULD-011")]
 #[test]
 fn heartbeat_carries_capability_bitmap() {
     const CAPABILITY_BITMAP_FIELD: bool = true;
-    assert!(CAPABILITY_BITMAP_FIELD);
+    const { assert!(CAPABILITY_BITMAP_FIELD) };
 }

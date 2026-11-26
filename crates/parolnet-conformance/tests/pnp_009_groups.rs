@@ -206,7 +206,7 @@ fn group_call_rejects_ninth_participant() {
 
     // Initiator is auto-added (participant 1); fill the remaining 7 slots.
     for i in 1..MAX_GROUP_CALL_PARTICIPANTS {
-        mgr.join_call(&call_id, PeerId([i as u8; 32])).unwrap();
+        mgr.join_call(&call_id, PeerId([i; 32])).unwrap();
     }
     // 9th (a 9th peer) MUST be rejected.
     let ninth = mgr.join_call(&call_id, PeerId([0x99; 32]));
@@ -535,7 +535,8 @@ fn group_operation_signature_covers_the_spec_map_with_empty_signature() {
     assert!(op.verify_signature(&admin_pub).is_ok());
 
     // Every signed field is covered.
-    let mutations: Vec<Box<dyn Fn(&mut GroupOperation)>> = vec![
+    type Mutation = Box<dyn Fn(&mut GroupOperation)>;
+    let mutations: Vec<Mutation> = vec![
         Box::new(|o| o.group_id.0[0] ^= 1),
         Box::new(|o| o.version += 1),
         Box::new(|o| {
@@ -1046,7 +1047,7 @@ fn sender_key_rotation_at_24_hours() {
 fn automatic_rotation_when_threshold_reached() {
     // Implementations track both counters and trigger on either threshold.
     const AUTO_ROTATION_TRACKED: bool = true;
-    assert!(AUTO_ROTATION_TRACKED);
+    const { assert!(AUTO_ROTATION_TRACKED) };
 }
 
 #[clause("PNP-009-SHOULD-005")]
@@ -1054,19 +1055,19 @@ fn automatic_rotation_when_threshold_reached() {
 fn group_call_end_triggers_leave() {
     // GroupCallEnd message type exists; participant behavior on receipt is to leave.
     const GROUP_CALL_END_LEAVES: bool = true;
-    assert!(GROUP_CALL_END_LEAVES);
+    const { assert!(GROUP_CALL_END_LEAVES) };
 }
 
 #[clause("PNP-009-SHOULD-006")]
 #[test]
 fn screenshare_conflict_notifies_user() {
     const SCREENSHARE_NOTIFY_BUSY: bool = true;
-    assert!(SCREENSHARE_NOTIFY_BUSY);
+    const { assert!(SCREENSHARE_NOTIFY_BUSY) };
 }
 
 #[clause("PNP-009-SHOULD-007")]
 #[test]
 fn group_file_integrity_failure_notifies_user() {
     const INTEGRITY_FAIL_NOTIFY: bool = true;
-    assert!(INTEGRITY_FAIL_NOTIFY);
+    const { assert!(INTEGRITY_FAIL_NOTIFY) };
 }

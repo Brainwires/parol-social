@@ -201,8 +201,11 @@ async fn run_session(
         OpusDecoder,
     )> = None;
     let mut builder = SampleBuilder::new(256, Vp8Packet::default(), 90_000);
+    let mut video_ssrc = None;
+    let mut horizon = None;
     let mut last_keyframe_request = Instant::now() - Duration::from_secs(10);
     loop {
+        let gap_deadline = builder.poll_timeout();
         tokio::select! {
             event = events.recv() => match event {
                 Some(RtcEvent::ConnectionState(state)) => {
@@ -247,17 +250,10 @@ async fn run_session(
                         continue;
                     }
                     stats.packets.fetch_add(1, Ordering::Relaxed);
+                    video_ssrc = Some(packet.header.ssrc);
                     let now = Instant::now();
                     builder.push(now, packet);
-                    while let Some(sample) = builder.pop(now) {
-                        stats.samples.fetch_add(1, Ordering::Relaxed);
-                        // A full queue means the decoder is behind: drop, it will ask for a
-                        // keyframe if the gap breaks the reference chain.
-                        let _ = sample_tx.try_send(sample.data.to_vec());
-                    }
-                    // The builder gave a gap up (a packet missing for its time bound): the
-                    // frames after it may refer to what was lost.
-                    if builder.take_key_frame_request() {
+                    if drain_video(&mut builder, now, &sample_tx, &stats, &rtc, video_ssrc, &mut horizon)? {
                         last_keyframe_request = Instant::now();
                         rtc.request_keyframe(track_id)?;
                     }
@@ -269,6 +265,17 @@ async fn run_session(
                 Some(_) => {}
                 None => break,
             },
+            // A gap reaches the builder's time bound while nothing arrives (a stall after a
+            // loss): give it up now, not on the next packet.
+            _ = parolnet_rtc::sleep_until(gap_deadline) => {
+                let now = Instant::now();
+                if drain_video(&mut builder, now, &sample_tx, &stats, &rtc, video_ssrc, &mut horizon)?
+                    && let Some(track) = &video_track
+                {
+                    last_keyframe_request = Instant::now();
+                    rtc.request_keyframe(track.clone())?;
+                }
+            }
             Some(()) = keyframe_rx.recv() => {
                 if last_keyframe_request.elapsed() > Duration::from_secs(1)
                     && let Some(track) = &video_track
@@ -283,6 +290,35 @@ async fn run_session(
     let _ = decode_thread.join();
     rtc.close().await;
     Ok(())
+}
+
+/// Sends every frame the builder has ready at `now` (after a packet, or at its
+/// `poll_timeout`) to the decoder and moves the NACK horizon on: what the builder built or
+/// gave up a retransmission can no longer help (RFC 4588 section 6.3). True when the builder
+/// gave a gap up (a packet missing for its time bound): the frames after it may refer to what
+/// was lost, so the caller asks for a key frame.
+fn drain_video(
+    builder: &mut SampleBuilder<Vp8Packet>,
+    now: Instant,
+    sample_tx: &std::sync::mpsc::SyncSender<Vec<u8>>,
+    stats: &Stats,
+    rtc: &parolnet_rtc::RtcHandle,
+    ssrc: Option<u32>,
+    horizon: &mut Option<u16>,
+) -> anyhow::Result<bool> {
+    while let Some(sample) = builder.pop(now) {
+        stats.samples.fetch_add(1, Ordering::Relaxed);
+        // A full queue means the decoder is behind: drop, it will ask for a keyframe if the
+        // gap breaks the reference chain.
+        let _ = sample_tx.try_send(sample.data.to_vec());
+    }
+    if let Some(ssrc) = ssrc
+        && builder.nack_horizon() != *horizon
+    {
+        *horizon = builder.nack_horizon();
+        rtc.set_nack_horizon(ssrc, *horizon)?;
+    }
+    Ok(builder.take_key_frame_request())
 }
 
 pub(crate) fn decode_loop(

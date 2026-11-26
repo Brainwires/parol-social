@@ -130,11 +130,11 @@ impl GroupFixture {
             .collect();
 
         for sender_idx in 0..4 {
-            for receiver_idx in 0..4 {
+            for (receiver_idx, receiver) in peers.iter().enumerate() {
                 if sender_idx == receiver_idx {
                     continue;
                 }
-                peers[receiver_idx]
+                receiver
                     .group_manager()
                     .process_sender_key_distribution(&group_id, ids[sender_idx], &dists[sender_idx])
                     .unwrap();

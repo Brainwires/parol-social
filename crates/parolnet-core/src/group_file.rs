@@ -387,10 +387,10 @@ mod tests {
         let mut receiver = GroupFileReceiver::from_offer(&offer);
 
         while let Some(mut chunk) = sender.next_chunk() {
-            if chunk.chunk_index == 0 {
-                if let Some(byte) = chunk.data.first_mut() {
-                    *byte ^= 0xFF;
-                }
+            if chunk.chunk_index == 0
+                && let Some(byte) = chunk.data.first_mut()
+            {
+                *byte ^= 0xFF;
             }
             receiver
                 .receive_chunk(chunk.chunk_index, chunk.data)

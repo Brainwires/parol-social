@@ -327,6 +327,11 @@ pub(crate) enum OutFrame {
     },
     /// Ask the contact for a keyframe.
     RequestKeyframe,
+    /// Stop asking for retransmissions of the stream `ssrc` before `oldest_useful`.
+    NackHorizon {
+        ssrc: u32,
+        oldest_useful: Option<u16>,
+    },
 }
 
 /// Sends our encoded frames (cheap to clone; usable from capture threads).
@@ -351,6 +356,18 @@ impl FrameSink {
     pub fn request_keyframe(&self) -> bool {
         self.0.send(OutFrame::RequestKeyframe).is_ok()
     }
+
+    /// The oldest sequence number of the contact's stream `ssrc` our receive path can still
+    /// use (its sample builder's `nack_horizon()`, given after popping): no retransmission is
+    /// asked for before it ([`parolnet_rtc::RtcHandle::set_nack_horizon`]).
+    pub fn set_nack_horizon(&self, ssrc: u32, oldest_useful: Option<u16>) -> bool {
+        self.0
+            .send(OutFrame::NackHorizon {
+                ssrc,
+                oldest_useful,
+            })
+            .is_ok()
+    }
 }
 
 /// The client's media end of a call (taken once per call).
@@ -369,6 +386,10 @@ pub(crate) async fn pump_frames(mut rx: mpsc::UnboundedReceiver<OutFrame>, tx: F
                 samples,
             } => tx.send_frame(kind, data, samples),
             OutFrame::RequestKeyframe => tx.request_keyframes(),
+            OutFrame::NackHorizon {
+                ssrc,
+                oldest_useful,
+            } => tx.set_nack_horizon(ssrc, oldest_useful),
         };
         if sent.is_err() {
             break;

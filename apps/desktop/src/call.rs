@@ -747,24 +747,44 @@ async fn receive(
     };
     let mut decoder = OpusDecoder::new().ok();
     let mut builder = SampleBuilder::new(256, Vp8Packet::default(), 90_000);
+    let mut video_ssrc = None;
+    let mut horizon = None;
     let mut last_request = Instant::now() - Duration::from_secs(10);
+    // Every frame the builder has ready at `now` (after a packet, or at its `poll_timeout`)
+    // to the decoder, and the NACK horizon moved on: what the builder built or gave up a
+    // retransmission can no longer help (RFC 4588 section 6.3). When the builder gave a gap
+    // up (a packet missing for its time bound) the frames after it may refer to what was
+    // lost: ask for a key frame.
+    let drain = |builder: &mut SampleBuilder<Vp8Packet>,
+                 now: Instant,
+                 ssrc: Option<u32>,
+                 horizon: &mut Option<u16>,
+                 last_request: &mut Instant| {
+        while let Some(sample) = builder.pop(now) {
+            stats.video.samples.fetch_add(1, Ordering::Relaxed);
+            let _ = sample_tx.try_send(sample.data.to_vec());
+        }
+        if let Some(ssrc) = ssrc
+            && builder.nack_horizon() != *horizon
+        {
+            *horizon = builder.nack_horizon();
+            let _ = frames.set_nack_horizon(ssrc, *horizon);
+        }
+        if builder.take_key_frame_request() {
+            *last_request = Instant::now();
+            let _ = frames.request_keyframe();
+        }
+    };
     loop {
+        let gap_deadline = builder.poll_timeout();
         tokio::select! {
             ev = events.recv() => match ev {
                 Some(MediaEvent::Rtp { kind: MediaKind::Video, packet }) => {
                     stats.video.packets.fetch_add(1, Ordering::Relaxed);
+                    video_ssrc = Some(packet.header.ssrc);
                     let now = Instant::now();
                     builder.push(now, packet);
-                    while let Some(sample) = builder.pop(now) {
-                        stats.video.samples.fetch_add(1, Ordering::Relaxed);
-                        let _ = sample_tx.try_send(sample.data.to_vec());
-                    }
-                    // The builder gave a gap up (a packet missing for its time bound): the
-                    // frames after it may refer to what was lost.
-                    if builder.take_key_frame_request() {
-                        last_request = Instant::now();
-                        let _ = frames.request_keyframe();
-                    }
+                    drain(&mut builder, now, video_ssrc, &mut horizon, &mut last_request);
                 }
                 Some(MediaEvent::Rtp { kind: MediaKind::Audio, packet }) => {
                     stats.audio_packets.fetch_add(1, Ordering::Relaxed);
@@ -802,6 +822,11 @@ async fn receive(
                 }
                 None => break,
             },
+            // A gap reaches the builder's time bound while nothing arrives (a stall after a
+            // loss): give it up now, not on the next packet.
+            _ = parolnet_rtc::sleep_until(gap_deadline) => {
+                drain(&mut builder, Instant::now(), video_ssrc, &mut horizon, &mut last_request);
+            }
             Some(()) = want_rx.recv() => {
                 if last_request.elapsed() > Duration::from_secs(1) {
                     last_request = Instant::now();
