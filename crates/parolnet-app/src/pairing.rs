@@ -191,6 +191,16 @@ impl Engine {
         Ok(contact)
     }
 
+    /// The contacts we entered a code of whose pairing has not sent its first message: the
+    /// connection it goes over is ours to offer (`pair_with_code`).
+    pub(super) fn scanner_pairings_waiting(&self) -> Vec<String> {
+        self.pairings
+            .iter()
+            .filter(|(_, slot)| slot.hint && !slot.started)
+            .map(|(peer, _)| peer.clone())
+            .collect()
+    }
+
     /// Mark the contact as being paired (saved with it): if a restart interrupts the
     /// pairing, the next start removes what it left (`State::forget_unfinished_pairings`).
     fn mark_pairing(&mut self, peer: &str, new: bool) -> Contact {

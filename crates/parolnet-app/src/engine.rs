@@ -1443,6 +1443,11 @@ impl Engine {
                 for p in waiting {
                     self.connect(&p, false);
                 }
+                // A code entered while the socket was not registered: its offer could not go
+                // out then, and the presenter, who does not know us yet, never offers.
+                for p in self.scanner_pairings_waiting() {
+                    self.connect(&p, true);
+                }
                 self.flush_unsent_descriptions();
                 self.run_probes();
             }
