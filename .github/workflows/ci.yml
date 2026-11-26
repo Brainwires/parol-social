@@ -26,6 +26,36 @@ jobs:
             ${{ runner.os }}-cargo-check-
       - run: cargo check --workspace
 
+  check-windows:
+    name: Cargo Check (Windows)
+    # The rest of this workflow builds on Linux only; the desktop ships on Windows too, and a
+    # platform-gated API (socket2's keepalive getters, say) breaks only there.
+    # runners-first: the self-hosted Windows pools serve only push / dispatch runs of allowlisted refs (ops/runners/allowlist.json) and this runs on pull_request, like every other job here
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Perl for the vendored OpenSSL
+        # parolnet-store's SQLCipher builds an OpenSSL libcrypto from source; its Configure
+        # needs a native Windows perl, not Git Bash's (first on PATH in bash steps).
+        run: |
+          perl="C:/Strawberry/perl/bin/perl.exe"
+          [ -f "$perl" ] || choco install strawberryperl -y --no-progress
+          echo "OPENSSL_SRC_PERL=$perl" >> "$GITHUB_ENV"
+      - uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-check-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-check-
+      - run: cargo check --workspace
+
   deny:
     name: Licence gate (cargo-deny)
     runs-on: ubuntu-latest

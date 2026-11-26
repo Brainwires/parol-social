@@ -218,7 +218,13 @@ impl TlsTransport {
     }
 }
 
-/// Enable TCP keepalive at [`TCP_KEEPALIVE`] and return what the kernel then reports.
+/// Enable TCP keepalive at [`TCP_KEEPALIVE`] and return the probe interval in effect.
+///
+/// Where the socket can be asked (`TCP_KEEPINTVL`, socket2's `tcp_keepalive_interval`) this
+/// is what the kernel reports. Windows sets the time and the interval together through
+/// `SIO_KEEPALIVE_VALS`, which fails the call when it is refused, and has no option socket2
+/// reads them back with: there the interval is the one just set, once `SO_KEEPALIVE` reads
+/// back on.
 fn enable_keepalive(stream: &TcpStream) -> std::io::Result<Option<Duration>> {
     let sock = socket2::SockRef::from(stream);
     let keepalive = socket2::TcpKeepalive::new()
@@ -228,7 +234,49 @@ fn enable_keepalive(stream: &TcpStream) -> std::io::Result<Option<Duration>> {
     if !sock.keepalive()? {
         return Ok(None);
     }
-    Ok(Some(sock.tcp_keepalive_interval()?))
+    keepalive_interval(&sock).map(Some)
+}
+
+/// The keepalive probe interval the kernel reports (the targets socket2 0.6 offers
+/// `tcp_keepalive_interval` on, with its `all` feature).
+#[cfg(any(
+    target_os = "android",
+    target_os = "dragonfly",
+    target_os = "freebsd",
+    target_os = "fuchsia",
+    target_os = "illumos",
+    target_os = "ios",
+    target_os = "visionos",
+    target_os = "linux",
+    target_os = "macos",
+    target_os = "netbsd",
+    target_os = "tvos",
+    target_os = "watchos",
+    target_os = "cygwin",
+))]
+fn keepalive_interval(sock: &socket2::SockRef<'_>) -> std::io::Result<Duration> {
+    sock.tcp_keepalive_interval()
+}
+
+/// Elsewhere (Windows) the interval cannot be read back: it is the one
+/// [`enable_keepalive`] set, which `set_tcp_keepalive` would have failed on otherwise.
+#[cfg(not(any(
+    target_os = "android",
+    target_os = "dragonfly",
+    target_os = "freebsd",
+    target_os = "fuchsia",
+    target_os = "illumos",
+    target_os = "ios",
+    target_os = "visionos",
+    target_os = "linux",
+    target_os = "macos",
+    target_os = "netbsd",
+    target_os = "tvos",
+    target_os = "watchos",
+    target_os = "cygwin",
+)))]
+fn keepalive_interval(_sock: &socket2::SockRef<'_>) -> std::io::Result<Duration> {
+    Ok(TCP_KEEPALIVE)
 }
 
 fn h2_err(e: h2::Error) -> TransportError {
@@ -449,8 +497,9 @@ pub struct TlsConnection {
 }
 
 impl TlsConnection {
-    /// The TCP keepalive interval the kernel reports for this connection's socket, `None`
-    /// when keepalive is off (PNP-006-MUST-027).
+    /// The TCP keepalive interval the kernel reports for this connection's socket (on
+    /// Windows, which cannot be asked, the one set), `None` when keepalive is off
+    /// (PNP-006-MUST-027).
     pub fn tcp_keepalive(&self) -> Option<Duration> {
         self.keepalive
     }

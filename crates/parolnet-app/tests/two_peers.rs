@@ -437,6 +437,50 @@ async fn a_restart_in_the_middle_of_a_pairing_leaves_no_contact() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A code entered before the app's relay socket is registered (right after start, as
+/// `parolnet-desktop --call-check` does, or while the relay is reconnecting): the offer the
+/// pairing needs goes out once the socket registers. The presenter does not know the scanner
+/// yet and never offers, so without it the pairing waits forever.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_code_entered_before_registration_still_pairs() {
+    let relay = start_relay().await;
+    let dir = unique_dir("pair-unregistered");
+    let (alice, mut alice_rx) = start(config(&dir, &relay, "alice")).await;
+    registered(&mut alice_rx).await;
+    let code = alice.create_pairing_code().await.unwrap();
+
+    let (bob, mut bob_rx) = start(config(&dir, &relay, "bob")).await;
+    bob.pair_with_code(&code).await.unwrap();
+    // The case under test: Bob's socket had not registered yet when the code went in.
+    let mut early = Vec::new();
+    while let Ok(ev) = bob_rx.try_recv() {
+        early.push(ev);
+    }
+    assert!(
+        !early
+            .iter()
+            .any(|e| matches!(e, AppEvent::Relay(RelayState::Registered { .. }))),
+        "bob registered before the code went in: {early:?}"
+    );
+
+    for (rx, who) in [(&mut bob_rx, "bob"), (&mut alice_rx, "alice")] {
+        wait_for(rx, &format!("{who}'s verified direct path"), 45, |e| {
+            matches!(
+                e,
+                AppEvent::Path {
+                    state: PathState::Direct,
+                    ..
+                }
+            )
+        })
+        .await;
+    }
+
+    alice.shutdown().await;
+    bob.shutdown().await;
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// A code made by `app` itself (to check that pairing with one's own code is refused).
 async fn bob_code_of(app: &AppHandle) -> String {
     app.create_pairing_code().await.unwrap()

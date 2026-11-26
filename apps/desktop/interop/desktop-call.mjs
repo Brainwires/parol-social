@@ -8,7 +8,8 @@
 // VP8 and Opus (call-check's own exit status) and the bot received the desktop's VP8.
 //
 // Environment: PAROLNET_RELAY_BIN, PAROLNET_BOT_BIN (default: $CARGO_TARGET_DIR or target/,
-// debug), INTEROP_VERBOSE=1.
+// debug), INTEROP_VERBOSE=1, INTEROP_LOG (the RUST_LOG of the bot and the desktop; on a
+// failure both sides' output is printed).
 
 import { spawn } from "node:child_process";
 import { existsSync, mkdtempSync, rmSync } from "node:fs";
@@ -27,6 +28,11 @@ const desktopBin = process.argv[2];
 const verbose = process.env.INTEROP_VERBOSE === "1";
 const work = mkdtempSync(join(tmpdir(), "parolnet-desktop-call-"));
 const children = [];
+const appLog = process.env.INTEROP_LOG || "parolnet_app=debug,parolnet_rtc=info,warn";
+// Both sides' output, printed when the check fails.
+const botOut = [];
+let botErr = "";
+let desktopErr = "";
 
 const log = (...a) => console.log(`[${new Date().toISOString().slice(11, 23)}]`, ...a);
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -52,11 +58,14 @@ async function main() {
   const url = `ws://127.0.0.1:${port}/ws`;
 
   const bot = spawn(botBin, ["--relay", url, "--data-dir", join(work, "bot"), "--host-only", "--bind", "127.0.0.1", "--show-code"], {
-    stdio: ["pipe", "pipe", verbose ? "inherit" : "ignore"],
+    stdio: ["pipe", "pipe", verbose ? "inherit" : "pipe"],
+    env: { ...process.env, RUST_LOG: appLog },
   });
   children.push(bot);
+  bot.stderr?.on("data", (d) => (botErr += d));
   const events = [];
   createInterface({ input: bot.stdout }).on("line", (line) => {
+    botOut.push(`[${new Date().toISOString().slice(11, 23)}] ${line}`);
     if (verbose) log("[bot]", line);
     try {
       const ev = JSON.parse(line);
@@ -78,7 +87,7 @@ async function main() {
   const desktop = spawn(
     desktopBin,
     ["--call-check", "--relay", url, "--data-dir", join(work, "desktop"), "--code", code, "--video", "--bind", "127.0.0.1", "--seconds", "8"],
-    { stdio: ["ignore", "pipe", verbose ? "inherit" : "pipe"] },
+    { stdio: ["ignore", "pipe", verbose ? "inherit" : "pipe"], env: { ...process.env, RUST_LOG: appLog } },
   );
   children.push(desktop);
   let result = "";
@@ -86,10 +95,9 @@ async function main() {
     log("[desktop]", line);
     if (line.startsWith("call-check")) result = line;
   });
-  let stderr = "";
-  desktop.stderr?.on("data", (d) => (stderr += d));
+  desktop.stderr?.on("data", (d) => (desktopErr += d));
   const status = await new Promise((r) => desktop.on("exit", (c) => r(c)));
-  if (status !== 0) throw new Error(`call-check exited ${status}: ${result || stderr.slice(-2000)}`);
+  if (status !== 0) throw new Error(`call-check exited ${status}: ${result || desktopErr.slice(-2000)}`);
   const media = events.filter((e) => e.event === "media").pop();
   if (!media || media.video_rx < 30) throw new Error(`the bot received too little of the desktop's video: ${JSON.stringify(media)}`);
   log(`PASS: ${result}; the bot received ${media.video_rx} VP8 packets from the desktop`);
@@ -101,6 +109,10 @@ try {
 } catch (e) {
   code = 1;
   console.error(`FAIL: ${e.message}`);
+  const tail = (text, n) => text.split("\n").slice(-n).join("\n");
+  console.error(`--- bot stdout (events) ---\n${botOut.slice(-200).join("\n")}`);
+  console.error(`--- bot stderr (RUST_LOG=${appLog}) ---\n${tail(botErr, 400)}`);
+  console.error(`--- desktop stderr (RUST_LOG=${appLog}) ---\n${tail(desktopErr, 400)}`);
 }
 for (const c of children) c.kill();
 rmSync(work, { recursive: true, force: true });
