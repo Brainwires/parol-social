@@ -166,7 +166,7 @@ jobs:
           key: ${{ runner.os }}-cargo-interop-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
             ${{ runner.os }}-cargo-interop-
-      - uses: actions/setup-node@v6
+      - uses: actions/setup-node@v7
         with:
           node-version: 22
       - name: Playwright
@@ -327,7 +327,7 @@ jobs:
         run: denext task test
       - name: Export the static site (the test build, then the production export)
         run: denext task build:test && denext task build
-      - uses: actions/setup-node@v6
+      - uses: actions/setup-node@v7
         with:
           node-version: 22
       - name: Playwright and its browsers
