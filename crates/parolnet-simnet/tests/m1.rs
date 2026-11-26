@@ -555,9 +555,20 @@ async fn the_estimate_climbs_on_an_open_link() {
             2_500_000,
             "{who}: up to the maximum"
         );
-        // About 8% a second: one megabit after some sixteen seconds.
         let at_1m = m.targets.iter().find(|t| t.1 >= 1_000_000).unwrap().0;
-        assert!((secs(12)..=secs(22)).contains(&at_1m), "{who}: {at_1m:?}");
+        // rtci 0.2.0 probes for bandwidth by default. The callee's probe finds the open path:
+        // 1 Mbit/s at 620 ms (CI 45841495800), where 0.1.0 climbed at about 8% a second and
+        // took some sixteen seconds; the bound goes from 12 s..=22 s to within 2 s.
+        // The caller does not probe yet: it climbs as in 0.1.0 (15.61 s in the same run), so
+        // it keeps the old 12 s..=22 s. That is an open rtci 0.2.0 finding: the probe retry
+        // stops after an unanswered first probe (`rtci-interceptor/src/cc/interceptor.rs`,
+        // `probe_unanswered`). Once it is fixed the caller's bound must become the callee's;
+        // this assertion then fails on the 12 s lower bound, which is intended.
+        if who == "callee" {
+            assert!(at_1m <= secs(2), "{who}: {at_1m:?}");
+        } else {
+            assert!((secs(12)..=secs(22)).contains(&at_1m), "{who}: {at_1m:?}");
+        }
         // The video followed it.
         let sent = m.video.bytes_sent as f64 * 8.0;
         assert!(sent > 20e6, "{who}: {sent} bits of video in 35 s");
