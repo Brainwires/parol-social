@@ -639,7 +639,8 @@ impl VideoEncoder {
 
 /// The receiving side's VP8 frame assembly, as the desktop's: a 256-packet window and the
 /// engine's default gap bound (a packet missing for 300 ms is given up, and the builder asks
-/// for a key frame with `take_key_frame_request`).
+/// for a key frame with `take_key_frame_request`). The receive loop pops on every packet and
+/// at the builder's `poll_timeout`, so a gap followed by silence is given up on time too.
 fn video_sample_builder() -> SampleBuilder<Vp8Packet> {
     SampleBuilder::new(256, Vp8Packet::default(), 90_000)
 }
@@ -695,9 +696,64 @@ impl VideoDecoder {
     }
 }
 
+/// The receiving side's video path: frame assembly, the decoder's rule, and what it asks of
+/// the sender.
+struct VideoReceive {
+    builder: SampleBuilder<Vp8Packet>,
+    decoder: VideoDecoder,
+    /// The SSRC the video arrives on (from its packets).
+    ssrc: Option<u32>,
+    /// The NACK horizon last given to the driver.
+    horizon: Option<u16>,
+    last_keyframe_request: Option<Instant>,
+}
+
 impl PeerTask {
     fn metrics(&self) -> MutexGuard<'_, Metrics> {
         self.metrics.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Takes every frame the builder has ready at `now` (after a packet, or at its
+    /// `poll_timeout`), judges it, moves the NACK horizon on and asks for a key frame when
+    /// the builder gave a gap up or the decoder lost its reference.
+    fn drain_video(&self, video: &mut VideoReceive, now: std::time::Instant) {
+        let at = self.started.elapsed();
+        while let Some(sample) = video.builder.pop(now) {
+            let Some(usable) = video.decoder.accept(&sample.data) else {
+                continue;
+            };
+            let mut m = self.metrics();
+            m.video.frames_received += 1;
+            if usable {
+                m.video.usable_at.push(at);
+            } else {
+                m.video.unusable += 1;
+            }
+        }
+        // What the builder built or gave up a retransmission can no longer help: stop asking
+        // for it (RFC 4588 section 6.3).
+        let horizon = video.builder.nack_horizon();
+        if horizon != video.horizon
+            && let Some(ssrc) = video.ssrc
+        {
+            video.horizon = horizon;
+            let _ = self.handle.set_nack_horizon(ssrc, horizon);
+        }
+        // The builder gave a gap up (a packet missing for its time bound): the frames after
+        // it may refer to what was lost.
+        let gave_up = video.builder.take_key_frame_request();
+        // A decoder without its reference asks for a keyframe, at most once a second (as
+        // the desktop's receive path does).
+        if gave_up
+            || !video.decoder.has_reference()
+                && video
+                    .last_keyframe_request
+                    .is_none_or(|t| t.elapsed() >= Duration::from_secs(1))
+        {
+            video.last_keyframe_request = Some(Instant::now());
+            self.metrics().video.keyframes_requested += 1;
+            let _ = self.handle.frame_sender().request_keyframes();
+        }
     }
 
     async fn run(mut self) {
@@ -714,16 +770,21 @@ impl PeerTask {
         let mut opus_encoder = OpusEncoder::new().expect("Opus encoder");
         let mut opus_decoder = OpusDecoder::new().expect("Opus decoder");
         let mut video_encoder = VideoEncoder::new(self.source);
-        let mut video_decoder = VideoDecoder::new(self.source);
-        let mut builder = video_sample_builder();
+        let mut video = VideoReceive {
+            builder: video_sample_builder(),
+            decoder: VideoDecoder::new(self.source),
+            ssrc: None,
+            horizon: None,
+            last_keyframe_request: None,
+        };
         let playout = PlayoutBuffer::new();
         let mut played: Vec<f32> = Vec::with_capacity(FRAME_20MS);
         let mut playing = false;
         let mut kinds: HashMap<String, MediaKind> = HashMap::new();
         let mut connected = false;
-        let mut last_keyframe_request: Option<Instant> = None;
 
         loop {
+            let gap_deadline = video.builder.poll_timeout();
             tokio::select! {
                 biased;
                 event = self.events.recv() => {
@@ -761,34 +822,10 @@ impl PeerTask {
                             }
                             Some(MediaKind::Video) => {
                                 self.metrics().video.packets_received += 1;
+                                video.ssrc = Some(packet.header.ssrc);
                                 let now = parolnet_rtc::now();
-                                builder.push(now, packet);
-                                while let Some(sample) = builder.pop(now) {
-                                    let Some(usable) = video_decoder.accept(&sample.data) else {
-                                        continue;
-                                    };
-                                    let mut m = self.metrics();
-                                    m.video.frames_received += 1;
-                                    if usable {
-                                        m.video.usable_at.push(at);
-                                    } else {
-                                        m.video.unusable += 1;
-                                    }
-                                }
-                                // The builder gave a gap up (a packet missing for its time
-                                // bound): the frames after it may refer to what was lost.
-                                let gave_up = builder.take_key_frame_request();
-                                // A decoder without its reference asks for a keyframe, at
-                                // most once a second (as the desktop's receive path does).
-                                if gave_up
-                                    || !video_decoder.has_reference()
-                                        && last_keyframe_request
-                                            .is_none_or(|t| t.elapsed() >= Duration::from_secs(1))
-                                {
-                                    last_keyframe_request = Some(Instant::now());
-                                    self.metrics().video.keyframes_requested += 1;
-                                    let _ = self.handle.frame_sender().request_keyframes();
-                                }
+                                video.builder.push(now, packet);
+                                self.drain_video(&mut video, now);
                             }
                             None => {}
                         },
@@ -821,6 +858,11 @@ impl PeerTask {
                         | RtcEvent::SelectedCandidatePairChanged
                         | RtcEvent::RemoteOfferIgnored => {}
                     }
+                }
+                // A gap reaches the builder's time bound while nothing arrives (a stall
+                // after a loss): give it up now, not on the next packet.
+                _ = parolnet_rtc::sleep_until(gap_deadline) => {
+                    self.drain_video(&mut video, parolnet_rtc::now());
                 }
                 Some(desc) = self.inbox.recv() => {
                     let _ = self.handle.set_remote_description(desc);

@@ -778,10 +778,10 @@ mod tests {
         let mut healthy_count = 0;
         let iterations = 200;
         for _ in 0..iterations {
-            if let Some(info) = dir.select_random(&[]) {
-                if info.peer_id == healthy_id {
-                    healthy_count += 1;
-                }
+            if let Some(info) = dir.select_random(&[])
+                && info.peer_id == healthy_id
+            {
+                healthy_count += 1;
             }
         }
 
@@ -823,10 +823,10 @@ mod tests {
         let mut good_count = 0;
         let iterations = 50;
         for _ in 0..iterations {
-            if let Some(info) = dir.select_random(&[]) {
-                if info.peer_id == good_id {
-                    good_count += 1;
-                }
+            if let Some(info) = dir.select_random(&[])
+                && info.peer_id == good_id
+            {
+                good_count += 1;
             }
         }
 

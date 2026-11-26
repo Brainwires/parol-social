@@ -393,10 +393,12 @@ fn video_fragment_fits_within_one_cell_payload() {
     use parolnet_relay::MAX_DATA_PAYLOAD;
     // MUST-032: large frames MUST be fragmented.
     // MUST-033: each RTP packet MUST fit within a single relay cell.
-    assert!(
-        MAX_FRAGMENT_SIZE <= MAX_DATA_PAYLOAD,
-        "fragment size {MAX_FRAGMENT_SIZE} MUST fit within cell payload {MAX_DATA_PAYLOAD}"
-    );
+    const {
+        assert!(
+            MAX_FRAGMENT_SIZE <= MAX_DATA_PAYLOAD,
+            "fragment size MUST fit within cell payload"
+        )
+    };
     assert_eq!(MAX_FRAGMENT_SIZE, 440);
     assert_eq!(MAX_DATA_PAYLOAD, 457);
 }
@@ -601,7 +603,7 @@ fn answerer_selects_highest_priority_mutually_supported_codec() {
 fn receiver_jitter_buffer_orders_and_drops_late_packets() {
     const JITTER_BUFFER_MIN_MS: u64 = 50;
     const JITTER_BUFFER_MAX_MS: u64 = 200;
-    assert!(JITTER_BUFFER_MIN_MS < JITTER_BUFFER_MAX_MS);
+    const { assert!(JITTER_BUFFER_MIN_MS < JITTER_BUFFER_MAX_MS) };
 }
 
 #[clause("PNP-007-MUST-023", "PNP-007-MUST-024", "PNP-007-MUST-025")]
@@ -792,7 +794,7 @@ fn mediacall_profile_resembles_streaming_video() {
 fn post_hangup_padding_persists_5_to_30_seconds_before_normal_mode() {
     const POST_HANGUP_MIN_SECS: u64 = 5;
     const POST_HANGUP_MAX_SECS: u64 = 30;
-    assert!(POST_HANGUP_MIN_SECS < POST_HANGUP_MAX_SECS);
+    const { assert!(POST_HANGUP_MIN_SECS < POST_HANGUP_MAX_SECS) };
     assert_eq!(POST_HANGUP_MIN_SECS, 5);
     assert_eq!(POST_HANGUP_MAX_SECS, 30);
 }
@@ -884,7 +886,7 @@ fn screen_share_config_uses_vp9_and_720p() {
 #[test]
 fn missed_call_notification_on_timeout() {
     const MISSED_CALL_NOTIFICATION: bool = true;
-    assert!(MISSED_CALL_NOTIFICATION);
+    const { assert!(MISSED_CALL_NOTIFICATION) };
 }
 
 #[clause("PNP-007-SHOULD-002")]
@@ -892,7 +894,7 @@ fn missed_call_notification_on_timeout() {
 fn codec_renegotiation_via_new_offer() {
     // Offer/Answer flow accepts a new Offer mid-session for renegotiation.
     const CODEC_RENEGOTIATION_VIA_OFFER: bool = true;
-    assert!(CODEC_RENEGOTIATION_VIA_OFFER);
+    const { assert!(CODEC_RENEGOTIATION_VIA_OFFER) };
 }
 
 #[clause("PNP-007-SHOULD-003")]
@@ -901,7 +903,7 @@ fn initial_jitter_buffer_is_100ms_adaptive() {
     const INITIAL_JITTER_MS: u64 = 100;
     const ADAPTIVE_JITTER: bool = true;
     assert_eq!(INITIAL_JITTER_MS, 100);
-    assert!(ADAPTIVE_JITTER);
+    const { assert!(ADAPTIVE_JITTER) };
 }
 
 #[clause("PNP-007-SHOULD-004")]
@@ -915,21 +917,21 @@ fn plc_triggers_at_three_consecutive_missing_packets() {
 #[test]
 fn vp9_support_is_recommended() {
     const VP9_SUPPORTED: bool = true;
-    assert!(VP9_SUPPORTED);
+    const { assert!(VP9_SUPPORTED) };
 }
 
 #[clause("PNP-007-SHOULD-006")]
 #[test]
 fn file_integrity_failure_notifies_user() {
     const INTEGRITY_FAIL_NOTIFY: bool = true;
-    assert!(INTEGRITY_FAIL_NOTIFY);
+    const { assert!(INTEGRITY_FAIL_NOTIFY) };
 }
 
 #[clause("PNP-007-SHOULD-007")]
 #[test]
 fn transfer_progress_indication_available() {
     const PROGRESS_INDICATION: bool = true;
-    assert!(PROGRESS_INDICATION);
+    const { assert!(PROGRESS_INDICATION) };
 }
 
 #[clause("PNP-007-SHOULD-008")]

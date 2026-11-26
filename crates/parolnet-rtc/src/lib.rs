@@ -109,6 +109,17 @@ pub fn now() -> Instant {
     tokio::time::Instant::now().into_std()
 }
 
+/// Waits until `deadline` on the clock of [`now`]; never completes for `None`. For a
+/// `select!` arm that wakes a receive path at an instant the engine names without a packet
+/// arriving first, such as a sample builder's `poll_timeout()` (a gap that reaches its time
+/// bound while nothing arrives).
+pub async fn sleep_until(deadline: Option<Instant>) {
+    match deadline {
+        Some(at) => tokio::time::sleep_until(tokio::time::Instant::from_std(at)).await,
+        None => std::future::pending().await,
+    }
+}
+
 /// Errors from the driver.
 #[derive(Debug, thiserror::Error)]
 pub enum RtcError {
@@ -473,6 +484,10 @@ enum Command {
         track_id: MediaStreamTrackId,
     },
     RequestKeyframes,
+    SetNackHorizon {
+        ssrc: u32,
+        oldest_useful: Option<u16>,
+    },
     SendFrame {
         kind: MediaKind,
         data: bytes::Bytes,
@@ -583,6 +598,16 @@ impl FrameSender {
     pub fn request_keyframes(&self) -> Result<(), RtcError> {
         self.commands
             .send(Command::RequestKeyframes)
+            .map_err(|_| RtcError::Stopped)
+    }
+
+    /// See [`RtcHandle::set_nack_horizon`].
+    pub fn set_nack_horizon(&self, ssrc: u32, oldest_useful: Option<u16>) -> Result<(), RtcError> {
+        self.commands
+            .send(Command::SetNackHorizon {
+                ssrc,
+                oldest_useful,
+            })
             .map_err(|_| RtcError::Stopped)
     }
 }
@@ -742,6 +767,19 @@ impl RtcHandle {
     /// Ask the sender of a video track for a keyframe (RTCP PLI).
     pub fn request_keyframe(&self, track_id: MediaStreamTrackId) -> Result<(), RtcError> {
         self.send(Command::RequestKeyframe { track_id })
+    }
+
+    /// Tell the NACK generator the oldest sequence number of the received stream `ssrc` that
+    /// the application can still use (`None` removes the horizon): no retransmission is asked
+    /// for a packet before it (RFC 4588 section 6.3: a retransmission is asked for only while
+    /// it can still be of use). A video receive path gives its sample builder's
+    /// `nack_horizon()` here after popping: what the builder built or gave up, a repair can no
+    /// longer help. An SSRC no remote track receives is ignored.
+    pub fn set_nack_horizon(&self, ssrc: u32, oldest_useful: Option<u16>) -> Result<(), RtcError> {
+        self.send(Command::SetNackHorizon {
+            ssrc,
+            oldest_useful,
+        })
     }
 
     /// The engine's stats report, plus the number of RTP events dropped because the event
@@ -2035,6 +2073,19 @@ impl Driver {
                                 media_ssrc,
                             })],
                         )?;
+                    }
+                }
+            }
+            Command::SetNackHorizon {
+                ssrc,
+                oldest_useful,
+            } => {
+                // The engine ignores an SSRC the receiver does not receive.
+                let receivers: Vec<RTCRtpReceiverId> =
+                    self.tracks.values().map(|(id, _)| *id).collect();
+                for receiver_id in receivers {
+                    if let Some(mut receiver) = self.pc.rtp_receiver(receiver_id) {
+                        receiver.set_nack_horizon(now, ssrc, oldest_useful)?;
                     }
                 }
             }

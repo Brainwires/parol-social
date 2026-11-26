@@ -3,6 +3,8 @@
 //!
 //! - call setup;
 //! - renegotiation (an audio call that gains and loses video) on a lossy link;
+//! - a stall that follows a loss: the receiver gives the gap up on its timer, asks for a key
+//!   frame and stops asking for retransmissions it can no longer use, and video resumes;
 //! - an ICE restart when one machine changes networks mid-call, and what happens without it;
 //! - the bandwidth estimate: where it goes on an open link, under a cap, and when the cap
 //!   comes and goes;
@@ -18,8 +20,12 @@
 use std::time::Duration;
 
 use parolnet_rtc::rtci::peer_connection::state::RTCPeerConnectionState;
+use parolnet_rtc::rtci::rtp_transceiver::rtp_sender::RtpCodecKind;
+use parolnet_rtc::rtci::statistics::report::RTCStatsReportEntry;
 use parolnet_rtc::{CandidateKind, MediaKind, NetworkMonitor};
-use parolnet_simnet::call::{CallConfig, Metrics, SimCall, VideoSourceKind, video_bitrate_for};
+use parolnet_simnet::call::{
+    CallConfig, Metrics, SimCall, SimPeer, VideoSourceKind, video_bitrate_for,
+};
 use parolnet_simnet::{LinkProfile, SimNet};
 
 fn secs(n: u64) -> Duration {
@@ -230,6 +236,163 @@ async fn renegotiation_on_a_lossy_link() {
         );
     }
     call.close().await;
+}
+
+/// Runs the call until `at` (since it started).
+async fn run_to(call: &SimCall, at: Duration) {
+    call.run_for(at.saturating_sub(call.elapsed())).await;
+}
+
+/// The NACKs a peer sent for the video it receives (`inbound-rtp` `nackCount`).
+async fn video_nacks_sent(peer: &SimPeer) -> u32 {
+    let (report, _) = peer.handle.stats().await.expect("stats");
+    report
+        .iter()
+        .filter_map(|entry| match entry {
+            RTCStatsReportEntry::InboundRtp(inbound)
+                if inbound.received_rtp_stream_stats.rtp_stream_stats.kind
+                    == RtpCodecKind::Video =>
+            {
+                Some(inbound.nack_count)
+            }
+            _ => None,
+        })
+        .sum()
+}
+
+/// What [`stall_after_a_gap`] measured on the callee (which receives the caller's video) and
+/// the caller (which sends it).
+struct Stall {
+    call: SimCall,
+    /// When the caller's link healed.
+    heal: Duration,
+    /// The callee's key-frame requests, after the last packet before the stall had arrived
+    /// and when the link healed.
+    requests: (u64, u64),
+    /// The caller's key frames sent, at the same two instants.
+    keyframes_sent: (u64, u64),
+    /// The callee's video NACKs: when the stall began, before the gap's time bound ran out,
+    /// after it, and when the link healed.
+    nacks: [u32; 4],
+}
+
+/// A gap that the receiver knows of, then nothing at all for longer than the gap bound
+/// (300 ms), then the link heals. Phases on the caller's uplink (the caller's media to the
+/// callee) and the callee's (its RTCP back):
+///
+/// 1. `t0 .. t0+200 ms`: the caller's link drops everything (about six frames);
+/// 2. `t0+200 .. t0+250 ms`: it carries again (at least one frame, 30 a second), so the
+///    callee learns of the gap; the callee's link drops everything, so no NACK reaches the
+///    caller and nothing repairs the gap;
+/// 3. `t0+250 ms .. t0+1750 ms`: the caller's link drops everything again; the callee's
+///    carries (its PLI and NACKs reach the caller, whose answers are lost);
+/// 4. from `t0+1750 ms`: both carry.
+///
+/// No packet reaches the callee in phase 3, so only a timer can give the gap up there.
+async fn stall_after_a_gap() -> Stall {
+    let (call, _) = call_on(LinkProfile::default(), CallConfig::default()).await;
+    call.run_for(secs(3)).await;
+    let t0 = call.elapsed();
+    let dead = LinkProfile {
+        loss: 1.0,
+        ..Default::default()
+    };
+    call.caller.host.set_profile(dead);
+    run_to(&call, t0 + ms(200)).await;
+    call.caller.host.set_profile(LinkProfile::default());
+    call.callee.host.set_profile(dead);
+    run_to(&call, t0 + ms(250)).await;
+    call.caller.host.set_profile(dead);
+    call.callee.host.set_profile(LinkProfile::default());
+    let nacks_at_stall = video_nacks_sent(&call.callee).await;
+    // The gap became known between t0+210 and t0+260 ms: its bound runs out between t0+510
+    // and t0+560 ms.
+    run_to(&call, t0 + ms(400)).await;
+    let requests_before = call.callee.metrics().video.keyframes_requested;
+    let keyframes_before = call.caller.metrics().video.keyframes_sent;
+    let nacks_before = video_nacks_sent(&call.callee).await;
+    run_to(&call, t0 + ms(700)).await;
+    let nacks_after = video_nacks_sent(&call.callee).await;
+    let heal = t0 + ms(1750);
+    run_to(&call, heal).await;
+    let requests_at_heal = call.callee.metrics().video.keyframes_requested;
+    let keyframes_at_heal = call.caller.metrics().video.keyframes_sent;
+    let nacks_at_heal = video_nacks_sent(&call.callee).await;
+    call.caller.host.set_profile(LinkProfile::default());
+    run_to(&call, heal + secs(3)).await;
+    Stall {
+        call,
+        heal,
+        requests: (requests_before, requests_at_heal),
+        keyframes_sent: (keyframes_before, keyframes_at_heal),
+        nacks: [nacks_at_stall, nacks_before, nacks_after, nacks_at_heal],
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_stall_after_a_gap_asks_for_a_key_frame_and_video_resumes() {
+    let stall = stall_after_a_gap().await;
+    let test = "a_stall_after_a_gap_asks_for_a_key_frame_and_video_resumes";
+    figure(test, "callee", "key-frame requests", stall.requests);
+    figure(test, "caller", "key frames sent", stall.keyframes_sent);
+    // Nothing arrived in the stall: only the builder's timer can have given the gap up.
+    assert!(
+        stall.requests.1 > stall.requests.0,
+        "no key-frame request while nothing arrived: {:?}",
+        stall.requests
+    );
+    // The request went out: the caller answered with a key frame (lost on its link).
+    assert!(
+        stall.keyframes_sent.1 > stall.keyframes_sent.0,
+        "the caller sent no key frame in the stall: {:?}",
+        stall.keyframes_sent
+    );
+    // Once the link heals, video resumes and does not freeze again.
+    let end = stall.call.elapsed();
+    let callee = stall.call.callee.snapshot();
+    let first = callee
+        .video
+        .usable_at
+        .iter()
+        .copied()
+        .find(|at| *at > stall.heal)
+        .expect("video after the link healed");
+    figure(
+        test,
+        "callee",
+        "first frame after healing",
+        first - stall.heal,
+    );
+    assert!(
+        first - stall.heal < ms(1500),
+        "video resumed {:?} after the link healed",
+        first - stall.heal
+    );
+    let gap = callee.video.longest_gap(first, end);
+    assert!(gap < secs(1), "video froze for {gap:?} after it resumed");
+    stall.call.close().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_gap_given_up_is_no_longer_asked_for() {
+    let stall = stall_after_a_gap().await;
+    let test = "a_gap_given_up_is_no_longer_asked_for";
+    let [at_stall, before, after, at_heal] = stall.nacks;
+    figure(test, "callee", "video NACKs", stall.nacks);
+    // The callee asked for the gap while it could still be used...
+    assert!(
+        before > at_stall,
+        "no NACK for the gap before its bound: {:?}",
+        stall.nacks
+    );
+    // ...and stopped once the builder gave it up (RFC 4588 section 6.3): its horizon moved
+    // past it, and nothing newer is missing.
+    assert_eq!(
+        at_heal, after,
+        "NACKs for packets the builder gave up: {:?}",
+        stall.nacks
+    );
+    stall.call.close().await;
 }
 
 #[tokio::test(start_paused = true)]

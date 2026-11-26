@@ -31,7 +31,7 @@ fn issue_one(authority: &TokenAuthority, input: &[u8]) -> Token {
 fn serialize_deserialize_roundtrips_issue_accept() {
     // Mint a token under the original authority, persist, rebuild — the
     // rebuilt authority MUST accept the original token.
-    let mut before = TokenAuthority::new(TokenConfig::default(), 1_000_000);
+    let before = TokenAuthority::new(TokenConfig::default(), 1_000_000);
     let nonce = [42u8; NONCE_LEN];
     let tok = issue_one(&before, &nonce);
 
@@ -75,7 +75,7 @@ fn from_persisted_triggers_rotation_on_stale_epoch() {
     };
 
     // Epoch at t=0 → t=99; t=100 is the start of epoch 1.
-    let mut old = TokenAuthority::new(cfg.clone(), 0);
+    let old = TokenAuthority::new(cfg.clone(), 0);
     let nonce = [7u8; NONCE_LEN];
     let tok = issue_one(&old, &nonce);
     let old_epoch = old.current_epoch();

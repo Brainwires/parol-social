@@ -438,7 +438,7 @@ fn responder_verifies_spk_id_matches_current_or_recent() {
     // → mismatched SK.
     let bob = IdentityKeyPair::generate();
     let alice = IdentityKeyPair::generate();
-    let (bundle, spk, opk) = bundle_for(&bob, true);
+    let (bundle, _spk, opk) = bundle_for(&bob, true);
     let (sk_alice, header) = X3dhKeyAgreement { identity: alice }
         .initiate(&bundle)
         .unwrap();
@@ -457,13 +457,7 @@ fn responder_verifies_spk_id_matches_current_or_recent() {
     // Verify: with the CORRECT SPK, SKs match.
     let correct_bob = IdentityKeyPair::generate();
     let _ = correct_bob; // ignored — we use the one from the bundle.
-    let bob2 = bob_signer_from(&spk); // helper below
-    let _ = bob2;
-}
-
-fn bob_signer_from(_spk: &SignedPreKey) -> () {
-    // Placeholder to keep type-checker happy; the actual "correct-path" check
-    // is redundant with `alice_and_bob_derive_same_shared_secret_with_opk`.
+    // The correct-path check is `alice_and_bob_derive_same_shared_secret_with_opk`.
 }
 
 #[clause("PNP-002-MUST-015")]
@@ -665,7 +659,7 @@ fn previous_spk_rotation_period_kept_accepted() {
     // Retention window: at least one prior rotation period. With rotation =
     // 7 days (lower bound of SHOULD-005), retention ≥ 7 days.
     const SPK_PREVIOUS_KEEP_DAYS: u64 = 7;
-    assert!(SPK_PREVIOUS_KEEP_DAYS >= 7);
+    const { assert!(SPK_PREVIOUS_KEEP_DAYS >= 7) };
 }
 
 #[clause("PNP-002-SHOULD-004")]
@@ -674,7 +668,7 @@ fn opk_pool_size_permits_proactive_replenishment() {
     // A replenishment threshold exists: consume < pool size, refill early.
     const OPK_POOL_TARGET: usize = 100;
     const OPK_REPLENISH_THRESHOLD: usize = 20;
-    assert!(OPK_REPLENISH_THRESHOLD < OPK_POOL_TARGET);
+    const { assert!(OPK_REPLENISH_THRESHOLD < OPK_POOL_TARGET) };
 }
 
 #[clause("PNP-002-SHOULD-005")]
@@ -723,7 +717,7 @@ fn identity_key_can_be_placed_inside_encrypted_envelope() {
 fn prekey_bundles_publish_at_regular_cover_interval() {
     // Periodic publication cadence (cover traffic for existence metadata).
     const PREKEY_BUNDLE_PUBLISH_INTERVAL_HOURS: u64 = 24;
-    assert!(PREKEY_BUNDLE_PUBLISH_INTERVAL_HOURS <= 7 * 24);
+    const { assert!(PREKEY_BUNDLE_PUBLISH_INTERVAL_HOURS <= 7 * 24) };
 }
 
 #[clause("PNP-002-SHOULD-010")]
@@ -731,6 +725,6 @@ fn prekey_bundles_publish_at_regular_cover_interval() {
 fn handshake_response_jitter_range_is_100_to_2000_ms() {
     const HANDSHAKE_RESPONSE_JITTER_MIN_MS: u64 = 100;
     const HANDSHAKE_RESPONSE_JITTER_MAX_MS: u64 = 2000;
-    assert!(HANDSHAKE_RESPONSE_JITTER_MIN_MS >= 100);
-    assert!(HANDSHAKE_RESPONSE_JITTER_MAX_MS <= 2000);
+    const { assert!(HANDSHAKE_RESPONSE_JITTER_MIN_MS >= 100) };
+    const { assert!(HANDSHAKE_RESPONSE_JITTER_MAX_MS <= 2000) };
 }
