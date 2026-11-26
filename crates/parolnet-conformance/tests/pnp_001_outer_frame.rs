@@ -475,11 +475,12 @@ fn client_refuses_to_spend_retired_epoch_token() {
     }
 
     let active = [0u8, 0, 0x10, 0];
-    let grace = Some([0u8, 0, 0x0F, 0xFF]);
+    let grace_epoch = [0u8, 0, 0x0F, 0xFF];
+    let grace = Some(grace_epoch);
     let retired = [0u8, 0, 0x0F, 0xFE];
 
     assert!(spend_ok(active, active, grace));
-    assert!(spend_ok(grace.unwrap(), active, grace));
+    assert!(spend_ok(grace_epoch, active, grace));
     assert!(
         !spend_ok(retired, active, grace),
         "MUST-069: retired-epoch token MUST NOT be spent"

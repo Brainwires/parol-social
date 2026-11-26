@@ -231,8 +231,6 @@ fn replay_cache_rejects_duplicate_message_ids() {
 
 // -- §6 MAC verification (constant-time) --------------------------------------
 
-use parolnet_protocol::envelope::Envelope;
-
 #[clause("PNP-001-MUST-009", "PNP-001-MUST-037")]
 #[test]
 fn envelope_mac_verification_via_aead() {
@@ -286,9 +284,8 @@ fn no_compression_api_surface_exists() {
     // surface. A stable way to pin this is to check that a hypothetical
     // compress function does not exist; if it were added this test would be
     // updated alongside a spec revision removing MUST-040.
-    // (Pinning via constant assertion — MUST-040 is an architectural rule,
+    // (Nothing to assert at run time: MUST-040 is an architectural rule,
     // enforced by the absence of a compression dependency in Cargo.toml.)
-    assert!(true, "MUST-040: absence-of-feature clause pinned");
 }
 
 // -- §3.5 Bucket constants ----------------------------------------------------
@@ -567,7 +564,7 @@ fn ciborium_uses_shortest_integer_encoding() {
 fn duplicate_map_keys_rejected() {
     // Build raw CBOR: map of 2 entries, both with key "a" → ciborium rejects.
     // 0xA2 = map(2), 0x61 'a' = text(1) "a", 0x01 = 1, 0x61 'a' = "a", 0x02 = 2.
-    let cbor = vec![0xA2, 0x61, b'a', 0x01, 0x61, b'a', 0x02];
+    let cbor = [0xA2, 0x61, b'a', 0x01, 0x61, b'a', 0x02];
     let r: Result<std::collections::BTreeMap<String, u64>, _> = ciborium::from_reader(&cbor[..]);
     // ciborium BTreeMap dedups, but the stricter check — a struct with duplicate
     // fields — MUST fail. We test the shape assertion via a shape validator:
@@ -876,16 +873,16 @@ fn relay_forward_jitter_range_is_50_to_250_ms() {
 fn seen_cache_retention_is_at_least_30_minutes() {
     // 30 minutes = 1800 seconds; cache retention MUST meet-or-exceed this.
     const SEEN_CACHE_MIN_SECS: u64 = 30 * 60;
-    assert!(SEEN_CACHE_MIN_SECS >= 1800);
+    const { assert!(SEEN_CACHE_MIN_SECS >= 1800) };
 }
 
 #[clause("PNP-001-SHOULD-007")]
 #[test]
 fn replay_cache_retention_is_at_least_60_minutes() {
     const REPLAY_CACHE_MIN_SECS: u64 = 60 * 60;
-    assert!(REPLAY_CACHE_MIN_SECS >= 3600);
+    const { assert!(REPLAY_CACHE_MIN_SECS >= 3600) };
     // Receiver window (MUST) is -30..+5 min → cache must cover the 30-min past window.
-    assert!(REPLAY_CACHE_MIN_SECS >= 30 * 60);
+    const { assert!(REPLAY_CACHE_MIN_SECS >= 30 * 60) };
 }
 
 #[clause("PNP-001-SHOULD-008")]

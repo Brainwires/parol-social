@@ -590,7 +590,7 @@ mod tests {
         let mut buf = Vec::new();
         buf.extend_from_slice(&((MAX_IBLT_CELLS + 1) as u16).to_be_bytes());
         buf.push(3);
-        buf.extend(std::iter::repeat(0u8).take((MAX_IBLT_CELLS + 1) * 68));
+        buf.extend(std::iter::repeat_n(0u8, (MAX_IBLT_CELLS + 1) * 68));
         assert!(Iblt::from_bytes(&buf).is_err());
     }
 

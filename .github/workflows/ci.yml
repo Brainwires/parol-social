@@ -56,6 +56,39 @@ jobs:
             ${{ runner.os }}-cargo-check-
       - run: cargo check --workspace
 
+  check-desktop:
+    name: Cargo Check (desktop app)
+    # apps/desktop is its own workspace (its own toolchain pin and lock file) and builds only in
+    # the Desktop spike workflow, which runs by hand: compile it here, without codegen, so a
+    # change to the crates it uses that breaks it shows on the pull request.
+    # runners-first: it installs system packages with sudo apt-get on a fresh image, and every job of this workflow runs GitHub-hosted on pull requests; moving the workflow to the pools is its own change
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - name: System packages
+        # What the desktop's build scripts probe or bind: libvpx, ALSA (cpal), the GPUI window
+        # system libraries, fontconfig, clang / libclang (bindgen for V4L2, nokhwa).
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config libvpx-dev libasound2-dev libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev \
+            libx11-xcb-dev libxcb1-dev libfontconfig-dev clang libclang-dev
+      - name: Toolchain (apps/desktop/rust-toolchain.toml)
+        working-directory: apps/desktop
+        run: rustup show active-toolchain || rustup toolchain install
+      - uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            apps/desktop/target
+          key: ${{ runner.os }}-desktop-check-${{ hashFiles('apps/desktop/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-desktop-check-
+      - name: cargo check
+        working-directory: apps/desktop
+        run: cargo check --locked --all-targets
+
   deny:
     name: Licence gate (cargo-deny)
     runs-on: ubuntu-latest
@@ -105,7 +138,7 @@ jobs:
           key: ${{ runner.os }}-cargo-clippy-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
             ${{ runner.os }}-cargo-clippy-
-      - run: cargo clippy --workspace -- -D warnings
+      - run: cargo clippy --workspace --all-targets -- -D warnings
 
   fmt:
     name: Rustfmt
