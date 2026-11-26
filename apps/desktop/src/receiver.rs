@@ -255,6 +255,12 @@ async fn run_session(
                         // keyframe if the gap breaks the reference chain.
                         let _ = sample_tx.try_send(sample.data.to_vec());
                     }
+                    // The builder gave a gap up (a packet missing for its time bound): the
+                    // frames after it may refer to what was lost.
+                    if builder.take_key_frame_request() {
+                        last_keyframe_request = Instant::now();
+                        rtc.request_keyframe(track_id)?;
+                    }
                 }
                 Some(RtcEvent::Closed { error }) => {
                     slot.set_status(format!("closed: {}", error.unwrap_or_default()));

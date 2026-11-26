@@ -637,6 +637,13 @@ impl VideoEncoder {
     }
 }
 
+/// The receiving side's VP8 frame assembly, as the desktop's: a 256-packet window and the
+/// engine's default gap bound (a packet missing for 300 ms is given up, and the builder asks
+/// for a key frame with `take_key_frame_request`).
+fn video_sample_builder() -> SampleBuilder<Vp8Packet> {
+    SampleBuilder::new(256, Vp8Packet::default(), 90_000)
+}
+
 /// The receiving side's video decoder: says whether a reassembled frame is usable.
 enum VideoDecoder {
     Model(ModelDecoder),
@@ -708,7 +715,7 @@ impl PeerTask {
         let mut opus_decoder = OpusDecoder::new().expect("Opus decoder");
         let mut video_encoder = VideoEncoder::new(self.source);
         let mut video_decoder = VideoDecoder::new(self.source);
-        let mut builder = SampleBuilder::new(256, Vp8Packet::default(), 90_000);
+        let mut builder = video_sample_builder();
         let playout = PlayoutBuffer::new();
         let mut played: Vec<f32> = Vec::with_capacity(FRAME_20MS);
         let mut playing = false;
@@ -768,11 +775,15 @@ impl PeerTask {
                                         m.video.unusable += 1;
                                     }
                                 }
+                                // The builder gave a gap up (a packet missing for its time
+                                // bound): the frames after it may refer to what was lost.
+                                let gave_up = builder.take_key_frame_request();
                                 // A decoder without its reference asks for a keyframe, at
                                 // most once a second (as the desktop's receive path does).
-                                if !video_decoder.has_reference()
-                                    && last_keyframe_request
-                                        .is_none_or(|t| t.elapsed() >= Duration::from_secs(1))
+                                if gave_up
+                                    || !video_decoder.has_reference()
+                                        && last_keyframe_request
+                                            .is_none_or(|t| t.elapsed() >= Duration::from_secs(1))
                                 {
                                     last_keyframe_request = Some(Instant::now());
                                     self.metrics().video.keyframes_requested += 1;
@@ -919,6 +930,36 @@ mod tests {
         assert!(!decoder.accept(frames[7]));
         assert!(decoder.has_reference());
         assert!(decoder.accept(frames[8]));
+    }
+
+    /// One RTP packet carrying a whole VP8 frame (RFC 7741: descriptor `S`=1, `PID`=0, then
+    /// the payload header, whose bit 0 is clear for a key frame).
+    fn vp8_packet(seq: u16, frame: u32, key: bool) -> parolnet_rtc::rtci::rtp::Packet {
+        let mut p = parolnet_rtc::rtci::rtp::Packet::default();
+        p.header.sequence_number = seq;
+        p.header.timestamp = frame * 3000;
+        p.header.marker = true;
+        p.payload = bytes::Bytes::from(vec![0x10, if key { 0x10 } else { 0x11 }, 0, 0, 0xa5]);
+        p
+    }
+
+    #[test]
+    fn a_frame_lost_for_the_gap_bound_asks_for_a_key_frame() {
+        let start = std::time::Instant::now();
+        let at = |ms: u64| start + Duration::from_millis(ms);
+        let mut builder = video_sample_builder();
+        builder.push(at(0), vp8_packet(100, 0, true));
+        builder.push(at(33), vp8_packet(101, 1, false));
+        // Frame 2 (packet 102) never arrives; frames 3 and 4 refer to it.
+        builder.push(at(100), vp8_packet(103, 3, false));
+        builder.push(at(133), vp8_packet(104, 4, false));
+        assert!(builder.pop(at(133)).is_some(), "the key frame");
+        while builder.pop(at(133)).is_some() {}
+        assert!(!builder.take_key_frame_request(), "a repair may still come");
+        // 300 ms after the first packet past the gap, the gap is given up.
+        while builder.pop(at(400)).is_some() {}
+        assert!(builder.take_key_frame_request());
+        assert!(!builder.take_key_frame_request(), "asked once");
     }
 
     #[test]
