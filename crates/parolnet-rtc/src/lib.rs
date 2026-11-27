@@ -1423,6 +1423,12 @@ struct Driver {
 /// The longest the loop sleeps when the engine names no deadline.
 const IDLE_WAKE: Duration = Duration::from_secs(1);
 
+/// The longest a closed connection is served for the engine's TURN releases
+/// ([`Driver::serve_after_close`]): a Refresh of lifetime 0 and its first two retransmissions
+/// (RFC 8489 section 6.2.1, RTO 500 ms: sent at 0, 0.5 s and 1.5 s). The engine holds no
+/// allocation in this driver's configuration, so the bound is a guard, not a wait.
+const CLOSE_SERVE_LIMIT: Duration = Duration::from_secs(2);
+
 /// Why the loop woke.
 enum Wake {
     Command(Option<Command>),
@@ -1439,6 +1445,7 @@ impl Driver {
             .err()
             .map(|e| e.to_string());
         let _ = self.pc.close();
+        self.serve_after_close().await;
         for relay in [self.relay.take(), self.retired_relay.take()]
             .into_iter()
             .flatten()
@@ -1448,6 +1455,52 @@ impl Driver {
             }
         }
         let _ = self.events.send(RtcEvent::Closed { error }).await;
+    }
+
+    /// The closed connection's last duties. `close()` queues the goodbye (RTCP BYE, SCTP
+    /// ABORT, DTLS `close_notify`) for the next `poll_write`, so the peer can end at once
+    /// instead of at its consent timeout (until rtci 0.2.1 this driver never sent it: the loop
+    /// stopped at `close()`); and from 0.2.1 a closed connection keeps serving
+    /// `poll_write` / `handle_read` / `handle_timeout` for the release transactions of the
+    /// engine's own TURN allocations (RFC 8656 sections 7.4 and 8), with `poll_timeout()`
+    /// `None` once they are done. This driver runs its own TURN client
+    /// (`RelayGathering::Application`, released in [`Driver::run`]), so the engine holds no
+    /// allocation and this ends after the flush; [`CLOSE_SERVE_LIMIT`] bounds it should that
+    /// change.
+    async fn serve_after_close(&mut self) {
+        let limit = now() + CLOSE_SERVE_LIMIT;
+        let mut buf = vec![0u8; 2048];
+        loop {
+            self.flush_writes().await;
+            while let Some(event) = self.pc.poll_event() {
+                if let RTCPeerConnectionEvent::OnTurnAllocationReleased { url, .. } = event {
+                    tracing::debug!(%url, "engine TURN allocation released");
+                }
+            }
+            let Some(deadline) = self.pc.poll_timeout() else {
+                return;
+            };
+            let now = now();
+            if now >= limit {
+                tracing::debug!("the closed connection still had work; not waited for");
+                return;
+            }
+            if deadline <= now {
+                let _ = self.pc.handle_timeout(now);
+                continue;
+            }
+            let start = self.next_sock;
+            tokio::select! {
+                biased;
+                _ = tokio::time::sleep_until(deadline.min(limit).into()) => {}
+                (index, received) = recv_any(&self.socks, start, &mut buf) => {
+                    self.next_sock = index + 1;
+                    if let Ok((n, peer_addr)) = received {
+                        self.on_datagram(index, peer_addr, &buf[..n]);
+                    }
+                }
+            }
+        }
     }
 
     async fn event_loop(
@@ -1875,6 +1928,20 @@ impl Driver {
                     RTCDataChannelEvent::OnBufferedAmountLow(id),
                 ) => {
                     self.emit(RtcEvent::DataChannelBufferedLow { id }).await;
+                }
+                // The engine's own TURN links (rtci 0.2.1). This driver runs its own TURN
+                // client (`RelayGathering::Application`), so the engine makes no allocation
+                // and raises neither; logged should that change.
+                RTCPeerConnectionEvent::OnTurnAllocationReleased { url, .. } => {
+                    tracing::debug!(%url, "engine TURN allocation released");
+                }
+                RTCPeerConnectionEvent::OnTurnRequestRejected {
+                    url,
+                    method,
+                    error_code,
+                    ..
+                } => {
+                    tracing::debug!(%url, method, error_code, "engine TURN request refused");
                 }
                 _ => {}
             }

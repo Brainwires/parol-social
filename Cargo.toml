@@ -48,7 +48,7 @@ parolnet-transfer = { path = "crates/parolnet-transfer" }
 # Realtime engine: `rtci`, Brainwires' fork of webrtc-rs/rtc (sans-I/O), renamed from `rtc`.
 # Its DTLS / SRTP provider is ring (C and assembly); the E2EE layer stays pure Rust.
 # Released on crates.io; the exact version is pinned in Cargo.lock.
-rtci = "0.2.0"
+rtci = "0.2.1"
 
 # Crypto
 x25519-dalek = { version = "2", features = ["static_secrets"] }
