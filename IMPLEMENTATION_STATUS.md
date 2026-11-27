@@ -140,8 +140,8 @@ See [docs/m1-desktop.md](docs/m1-desktop.md) for what runs end to end, the tests
   OpenSSL, key rotation, and a UI for "delete all data" / a lost key.
 - **`parolnet-rtc`**: server-reflexive candidates from STUN (binding request on the connection's
   socket before its loop starts), text data-channel messages, the channel label on open,
-  `default_local_ip`. Engine `rtci` 0.2.0 (was `rtc` `v0.22.0+brainwires.6`; `.5` follows ICE renomination, `.6` is the
-  engine's conformance release, 0.1.0 the renamed first crates.io release, 0.2.0 its congestion and repair defaults;
+  `default_local_ip`. Engine `rtci` 0.2.1 (was `rtc` `v0.22.0+brainwires.6`; `.5` follows ICE renomination, `.6` is the
+  engine's conformance release, 0.1.0 the renamed first crates.io release, 0.2.0 its congestion and repair defaults, 0.2.1 its patch release;
   see CHANGELOG).
 - **TURN, user-supplied only** (PNP-001-MUST-082): `parolnet-rtc` gathers a relay candidate from
   the TURN server the user configured (UDP, long-term credentials, `rtc-turn` driven on the
@@ -173,7 +173,7 @@ See [docs/m1-desktop.md](docs/m1-desktop.md) for what runs end to end, the tests
   events out (local description, states, tracks, RTP, data-channel messages). Host candidates on
   the bound socket only; srflx / TURN gathering, multiple sockets and the virtual-time mode are M1.
   A loopback test connects two drivers and exchanges data-channel messages.
-- **Engine pin.** `rtci` 0.2.0 from crates.io (formerly `rtc`, repository `Brainwires/rtci`, formerly
+- **Engine pin.** `rtci` 0.2.1 from crates.io (formerly `rtc`, repository `Brainwires/rtci`, formerly
   `Brainwires/webrtc-rs-rtc`), the exact version pinned in `Cargo.lock`.
 - **Desktop spike** (`apps/desktop`). A GPUI window shows a VP8 stream that headless Chromium sends
   through `webrtc-rs-rtc`; libvpx decodes it; macOS draws an IOSurface-backed NV12 `CVPixelBuffer`
