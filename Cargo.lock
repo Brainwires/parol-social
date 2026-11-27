@@ -3138,7 +3138,7 @@ name = "parolnet-conformance"
 version = "0.1.0"
 dependencies = [
  "async-trait",
- "base64 0.22.1",
+ "base64 0.23.1",
  "bytes",
  "ciborium",
  "curve25519-dalek",
@@ -3186,7 +3186,7 @@ name = "parolnet-core"
 version = "0.1.0"
 dependencies = [
  "async-trait",
- "base64 0.22.1",
+ "base64 0.23.1",
  "ciborium",
  "codec2",
  "ed25519-dalek",
@@ -3305,7 +3305,7 @@ name = "parolnet-relay"
 version = "0.1.0"
 dependencies = [
  "async-trait",
- "base64 0.22.1",
+ "base64 0.23.1",
  "ciborium",
  "curve25519-dalek",
  "ed25519-dalek",
@@ -3337,7 +3337,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "axum",
- "base64 0.22.1",
+ "base64 0.23.1",
  "ciborium",
  "ed25519-dalek",
  "futures-util",
