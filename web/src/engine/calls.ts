@@ -11,7 +11,7 @@
 // Everything here runs inside the engine's mailbox except media capture and SDP work, which
 // re-enter it through `host.internal`.
 import { toHex } from "./bytes.ts";
-import { hasCandidates } from "./ice.ts";
+import { endOfCandidates, hasCandidates, hasEndOfCandidates } from "./ice.ts";
 import type {
   DtlsTransport,
   IceCandidateInit,
@@ -80,6 +80,8 @@ interface Call {
   pendingIce: IceCandidateInit[];
   descriptionSent: boolean;
   lateIce: number;
+  /** The peer has our end of candidates: in the description, or as an `ice` signal. */
+  endSent: boolean;
   local: MediaStreamLike | null;
   remote: MediaStreamLike | null;
   ringTimer: unknown;
@@ -170,6 +172,7 @@ export class CallManager {
       pendingIce: [],
       descriptionSent: false,
       lateIce: 0,
+      endSent: false,
       local: null,
       remote: null,
       ringTimer: null,
@@ -523,6 +526,13 @@ export class CallManager {
         return;
       }
       c.descriptionSent = true;
+      // PNP-011-MUST-035: the description ends our gathering when it says so; otherwise an
+      // `ice` signal does, now or once gathering completes.
+      c.endSent = hasEndOfCandidates(sdp);
+      if (!c.endSent && pc.iceGatheringState === "complete") {
+        await this.sendEndOfCandidates(c, pc);
+        if (!this.alive(c)) return;
+      }
       if (!c.incoming) this.armRing(c);
     });
   }
@@ -601,7 +611,15 @@ export class CallManager {
     };
     pc.onicecandidate = (ev) => {
       const cand = ev.candidate;
-      if (!cand || !cand.candidate) return;
+      if (!cand) {
+        // Gathering is complete on every transport: after the description, its end follows.
+        host.internal(async () => {
+          if (!this.alive(c) || c.pc !== pc || !c.descriptionSent || c.endSent) return;
+          await this.sendEndOfCandidates(c, pc);
+        });
+        return;
+      }
+      if (!cand.candidate) return;
       const init: IceCandidateInit = typeof cand.toJSON === "function" ? cand.toJSON() : {
         candidate: cand.candidate,
         sdpMid: cand.sdpMid,
@@ -622,6 +640,21 @@ export class CallManager {
         });
       });
     };
+  }
+
+  /**
+   * Our end-of-candidates indication as an `ice` signal (PNP-011-MUST-035), once per call; it
+   * is not one of the `CALL_LATE_ICE_MAX` candidates.
+   */
+  private async sendEndOfCandidates(c: Call, pc: PeerConnection): Promise<void> {
+    const sdp = pc.localDescription?.sdp;
+    if (!sdp) return;
+    c.endSent = true;
+    await this.host.sendSignal(c.peerId, {
+      action: "ice",
+      callId: c.callId,
+      candidate: endOfCandidates(sdp),
+    });
   }
 
   // ── Signals from the contact ─────────────────────────────────────
@@ -677,7 +710,10 @@ export class CallManager {
         return;
       }
       case "ice": {
-        if (!c || !sig.candidate.candidate) return;
+        // A candidate, or the contact's end of candidates (an empty `candidate`), which is
+        // applied or held the same way (PNP-011-MUST-036); `addIceCandidate` takes it as is,
+        // and one of a generation the call does not have is refused there and ignored here.
+        if (!c) return;
         if (c.remoteSet && c.pc && c.pc.remoteDescription) {
           void c.pc.addIceCandidate(sig.candidate).catch(() => {});
         } else if (c.pendingIce.length < CALL_PENDING_ICE_MAX) {

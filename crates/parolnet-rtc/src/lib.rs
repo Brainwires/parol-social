@@ -516,6 +516,7 @@ enum Command {
     },
     Quality(oneshot::Sender<ConnectionQuality>),
     LocalAddrs(oneshot::Sender<Vec<SocketAddr>>),
+    RemoteDescription(oneshot::Sender<Option<RTCSessionDescription>>),
     Close,
 }
 
@@ -633,6 +634,15 @@ impl RtcHandle {
         rx.await.map_err(|_| RtcError::Stopped)
     }
 
+    /// The peer's description as the connection holds it now: the one applied, with the
+    /// candidates and end-of-candidates indications added to it since
+    /// ([`RtcHandle::add_remote_candidate`]). `None` before one is applied.
+    pub async fn remote_description(&self) -> Result<Option<RTCSessionDescription>, RtcError> {
+        let (tx, rx) = oneshot::channel();
+        self.send(Command::RemoteDescription(tx))?;
+        rx.await.map_err(|_| RtcError::Stopped)
+    }
+
     /// The address allocated on the TURN server (the relay candidate), when there is one.
     pub fn relayed_addr(&self) -> Option<SocketAddr> {
         self.relayed_addr
@@ -654,7 +664,12 @@ impl RtcHandle {
         self.send(Command::SetRemoteDescription(Box::new(desc)))
     }
 
-    /// Add a trickled remote candidate.
+    /// Add a trickled remote candidate. One whose `candidate` is the empty string is the
+    /// peer's end-of-candidates indication (RFC 8838 section 13; PNP-011-MUST-036,
+    /// PNP-001-MUST-089): for the ICE generation its `username_fragment` names (the latest
+    /// without one), and for the media section its `sdp_mid` / `sdp_mline_index` names (every
+    /// section without either). An indication the connection cannot apply (a generation it
+    /// does not have) is ignored and does not end the connection.
     pub fn add_remote_candidate(&self, candidate: RTCIceCandidateInit) -> Result<(), RtcError> {
         self.send(Command::AddRemoteCandidate(candidate))
     }
@@ -2060,6 +2075,14 @@ impl Driver {
                 self.emit_local_description().await;
             }
             Command::SetRemoteDescription(desc) => self.on_remote_description(*desc).await?,
+            Command::AddRemoteCandidate(candidate) if candidate.candidate.is_empty() => {
+                // The peer's end of candidates. A stale one (another ICE generation, a media
+                // section the description does not have) changes nothing and is no reason to
+                // give the connection up (PNP-011-MUST-036, PNP-001-MUST-089).
+                if let Err(err) = self.pc.add_remote_candidate(candidate) {
+                    tracing::debug!(%err, "end-of-candidates indication ignored");
+                }
+            }
             Command::AddRemoteCandidate(candidate) => {
                 if has_mdns_candidate(&candidate.candidate) {
                     self.open_mdns();
@@ -2217,6 +2240,9 @@ impl Driver {
             }
             Command::LocalAddrs(reply) => {
                 let _ = reply.send(self.socks.iter().map(|s| s.local).collect());
+            }
+            Command::RemoteDescription(reply) => {
+                let _ = reply.send(self.pc.remote_description().cloned());
             }
             Command::Close => {}
         }
@@ -2754,10 +2780,24 @@ impl Driver {
         }
     }
 
+    /// The candidates of a gathering, then its end: the descriptions made from here on carry
+    /// `a=end-of-candidates` (PNP-011-MUST-035, PNP-001-MUST-088). An ICE agent that follows
+    /// W3C webrtc-pc section 5.6.4 reports `failed` only once its peer has the indication,
+    /// and the engine finishes a generation's gathering on this empty candidate alone
+    /// ([`RTCPeerConnection::add_local_candidate`]); without it the gathering state stays
+    /// `gathering`. Every gathering ends here: the first offer and answer and those of an ICE
+    /// restart or re-keying. No candidate of the generation is added after it.
+    ///
+    /// [`RTCPeerConnection::add_local_candidate`]: rtci::peer_connection::RTCPeerConnection::add_local_candidate
+    fn add_local_candidates(&mut self) -> Result<(), RtcError> {
+        self.add_gathered_candidates()?;
+        self.add_candidate(RTCIceCandidateInit::default())
+    }
+
     /// One host candidate per socket, the server-reflexive ones learned from STUN and the
     /// relay candidate; the relay candidate alone when relay-only. Priorities follow the
     /// sockets' order of preference.
-    fn add_local_candidates(&mut self) -> Result<(), RtcError> {
+    fn add_gathered_candidates(&mut self) -> Result<(), RtcError> {
         if let Some(relayed) = self.relay.as_ref().map(turn::Relay::relayed) {
             // No related address: it would name the address the relay exists to hide.
             let candidate = CandidateRelayConfig {

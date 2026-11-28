@@ -19,6 +19,7 @@
 
 use std::time::Duration;
 
+use parolnet_app::call::{DISCONNECT_GRACE, PathWatch};
 use parolnet_rtc::rtci::peer_connection::state::RTCPeerConnectionState;
 use parolnet_rtc::rtci::rtp_transceiver::rtp_sender::RtpCodecKind;
 use parolnet_rtc::rtci::statistics::report::RTCStatsReportEntry;
@@ -41,6 +42,44 @@ fn ms(n: u64) -> Duration {
 /// figure, passing or not.
 fn figure(test: &str, who: &str, what: &str, value: impl std::fmt::Debug) {
     eprintln!("figure {test} | {who} | {what} = {value:?}");
+}
+
+/// When the app's rule for a call without a path (PNP-011-MUST-037) ends the call, given one
+/// side's connection states up to `until`: a grace timer of [`DISCONNECT_GRACE`] armed on
+/// `disconnected`, run in the same (virtual) time as the states.
+fn grace_ends_at(
+    states: &[(Duration, RTCPeerConnectionState)],
+    until: Duration,
+) -> Option<Duration> {
+    let mut watch = PathWatch::default();
+    let mut timers: Vec<(u64, Duration)> = Vec::new();
+    for &(at, state) in states.iter().filter(|s| s.0 <= until) {
+        if let Some(&(_, due)) = timers
+            .iter()
+            .find(|(t, due)| *due <= at && watch.expired(*t))
+        {
+            return Some(due);
+        }
+        timers.retain(|(_, due)| *due > at);
+        if let Some(timer) = watch.on_state(state) {
+            timers.push((timer, at + DISCONNECT_GRACE));
+        }
+    }
+    timers
+        .into_iter()
+        .find(|(t, due)| *due <= until && watch.expired(*t))
+        .map(|(_, due)| due)
+}
+
+/// Both sides' descriptions end their gathering (`a=end-of-candidates`, PNP-011-MUST-035).
+fn assert_descriptions_end_gathering(who: &str, m: &Metrics) {
+    assert!(!m.descriptions.is_empty(), "{who}");
+    for (at, kind, sdp) in &m.descriptions {
+        assert!(
+            sdp.lines().any(|l| l == "a=end-of-candidates"),
+            "{who}: the {kind:?} at {at:?} does not end its gathering\n{sdp}"
+        );
+    }
 }
 
 /// A call on `profile` (both directions), connected.
@@ -447,6 +486,12 @@ async fn an_ice_restart_follows_a_machine_to_another_network() {
         offer.contains("10.0.9.1") && !offer.contains("10.0.0.1 "),
         "{offer}"
     );
+    // The restart gathered again, and its offer and answer end that gathering too.
+    for (who, m) in [("caller", &caller), ("callee", &callee)] {
+        assert_descriptions_end_gathering(who, m);
+        // The path came back well within the grace period: the call stays.
+        assert_eq!(grace_ends_at(&m.states, end), None, "{who}: {:?}", m.states);
+    }
     for (who, m) in [("caller", &caller), ("callee", &callee)] {
         assert_eq!(m.closed, None, "{who}: the connection survived");
         assert!(
@@ -519,6 +564,58 @@ async fn without_a_restart_the_same_move_ends_the_call() {
         failed(&c.caller.metrics()) && failed(&c.callee.metrics())
     })
     .await;
+    call.close().await;
+}
+
+/// PNP-011-MUST-037 in virtual time: the same move without a restart leaves both sides
+/// `disconnected`, and the grace period ends the call from there, whether or not the ICE
+/// agent ever reports `failed` (which an agent that follows W3C webrtc-pc 5.6.4 does only
+/// with the peer's end of candidates).
+#[tokio::test(start_paused = true)]
+async fn a_call_without_a_path_ends_when_the_grace_period_runs_out() {
+    let (call, _) = call_on(LinkProfile::default(), CallConfig::default()).await;
+    call.run_for(secs(5)).await;
+    let moved = call.elapsed();
+    call.caller.host.set_addresses(&["10.0.9.1"]);
+    call.until("both sides to lose the path", secs(30), |c| {
+        let lost = |m: &Metrics| {
+            m.states
+                .iter()
+                .any(|s| s.0 >= moved && s.1 == RTCPeerConnectionState::Disconnected)
+        };
+        lost(&c.caller.metrics()) && lost(&c.callee.metrics())
+    })
+    .await;
+    call.run_for(DISCONNECT_GRACE + secs(1)).await;
+    let end = call.elapsed();
+    for (who, m) in [
+        ("caller", call.caller.snapshot()),
+        ("callee", call.callee.snapshot()),
+    ] {
+        let lost = m
+            .states
+            .iter()
+            .find(|s| s.0 >= moved && s.1 == RTCPeerConnectionState::Disconnected)
+            .map(|s| s.0)
+            .expect("disconnected");
+        let ends = grace_ends_at(&m.states, end);
+        figure(
+            "a_call_without_a_path_ends_when_the_grace_period_runs_out",
+            who,
+            "lost after move / ends after move",
+            (lost - moved, ends.map(|e| e - moved)),
+        );
+        assert_eq!(ends, Some(lost + DISCONNECT_GRACE), "{who}: {:?}", m.states);
+        // Nothing connected again in between.
+        assert!(
+            !m.states
+                .iter()
+                .any(|s| s.0 > lost && s.1 == RTCPeerConnectionState::Connected),
+            "{who}: {:?}",
+            m.states
+        );
+        assert_descriptions_end_gathering(who, &m);
+    }
     call.close().await;
 }
 

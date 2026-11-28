@@ -6,7 +6,14 @@
 import { fromHex, fromUtf8, utf8, wipe } from "./bytes.ts";
 import { CallManager } from "./calls.ts";
 import { TransferManager } from "./transfers.ts";
-import { fetchStun, hasCandidates, peerConfig, validateTurn } from "./ice.ts";
+import {
+  endOfCandidates,
+  fetchStun,
+  hasCandidates,
+  hasEndOfCandidates,
+  peerConfig,
+  validateTurn,
+} from "./ice.ts";
 import type {
   DataChannel,
   FileSource,
@@ -195,6 +202,8 @@ interface Conn {
   verified: boolean;
   descriptionSent: boolean;
   lateIce: number;
+  /** The peer has our end of candidates: in the description, or as `rtc_ice`. */
+  endSent: boolean;
   timers: unknown[];
 }
 
@@ -2140,10 +2149,15 @@ export class Engine {
       }
       return;
     }
-    // rtc_ice
+    // rtc_ice: a candidate, or the peer's end of candidates (an empty `candidate`), which is
+    // applied or held the same way (PNP-001-MUST-089); `addIceCandidate` takes it as is, and
+    // one of a generation the connection does not have is refused there and ignored here.
     const candidate = parseIcePayload(payload);
-    if (!candidate || !candidate.candidate) return; // malformed, or end-of-candidates
-    if (this.turn?.relayOnly && !/ typ relay( |$)/.test(candidate.candidate)) {
+    if (!candidate) return; // malformed
+    if (
+      this.turn?.relayOnly && candidate.candidate !== "" &&
+      !/ typ relay( |$)/.test(candidate.candidate ?? "")
+    ) {
       return;
     }
     if (conn.remoteSet && conn.pc.remoteDescription) {
@@ -2272,6 +2286,7 @@ export class Engine {
       verified: false,
       descriptionSent: false,
       lateIce: 0,
+      endSent: false,
       timers: [],
     };
     st.conn = conn;
@@ -2296,7 +2311,14 @@ export class Engine {
     };
     pc.onicecandidate = (ev) => {
       const c = ev.candidate;
-      if (!c || !c.candidate) return;
+      if (!c) {
+        // Gathering is complete on every transport (the legacy null candidate): the peer
+        // gets our end of candidates (PNP-001-MUST-088). The per-transport empty
+        // candidates some browsers surface before it are not sent on their own.
+        void this.internal(() => this.onGatheringDone(peer, conn));
+        return;
+      }
+      if (!c.candidate) return;
       const init: IceCandidateInit = typeof c.toJSON === "function" ? c.toJSON() : {
         candidate: c.candidate,
         sdpMid: c.sdpMid,
@@ -2428,10 +2450,34 @@ export class Engine {
       return;
     }
     conn.descriptionSent = true;
+    // PNP-001-MUST-088: the description ends our gathering when it says so; otherwise an
+    // `rtc_ice` does, now or once gathering completes.
+    conn.endSent = hasEndOfCandidates(local.sdp);
+    if (!conn.endSent && conn.pc.iceGatheringState === "complete") {
+      this.sendEndOfCandidates(peer, conn);
+    }
     if (conn.initiator) {
       this.connTimer(peer, conn, ANSWER_TIMEOUT_MS, () => {
         if (!conn.remoteSet) this.connFailed(peer, conn, "Timeout");
       });
+    }
+  }
+
+  /** Gathering completed: after the description went out, its end follows as `rtc_ice`. */
+  private onGatheringDone(peer: string, conn: Conn): void {
+    if (!this.live(peer, conn) || !conn.descriptionSent || conn.endSent) return;
+    this.sendEndOfCandidates(peer, conn);
+  }
+
+  /**
+   * Our end-of-candidates indication as `rtc_ice` (PNP-001-MUST-088), once per connection:
+   * it is not one of the `LATE_ICE_MAX` candidates, and is sent after the channel opened too.
+   */
+  private sendEndOfCandidates(peer: string, conn: Conn): void {
+    const sdp = conn.pc.localDescription?.sdp;
+    if (!sdp) return;
+    if (this.signal("rtc_ice", peer, JSON.stringify(endOfCandidates(sdp)))) {
+      conn.endSent = true;
     }
   }
 

@@ -32,7 +32,7 @@ use zeroize::Zeroize;
 
 use crate::call::{
     CallEnd, CallInfo, CallMedia, CallQuality, CallSignal, CallState, FrameSink, MediaEvent,
-    OfferDecision, OutFrame, ReofferDecision, VideoChange, local_features, new_call_id,
+    OfferDecision, OutFrame, PathWatch, ReofferDecision, VideoChange, local_features, new_call_id,
 };
 use crate::reconnect::ProbeSchedule;
 use crate::signaling::{self, SigEvent, SigHandle, Signer};
@@ -76,6 +76,8 @@ const CALL_PENDING_ICE_MAX: usize = crate::call::MAX_PENDING_CANDIDATES;
 const CALL_MEDIA_CAPACITY: usize = 2048;
 const RESTART_TIMEOUT: Duration = crate::wire::RESTART_TIMEOUT;
 const CALL_REOFFER_TIMEOUT: Duration = crate::call::REOFFER_TIMEOUT;
+/// A call without a path for this long ends (PNP-011-MUST-037).
+const CALL_DISCONNECT_GRACE: Duration = crate::call::DISCONNECT_GRACE;
 
 pub(crate) enum Input {
     Command(Command),
@@ -178,6 +180,12 @@ pub(crate) enum Timer {
     CallConnect {
         call_id: String,
     },
+    /// A call's connection went disconnected (PNP-011-MUST-037); `timer` is its
+    /// [`PathWatch`](crate::call::PathWatch) generation.
+    CallDisconnect {
+        call_id: String,
+        timer: u64,
+    },
     OfferFallback {
         peer: String,
     },
@@ -249,6 +257,9 @@ struct Conn {
     pending_ice: Vec<RTCIceCandidateInit>,
     dc: Option<usize>,
     last_state: Option<RTCPeerConnectionState>,
+    /// The connection has reported `connected` at least once: a grace period that expires
+    /// on one that never did is ICE that found no path, not a lost one.
+    ever_connected: bool,
     /// Our local description and the remote one we applied (for the channel binding).
     local_sdp: Option<String>,
     remote_sdp: Option<String>,
@@ -351,6 +362,8 @@ struct Call {
     reoffer: Option<u64>,
     /// A `reoffer` / `reanswer` that could not be sent (no verified channel at that moment).
     unsent: Option<CallSignal>,
+    /// How long the call's connection has had no path (PNP-011-MUST-037).
+    path: PathWatch,
 }
 
 struct PeerState {
@@ -1682,9 +1695,8 @@ impl Engine {
                 let Ok(candidate) = serde_json::from_str::<RTCIceCandidateInit>(payload) else {
                     return;
                 };
-                if candidate.candidate.is_empty() {
-                    return; // end-of-candidates
-                }
+                // A candidate, or the peer's end of candidates (an empty `candidate`), which is
+                // applied (or held) the same way (PNP-001-MUST-089).
                 match (conn.remote_set, conn.handle.as_ref()) {
                     (true, Some(h)) => {
                         let _ = h.add_remote_candidate(candidate);
@@ -1787,6 +1799,7 @@ impl Engine {
             pending_ice: Vec::new(),
             dc: None,
             last_state: None,
+            ever_connected: false,
             local_sdp: None,
             remote_sdp: None,
             binding_sent: false,
@@ -1952,6 +1965,7 @@ impl Engine {
             }
             RtcEvent::ConnectionState(state) => {
                 conn.last_state = Some(state);
+                conn.ever_connected |= state == RTCPeerConnectionState::Connected;
                 let (verified, restarts) = (conn.is_verified(), conn.peer_restarts);
                 match state {
                     RTCPeerConnectionState::Disconnected => {
@@ -2245,13 +2259,15 @@ impl Engine {
                 }
             }
             Timer::DisconnectGrace { peer, epoch } => {
-                if self.conn_mut(&peer, epoch).is_some_and(|c| {
-                    matches!(
-                        c.last_state,
-                        Some(RTCPeerConnectionState::Disconnected | RTCPeerConnectionState::Failed)
-                    )
-                }) {
-                    self.conn_failed(&peer, FailReason::Timeout);
+                let Some(conn) = self.conn_mut(&peer, epoch) else {
+                    return;
+                };
+                if matches!(
+                    conn.last_state,
+                    Some(RTCPeerConnectionState::Disconnected | RTCPeerConnectionState::Failed)
+                ) {
+                    let reason = disconnect_grace_reason(conn.ever_connected);
+                    self.conn_failed(&peer, reason);
                 }
             }
             Timer::CallRing { call_id } => {
@@ -2265,6 +2281,20 @@ impl Engine {
                         self.signal_call_end(&call_id, false);
                         self.end_call(&call_id, CallEnd::NoAnswer);
                     }
+                }
+            }
+            Timer::CallDisconnect { call_id, timer } => {
+                let lost = self
+                    .calls
+                    .get(&call_id)
+                    .is_some_and(|c| !c.info.is_over() && c.path.expired(timer));
+                if lost {
+                    tracing::info!(call = %call_id, "the call's connection did not come back");
+                    self.signal_call_end(&call_id, false);
+                    self.end_call(
+                        &call_id,
+                        CallEnd::Failed("the media connection was lost".into()),
+                    );
                 }
             }
             Timer::CallConnect { call_id } => {
@@ -2634,6 +2664,7 @@ impl Engine {
                 established: false,
                 reoffer: None,
                 unsent: None,
+                path: PathWatch::default(),
             },
         );
         self.after(CALL_RING_TIMEOUT, Timer::CallRing { call_id });
@@ -2975,10 +3006,28 @@ impl Engine {
             }
             RtcEvent::ConnectionState(state) => match state {
                 RTCPeerConnectionState::Connected => {
+                    if let Some(c) = self.calls.get_mut(call_id) {
+                        c.path.on_state(state);
+                    }
                     self.set_call_state(call_id, CallState::Active);
                 }
                 RTCPeerConnectionState::Disconnected => {
-                    // The media path is gone: look for another before ICE gives up.
+                    // The media path is gone: the call ends unless it is back within the
+                    // grace period (PNP-011-MUST-037), whatever ICE reports; meanwhile look
+                    // for another path.
+                    let timer = self
+                        .calls
+                        .get_mut(call_id)
+                        .and_then(|c| c.path.on_state(state));
+                    if let Some(timer) = timer {
+                        self.after(
+                            CALL_DISCONNECT_GRACE,
+                            Timer::CallDisconnect {
+                                call_id: call_id.to_owned(),
+                                timer,
+                            },
+                        );
+                    }
                     self.restart_call(call_id);
                 }
                 RTCPeerConnectionState::Failed | RTCPeerConnectionState::Closed => {
@@ -3199,9 +3248,8 @@ impl Engine {
                 let Some(c) = self.calls.get_mut(&call_id) else {
                     return;
                 };
-                if candidate.candidate.is_empty() {
-                    return;
-                }
+                // A candidate, or the peer's end of candidates (an empty `candidate`), which is
+                // applied (or held with the early candidates) the same way (PNP-011-MUST-036).
                 match (c.remote_set, c.handle.as_ref()) {
                     (true, Some(h)) => {
                         let _ = h.add_remote_candidate(candidate);
@@ -3215,6 +3263,18 @@ impl Engine {
             CallSignal::Hangup { .. } => self.end_call(&call_id, CallEnd::RemoteHungUp),
             CallSignal::Reject { .. } => self.end_call(&call_id, CallEnd::Rejected),
         }
+    }
+}
+
+/// Why a data connection whose disconnect grace period ran out is given up: one that never
+/// connected is ICE that found no path (as an ICE agent's `failed` would say, which it
+/// reports only with the peer's end of candidates, W3C webrtc-pc section 5.6.4), one that was
+/// connected lost its path.
+fn disconnect_grace_reason(ever_connected: bool) -> FailReason {
+    if ever_connected {
+        FailReason::Timeout
+    } else {
+        FailReason::IceFailed
     }
 }
 
@@ -3248,4 +3308,15 @@ fn dropped_owners(state: &State, ids: Vec<u64>) -> Vec<(String, u64)> {
                 .map(|(p, _)| (p.clone(), id))
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_grace_period_that_expires_before_any_connect_is_ice_failing() {
+        assert_eq!(disconnect_grace_reason(false), FailReason::IceFailed);
+        assert_eq!(disconnect_grace_reason(true), FailReason::Timeout);
+    }
 }

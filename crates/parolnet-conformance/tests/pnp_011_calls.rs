@@ -27,6 +27,7 @@ use parolnet_rtc::net::{
 };
 use parolnet_rtc::rtci::peer_connection::sdp::{RTCSdpType, RTCSessionDescription};
 use parolnet_rtc::rtci::peer_connection::state::RTCPeerConnectionState;
+use parolnet_rtc::rtci::peer_connection::transport::RTCIceCandidateInit;
 use parolnet_rtc::{
     ConnectionQuality, MediaKind, RtcConfig, RtcEvent, RtcHandle, ice_ufrag, media_directions,
 };
@@ -340,6 +341,9 @@ struct Pair {
     a: Peer,
     b: Peer,
     signal: bool,
+    /// Deliver the descriptions without their `a=end-of-candidates` (as a browser that writes
+    /// none sends them).
+    strip_end_of_candidates: bool,
 }
 
 impl Pair {
@@ -349,6 +353,7 @@ impl Pair {
             a: Peer::new(connection_config(video, false, RtcConfig::default())).await,
             b: Peer::new(connection_config(video, true, RtcConfig::default())).await,
             signal: true,
+            strip_end_of_candidates: false,
         }
     }
 
@@ -366,6 +371,7 @@ impl Pair {
             })
             .await,
             signal: true,
+            strip_end_of_candidates: false,
         }
     }
 
@@ -384,7 +390,12 @@ impl Pair {
             RtcEvent::LocalDescription(desc) => {
                 from.descriptions.push((*desc).clone());
                 if self.signal {
-                    to.handle.set_remote_description(*desc).unwrap();
+                    let desc = if self.strip_end_of_candidates {
+                        without_end_of_candidates(&desc)
+                    } else {
+                        *desc
+                    };
+                    to.handle.set_remote_description(desc).unwrap();
                 }
             }
             RtcEvent::ConnectionState(state) => from.states.push(state),
@@ -413,6 +424,21 @@ impl Pair {
         self.a.handle.close().await;
         self.b.handle.close().await;
     }
+}
+
+/// `desc` without its `a=end-of-candidates` lines.
+fn without_end_of_candidates(desc: &RTCSessionDescription) -> RTCSessionDescription {
+    let sdp = desc.sdp.replace("a=end-of-candidates\r\n", "");
+    match desc.sdp_type {
+        RTCSdpType::Offer => RTCSessionDescription::offer(sdp),
+        _ => RTCSessionDescription::answer(sdp),
+    }
+    .expect("a description")
+}
+
+/// The description ends its gathering: `a=end-of-candidates` in its (bundled) media.
+fn ends_gathering(sdp: &str) -> bool {
+    sdp.lines().any(|l| l == "a=end-of-candidates")
 }
 
 fn lines<'a>(sdp: &'a str, prefix: &str) -> Vec<&'a str> {
@@ -622,6 +648,109 @@ async fn a_description_contains_the_candidates_gathered_for_it() {
         assert!(hosts.iter().all(|l| l.contains(" 127.0.0.1 ")), "{hosts:?}");
         assert!(ice_ufrag(sdp).is_some());
     }
+}
+
+// ── The end of candidates (section 4.4; PNP-001 section 10.5) ───────────────────────────
+
+#[clause("PNP-011-MUST-035", "PNP-001-MUST-088")]
+#[tokio::test]
+async fn every_description_ends_its_gathering() {
+    // A call's offer and answer.
+    let (offer, answer) = call_descriptions(true).await;
+    for sdp in [&offer, &answer] {
+        assert!(ends_gathering(sdp), "{sdp}");
+    }
+    // A data connection's, and those of its ICE restart (a new gathering).
+    let mut pair = Pair::data().await;
+    pair.connect().await;
+    pair.until("the channel", |p| {
+        p.a.channel.is_some() && p.b.channel.is_some()
+    })
+    .await;
+    pair.a.handle.restart_ice().unwrap();
+    pair.until("the restart's answer", |p| p.b.descriptions.len() == 2)
+        .await;
+    assert_eq!(pair.a.descriptions.len(), 2);
+    for desc in pair.a.descriptions.iter().chain(&pair.b.descriptions) {
+        assert!(ends_gathering(&desc.sdp), "{}", desc.sdp);
+    }
+    pair.close().await;
+}
+
+/// The peer's description as the connection holds it, with what was added to it since.
+async fn remote_sdp(handle: &RtcHandle) -> String {
+    handle
+        .remote_description()
+        .await
+        .expect("the connection runs")
+        .expect("a remote description")
+        .sdp
+}
+
+#[clause("PNP-011-MUST-036", "PNP-001-MUST-089")]
+#[tokio::test]
+async fn an_end_of_candidates_indication_is_applied_and_a_stale_one_ignored() {
+    // The peer's descriptions do not end their gathering, as a browser's that writes no
+    // `a=end-of-candidates`; its end comes as an indication.
+    let mut pair = Pair::call(false).await;
+    pair.strip_end_of_candidates = true;
+    pair.connect().await;
+    assert!(!ends_gathering(&remote_sdp(&pair.b.handle).await));
+    let offer = pair.a.descriptions[0].sdp.clone();
+    let end = |ufrag: Option<String>| RTCIceCandidateInit {
+        candidate: String::new(),
+        sdp_mline_index: Some(0),
+        username_fragment: ufrag,
+        ..Default::default()
+    };
+    // One of a generation the connection does not have: ignored, and the call goes on.
+    pair.b
+        .handle
+        .add_remote_candidate(end(Some("stale".into())))
+        .unwrap();
+    pair.step(Duration::from_millis(200)).await;
+    assert!(!ends_gathering(&remote_sdp(&pair.b.handle).await));
+    // The peer's own: applied to the connection.
+    pair.b
+        .handle
+        .add_remote_candidate(end(ice_ufrag(&offer).map(str::to_owned)))
+        .unwrap();
+    pair.step(Duration::from_millis(200)).await;
+    assert!(ends_gathering(&remote_sdp(&pair.b.handle).await));
+    // And one that names no generation is for the latest (W3C addIceCandidate).
+    assert!(!ends_gathering(&remote_sdp(&pair.a.handle).await));
+    pair.a.handle.add_remote_candidate(end(None)).unwrap();
+    pair.step(Duration::from_millis(200)).await;
+    assert!(ends_gathering(&remote_sdp(&pair.a.handle).await));
+    for _ in 0..10 {
+        pair.step(Duration::from_millis(50)).await;
+    }
+    assert!(pair.a.connected() && pair.b.connected());
+    pair.close().await;
+}
+
+#[clause("PNP-011-MUST-037")]
+#[test]
+fn a_call_without_a_path_for_thirty_seconds_ends() {
+    use RTCPeerConnectionState::{Connected, Connecting, Disconnected};
+    assert_eq!(call::DISCONNECT_GRACE, Duration::from_secs(30));
+    let mut watch = call::PathWatch::default();
+    assert_eq!(watch.on_state(Connected), None);
+    let timer = watch
+        .on_state(Disconnected)
+        .expect("the grace timer is armed");
+    // An ICE restart's checks, or another `disconnected`, change nothing.
+    assert_eq!(watch.on_state(Connecting), None);
+    assert_eq!(watch.on_state(Disconnected), None);
+    assert!(
+        watch.expired(timer),
+        "no path for the whole grace: the call ends"
+    );
+    // Back in time: the timer finds the call connected and leaves it.
+    let mut watch = call::PathWatch::default();
+    let timer = watch.on_state(Disconnected).expect("armed");
+    assert_eq!(watch.on_state(Connected), None);
+    assert!(!watch.expired(timer));
 }
 
 fn address(interface: &str, ip: &str, prefix_len: u8) -> LocalAddress {

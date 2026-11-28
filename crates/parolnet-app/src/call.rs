@@ -15,6 +15,7 @@
 
 use std::time::Duration;
 
+use parolnet_rtc::rtci::peer_connection::state::RTCPeerConnectionState;
 use parolnet_rtc::rtci::peer_connection::transport::RTCIceCandidateInit;
 use parolnet_rtc::{
     CongestionConfig, ConnectionQuality, FrameSender, MediaConfig, MediaKind, RtcConfig,
@@ -35,6 +36,51 @@ pub const QUALITY_INTERVAL: Duration = Duration::from_secs(1);
 /// Candidates of `ice` signals kept until the remote description is applied (PNP-011
 /// section 4.4).
 pub const MAX_PENDING_CANDIDATES: usize = 64;
+/// A call whose connection is disconnected and does not come back within this ends as
+/// failed (PNP-011-MUST-037): the time a connection has to come up ([`CONNECT_TIMEOUT`]) and
+/// RFC 7675's consent timeout.
+pub const DISCONNECT_GRACE: Duration = Duration::from_secs(30);
+
+/// When a call has had no path for too long (PNP-011 section 6, PNP-011-MUST-037).
+///
+/// The call's connection reports `disconnected` when its path is gone. An ICE agent that
+/// follows W3C webrtc-pc section 5.6.4 reports `failed` only once the peer's end of
+/// candidates is applied, which a peer may never signal, so the end of the call does not
+/// wait for it: the first `disconnected` arms a grace timer of [`DISCONNECT_GRACE`], only
+/// `connected` disarms it, and when it expires armed the call ends. An ICE restart under way
+/// (PNP-011 section 8.1) does not disarm it.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct PathWatch {
+    /// The timers armed so far; the one in force is `Some(n)`.
+    armed: Option<u64>,
+    timers: u64,
+}
+
+impl PathWatch {
+    /// The connection's state changed. `Some(n)`: arm a grace timer that expires with
+    /// generation `n` after [`DISCONNECT_GRACE`] (and then ask [`PathWatch::expired`]).
+    pub fn on_state(&mut self, state: RTCPeerConnectionState) -> Option<u64> {
+        match state {
+            RTCPeerConnectionState::Connected => {
+                self.armed = None;
+                None
+            }
+            // A second `disconnected` (the path came back for a moment, or a restart's
+            // checks lost it again) keeps the deadline of the first.
+            RTCPeerConnectionState::Disconnected if self.armed.is_none() => {
+                self.timers += 1;
+                self.armed = Some(self.timers);
+                self.armed
+            }
+            _ => None,
+        }
+    }
+
+    /// The grace timer of generation `timer` expired: whether the call ends now.
+    pub fn expired(&self, timer: u64) -> bool {
+        self.armed == Some(timer)
+    }
+}
 
 /// The configuration of a call's own connection (PNP-011 section 5), on top of `base` (how
 /// this client binds, its STUN servers, the user's TURN server and policy): Opus both ways,
@@ -581,6 +627,29 @@ pub fn new_call_id() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_path_watch_ends_the_call_only_after_an_unbroken_disconnect() {
+        use RTCPeerConnectionState::*;
+        let mut watch = PathWatch::default();
+        assert_eq!(watch.on_state(Connecting), None);
+        assert_eq!(watch.on_state(Connected), None);
+        // Lost: a timer is armed, and a second `disconnected` keeps the first deadline.
+        let first = watch.on_state(Disconnected).expect("armed");
+        assert_eq!(watch.on_state(Disconnected), None);
+        // An ICE restart's checks do not disarm it.
+        assert_eq!(watch.on_state(Connecting), None);
+        assert!(watch.expired(first));
+        // Back in time: the timer that fires later changes nothing.
+        assert_eq!(watch.on_state(Connected), None);
+        assert!(!watch.expired(first));
+        // Lost again: a new timer; the old one stays dead.
+        let second = watch.on_state(Disconnected).expect("armed again");
+        assert_ne!(first, second);
+        assert!(!watch.expired(first));
+        assert!(watch.expired(second));
+        assert_eq!(DISCONNECT_GRACE, Duration::from_secs(30));
+    }
 
     #[test]
     fn signals_match_the_pwa_shapes() {

@@ -49,7 +49,74 @@ Deno.test(
     ]);
     const offerPc = small.pcs.at(-1)!;
     assert(offerPc.localDescription!.sdp.includes("a=candidate:"));
+    // The description ends its gathering itself (PNP-001-MUST-088).
+    assert(offerPc.localDescription!.sdp.includes("a=end-of-candidates"));
     assertEquals(offerPc.channels[0].label, "parolnet");
+  }),
+);
+
+Deno.test(
+  "end of candidates: a description without a=end-of-candidates is followed by one rtc_ice, which the peer applies",
+  withWorld(async (w) => {
+    const [x, y] = await orderedPair(w);
+    await w.pair(x, y);
+    const [small, large] = await restartBoth(w, x, y);
+    w.relay.signals = [];
+    w.relay.down = false;
+    // As Chromium: gathering completes, the description does not say so.
+    w.rtc.writeEndOfCandidates = false;
+    small.engine.networkChanged();
+    large.engine.networkChanged();
+    await w.advance(2_000);
+    assertEquals(small.path(large), "Direct");
+    assertEquals(w.relay.signals.map((s) => s.type), [
+      "rtc_offer",
+      "rtc_ice",
+      "rtc_answer",
+      "rtc_ice",
+    ]);
+    // PNP-001-MUST-089: each side applied the other's indication, as `addIceCandidate`
+    // takes it: an empty candidate for the first media section.
+    for (const pc of [small.pcs.at(-1)!, large.pcs.at(-1)!]) {
+      assertEquals(pc.remoteCandidates, [{
+        candidate: "",
+        sdpMid: null,
+        sdpMLineIndex: 0,
+        usernameFragment: null,
+      }]);
+    }
+    // Once per connection: nothing more when the channel is open.
+    await w.advance(5_000);
+    assertEquals(w.relay.signals.filter((s) => s.type === "rtc_ice").length, 2);
+  }),
+);
+
+Deno.test(
+  "end of candidates: a description sent before gathering finished is followed by the end once it has",
+  withWorld(async (w) => {
+    const [x, y] = await orderedPair(w);
+    await w.pair(x, y);
+    const [small, large] = await restartBoth(w, x, y);
+    w.relay.signals = [];
+    w.relay.down = false;
+    w.rtc.neverFinishGathering = true;
+    small.engine.networkChanged();
+    large.engine.networkChanged();
+    // The descriptions go out at the gathering cap.
+    await w.advance(8_000);
+    assertEquals(w.relay.signals.map((s) => s.type), ["rtc_offer", "rtc_answer"]);
+    const offerPc = small.pcs.at(-1)!;
+    assert(!offerPc.localDescription!.sdp.includes("a=end-of-candidates"));
+    // Gathering finishes later: the end follows on its own.
+    offerPc.iceGatheringState = "complete";
+    offerPc.onicecandidate?.({ candidate: null });
+    await w.settle();
+    assertEquals(w.relay.signals.map((s) => s.type), ["rtc_offer", "rtc_answer", "rtc_ice"]);
+    assertEquals(large.pcs.at(-1)!.remoteCandidates.map((c) => c.candidate), [""]);
+    // A second null candidate sends nothing more.
+    offerPc.onicecandidate?.({ candidate: null });
+    await w.settle();
+    assertEquals(w.relay.signals.length, 3);
   }),
 );
 

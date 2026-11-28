@@ -24,3 +24,6 @@ tracing.workspace = true
 tokio = { workspace = true, features = ["full", "test-util"] }
 # The record stream of PNP-010, for the transfer that crosses an ICE restart.
 parolnet-transfer.workspace = true
+# The app's call rules checked on the simulated network in virtual time: how long a call may
+# have no path (PNP-011-MUST-037).
+parolnet-app.workspace = true

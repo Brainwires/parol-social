@@ -502,8 +502,17 @@ export class FakePc implements PeerConnection {
     this.localDescription = desc;
     if (!this.rtc.neverFinishGathering) {
       queueMicrotask(() => {
+        // As Firefox: the description says gathering is over (`writeEndOfCandidates`).
+        // Then, as every browser, the null candidate.
+        if (this.rtc.writeEndOfCandidates && this.localDescription) {
+          this.localDescription = {
+            ...this.localDescription,
+            sdp: this.localDescription.sdp + "a=end-of-candidates\r\n",
+          };
+        }
         this.iceGatheringState = "complete";
         this.onicegatheringstatechange?.();
+        this.onicecandidate?.({ candidate: null });
       });
     }
     // An answerer's local description completes the exchange on its side.
@@ -574,6 +583,11 @@ export class FakeRtc {
   /** ICE fails as soon as the answer is applied. */
   failIce = false;
   neverFinishGathering = false;
+  /**
+   * A finished gathering writes `a=end-of-candidates` into the local description (Firefox);
+   * off, it writes none (Chromium) and only the null candidate says gathering is over.
+   */
+  writeEndOfCandidates = true;
   /** Relay-only connections gather no candidate at all. */
   turnUnreachable = false;
   /** Senders expose their DTLS transport (`RtpSender.transport`). */
