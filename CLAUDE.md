@@ -79,7 +79,8 @@ parolnet-transfer (PNP-010 file transfer, sans-I/O; no workspace deps, WASM-comp
 parolnet-rtc (native only; drives the sans-I/O `rtci` engine; no workspace deps)
   |
   +---> parolnet-simnet (test-only; an in-memory network that runs parolnet-rtc in virtual
-          time, and the M1 call checks; + parolnet-media default features; `vpx` opt-in)
+          time, and the M1 call checks; + parolnet-media default features; `vpx` opt-in;
+          parolnet-app as a dev-dependency only, for the call rules its tests replay)
 parolnet-store (native only; encrypted persistence: SQLite + SQLCipher, key in the OS keychain; no workspace deps)
   |
   v

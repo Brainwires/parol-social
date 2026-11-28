@@ -1,12 +1,19 @@
 # PNP-011: ParolNet 1:1 Calls
 
 ### Status: CANDIDATE
-### Version: 0.2
-### Date: 2026-11-23
+### Version: 0.3
+### Date: 2026-11-28
 
 ---
 
 ## Changelog
+
+**v0.3 (2026-11-28) — The end of candidates; a call without a path ends**
+
+- Section 4.4: an `ice` signal whose `candidate` is empty is the end-of-candidates indication of RFC 8838 section 13 (W3C webrtc-pc `addIceCandidate`). Each side now signals the end of every gathering, in the description (`a=end-of-candidates`) or with such an `ice` signal, and a receiver applies it to the call connection. Before, it "added nothing" and no ParolNet peer sent one. An ICE agent that follows W3C webrtc-pc section 5.6.4 reports `failed` only once it holds the peer's end of candidates, so without it a call whose path died never failed. New clauses **PNP-011-MUST-035**, **PNP-011-MUST-036**.
+- Section 5.5: a description sent after gathering carries the end of candidates.
+- Section 6: a call whose connection stays disconnected for 30 seconds ends as failed, whatever the ICE agent reports and whether or not the peer signals the end of its candidates. New clause **PNP-011-MUST-037**. Section 8.1 refers to it.
+- A peer that signals no end of candidates (an earlier version) is still understood: its calls end by the timer of section 6.
 
 **v0.2 (2026-11-23) — SRTP re-keying**
 
@@ -107,9 +114,17 @@ A call that is not answered within 60 seconds MUST end: the caller sends `hangup
 
 After the answer (sent or applied), the call connection MUST connect within 30 seconds; a peer whose connection has not connected by then sends `hangup` and reports the call as failed. **PNP-011-MUST-011**
 
-### 4.4 Early Candidates
+### 4.4 Early Candidates and the End of Candidates
 
-Descriptions carry their candidates (section 5.5); `ice` signals carry candidates found later. One may arrive before the receiver has applied the description it belongs to (a callee that has not accepted yet). A receiver SHOULD keep up to 64 such candidates per call and add them once the description is applied, and drop those beyond. **PNP-011-SHOULD-001** An `ice` signal whose `candidate.candidate` is the empty string marks the end of candidates and adds nothing.
+Descriptions carry their candidates (section 5.5); `ice` signals carry candidates found later. One may arrive before the receiver has applied the description it belongs to (a callee that has not accepted yet). A receiver SHOULD keep up to 64 such candidates per call and add them once the description is applied, and drop those beyond. **PNP-011-SHOULD-001**
+
+An `ice` signal whose `candidate.candidate` is the empty string is an end-of-candidates indication (RFC 8838 section 13; W3C webrtc-pc, `RTCIceCandidateInit` and `addIceCandidate`): its sender will signal no further candidate for the ICE generation that `candidate.usernameFragment` names, or for its latest generation when the field is absent. `sdpMid` and `sdpMLineIndex` name the media section as for a candidate; with neither, the indication is for every media section.
+
+A peer MUST signal the end of its candidates after each gathering of a call connection: the first one, and the one of every ICE restart (section 8.1). A description sent once that gathering has finished carries it as `a=end-of-candidates` in its media sections (RFC 9429 sections 5.2.2 and 5.3.2); a peer that sent its description before gathering finished sends one `ice` signal of the form above once it has, even when it found no further candidate. **PNP-011-MUST-035**
+
+A receiver MUST apply an end-of-candidates indication, whether a description or an `ice` signal carries it, to the call connection (RFC 9429 section 5.10; W3C webrtc-pc `addIceCandidate`), keeping an `ice` signal that arrives before its description is applied with the early candidates above. It MUST NOT treat the indication as a candidate, and MUST ignore, without ending the call, one that names an ICE generation the connection does not have. **PNP-011-MUST-036** After the indication, further candidates of that generation are ignored (RFC 8838 section 14).
+
+An ICE agent that follows W3C webrtc-pc section 5.6.4 reports `failed` only after it has the peer's end of candidates: with a peer that never signals one, it never reports `failed`. Section 6 bounds such a call.
 
 ## 5. The Media Session
 
@@ -143,7 +158,7 @@ The video section offers the RTCP feedback `nack`, `nack pli`, `ccm fir` and `go
 
 ### 5.5 Candidates
 
-A description is sent once candidate gathering for it has finished, and MUST contain the candidates gathered. **PNP-011-MUST-017** (`ice` signals remain valid for candidates that turn up later, and browsers send them.)
+A description is sent once candidate gathering for it has finished, and MUST contain the candidates gathered. **PNP-011-MUST-017** (`ice` signals remain valid for candidates that turn up later, and browsers send them.) Such a description also ends its gathering with `a=end-of-candidates` (section 4.4).
 
 Which candidates a peer may have at all is fixed by PNP-001 section 10.5: STUN servers come from the peer's own relay and from nowhere else, a TURN server only from the user's own settings, and with "relay only" selected nothing but relay candidates is signalled or used. This section adds which local addresses become host candidates.
 
@@ -158,6 +173,8 @@ Peers resolve the mDNS names (`<uuid>.local`) that browsers signal in place of p
 ## 6. Ending a Call
 
 `hangup` ends a call in any state; `reject` ends one that the callee has not accepted. A peer that receives either closes its call connection and reports the end; neither is answered. A call whose connection fails (ICE fails, or the connection closes) ends as failed, and the peer that noticed sends `hangup`.
+
+A call whose connection reports `disconnected` (its path is gone: consent expired, RFC 7675) and has not reported `connected` again 30 seconds later MUST end as failed, whatever is being done about it meanwhile (an ICE restart, section 8.1) and whatever the ICE agent reports; the peer sends `hangup`. **PNP-011-MUST-037** The end of the call does not depend on the agent reporting `failed`, which it does only with the peer's end of candidates (section 4.4). Thirty seconds is the time a connection has to come up (PNP-011-MUST-011) and the consent timeout of RFC 7675 section 5.1, and longer than an unanswered ICE restart takes to be taken back (section 7.4).
 
 ## 7. Renegotiation
 
@@ -203,7 +220,7 @@ The offer of an ICE restart MUST carry a new ICE username fragment and password 
 
 Until the restart has selected a candidate pair, both peers MUST go on sending and accepting the session's packets (DTLS, SRTP) on the pair the session had (RFC 8445 section 9): an ICE restart does not interrupt a path that still works. **PNP-011-MUST-029**
 
-A call whose peer does not list `renegotiate` cannot be restarted; it continues while its path does and ends as failed when ICE fails.
+A call whose peer does not list `renegotiate` cannot be restarted; it continues while its path does and ends as failed when ICE fails or when it has had no path for the time section 6 allows. The same holds for a restart that finds no path.
 
 ### 8.2 On the Data Connection
 

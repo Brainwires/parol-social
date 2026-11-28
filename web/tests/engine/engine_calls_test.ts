@@ -296,6 +296,60 @@ Deno.test(
 );
 
 Deno.test(
+  "call: an end of candidates that arrives before the user accepts is kept and applied",
+  withWorld(async (w) => {
+    const [a, b] = await pairWithMedia(w);
+    const started = await a.engine.startCall(b.id, false);
+    await w.settle();
+    const end = { candidate: "", sdpMid: "0", sdpMLineIndex: 0, usernameFragment: null };
+    inject(a, b, { action: "ice", callId: started.callId, candidate: end });
+    await w.settle();
+    await b.engine.acceptCall(started.callId);
+    await w.settle();
+    // PNP-011-MUST-036: handed to `addIceCandidate` as it came, not dropped.
+    assertEquals(callPcs(b)[0].remoteCandidates, [end]);
+    assertEquals(call(b).state.kind, "Active");
+  }),
+);
+
+Deno.test(
+  "call: without a=end-of-candidates in the descriptions, each side ends its gathering with one ice signal",
+  withWorld(async (w) => {
+    const [a, b] = await pairWithMedia(w);
+    // As Chromium: gathering completes, the descriptions do not say so.
+    w.rtc.writeEndOfCandidates = false;
+    const started = await a.engine.startCall(b.id, false);
+    await w.settle();
+    await b.engine.acceptCall(started.callId);
+    await w.settle();
+    assertEquals(call(a).state.kind, "Active");
+    // PNP-011-MUST-035 / MUST-036: each side's end reached the other and was applied.
+    const end = { candidate: "", sdpMid: null, sdpMLineIndex: 0, usernameFragment: null };
+    assertEquals(callPcs(a)[0].remoteCandidates, [end]);
+    assertEquals(callPcs(b)[0].remoteCandidates, [end]);
+    // Once per call.
+    callPcs(a)[0].onicecandidate?.({ candidate: null });
+    await w.settle();
+    assertEquals(callPcs(b)[0].remoteCandidates.length, 1);
+  }),
+);
+
+Deno.test(
+  "call: a description that ends its gathering needs no ice signal",
+  withWorld(async (w) => {
+    const [a, b] = await pairWithMedia(w);
+    const started = await a.engine.startCall(b.id, false);
+    await w.settle();
+    await b.engine.acceptCall(started.callId);
+    await w.settle();
+    assertEquals(call(a).state.kind, "Active");
+    assert(callPcs(a)[0].localDescription!.sdp.includes("a=end-of-candidates"));
+    assertEquals(callPcs(a)[0].remoteCandidates, []);
+    assertEquals(callPcs(b)[0].remoteCandidates, []);
+  }),
+);
+
+Deno.test(
   "call: nobody answers for 60 s: the caller hangs up and the callee's ringing stops",
   withWorld(async (w) => {
     const [a, b] = await pairWithMedia(w);

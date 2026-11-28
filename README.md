@@ -80,7 +80,7 @@ apps/desktop (GPUI)      web/ (TS + wasm)        later: iOS / Android shells (Un
 | `apps/desktop` | GPUI desktop client: contacts, pairing, chat (UI v0), 1:1 calls with camera, echo cancellation and device menus; the M0 video spike behind `--spike` | M1 |
 | `parolnet-media` | Call media for native clients (no dependency on the rest of the workspace): frames, the capture traits and synthetic sources, resampling, Opus, echo cancellation / noise suppression / gain (AEC3, pure Rust), the audio duplex path; behind opt-in features, VP8 through libvpx, microphone and speakers (cpal), camera capture (nokhwa) | M1 |
 | `parolnet-transfer` | File transfer (PNP-010) without I/O, for native and wasm: the offer and its answers, sealed 64 KiB records (ChaCha20-Poly1305, STREAM nonces, a key per attempt), resume at the record the receiver names, the final SHA-256 check, limits. `parolnet-app` streams files from and to disk with it; the web app drives it through `parolnet-wasm` | M1 |
-| `parolnet-simnet` | Test-only: a deterministic in-memory network (loss, jitter, reordering, a rate cap) that runs `parolnet-rtc` in virtual time, and the M1 call checks on it (setup, renegotiation, ICE restart, the estimate; 2% loss, 300 kbit/s cap, 100 ms jitter) | M1 |
+| `parolnet-simnet` | Test-only: a deterministic in-memory network (loss, jitter, reordering, a rate cap) that runs `parolnet-rtc` in virtual time, and the M1 call checks on it (setup, renegotiation, ICE restart, the end of a call that lost its path, the estimate; 2% loss, 300 kbit/s cap, 100 ms jitter) | M1 |
 | `parolnet-call` | Calls | M1 |
 | `parolnet-mls`, `-sframe`, `-sfu` | MLS groups and devices, SFrame, the SFU | M2 |
 
